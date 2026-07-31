@@ -1,0 +1,330 @@
+//! workerd runtime manager: turns live module-worker manifests into
+//! supervised workerd child processes, one per worker, listening on
+//! loopback ports that ingress proxies to.
+//!
+//! Per worker+version we materialize a directory:
+//!   <data>/workers/<name>/<version>/
+//!     config.capnp       generated workerd config
+//!     src/<module paths> module files copied out of the blob store
+//!
+//! Version bump → new dir, new process, old one killed after the new
+//! socket answers. workerd absent → workers are marked unavailable
+//! (ingress still serves asset trees natively; the merged "Pages"
+//! path never needs workerd).
+//!
+//! KV bindings surface as env vars (RF_KV_<BINDING>_URL) pointing at
+//! the loopback peer API v0.1; native kvNamespace service bindings are
+//! v0.2 once verified against real workerd.
+
+use crate::node::{Node, NodeEvent};
+use anyhow::{Context, Result};
+use rf_core::manifest::{ModuleKind, WorkerManifest};
+use std::collections::HashMap;
+use std::path::PathBuf;
+use std::process::Stdio;
+use std::sync::Arc;
+use tokio::process::{Child, Command};
+
+pub struct Runtime {
+    node: Arc<Node>,
+    workerd: Option<PathBuf>,
+    port_base: u16,
+    running: HashMap<String, RunningWorker>,
+}
+
+struct RunningWorker {
+    version: u64,
+    port: u16,
+    child: Option<Child>,
+}
+
+/// Where ingress should send traffic for a module worker.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WorkerPort(pub u16);
+
+impl Runtime {
+    pub fn new(node: Arc<Node>) -> Self {
+        let workerd = node
+            .cfg
+            .runtime
+            .workerd
+            .clone()
+            .or_else(|| which_workerd());
+        if workerd.is_none() {
+            tracing::warn!(
+                "workerd binary not found — module workers disabled, assets still serve"
+            );
+        }
+        let port_base = node.cfg.runtime.port_base;
+        Self { node, workerd, port_base, running: HashMap::new() }
+    }
+
+    /// Long-running reconcile loop.
+    pub async fn run(mut self) {
+        let mut rx = self.node.subscribe();
+        // Initial reconcile at boot.
+        self.reconcile().await;
+        loop {
+            tokio::select! {
+                ev = rx.recv() => match ev {
+                    Ok(NodeEvent::Manifests) => self.reconcile().await,
+                    Ok(_) => {}
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
+                    Err(_) => return,
+                },
+                // Re-check periodically: blobs may have arrived, or a
+                // child may have died.
+                _ = tokio::time::sleep(std::time::Duration::from_secs(10)) => {
+                    self.reap();
+                    self.reconcile().await;
+                }
+            }
+        }
+    }
+
+    fn reap(&mut self) {
+        for (name, rw) in self.running.iter_mut() {
+            if let Some(child) = &mut rw.child {
+                if let Ok(Some(status)) = child.try_wait() {
+                    tracing::warn!("workerd for {name} exited: {status}");
+                    rw.child = None;
+                }
+            }
+        }
+    }
+
+    /// Port registry published for ingress. name → port for every
+    /// worker whose process is (believed) up.
+    fn ports_snapshot(running: &HashMap<String, RunningWorker>) -> HashMap<String, u16> {
+        running
+            .iter()
+            .filter(|(_, rw)| rw.child.is_some())
+            .map(|(n, rw)| (n.clone(), rw.port))
+            .collect()
+    }
+
+    async fn reconcile(&mut self) {
+        let desired: Vec<WorkerManifest> = self
+            .node
+            .live_manifests()
+            .into_iter()
+            .filter(|m| !m.main.is_empty())
+            .collect();
+
+        // Stop workers that disappeared.
+        let names: std::collections::HashSet<&str> =
+            desired.iter().map(|m| m.name.as_str()).collect();
+        let stale: Vec<String> = self
+            .running
+            .keys()
+            .filter(|n| !names.contains(n.as_str()))
+            .cloned()
+            .collect();
+        for name in stale {
+            if let Some(mut rw) = self.running.remove(&name) {
+                if let Some(child) = &mut rw.child {
+                    let _ = child.start_kill();
+                }
+                tracing::info!("stopped worker {name}");
+            }
+        }
+
+        for m in desired {
+            let current = self.running.get(&m.name);
+            let up = current.map(|rw| rw.child.is_some()).unwrap_or(false);
+            if current.map(|rw| rw.version) == Some(m.version) && up {
+                continue; // already running this version
+            }
+            if self.node.missing_blobs().iter().any(|s| m.blob_refs().any(|r| r == *s)) {
+                tracing::debug!("worker {} waiting for blobs", m.name);
+                continue;
+            }
+            match self.start_worker(&m).await {
+                Ok(()) => {}
+                Err(e) => tracing::warn!("starting worker {}: {e:#}", m.name),
+            }
+        }
+        // Publish the port table for ingress.
+        let ports = Self::ports_snapshot(&self.running);
+        self.node.set_worker_ports(ports);
+    }
+
+    fn alloc_port(&self, name: &str) -> u16 {
+        // Stable slot by name hash, linear probe over occupied ports.
+        let mut slot = {
+            let d = sha2::Sha256::digest(name.as_bytes());
+            u16::from_le_bytes([d[0], d[1]]) % 1000
+        };
+        let used: std::collections::HashSet<u16> =
+            self.running.values().map(|r| r.port).collect();
+        loop {
+            let port = self.port_base + slot;
+            if !used.contains(&port) {
+                return port;
+            }
+            slot = (slot + 1) % 1000;
+        }
+    }
+
+    async fn start_worker(&mut self, m: &WorkerManifest) -> Result<()> {
+        let Some(workerd) = &self.workerd else {
+            return Ok(()); // no runtime on this node
+        };
+        let port = self
+            .running
+            .get(&m.name)
+            .map(|r| r.port)
+            .unwrap_or_else(|| self.alloc_port(&m.name));
+
+        let dir = self
+            .node
+            .cfg
+            .data_dir
+            .join("workers")
+            .join(&m.name)
+            .join(m.version.to_string());
+        let src = dir.join("src");
+        std::fs::create_dir_all(&src)?;
+        for module in &m.modules {
+            let path = src.join(&module.path);
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            let bytes = self.node.blobs.get(&module.sha256).context("module blob")?;
+            std::fs::write(&path, bytes)?;
+        }
+        let config = generate_config(m, port, self.node.cfg.peer_api.listen.port());
+        std::fs::write(dir.join("config.capnp"), config)?;
+
+        // Kill the old version before binding the port again.
+        if let Some(rw) = self.running.get_mut(&m.name) {
+            if let Some(child) = &mut rw.child {
+                let _ = child.start_kill();
+            }
+        }
+
+        let child = Command::new(workerd)
+            .arg("serve")
+            .arg(dir.join("config.capnp"))
+            .current_dir(&dir)
+            .stdout(Stdio::null())
+            .stderr(Stdio::inherit())
+            .kill_on_drop(true)
+            .spawn()
+            .with_context(|| format!("spawning workerd for {}", m.name))?;
+
+        tracing::info!("worker {} v{} on 127.0.0.1:{port}", m.name, m.version);
+        self.running
+            .insert(m.name.clone(), RunningWorker { version: m.version, port, child: Some(child) });
+        Ok(())
+    }
+}
+
+use sha2::Digest;
+
+fn which_workerd() -> Option<PathBuf> {
+    let path = std::env::var_os("PATH")?;
+    for dir in std::env::split_paths(&path) {
+        let candidate = dir.join("workerd");
+        if candidate.is_file() {
+            return Some(candidate);
+        }
+    }
+    None
+}
+
+/// Emit the workerd capnp config for one worker.
+pub fn generate_config(m: &WorkerManifest, port: u16, peer_api_port: u16) -> String {
+    let mut modules = String::new();
+    for module in &m.modules {
+        let kind = match module.kind {
+            ModuleKind::EsModule => "esModule",
+            ModuleKind::CommonJs => "commonJsModule",
+            ModuleKind::Wasm => "wasm",
+            ModuleKind::Text => "text",
+            ModuleKind::Data => "data",
+        };
+        modules.push_str(&format!(
+            "        (name = \"{}\", {kind} = embed \"src/{}\"),\n",
+            module.path, module.path
+        ));
+    }
+    let mut bindings = String::new();
+    for (k, v) in &m.env {
+        bindings.push_str(&format!(
+            "        (name = \"{}\", text = {}),\n",
+            k,
+            capnp_string(v)
+        ));
+    }
+    for (binding, ns) in &m.kv_bindings {
+        bindings.push_str(&format!(
+            "        (name = \"RF_KV_{}_URL\", text = \"http://127.0.0.1:{}/v1/kv/{}\"),\n",
+            binding.to_uppercase(),
+            peer_api_port,
+            ns
+        ));
+    }
+    format!(
+        r#"# generated by rf — do not edit
+using Workerd = import "/workerd/workerd.capnp";
+
+const config :Workerd.Config = (
+  services = [
+    (name = "main", worker = (
+      modules = [
+{modules}      ],
+      compatibilityDate = "{compat}",
+      bindings = [
+{bindings}      ],
+    )),
+  ],
+  sockets = [
+    (name = "http", address = "127.0.0.1:{port}", http = (), service = "main"),
+  ],
+);
+"#,
+        compat = m.compatibility_date,
+    )
+}
+
+fn capnp_string(s: &str) -> String {
+    format!("\"{}\"", s.replace('\\', "\\\\").replace('"', "\\\""))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rf_core::manifest::Module;
+    use std::collections::BTreeMap;
+
+    #[test]
+    fn config_contains_modules_env_and_socket() {
+        let m = WorkerManifest {
+            name: "w".into(),
+            version: 3,
+            deleted: false,
+            main: "index.js".into(),
+            modules: vec![Module {
+                path: "index.js".into(),
+                sha256: [0; 32],
+                kind: ModuleKind::EsModule,
+                size: 1,
+            }],
+            assets: vec![],
+            hostnames: vec![],
+            env: BTreeMap::from([("GREETING".into(), "hi \"there\"".into())]),
+            kv_bindings: BTreeMap::from([("CACHE".into(), "ns1".into())]),
+            crons: vec![],
+            compatibility_date: "2026-07-31".into(),
+        };
+        let cfg = generate_config(&m, 30111, 7382);
+        assert!(cfg.contains("esModule = embed \"src/index.js\""));
+        assert!(cfg.contains("127.0.0.1:30111"));
+        assert!(cfg.contains("GREETING"));
+        assert!(cfg.contains("hi \\\"there\\\""));
+        assert!(cfg.contains("RF_KV_CACHE_URL"));
+        assert!(cfg.contains("/v1/kv/ns1"));
+        assert!(cfg.contains("compatibilityDate = \"2026-07-31\""));
+    }
+}

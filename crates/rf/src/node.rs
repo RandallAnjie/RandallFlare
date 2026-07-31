@@ -47,6 +47,8 @@ pub struct Inner {
     pub kv: HashMap<String, Namespace>,
     /// node_id hex → view. Live peers only (dead ones drop out).
     pub peers: BTreeMap<String, PeerView>,
+    /// worker name → local workerd port (published by the runtime).
+    pub worker_ports: HashMap<String, u16>,
 }
 
 pub struct Node {
@@ -75,6 +77,7 @@ impl Node {
             manifests: ManifestSet::new(cfg.operator),
             kv: HashMap::new(),
             peers: BTreeMap::new(),
+            worker_ports: HashMap::new(),
         };
         // Hydrate: static stability means booting entirely from disk.
         for env in store.load_manifests()? {
@@ -339,6 +342,14 @@ impl Node {
 
     pub fn live_manifests(&self) -> Vec<WorkerManifest> {
         self.inner.lock().unwrap().manifests.live().map(|r| r.manifest.clone()).collect()
+    }
+
+    pub fn set_worker_ports(&self, ports: HashMap<String, u16>) {
+        self.inner.lock().unwrap().worker_ports = ports;
+    }
+
+    pub fn worker_port(&self, name: &str) -> Option<u16> {
+        self.inner.lock().unwrap().worker_ports.get(name).copied()
     }
 
     /// Periodic GC of dead claims + KV tombstones.
