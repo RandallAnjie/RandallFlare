@@ -111,6 +111,7 @@ struct Driver {
     name: String,
     raft: Raft,
     sql: rusqlite::Connection,
+    path: std::path::PathBuf,
     client: PeerClient,
     /// tag → responder for proposals in flight.
     pending: HashMap<u64, oneshot::Sender<Result<ExecResult>>>,
@@ -127,6 +128,7 @@ impl Driver {
         let dir = node.cfg.data_dir.join("d1");
         std::fs::create_dir_all(&dir)?;
         let sql = rusqlite::Connection::open(dir.join(format!("{name}.sqlite")))?;
+        // (path recorded below for snapshot capture/install)
         sql.pragma_update(None, "journal_mode", "WAL")?;
         sql.execute_batch(
             "CREATE TABLE IF NOT EXISTS _rf_applied (id INTEGER PRIMARY KEY CHECK (id = 0), seq INTEGER NOT NULL);
@@ -135,11 +137,17 @@ impl Driver {
         let applied_i: i64 =
             sql.query_row("SELECT seq FROM _rf_applied WHERE id = 0", [], |r| r.get(0))?;
         let applied = applied_i as u64;
-        let (epoch, voted_for) = node.store.load_d1_meta(&name)?;
+        let (epoch, voted_for, base_seq, base_epoch) = node.store.load_d1_meta(&name)?;
         let log = node.store.load_d1_log(&name)?;
-        let raft = Raft::restore(node.id(), group, epoch, voted_for, log, applied);
+        let raft = Raft::restore(
+            node.id(), group, epoch, voted_for, base_seq, base_epoch, log, applied,
+        );
         let client = PeerClient::new(node.cfg.cluster_secret_bytes()?);
-        Ok(Self { node, name, raft, sql, client, pending: HashMap::new(), my_entries: HashMap::new() })
+        let path = dir.join(format!("{name}.sqlite"));
+        Ok(Self {
+            node, name, raft, sql, path, client,
+            pending: HashMap::new(), my_entries: HashMap::new(),
+        })
     }
 
     async fn run(mut self, mut rx: mpsc::Receiver<DriverCmd>) {
@@ -230,6 +238,8 @@ impl Driver {
                         &self.name,
                         self.raft.epoch,
                         self.raft.voted_for,
+                        self.raft.base_seq,
+                        self.raft.base_epoch,
                     ) {
                         tracing::error!("d1 {}: persist meta: {e:#}", self.name);
                     }
@@ -267,6 +277,51 @@ impl Driver {
                     });
                 }
                 Action::Apply(entry) => self.apply(entry),
+                Action::NeedSnapshot { to } => {
+                    match self.capture_snapshot() {
+                        Ok(data) => {
+                            let (last_seq, last_epoch) = self.raft.snapshot_point();
+                            let msg = Msg::InstallSnapshot {
+                                epoch: self.raft.epoch,
+                                last_seq,
+                                last_epoch,
+                                data,
+                            };
+                            let wire = WireMsg { from: self.node.id(), msg };
+                            let Some(peer) = self
+                                .node
+                                .peers()
+                                .get(&to.to_string())
+                                .and_then(|p| p.api_addr)
+                            else {
+                                continue;
+                            };
+                            let body = postcard::to_stdvec(&wire).expect("wire encode");
+                            let client = self.client.clone();
+                            let name = self.name.clone();
+                            tokio::spawn(async move {
+                                let path = format!("/v1/quorum/{name}");
+                                if let Err(e) =
+                                    client.post(&peer.to_string(), &path, body).await
+                                {
+                                    tracing::debug!("d1 {name}: snapshot to {peer}: {e}");
+                                }
+                            });
+                            tracing::info!(
+                                "d1 {}: shipping snapshot (seq {last_seq}) to laggard",
+                                self.name
+                            );
+                        }
+                        Err(e) => tracing::warn!("d1 {}: snapshot capture: {e:#}", self.name),
+                    }
+                }
+                Action::ApplySnapshot { seq, data } => {
+                    if let Err(e) = self.install_snapshot(seq, &data) {
+                        tracing::error!("d1 {}: snapshot install: {e:#}", self.name);
+                    } else {
+                        tracing::info!("d1 {}: installed snapshot at seq {seq}", self.name);
+                    }
+                }
                 Action::BecameLeader => {
                     tracing::info!("d1 {}: leader (epoch {})", self.name, self.raft.epoch);
                 }
@@ -283,6 +338,75 @@ impl Driver {
                     self.my_entries.clear();
                 }
             }
+        }
+        self.maybe_compact();
+    }
+
+    /// Read the SQLite file as a complete snapshot: checkpoint the
+    /// WAL first so the main file alone is the full state.
+    fn capture_snapshot(&mut self) -> Result<Vec<u8>> {
+        self.sql
+            .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |_| Ok(()))
+            .context("wal checkpoint")?;
+        std::fs::read(&self.path).context("reading sqlite file")
+    }
+
+    /// Replace the local database with a shipped snapshot.
+    fn install_snapshot(&mut self, seq: u64, data: &[u8]) -> Result<()> {
+        // Swap the connection out before touching files.
+        let tmp = self.path.with_extension("snap-tmp");
+        std::fs::write(&tmp, data)?;
+        // Point the handle at an in-memory db while we replace the
+        // file (dropping the old connection releases its locks).
+        self.sql = rusqlite::Connection::open_in_memory()?;
+        // Stale WAL/SHM from the old database must not survive the
+        // swap — they'd be replayed into the new file.
+        let _ = std::fs::remove_file(self.path.with_extension("sqlite-wal"));
+        let _ = std::fs::remove_file(self.path.with_extension("sqlite-shm"));
+        std::fs::rename(&tmp, &self.path)?;
+        let sql = rusqlite::Connection::open(&self.path)?;
+        sql.pragma_update(None, "journal_mode", "WAL")?;
+        let marker: i64 =
+            sql.query_row("SELECT seq FROM _rf_applied WHERE id = 0", [], |r| r.get(0))?;
+        if marker as u64 != seq {
+            // Shouldn't happen (sender captures at its applied mark);
+            // trust the protocol's declared seq.
+            tracing::warn!(
+                "d1 {}: snapshot marker {marker} != declared {seq}; correcting",
+                self.name
+            );
+            sql.execute("UPDATE _rf_applied SET seq = ?1 WHERE id = 0", [seq as i64])?;
+        }
+        self.sql = sql;
+        Ok(())
+    }
+
+    /// Compact the in-memory + stored log once it outgrows the
+    /// configured threshold.
+    fn maybe_compact(&mut self) {
+        let threshold = self.node.cfg.d1.compact_threshold;
+        let keep = self.node.cfg.d1.keep_tail;
+        if (self.raft.log.len() as u64) <= threshold {
+            return;
+        }
+        if self.raft.compact(keep) {
+            if let Err(e) = self.node.store.compact_d1_log(&self.name, self.raft.base_seq) {
+                tracing::error!("d1 {}: compact store: {e:#}", self.name);
+            }
+            if let Err(e) = self.node.store.put_d1_meta(
+                &self.name,
+                self.raft.epoch,
+                self.raft.voted_for,
+                self.raft.base_seq,
+                self.raft.base_epoch,
+            ) {
+                tracing::error!("d1 {}: compact meta: {e:#}", self.name);
+            }
+            tracing::info!(
+                "d1 {}: compacted log below seq {}",
+                self.name,
+                self.raft.base_seq
+            );
         }
     }
 

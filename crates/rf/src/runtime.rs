@@ -9,8 +9,8 @@
 //!
 //! Version bump → new dir, new process, old one killed after the new
 //! socket answers. workerd absent → workers are marked unavailable
-//! (ingress still serves asset trees natively; the merged "Pages"
-//! path never needs workerd).
+//! (ingress still serves asset trees natively; the static-site
+//! serving path never needs workerd).
 //!
 //! KV bindings are native workerd `kvNamespace` bindings: each one
 //! points at an external service → the node's loopback kvbind server,

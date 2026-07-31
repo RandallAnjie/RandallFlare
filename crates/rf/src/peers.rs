@@ -160,7 +160,7 @@ impl PeerClient {
         let body =
             serde_json::json!({ "sql": sql, "params": params }).to_string().into_bytes();
         let mut target = base.to_string();
-        for _ in 0..20 {
+        for _ in 0..25 {
             match self.post(&target, &format!("/v1/d1/{db}/exec"), body.clone()).await {
                 Ok(raw) => return Ok(serde_json::from_slice(&raw)?),
                 Err(e) => {

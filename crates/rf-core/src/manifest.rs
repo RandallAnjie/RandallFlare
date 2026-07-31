@@ -1,6 +1,6 @@
 //! Worker manifests — the operator-signed unit of deployment.
 //!
-//! Workers and Pages are one product: a worker = ES modules + an
+//! The single deploy unit: a worker = ES modules + an
 //! optional static asset tree (served under an `ASSETS` binding /
 //! fallback route). All file content is referenced by sha256 and moves
 //! through the content-addressed blob store; the manifest is just the
@@ -62,7 +62,7 @@ pub struct WorkerManifest {
     pub prev: Option<[u8; 32]>,
     pub deleted: bool,
     /// Path of the main module. Empty string = assets-only worker
-    /// (the merged "Pages" case) — ingress serves the asset tree
+    /// (a pure static site) — ingress serves the asset tree
     /// directly with no JS in front.
     pub main: String,
     pub modules: Vec<Module>,

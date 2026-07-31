@@ -1,14 +1,14 @@
 //! Ingress: the :80 listener on public nodes. Routes by Host header
 //! against the manifest routing table.
 //!
-//! - Assets (the merged Pages product) are served natively from the
+//! - Static assets are served natively from the
 //!   blob store — no workerd involved: exact path, then
 //!   `<path>/index.html`, then `404.html`, then plain 404. A worker
 //!   with BOTH modules and assets gets asset-first fallthrough: asset
 //!   hit wins, miss goes to the module.
 //! - Module workers proxy to the local workerd port.
-//! - TLS (:443, rcgen self-signed + ACME claims) is v0.2; run behind
-//!   the operator's TLS terminator or plain HTTP until then.
+//! - TLS: serve_tls with the SNI cert store (<data>/certs, ACME- or
+//!   certbot-fed, hot-reloaded).
 
 use crate::node::Node;
 use anyhow::Result;

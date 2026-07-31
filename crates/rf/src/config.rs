@@ -41,6 +41,38 @@ pub struct NodeConfig {
     pub anchor: AnchorConfig,
     #[serde(default)]
     pub acme: Option<AcmeConfig>,
+    #[serde(default)]
+    pub d1: D1Config,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct D1Config {
+    /// Compact a database's Raft log once it exceeds this many
+    /// entries…
+    #[serde(default = "default_compact_threshold")]
+    pub compact_threshold: u64,
+    /// …keeping this many recent entries for cheap follower catch-up
+    /// (older laggards get a full snapshot).
+    #[serde(default = "default_keep_tail")]
+    pub keep_tail: u64,
+}
+
+impl Default for D1Config {
+    fn default() -> Self {
+        Self {
+            compact_threshold: default_compact_threshold(),
+            keep_tail: default_keep_tail(),
+        }
+    }
+}
+
+fn default_compact_threshold() -> u64 {
+    4096
+}
+
+fn default_keep_tail() -> u64 {
+    256
 }
 
 #[derive(Debug, Clone, Deserialize)]

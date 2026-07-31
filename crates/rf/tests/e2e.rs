@@ -569,6 +569,114 @@ async fn d1_quorum_replicates_and_survives_replica_loss() {
     }
 }
 
+/// Snapshot catch-up: a replica misses enough writes that the leader
+/// compacts its log past what the laggard needs; on rejoin it must be
+/// brought current via InstallSnapshot — then prove it's a real voter
+/// by killing the leader and writing through the recovered node's
+/// majority.
+#[tokio::test(flavor = "multi_thread")]
+async fn d1_laggard_recovers_via_snapshot() {
+    let operator = Keypair::from_seed([17u8; 32]);
+    let client = PeerClient::new(SECRET);
+
+    let mk = |label: &str, seeds: &[u16]| -> TestNode {
+        let dir =
+            std::env::temp_dir().join(format!("rf-e2e-{label}-{}", rand::random::<u32>()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (gossip, api, ingress) = (free_port(), free_port(), free_port());
+        let mut cfg = std::fs::read_to_string(write_config(
+            &dir, &operator, gossip, api, ingress, seeds, label,
+        ))
+        .unwrap();
+        cfg.push_str("\n[d1]\ncompact_threshold = 12\nkeep_tail = 3\n");
+        std::fs::write(dir.join("rf.toml"), cfg).unwrap();
+        let child = spawn_node(&dir, &dir.join("rf.toml"));
+        TestNode { child, api: format!("127.0.0.1:{api}"), ingress, gossip, _dir: dir }
+    };
+
+    let mut a = mk("snapa", &[]);
+    wait_ping(&a.api, Duration::from_secs(15)).await;
+    let mut b = mk("snapb", &[a.gossip]);
+    let mut c = mk("snapc", &[a.gossip]);
+    wait_ping(&b.api, Duration::from_secs(15)).await;
+    wait_ping(&c.api, Duration::from_secs(15)).await;
+    let deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        let status = client.status(&a.api).await.unwrap_or_default();
+        if status["peers"].as_array().map(|p| p.len()).unwrap_or(0) >= 2 {
+            break;
+        }
+        assert!(Instant::now() < deadline, "membership never converged");
+        tokio::time::sleep(Duration::from_millis(300)).await;
+    }
+
+    client.post(&a.api, "/v1/d1/create", br#"{"name":"snapdb"}"#.to_vec()).await.unwrap();
+    client
+        .d1_exec(&a.api, "snapdb", "CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)", serde_json::json!([]))
+        .await
+        .unwrap();
+    // Make sure C's driver has joined (first write replicated) before
+    // taking it down — we want it BEHIND, not UNKNOWN.
+    client
+        .d1_exec(&a.api, "snapdb", "INSERT INTO t (v) VALUES ('seed')", serde_json::json!([]))
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    c.child.kill().unwrap();
+    c.child.wait().unwrap();
+
+    // 30 writes >> compact_threshold(12): survivors compact past
+    // anything C still has.
+    for i in 0..30 {
+        client
+            .d1_exec(
+                &a.api,
+                "snapdb",
+                "INSERT INTO t (v) VALUES (?1)",
+                serde_json::json!([format!("row{i}")]),
+            )
+            .await
+            .unwrap();
+    }
+
+    // C rejoins with its stale state; snapshot must bring it current.
+    let c_dir = c._dir.clone();
+    let mut c2 = spawn_node(&c_dir, &c_dir.join("rf.toml"));
+    wait_ping(&c.api, Duration::from_secs(15)).await;
+    // Give replication a moment, then verify C actually holds the data
+    // by making it part of the only available majority: kill the
+    // current leader.
+    tokio::time::sleep(Duration::from_secs(4)).await;
+    let probe = br#"{"sql":"SELECT 1 AS ok","params":[]}"#.to_vec();
+    let mut leader_is_a = false;
+    if let Ok(raw) = client.post(&a.api, "/v1/d1/snapdb/exec", probe.clone()).await {
+        let v: serde_json::Value = serde_json::from_slice(&raw).unwrap();
+        leader_is_a = v["rows"][0]["ok"] == 1;
+    }
+    let (dead, survivor) = if leader_is_a { (&mut a, &b) } else { (&mut b, &a) };
+    dead.child.kill().unwrap();
+    dead.child.wait().unwrap();
+
+    // Quorum now requires C. Writes + reads must still work, with all
+    // 31 acknowledged rows present.
+    client
+        .d1_exec(&survivor.api, "snapdb", "INSERT INTO t (v) VALUES ('post-recovery')", serde_json::json!([]))
+        .await
+        .expect("write with recovered laggard in the majority");
+    let count = client
+        .d1_exec(&survivor.api, "snapdb", "SELECT COUNT(*) AS n FROM t", serde_json::json!([]))
+        .await
+        .unwrap();
+    assert_eq!(count["rows"][0]["n"], 32, "all rows incl. snapshot-recovered: {count}");
+
+    for mut n in [a, b] {
+        n.child.kill().ok();
+        n.child.wait().ok();
+    }
+    c2.kill().ok();
+    c2.wait().ok();
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn two_node_deploy_kv_and_static_stability() {
     let operator = Keypair::from_seed([7u8; 32]);
@@ -581,7 +689,7 @@ async fn two_node_deploy_kv_and_static_stability() {
     let mut b = start("b", &operator, &[a.gossip]);
     wait_ping(&b.api, Duration::from_secs(15)).await;
 
-    // Deploy an assets-only worker (the merged Pages case) to A.
+    // Deploy an assets-only worker (a pure static site) to A.
     let op_any = AnyKeypair::Ed(operator.clone());
     let bundle_dir = make_bundle("site.test");
     let bundle = rf::deploy::read_bundle(&bundle_dir).unwrap();
@@ -624,7 +732,7 @@ async fn two_node_deploy_kv_and_static_stability() {
     assert_eq!(resp.status(), 200);
     assert!(resp.text().await.unwrap().contains("hello from rf"));
 
-    // Directory index + custom 404 (Pages semantics).
+    // Directory index + custom 404 for static assets.
     let docs = http
         .get(format!("http://127.0.0.1:{}/docs/", b.ingress))
         .header("host", "site.test")

@@ -24,7 +24,7 @@ One static binary, `rf`. Every node runs:
   deterministic adjudication. Used for every singleton job: cron ticks,
   DNS repair, ACME renewal.
 - **runtime** — workerd child processes, one per active worker.
-  *Workers and Pages are one product here*: a worker is modules plus an
+  There is exactly one deploy unit — the worker: modules plus an
   optional static asset tree (served via a disk service bound as
   `ASSETS`).
 - **ingress** — rustls TLS, SNI/Host routing to local workerd, reverse

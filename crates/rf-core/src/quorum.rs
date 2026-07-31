@@ -56,6 +56,15 @@ pub enum Msg {
         match_seq: u64,
         ok: bool,
     },
+    /// State-machine snapshot for a follower whose next entry has
+    /// been compacted away. `data` is the full state at `last_seq`
+    /// (for D1: the SQLite file bytes, applied marker included).
+    InstallSnapshot {
+        epoch: u64,
+        last_seq: u64,
+        last_epoch: u64,
+        data: Vec<u8>,
+    },
 }
 
 /// What the IO shell must do after a transition. Ordering matters:
@@ -69,6 +78,13 @@ pub enum Action {
     Send(PublicId, Msg),
     /// Entry is committed — apply to the state machine (in order).
     Apply(Entry),
+    /// Replace the whole state machine with this snapshot (jump the
+    /// applied mark to `seq`), then persist meta+log.
+    ApplySnapshot { seq: u64, data: Vec<u8> },
+    /// The driver must capture the current state machine and send
+    /// `Msg::InstallSnapshot` to this peer (the entries it needs are
+    /// compacted away).
+    NeedSnapshot { to: PublicId },
     /// Signals for the driver's bookkeeping.
     BecameLeader,
     LostLeadership,
@@ -88,8 +104,12 @@ pub struct Raft {
     pub group: Vec<PublicId>,
     pub epoch: u64,
     pub voted_for: Option<PublicId>,
-    /// seq of log[0] is 1; log is contiguous.
+    /// Contiguous; log[0].seq == base_seq + 1. Everything at or below
+    /// base_seq has been compacted into the state machine.
     pub log: Vec<Entry>,
+    /// Snapshot point: seq/epoch of the last compacted entry.
+    pub base_seq: u64,
+    pub base_epoch: u64,
     pub commit: u64,
     applied: u64,
     role: Role,
@@ -114,6 +134,8 @@ impl Raft {
             epoch: 0,
             voted_for: None,
             log: Vec::new(),
+            base_seq: 0,
+            base_epoch: 0,
             commit: 0,
             applied: 0,
             role: Role::Follower,
@@ -121,23 +143,58 @@ impl Raft {
     }
 
     /// Restore from persisted state (meta + log + last applied).
+    #[allow(clippy::too_many_arguments)]
     pub fn restore(
         me: PublicId,
         group: Vec<PublicId>,
         epoch: u64,
         voted_for: Option<PublicId>,
+        base_seq: u64,
+        base_epoch: u64,
         log: Vec<Entry>,
         applied: u64,
     ) -> Self {
         let mut r = Self::new(me, group);
         r.epoch = epoch;
         r.voted_for = voted_for;
+        r.base_seq = base_seq;
+        r.base_epoch = base_epoch;
         r.log = log;
         // Commit is volatile in Raft; it re-derives. Applied is the
-        // state machine's high-water mark (never re-apply).
+        // state machine's high-water mark (never re-apply). It can't
+        // sit below the snapshot point.
+        let applied = applied.max(base_seq);
         r.commit = applied;
         r.applied = applied;
         r
+    }
+
+    /// (seq, epoch) the current state machine corresponds to — what a
+    /// shipped snapshot must declare.
+    pub fn snapshot_point(&self) -> (u64, u64) {
+        let epoch = if self.applied == self.base_seq {
+            self.base_epoch
+        } else {
+            self.entry(self.applied).map(|e| e.epoch).unwrap_or(self.base_epoch)
+        };
+        (self.applied, epoch)
+    }
+
+    /// Drop log entries compacted into the state machine, keeping
+    /// `keep_tail` recent ones for cheap follower catch-up. Returns
+    /// true when anything was dropped (caller persists meta + log).
+    pub fn compact(&mut self, keep_tail: u64) -> bool {
+        let new_base = self.applied.saturating_sub(keep_tail);
+        if new_base <= self.base_seq {
+            return false;
+        }
+        let Some(e) = self.entry(new_base) else { return false };
+        let new_base_epoch = e.epoch;
+        let drop_count = (new_base - self.base_seq) as usize;
+        self.log.drain(..drop_count);
+        self.base_seq = new_base;
+        self.base_epoch = new_base_epoch;
+        true
     }
 
     pub fn is_leader(&self) -> bool {
@@ -159,15 +216,23 @@ impl Raft {
     fn last(&self) -> (u64, u64) {
         match self.log.last() {
             Some(e) => (e.epoch, e.seq),
-            None => (0, 0),
+            None => (self.base_epoch, self.base_seq),
         }
     }
 
     fn entry(&self, seq: u64) -> Option<&Entry> {
-        if seq == 0 || seq as usize > self.log.len() {
-            None
+        if seq <= self.base_seq {
+            return None;
+        }
+        self.log.get((seq - self.base_seq) as usize - 1)
+    }
+
+    /// Epoch at `seq` when known (in-log or the snapshot point).
+    fn epoch_at(&self, seq: u64) -> Option<u64> {
+        if seq == self.base_seq {
+            Some(self.base_epoch)
         } else {
-            self.log.get(seq as usize - 1)
+            self.entry(seq).map(|e| e.epoch)
         }
     }
 
@@ -258,11 +323,18 @@ impl Raft {
     fn replicate_all(&mut self) -> Vec<Action> {
         let commit = self.commit;
         let epoch = self.epoch;
+        let base_seq = self.base_seq;
         let Role::Leader { next, .. } = &self.role else { return vec![] };
         let mut actions = vec![];
         for (peer, next_seq) in next.clone() {
             let prev_seq = next_seq - 1;
-            let prev_epoch = self.entry(prev_seq).map(|e| e.epoch).unwrap_or(0);
+            if prev_seq < base_seq {
+                // The entries this peer needs are compacted — ship a
+                // snapshot instead (driver captures + sends it).
+                actions.push(Action::NeedSnapshot { to: peer });
+                continue;
+            }
+            let prev_epoch = self.epoch_at(prev_seq).unwrap_or(0);
             let entries: Vec<Entry> =
                 self.log.iter().filter(|e| e.seq >= next_seq).cloned().collect();
             actions.push(Action::Send(
@@ -367,23 +439,30 @@ impl Raft {
                     actions.push(Action::PersistMeta);
                 }
                 // Log consistency check at (prev_seq, prev_epoch).
+                // Anything at/below our snapshot point is committed
+                // history — matches by construction.
                 let prev_ok = prev_seq == 0
-                    || self.entry(prev_seq).map(|e| e.epoch) == Some(prev_epoch);
+                    || prev_seq < self.base_seq
+                    || self.epoch_at(prev_seq) == Some(prev_epoch);
                 if !prev_ok {
-                    let hint = self.last().1.min(prev_seq.saturating_sub(1));
+                    let hint = self.last().1.min(prev_seq.saturating_sub(1)).max(self.base_seq);
                     actions.push(Action::Send(
                         from,
                         Msg::AppendResp { epoch: self.epoch, match_seq: hint, ok: false },
                     ));
                     return actions;
                 }
-                // Append, truncating any conflicting suffix.
+                // Append, truncating any conflicting suffix. Entries
+                // at/below the snapshot point are already applied.
                 let mut persist_from: Option<u64> = None;
                 for e in entries {
+                    if e.seq <= self.base_seq {
+                        continue;
+                    }
                     match self.entry(e.seq) {
                         Some(existing) if existing.epoch == e.epoch => continue,
                         _ => {
-                            self.log.truncate(e.seq as usize - 1);
+                            self.log.truncate((e.seq - self.base_seq) as usize - 1);
                             persist_from.get_or_insert(e.seq);
                             self.log.push(e);
                         }
@@ -400,6 +479,44 @@ impl Raft {
                 actions.push(Action::Send(
                     from,
                     Msg::AppendResp { epoch: self.epoch, match_seq, ok: true },
+                ));
+                actions
+            }
+            Msg::InstallSnapshot { epoch, last_seq, last_epoch, data } => {
+                if epoch < self.epoch {
+                    return vec![Action::Send(
+                        from,
+                        Msg::AppendResp { epoch: self.epoch, match_seq: 0, ok: false },
+                    )];
+                }
+                let mut actions = self.become_follower(epoch);
+                if self.voted_for.is_none() {
+                    self.voted_for = Some(from);
+                    actions.push(Action::PersistMeta);
+                }
+                if last_seq <= self.applied {
+                    // Stale snapshot — we're already past it.
+                    actions.push(Action::Send(
+                        from,
+                        Msg::AppendResp {
+                            epoch: self.epoch,
+                            match_seq: self.last().1,
+                            ok: true,
+                        },
+                    ));
+                    return actions;
+                }
+                self.log.clear();
+                self.base_seq = last_seq;
+                self.base_epoch = last_epoch;
+                self.commit = last_seq;
+                self.applied = last_seq;
+                actions.push(Action::ApplySnapshot { seq: last_seq, data });
+                actions.push(Action::PersistMeta);
+                actions.push(Action::PersistLog { from_seq: last_seq + 1 });
+                actions.push(Action::Send(
+                    from,
+                    Msg::AppendResp { epoch: self.epoch, match_seq: last_seq, ok: true },
                 ));
                 actions
             }
@@ -423,8 +540,20 @@ impl Raft {
                     self.advance_commit()
                 } else {
                     // Back up toward the follower's hint and retry.
+                    let floor = self.base_seq + 1;
                     if let Some(n) = next.iter_mut().find(|(p, _)| *p == from) {
-                        n.1 = (match_seq + 1).max(1).min(n.1.saturating_sub(1).max(1));
+                        if n.1 <= floor {
+                            // Already sending from our lowest possible
+                            // prev and it still mismatches: the
+                            // follower's divergence reaches into our
+                            // compacted history — only a snapshot can
+                            // resolve it. (base_seq > 0 here: with
+                            // base 0 the floor Append has prev_seq 0,
+                            // which never mismatches.)
+                            n.1 = self.base_seq.max(1);
+                        } else {
+                            n.1 = (match_seq + 1).min(n.1 - 1).max(floor);
+                        }
                     }
                     self.replicate_all()
                 }
@@ -493,6 +622,31 @@ mod tests {
                 match a {
                     Action::Send(to, msg) => self.queues.push_back((me, to, msg)),
                     Action::Apply(e) => self.applied.entry(me).or_default().push(e),
+                    Action::NeedSnapshot { to } => {
+                        // Model the driver: the "state machine" here
+                        // is the applied entry list; ship it whole.
+                        let node = &self.nodes[&me];
+                        let (last_seq, last_epoch) = node.snapshot_point();
+                        let epoch = node.epoch;
+                        let data = postcard::to_stdvec(
+                            self.applied.get(&me).unwrap_or(&vec![]),
+                        )
+                        .unwrap();
+                        self.queues.push_back((
+                            me,
+                            to,
+                            Msg::InstallSnapshot { epoch, last_seq, last_epoch, data },
+                        ));
+                    }
+                    Action::ApplySnapshot { seq, data } => {
+                        let entries: Vec<Entry> = postcard::from_bytes(&data).unwrap();
+                        assert_eq!(
+                            entries.last().map(|e| e.seq).unwrap_or(0),
+                            seq,
+                            "snapshot data must match its declared seq"
+                        );
+                        self.applied.insert(me, entries);
+                    }
                     Action::BecameLeader => self.leaders_events.push((me, true)),
                     Action::LostLeadership => self.leaders_events.push((me, false)),
                     Action::PersistMeta | Action::PersistLog { .. } => {}
@@ -804,6 +958,130 @@ mod tests {
     }
 
     #[test]
+    fn compaction_preserves_replication() {
+        let mut net = Net::new(&[1, 2, 3]);
+        net.elect(1);
+        for i in 0..10 {
+            net.propose(1, format!("c{i}").as_bytes());
+        }
+        // Leader compacts almost everything.
+        let me = pid(1);
+        assert!(net.nodes.get_mut(&me).unwrap().compact(2));
+        assert_eq!(net.nodes[&me].base_seq, 8);
+        // Replication continues fine for up-to-date followers.
+        net.propose(1, b"after-compact");
+        for id in [1, 2, 3] {
+            assert_eq!(net.applied_cmds(id).len(), 11, "node {id}");
+        }
+    }
+
+    #[test]
+    fn laggard_catches_up_via_snapshot() {
+        let mut net = Net::new(&[1, 2, 3]);
+        net.elect(1);
+        net.propose(1, b"a");
+        // Node 3 goes dark; the cluster moves on and compacts.
+        net.isolate(3);
+        for i in 0..8 {
+            net.propose(1, format!("m{i}").as_bytes());
+        }
+        let me = pid(1);
+        assert!(net.nodes.get_mut(&me).unwrap().compact(1));
+        // Node 3 returns; heartbeat path must ship a snapshot.
+        net.heal();
+        net.heartbeat(1);
+        net.heartbeat(1); // second pulse: post-snapshot tail entries
+        assert_eq!(
+            net.applied_cmds(3),
+            net.applied_cmds(1),
+            "laggard must converge via snapshot + tail"
+        );
+        // And it keeps participating normally afterwards.
+        net.propose(1, b"z");
+        assert_eq!(net.applied_cmds(3).last().unwrap(), &b"z".to_vec());
+    }
+
+    #[test]
+    fn chaos_with_compaction_stays_consistent() {
+        use rand::{rngs::StdRng, Rng, SeedableRng};
+        for seed in 0..40u64 {
+            let mut rng = StdRng::seed_from_u64(seed);
+            let mut net = Net::new(&[1, 2, 3]);
+            let mut proposed = 0u32;
+            for _ in 0..300 {
+                match rng.gen_range(0..100) {
+                    0..=7 => {
+                        let id = *[1u8, 2, 3].iter().nth(rng.gen_range(0..3)).unwrap();
+                        let me = pid(id);
+                        let actions = net.nodes.get_mut(&me).unwrap().tick_election();
+                        net.absorb(me, actions);
+                    }
+                    8..=35 => {
+                        for id in [1u8, 2, 3] {
+                            let me = pid(id);
+                            if net.nodes[&me].is_leader() {
+                                proposed += 1;
+                                let cmd = format!("c{proposed}").into_bytes();
+                                if let Ok((_, actions)) =
+                                    net.nodes.get_mut(&me).unwrap().propose(cmd)
+                                {
+                                    net.absorb(me, actions);
+                                }
+                                break;
+                            }
+                        }
+                    }
+                    36..=45 => {
+                        // Random compaction on a random node.
+                        let id = *[1u8, 2, 3].iter().nth(rng.gen_range(0..3)).unwrap();
+                        let keep = rng.gen_range(0..3);
+                        net.nodes.get_mut(&pid(id)).unwrap().compact(keep);
+                    }
+                    46..=55 => {
+                        if net.cut.is_empty() {
+                            let id = *[1u8, 2, 3].iter().nth(rng.gen_range(0..3)).unwrap();
+                            net.isolate(id);
+                        } else {
+                            net.heal();
+                        }
+                    }
+                    56..=63 => {
+                        if !net.queues.is_empty() {
+                            let idx = rng.gen_range(0..net.queues.len());
+                            net.queues.remove(idx);
+                        }
+                    }
+                    _ => {
+                        if !net.queues.is_empty() {
+                            let idx = rng.gen_range(0..net.queues.len());
+                            let (from, to, msg) = net.queues.remove(idx).unwrap();
+                            if !net.cut.contains(&(from, to)) {
+                                let actions =
+                                    net.nodes.get_mut(&to).unwrap().handle(from, msg);
+                                net.absorb(to, actions);
+                            }
+                        }
+                    }
+                }
+            }
+            net.heal();
+            net.deliver_all();
+            for a in [1u8, 2, 3] {
+                for b in [1u8, 2, 3] {
+                    let la = net.applied_cmds(a);
+                    let lb = net.applied_cmds(b);
+                    let n = la.len().min(lb.len());
+                    assert_eq!(
+                        &la[..n],
+                        &lb[..n],
+                        "seed {seed}: logs diverged between {a} and {b} under compaction"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
     fn restore_rejoins_and_catches_up() {
         let mut net = Net::new(&[1, 2, 3]);
         net.elect(1);
@@ -815,6 +1093,8 @@ mod tests {
             old.group.clone(),
             old.epoch,
             old.voted_for,
+            old.base_seq,
+            old.base_epoch,
             old.log.clone(),
             1, // applied a
         );

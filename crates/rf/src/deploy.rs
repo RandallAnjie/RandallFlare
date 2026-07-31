@@ -6,7 +6,7 @@
 //!   rf.json          spec (see DeploySpec)
 //!   <modules>        every non-asset file = a module (main required
 //!                    unless the worker is assets-only)
-//!   <assets dir>/    optional static tree (the merged Pages product)
+//!   <assets dir>/    optional static asset tree
 
 use crate::peers::PeerClient;
 use anyhow::{bail, Context, Result};

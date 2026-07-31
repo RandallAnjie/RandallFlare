@@ -148,8 +148,10 @@ impl Store {
         name: &str,
         epoch: u64,
         voted_for: Option<rf_core::identity::PublicId>,
+        base_seq: u64,
+        base_epoch: u64,
     ) -> Result<()> {
-        let bytes = postcard::to_stdvec(&(epoch, voted_for))?;
+        let bytes = postcard::to_stdvec(&(epoch, voted_for, base_seq, base_epoch))?;
         let tx = self.db.begin_write()?;
         {
             let mut t = tx.open_table(D1META)?;
@@ -159,16 +161,36 @@ impl Store {
         Ok(())
     }
 
+    /// (epoch, voted_for, base_seq, base_epoch)
     pub fn load_d1_meta(
         &self,
         name: &str,
-    ) -> Result<(u64, Option<rf_core::identity::PublicId>)> {
+    ) -> Result<(u64, Option<rf_core::identity::PublicId>, u64, u64)> {
         let tx = self.db.begin_read()?;
         let t = tx.open_table(D1META)?;
         match t.get(name)? {
             Some(v) => Ok(postcard::from_bytes(v.value()).context("corrupt d1 meta")?),
-            None => Ok((0, None)),
+            None => Ok((0, None, 0, 0)),
         }
+    }
+
+    /// Drop log entries at or below `upto_seq` (post-compaction).
+    pub fn compact_d1_log(&self, name: &str, upto_seq: u64) -> Result<()> {
+        let tx = self.db.begin_write()?;
+        {
+            let mut t = tx.open_table(D1LOG)?;
+            let start = format!("{name}\0");
+            let end = Self::d1_log_key(name, upto_seq + 1);
+            let stale: Vec<String> = t
+                .range::<&str>(start.as_str()..end.as_str())?
+                .map(|item| item.map(|(k, _)| k.value().to_string()))
+                .collect::<std::result::Result<_, _>>()?;
+            for k in stale {
+                t.remove(k.as_str())?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
     }
 
     fn d1_log_key(name: &str, seq: u64) -> String {

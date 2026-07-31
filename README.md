@@ -20,7 +20,7 @@ Working today, verified by a two-node e2e suite:
 - SWIM gossip membership (chitchat) + HMAC-authed anti-entropy sync
 - Operator-signed worker manifests as a convergent CRDT
 - Content-addressed blob sync (modules + static assets)
-- **Workers and Pages merged**: a worker = ES modules + an optional
+- **One product: workers.** A worker = ES modules + an optional
   static asset tree; assets serve natively from every node
 - KV: last-write-wins CRDT with HLC, tombstones, TTL, ~gossip-window
   propagation (CF KV consistency contract)
