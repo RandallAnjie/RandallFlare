@@ -1,0 +1,25 @@
+# RandallFlare node. Install:
+#   cp infra/rf.service /etc/systemd/system/rf.service
+#   install -m600 /dev/null /etc/rf.env    # CF_API_TOKEN=... (optional)
+#   systemctl daemon-reload && systemctl enable --now rf
+[Unit]
+Description=RandallFlare edge node
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+ExecStart=/usr/local/bin/rf run --config /etc/rf.toml
+EnvironmentFile=-/etc/rf.env
+Restart=always
+RestartSec=3
+
+# The node needs to write its data_dir and spawn workerd; keep
+# hardening compatible with that.
+NoNewPrivileges=true
+ProtectSystem=full
+ProtectHome=read-only
+PrivateTmp=true
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target

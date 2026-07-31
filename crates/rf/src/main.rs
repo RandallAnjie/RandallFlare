@@ -195,6 +195,23 @@ async fn async_main(cli: Cli) -> Result<()> {
     }
 }
 
+async fn detect_public_ipv4() -> Result<String> {
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(8))
+        .build()?;
+    for url in ["https://api.ipify.org", "https://ipv4.icanhazip.com"] {
+        if let Ok(resp) = client.get(url).send().await {
+            if let Ok(text) = resp.text().await {
+                let ip = text.trim().to_string();
+                if ip.parse::<std::net::Ipv4Addr>().is_ok() {
+                    return Ok(ip);
+                }
+            }
+        }
+    }
+    anyhow::bail!("no detector reachable")
+}
+
 fn keygen(dir: Option<PathBuf>, eth: bool) -> Result<()> {
     let dir = dir.unwrap_or_else(|| {
         let home = std::env::var_os("HOME").map(PathBuf::from).unwrap_or_default();
@@ -236,7 +253,21 @@ async fn run(config_path: PathBuf) -> Result<()> {
         )
         .init();
 
-    let cfg = NodeConfig::load(&config_path)?;
+    let mut cfg = NodeConfig::load(&config_path)?;
+    // Public nodes need their IPv4 for DNS self-registration; detect
+    // it when the config doesn't pin one.
+    if let Some(dns) = cfg.dns.as_mut() {
+        if dns.my_ipv4.is_none() && cfg.public {
+            match detect_public_ipv4().await {
+                Ok(ip) => {
+                    tracing::info!("detected public ipv4: {ip}");
+                    dns.my_ipv4 = Some(ip);
+                }
+                Err(e) => tracing::warn!("public ipv4 detection failed: {e} — set dns.my_ipv4"),
+            }
+        }
+    }
+    let cfg = cfg;
     let keypair = rf::keys::load_or_create(&cfg.data_dir.join("node.key"))?;
     tracing::info!("node {} ({})", keypair.public().short(), cfg.label);
 
@@ -278,6 +309,33 @@ async fn run(config_path: PathBuf) -> Result<()> {
             _ => tracing::warn!(
                 "dns configured but {} is empty — dns disabled",
                 dns_cfg.api_token_env
+            ),
+        }
+    }
+
+    // Certs issued anywhere in the cluster materialize on every node.
+    rf::acme::spawn_materializer(node.clone());
+    if let Some(acme_cfg) = node.cfg.acme.clone() {
+        let zone = acme_cfg
+            .zone
+            .clone()
+            .or_else(|| node.cfg.dns.as_ref().map(|d| d.zone.clone()));
+        let token_env = acme_cfg
+            .api_token_env
+            .clone()
+            .or_else(|| node.cfg.dns.as_ref().map(|d| d.api_token_env.clone()))
+            .unwrap_or_else(|| "CF_API_TOKEN".into());
+        match (zone, std::env::var(&token_env).ok().filter(|t| !t.is_empty())) {
+            (Some(zone), Some(token)) => {
+                let dns_api = match &acme_cfg.dns_api_base {
+                    Some(base) => rf::dns::DnsApi::new(base.clone(), token, zone),
+                    None => rf::dns::DnsApi::cloudflare(token, zone),
+                };
+                rf::acme::spawn_renewer(node.clone(), acme_cfg, dns_api);
+                tracing::info!("acme renewer armed");
+            }
+            _ => tracing::warn!(
+                "acme configured but zone or {token_env} missing — renewer disabled"
             ),
         }
     }

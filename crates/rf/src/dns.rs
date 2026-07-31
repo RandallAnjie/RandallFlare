@@ -111,6 +111,53 @@ impl DnsApi {
         Ok(())
     }
 
+    pub async fn create_txt_record(&self, name: &str, content: &str) -> Result<()> {
+        let zone = self.zone_id().await?;
+        self.http
+            .post(format!("{}/zones/{zone}/dns_records", self.base))
+            .bearer_auth(&self.token)
+            .json(&serde_json::json!({
+                "type": "TXT",
+                "name": name,
+                "content": content,
+                "ttl": 60,
+            }))
+            .send()
+            .await?
+            .error_for_status()?;
+        Ok(())
+    }
+
+    /// Delete the TXT record matching name+content (ACME cleanup).
+    pub async fn delete_txt_record(&self, name: &str, content: &str) -> Result<()> {
+        let zone = self.zone_id().await?;
+        let v: serde_json::Value = self
+            .http
+            .get(format!(
+                "{}/zones/{zone}/dns_records?type=TXT&name={name}&per_page=100",
+                self.base
+            ))
+            .bearer_auth(&self.token)
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+        if let Some(items) = v["result"].as_array() {
+            for r in items {
+                // CF stores TXT content quoted or bare depending on
+                // API age — match either.
+                let c = r["content"].as_str().unwrap_or_default().trim_matches('"');
+                if c == content {
+                    if let Some(id) = r["id"].as_str() {
+                        self.delete_record(id).await?;
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
     pub async fn delete_record(&self, id: &str) -> Result<()> {
         let zone = self.zone_id().await?;
         self.http

@@ -291,6 +291,192 @@ async fn tls_ingress_serves_with_sni_cert() {
     child.wait().unwrap();
 }
 
+/// Full ACME flow against a real pebble server (Let's Encrypt's test
+/// CA, PEBBLE_VA_ALWAYS_VALID=1): the node claims the renewal task,
+/// runs a DNS-01 order (TXT via a mock Cloudflare API), stores the
+/// cert in cluster KV, and the materializer writes it to <data>/certs.
+/// Skips when pebble isn't on PATH.
+#[tokio::test(flavor = "multi_thread")]
+async fn acme_issues_via_pebble_and_materializes() {
+    let pebble_present = std::env::var_os("PATH")
+        .map(|p| std::env::split_paths(&p).any(|d| d.join("pebble").is_file()))
+        .unwrap_or(false);
+    if !pebble_present {
+        eprintln!("SKIP: pebble not on PATH — ACME e2e not exercised");
+        return;
+    }
+
+    let dir = std::env::temp_dir().join(format!("rf-e2e-acme-{}", rand::random::<u32>()));
+    std::fs::create_dir_all(&dir).unwrap();
+
+    // --- CA + server cert for pebble's own HTTPS endpoint ---
+    let mut ca_params = rcgen::CertificateParams::new(Vec::<String>::new()).unwrap();
+    ca_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+    let ca_key = rcgen::KeyPair::generate().unwrap();
+    let ca = rcgen::CertifiedIssuer::self_signed(ca_params, ca_key).unwrap();
+    std::fs::write(dir.join("ca.pem"), ca.pem()).unwrap();
+    let server_key = rcgen::KeyPair::generate().unwrap();
+    let server_cert = rcgen::CertificateParams::new(vec![
+        "localhost".to_string(),
+        "127.0.0.1".to_string(),
+    ])
+    .unwrap()
+    .signed_by(&server_key, &ca)
+    .unwrap();
+    std::fs::write(dir.join("pebble.crt"), server_cert.pem()).unwrap();
+    std::fs::write(dir.join("pebble.key"), server_key.serialize_pem()).unwrap();
+
+    // --- pebble ---
+    let pebble_port = free_port();
+    let pebble_mgmt = free_port();
+    std::fs::write(
+        dir.join("pebble-config.json"),
+        serde_json::json!({
+            "pebble": {
+                "listenAddress": format!("127.0.0.1:{pebble_port}"),
+                "managementListenAddress": format!("127.0.0.1:{pebble_mgmt}"),
+                "certificate": dir.join("pebble.crt"),
+                "privateKey": dir.join("pebble.key"),
+                "httpPort": 5002,
+                "tlsPort": 5001,
+                "ocspResponderURL": "",
+                "externalAccountBindingRequired": false,
+            }
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let mut pebble = Command::new("pebble")
+        .arg("-config")
+        .arg(dir.join("pebble-config.json"))
+        .env("PEBBLE_VA_ALWAYS_VALID", "1")
+        .env("PEBBLE_WFE_NONCEREJECT", "0")
+        .stdout(Stdio::from(std::fs::File::create(dir.join("pebble.log")).unwrap()))
+        .stderr(Stdio::from(std::fs::File::create(dir.join("pebble.err")).unwrap()))
+        .spawn()
+        .expect("spawn pebble");
+    // Wait for pebble's socket.
+    let deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        if std::net::TcpStream::connect(("127.0.0.1", pebble_port)).is_ok() {
+            break;
+        }
+        assert!(Instant::now() < deadline, "pebble never came up");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+
+    // --- mock Cloudflare API (TXT records in memory) ---
+    use std::sync::Mutex;
+    let txt: std::sync::Arc<Mutex<Vec<(String, String, String)>>> =
+        std::sync::Arc::new(Mutex::new(vec![])); // (id, name, content)
+    let (t1, t2, t3) = (txt.clone(), txt.clone(), txt.clone());
+    let cf_app = axum::Router::new()
+        .route(
+            "/zones",
+            axum::routing::get(|| async {
+                axum::Json(serde_json::json!({"result": [{"id": "z1"}]}))
+            }),
+        )
+        .route(
+            "/zones/z1/dns_records",
+            axum::routing::get(move || {
+                let t = t1.clone();
+                async move {
+                    let items: Vec<_> = t
+                        .lock()
+                        .unwrap()
+                        .iter()
+                        .map(|(id, name, content)| {
+                            serde_json::json!({"id": id, "name": name, "content": content})
+                        })
+                        .collect();
+                    axum::Json(serde_json::json!({"result": items}))
+                }
+            })
+            .post(move |axum::Json(v): axum::Json<serde_json::Value>| {
+                let t = t2.clone();
+                async move {
+                    let mut g = t.lock().unwrap();
+                    let id = format!("r{}", g.len() + 1);
+                    g.push((
+                        id,
+                        v["name"].as_str().unwrap_or_default().to_string(),
+                        v["content"].as_str().unwrap_or_default().to_string(),
+                    ));
+                    axum::Json(serde_json::json!({"result": {}}))
+                }
+            }),
+        )
+        .route(
+            "/zones/z1/dns_records/{id}",
+            axum::routing::delete(
+                move |axum::extract::Path(id): axum::extract::Path<String>| {
+                    let t = t3.clone();
+                    async move {
+                        t.lock().unwrap().retain(|(i, _, _)| *i != id);
+                        axum::Json(serde_json::json!({"result": {}}))
+                    }
+                },
+            ),
+        );
+    let cf_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let cf_base = format!("http://{}", cf_listener.local_addr().unwrap());
+    tokio::spawn(async move {
+        axum::serve(cf_listener, cf_app).await.unwrap();
+    });
+
+    // --- rf node with [acme] ---
+    let operator = Keypair::from_seed([11u8; 32]);
+    let (gossip, api, ingress) = (free_port(), free_port(), free_port());
+    let mut cfg = std::fs::read_to_string(write_config(
+        &dir, &operator, gossip, api, ingress, &[], "acme",
+    ))
+    .unwrap();
+    cfg.push_str(&format!(
+        r#"
+[acme]
+email = "test@example.com"
+hostnames = ["acme.test"]
+zone = "test.zone"
+api_token_env = "RF_TEST_CF_TOKEN"
+directory_url = "https://localhost:{pebble_port}/dir"
+ca_root = "{ca}"
+dns_api_base = "{cf_base}"
+"#,
+        ca = dir.join("ca.pem").display(),
+    ));
+    std::fs::write(dir.join("rf.toml"), cfg).unwrap();
+    std::env::set_var("RF_TEST_CF_TOKEN", "test-token");
+    let mut child = spawn_node(&dir, &dir.join("rf.toml"));
+    wait_ping(&format!("127.0.0.1:{api}"), Duration::from_secs(15)).await;
+
+    // Cert must appear in <data>/certs via claim → order → KV →
+    // materializer.
+    let crt = dir.join("data").join("certs").join("acme.test.crt");
+    let deadline = Instant::now() + Duration::from_secs(90);
+    loop {
+        if crt.exists() {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "cert never materialized; node log: {}",
+            std::fs::read_to_string(dir.join("node.log")).unwrap_or_default()
+        );
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+    let pem = std::fs::read_to_string(&crt).unwrap();
+    assert!(pem.contains("BEGIN CERTIFICATE"));
+    assert!(crt.with_extension("key").exists());
+    // Challenge TXT records were cleaned up.
+    assert!(txt.lock().unwrap().is_empty(), "TXT records not cleaned: {:?}", txt.lock().unwrap());
+
+    child.kill().unwrap();
+    child.wait().unwrap();
+    pebble.kill().unwrap();
+    pebble.wait().unwrap();
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn two_node_deploy_kv_and_static_stability() {
     let operator = Keypair::from_seed([7u8; 32]);

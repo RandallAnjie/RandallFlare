@@ -39,6 +39,35 @@ pub struct NodeConfig {
     pub runtime: RuntimeConfig,
     #[serde(default)]
     pub anchor: AnchorConfig,
+    #[serde(default)]
+    pub acme: Option<AcmeConfig>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AcmeConfig {
+    /// Contact email for the ACME account.
+    pub email: String,
+    /// Hostnames to keep certified; "*.edge.example.com" works
+    /// (wildcards need DNS-01, which is what we do anyway).
+    pub hostnames: Vec<String>,
+    /// Cloudflare zone the TXT challenges live in. Falls back to
+    /// [dns].zone when unset.
+    #[serde(default)]
+    pub zone: Option<String>,
+    /// Env var with the CF token; defaults to [dns]'s token env or
+    /// CF_API_TOKEN.
+    #[serde(default)]
+    pub api_token_env: Option<String>,
+    /// ACME directory; default Let's Encrypt production.
+    #[serde(default)]
+    pub directory_url: Option<String>,
+    /// Extra trust root PEM for the ACME server (pebble in tests).
+    #[serde(default)]
+    pub ca_root: Option<PathBuf>,
+    /// Override the DNS API base (mock server in tests).
+    #[serde(default)]
+    pub dns_api_base: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]

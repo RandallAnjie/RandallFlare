@@ -41,9 +41,13 @@ Also in: HTTPS ingress (SNI cert store, hot-reload, wildcard files,
 self-signed fallback) and **native workerd kvNamespace bindings** —
 `env.CACHE.get/put/list` verified against a real workerd binary.
 
-v0.2 remaining: ACME renewal as a claimed task, overlay transport for
-non-public nodes, self-update on. v0.3: per-object micro-quorums for
-D1/Durable Objects.
+**ACME is claim-driven**: renewal for each hostname is a claimed task —
+one node wins, orders via DNS-01 (Cloudflare TXT), and the issued cert
+replicates cluster-wide through KV (verified end-to-end against
+Let's Encrypt's pebble test server).
+
+v0.2 remaining: overlay transport for non-public nodes, self-update
+on. v0.3: per-object micro-quorums for D1/Durable Objects.
 
 ## Build
 
@@ -82,11 +86,26 @@ https = "0.0.0.0:443"   # SNI certs from <data_dir>/certs/<host>.crt/.key
 [dns]                                # optional, public nodes
 hostname = "edge.example.com"
 zone = "example.com"
-my_ipv4 = "203.0.113.7"
+# my_ipv4 = "203.0.113.7"           # auto-detected when omitted
 # token read from $CF_API_TOKEN
+
+[acme]                               # optional: auto-issue TLS certs
+email = "you@example.com"
+hostnames = ["edge.example.com", "*.edge.example.com"]
+# zone/token default to [dns]'s. One node claims each renewal task,
+# orders via DNS-01, and the cert replicates to every node's
+# <data_dir>/certs through cluster KV.
 
 rf run --config rf.toml
 ```
+
+As a service: `infra/rf.service` (put `CF_API_TOKEN=…` in `/etc/rf.env`,
+config at `/etc/rf.toml`, binary at `/usr/local/bin/rf`).
+
+> Security note (v0.2): the peer API authenticates with a cluster HMAC
+> but is not yet encrypted on the wire — deploy over a trusted path
+> (same DC, WireGuard, SSH tunnel) and avoid real secrets in worker
+> `env` until the overlay transport lands.
 
 ## Deploy a worker
 
