@@ -1,0 +1,354 @@
+//! The node's shared in-memory state: rf-core decision structures
+//! hydrated from the store on boot, write-through on every change,
+//! change events fanned out to the gossip/runtime/ingress loops.
+
+use crate::blob::BlobStore;
+use crate::config::NodeConfig;
+use crate::store::Store;
+use anyhow::Result;
+use rf_core::claim::{ClaimSet, Ingest};
+use rf_core::envelope::Envelope;
+use rf_core::hlc::{Clock, Hlc};
+use rf_core::identity::{Keypair, PublicId};
+use rf_core::kv::{KvEntry, Merge, Namespace};
+use rf_core::manifest::{ManifestIngest, ManifestSet, WorkerManifest};
+use std::collections::{BTreeMap, HashMap};
+use std::net::SocketAddr;
+use std::sync::Mutex;
+use tokio::sync::broadcast;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NodeEvent {
+    /// A manifest changed — runtime must reconcile, gossip must
+    /// republish the digest, blobs may need fetching.
+    Manifests,
+    /// One of our own claims changed — gossip must republish.
+    OwnClaims,
+    /// A KV namespace changed locally.
+    Kv(String),
+}
+
+/// What we know about a live peer, scraped from its gossip state.
+#[derive(Debug, Clone, Default)]
+pub struct PeerView {
+    pub api_addr: Option<SocketAddr>,
+    pub public: bool,
+    pub label: String,
+    pub ipv4: Option<String>,
+    pub manifest_digest: String,
+    pub kv_digests: BTreeMap<String, String>,
+    pub generation: u64,
+}
+
+pub struct Inner {
+    pub clock: Clock,
+    pub claims: ClaimSet,
+    pub manifests: ManifestSet,
+    pub kv: HashMap<String, Namespace>,
+    /// node_id hex → view. Live peers only (dead ones drop out).
+    pub peers: BTreeMap<String, PeerView>,
+}
+
+pub struct Node {
+    pub cfg: NodeConfig,
+    pub keypair: Keypair,
+    pub store: Store,
+    pub blobs: BlobStore,
+    pub inner: Mutex<Inner>,
+    events: broadcast::Sender<NodeEvent>,
+}
+
+pub fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+impl Node {
+    pub fn open(cfg: NodeConfig, keypair: Keypair) -> Result<Self> {
+        let store = Store::open(&cfg.data_dir.join("state.redb"))?;
+        let blobs = BlobStore::open(cfg.data_dir.join("blobs"))?;
+        let mut inner = Inner {
+            clock: Clock::new(),
+            claims: ClaimSet::new(),
+            manifests: ManifestSet::new(cfg.operator),
+            kv: HashMap::new(),
+            peers: BTreeMap::new(),
+        };
+        // Hydrate: static stability means booting entirely from disk.
+        for env in store.load_manifests()? {
+            if let Err(e) = inner.manifests.ingest(&env) {
+                tracing::warn!("dropping stored manifest: {e}");
+            }
+        }
+        for env in store.load_claims()? {
+            if let Err(e) = inner.claims.ingest(&env) {
+                tracing::warn!("dropping stored claim: {e}");
+            }
+        }
+        for (ns, key, entry) in store.load_kv()? {
+            inner.clock.observe(entry.hlc, now_ms());
+            inner.kv.entry(ns).or_default().merge(&key, entry);
+        }
+        let (events, _) = broadcast::channel(256);
+        Ok(Self { cfg, keypair, store, blobs, inner: Mutex::new(inner), events })
+    }
+
+    pub fn id(&self) -> PublicId {
+        self.keypair.public()
+    }
+
+    pub fn id_hex(&self) -> String {
+        self.id().to_string()
+    }
+
+    pub fn subscribe(&self) -> broadcast::Receiver<NodeEvent> {
+        self.events.subscribe()
+    }
+
+    fn emit(&self, ev: NodeEvent) {
+        let _ = self.events.send(ev);
+    }
+
+    pub fn hlc_now(&self) -> Hlc {
+        self.inner.lock().unwrap().clock.now(now_ms())
+    }
+
+    // ---- manifests ----
+
+    /// Ingest a manifest envelope (from gossip sync or a deploy).
+    /// Returns Ok(true) when state changed.
+    pub fn ingest_manifest(&self, env: &Envelope) -> Result<bool> {
+        let changed = {
+            let mut inner = self.inner.lock().unwrap();
+            match inner.manifests.ingest(env)? {
+                ManifestIngest::Changed => {
+                    let m: WorkerManifest = env.open(Some(&self.cfg.operator))?;
+                    self.store.put_manifest(&m.name, env)?;
+                    true
+                }
+                ManifestIngest::Stale => false,
+            }
+        };
+        if changed {
+            self.emit(NodeEvent::Manifests);
+        }
+        Ok(changed)
+    }
+
+    pub fn manifest_digest_hex(&self) -> String {
+        hex::encode(self.inner.lock().unwrap().manifests.digest())
+    }
+
+    pub fn manifest_envelopes(&self) -> Vec<Envelope> {
+        self.inner.lock().unwrap().manifests.all().map(|r| r.envelope.clone()).collect()
+    }
+
+    /// Blob hashes referenced by live manifests but absent on disk.
+    pub fn missing_blobs(&self) -> Vec<[u8; 32]> {
+        let inner = self.inner.lock().unwrap();
+        let mut missing = Vec::new();
+        for rec in inner.manifests.live() {
+            for sha in rec.manifest.blob_refs() {
+                if !self.blobs.has(&sha) && !missing.contains(&sha) {
+                    missing.push(sha);
+                }
+            }
+        }
+        missing
+    }
+
+    // ---- claims ----
+
+    pub fn ingest_claim(&self, env: &Envelope) -> Result<bool> {
+        let changed = {
+            let mut inner = self.inner.lock().unwrap();
+            match inner.claims.ingest(env) {
+                Ok(Ingest::Changed) => {
+                    // Pull our clock past the remote's so our next
+                    // claims sort after everything we've seen.
+                    if let Ok(c) = env.open::<rf_core::claim::Claim>(None) {
+                        inner.clock.observe(c.renewed, now_ms());
+                        self.store.put_claim(&c.task, &c.holder.to_string(), env)?;
+                    }
+                    true
+                }
+                Ok(Ingest::Stale) => false,
+                Err(e) => {
+                    tracing::debug!("rejecting claim: {e}");
+                    false
+                }
+            }
+        };
+        if changed {
+            self.emit(NodeEvent::OwnClaims); // republish set may change winners
+        }
+        Ok(changed)
+    }
+
+    /// Try to grab `task`. Returns true if, as of local knowledge, we
+    /// issued a claim (we may still lose adjudication once gossip
+    /// converges — callers must re-check `holds` after a settle delay).
+    pub fn claim_try(&self, task: &str, ttl_ms: u64) -> Result<bool> {
+        let env = {
+            let mut inner = self.inner.lock().unwrap();
+            if !inner.claims.open_for_claim(task, now_ms()) {
+                return Ok(false);
+            }
+            let now = inner.clock.now(now_ms());
+            ClaimSet::make_claim(&self.keypair, task, now, ttl_ms)
+        };
+        self.ingest_claim(&env)?;
+        self.emit(NodeEvent::OwnClaims);
+        Ok(true)
+    }
+
+    pub fn holds(&self, task: &str) -> bool {
+        self.inner.lock().unwrap().claims.holds(task, &self.id(), now_ms())
+    }
+
+    /// Renew or release our claim on `task`.
+    pub fn claim_renew(&self, task: &str, release: bool) -> Result<()> {
+        let env = {
+            let mut inner = self.inner.lock().unwrap();
+            let me = self.id();
+            let Some(rec) = inner.claims.mine(task, &me) else {
+                return Ok(());
+            };
+            let prior = rec.claim.clone();
+            let now = inner.clock.now(now_ms());
+            ClaimSet::renew(&self.keypair, &prior, now, release)
+        };
+        self.ingest_claim(&env)?;
+        self.emit(NodeEvent::OwnClaims);
+        Ok(())
+    }
+
+    /// Our own live claims, for gossip publication.
+    pub fn own_claim_envelopes(&self) -> Vec<(String, Envelope)> {
+        let inner = self.inner.lock().unwrap();
+        let me = self.id();
+        let now = now_ms();
+        inner
+            .claims
+            .live_envelopes(now)
+            .into_iter()
+            .filter_map(|env| {
+                let c: rf_core::claim::Claim = env.open(None).ok()?;
+                (c.holder == me).then(|| (c.task, env.clone()))
+            })
+            .collect()
+    }
+
+    pub fn claim_envelopes(&self) -> Vec<Envelope> {
+        let inner = self.inner.lock().unwrap();
+        inner.claims.live_envelopes(now_ms()).into_iter().cloned().collect()
+    }
+
+    // ---- kv ----
+
+    pub fn kv_put(
+        &self,
+        ns: &str,
+        key: &str,
+        value: Option<Vec<u8>>,
+        expires_at_ms: Option<u64>,
+    ) -> Result<()> {
+        {
+            let mut inner = self.inner.lock().unwrap();
+            let hlc = inner.clock.now(now_ms());
+            let writer = self.id();
+            let entry = inner.kv.entry(ns.to_string()).or_default().put(
+                key,
+                value,
+                hlc,
+                writer,
+                expires_at_ms,
+            );
+            self.store.put_kv(ns, key, &entry)?;
+        }
+        self.emit(NodeEvent::Kv(ns.to_string()));
+        Ok(())
+    }
+
+    pub fn kv_get(&self, ns: &str, key: &str) -> Option<Vec<u8>> {
+        let inner = self.inner.lock().unwrap();
+        inner.kv.get(ns)?.get(key, now_ms()).map(|v| v.to_vec())
+    }
+
+    pub fn kv_list(&self, ns: &str, prefix: &str, limit: usize) -> Vec<String> {
+        let inner = self.inner.lock().unwrap();
+        match inner.kv.get(ns) {
+            Some(n) => n.list(prefix, now_ms(), limit).map(|s| s.to_string()).collect(),
+            None => Vec::new(),
+        }
+    }
+
+    pub fn kv_merge_remote(&self, ns: &str, items: Vec<(String, KvEntry)>) -> Result<usize> {
+        let mut applied = 0;
+        {
+            let mut inner = self.inner.lock().unwrap();
+            for (key, entry) in items {
+                inner.clock.observe(entry.hlc, now_ms());
+                if inner.kv.entry(ns.to_string()).or_default().merge(&key, entry.clone())
+                    == Merge::Applied
+                {
+                    self.store.put_kv(ns, &key, &entry)?;
+                    applied += 1;
+                }
+            }
+        }
+        if applied > 0 {
+            self.emit(NodeEvent::Kv(ns.to_string()));
+        }
+        Ok(applied)
+    }
+
+    pub fn kv_digests(&self) -> BTreeMap<String, String> {
+        let inner = self.inner.lock().unwrap();
+        inner.kv.iter().map(|(ns, n)| (ns.clone(), hex::encode(n.digest()))).collect()
+    }
+
+    pub fn kv_dump(&self, ns: &str) -> Vec<(String, KvEntry)> {
+        let inner = self.inner.lock().unwrap();
+        match inner.kv.get(ns) {
+            Some(n) => n.dump().map(|(k, e)| (k.clone(), e.clone())).collect(),
+            None => Vec::new(),
+        }
+    }
+
+    // ---- peers ----
+
+    pub fn update_peers(&self, peers: BTreeMap<String, PeerView>) {
+        self.inner.lock().unwrap().peers = peers;
+    }
+
+    pub fn peers(&self) -> BTreeMap<String, PeerView> {
+        self.inner.lock().unwrap().peers.clone()
+    }
+
+    /// Routing table: hostname → worker.
+    pub fn routes(&self) -> BTreeMap<String, String> {
+        self.inner.lock().unwrap().manifests.routes()
+    }
+
+    pub fn manifest(&self, name: &str) -> Option<WorkerManifest> {
+        self.inner.lock().unwrap().manifests.get(name).map(|r| r.manifest.clone())
+    }
+
+    pub fn live_manifests(&self) -> Vec<WorkerManifest> {
+        self.inner.lock().unwrap().manifests.live().map(|r| r.manifest.clone()).collect()
+    }
+
+    /// Periodic GC of dead claims + KV tombstones.
+    pub fn gc(&self) {
+        let mut inner = self.inner.lock().unwrap();
+        let now = now_ms();
+        const HORIZON_MS: u64 = 24 * 3600 * 1000;
+        inner.claims.gc(now, HORIZON_MS);
+        for ns in inner.kv.values_mut() {
+            ns.gc(now, HORIZON_MS);
+        }
+    }
+}

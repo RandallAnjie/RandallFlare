@@ -11,8 +11,70 @@ use serde::{Deserialize, Serialize};
 pub type NodeId = [u8; 32];
 
 /// Any public identity (node or operator) with verification helpers.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+/// Serde: hex string in human-readable formats (TOML/JSON), raw bytes
+/// in binary ones (postcard wire).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct PublicId(pub [u8; 32]);
+
+impl Serialize for PublicId {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        if s.is_human_readable() {
+            s.serialize_str(&hex::encode(self.0))
+        } else {
+            s.serialize_bytes(&self.0)
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for PublicId {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        use serde::de::Error;
+        if d.is_human_readable() {
+            let s = String::deserialize(d)?;
+            s.parse().map_err(D::Error::custom)
+        } else {
+            let b: serde_bytes_shim::Bytes = Deserialize::deserialize(d)?;
+            let arr: [u8; 32] =
+                b.0.try_into().map_err(|_| D::Error::custom("expected 32 bytes"))?;
+            Ok(PublicId(arr))
+        }
+    }
+}
+
+/// Minimal owned-bytes shim so we don't pull the serde_bytes crate:
+/// postcard encodes `serialize_bytes` as a length-prefixed byte run,
+/// and this deserializes it back without an intermediate Vec<u64>.
+mod serde_bytes_shim {
+    pub struct Bytes(pub Vec<u8>);
+    impl<'de> serde::Deserialize<'de> for Bytes {
+        fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+            struct V;
+            impl<'de> serde::de::Visitor<'de> for V {
+                type Value = Bytes;
+                fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                    f.write_str("bytes")
+                }
+                fn visit_bytes<E: serde::de::Error>(self, v: &[u8]) -> Result<Bytes, E> {
+                    Ok(Bytes(v.to_vec()))
+                }
+                fn visit_byte_buf<E: serde::de::Error>(self, v: Vec<u8>) -> Result<Bytes, E> {
+                    Ok(Bytes(v))
+                }
+                fn visit_seq<A: serde::de::SeqAccess<'de>>(
+                    self,
+                    mut seq: A,
+                ) -> Result<Bytes, A::Error> {
+                    let mut out = Vec::with_capacity(seq.size_hint().unwrap_or(0));
+                    while let Some(b) = seq.next_element::<u8>()? {
+                        out.push(b);
+                    }
+                    Ok(Bytes(out))
+                }
+            }
+            d.deserialize_byte_buf(V)
+        }
+    }
+}
 
 impl PublicId {
     pub fn verify(&self, msg: &[u8], sig: &[u8; 64]) -> bool {
