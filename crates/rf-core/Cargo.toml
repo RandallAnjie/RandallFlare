@@ -1,0 +1,18 @@
+[package]
+name = "rf-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Pure decision core for RandallFlare: identity, HLC, claims, manifests, KV CRDT. No IO."
+
+[dependencies]
+ed25519-dalek = { version = "2", features = ["serde"] }
+sha2 = "0.10"
+serde = { version = "1", features = ["derive"] }
+postcard = { version = "1", features = ["use-std"] }
+hex = "0.4"
+serde-big-array = "0.5"
+
+[dev-dependencies]
+rand = "0.8"
