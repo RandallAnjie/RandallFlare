@@ -69,15 +69,17 @@ http = "127.0.0.1:{ingress_port}"
 }
 
 fn spawn_node(dir: &Path, config: &Path) -> Child {
+    // tracing writes to stdout; workerd children inherit stderr —
+    // both land in node.log.
+    let log = std::fs::File::create(dir.join("node.log")).unwrap();
+    let log2 = log.try_clone().unwrap();
     Command::new(env!("CARGO_BIN_EXE_rf"))
         .arg("run")
         .arg("--config")
         .arg(config)
         .env("RUST_LOG", "info")
-        .stdout(Stdio::null())
-        .stderr(Stdio::from(
-            std::fs::File::create(dir.join("node.log")).unwrap(),
-        ))
+        .stdout(Stdio::from(log))
+        .stderr(Stdio::from(log2))
         .spawn()
         .expect("spawn rf")
 }
@@ -475,6 +477,96 @@ dns_api_base = "{cf_base}"
     child.wait().unwrap();
     pebble.kill().unwrap();
     pebble.wait().unwrap();
+}
+
+/// D1 micro-quorum: three nodes, one replicated SQLite database.
+/// Writes commit through the per-db Raft group; killing one replica
+/// (possibly the leader) must not lose acknowledged rows, and writes
+/// must keep working through the surviving majority.
+#[tokio::test(flavor = "multi_thread")]
+async fn d1_quorum_replicates_and_survives_replica_loss() {
+    let operator = Keypair::from_seed([13u8; 32]);
+    let client = PeerClient::new(SECRET);
+
+    // Three-node cluster: b and c seed off a.
+    let mut a = start("d1a", &operator, &[]);
+    wait_ping(&a.api, Duration::from_secs(15)).await;
+    let mut b = start("d1b", &operator, &[a.gossip]);
+    let mut c = start("d1c", &operator, &[a.gossip]);
+    wait_ping(&b.api, Duration::from_secs(15)).await;
+    wait_ping(&c.api, Duration::from_secs(15)).await;
+    // Let membership settle so the replica group sees all three.
+    let deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        let status = client.status(&a.api).await.unwrap_or_default();
+        if status["peers"].as_array().map(|p| p.len()).unwrap_or(0) >= 2 {
+            break;
+        }
+        assert!(Instant::now() < deadline, "membership never converged");
+        tokio::time::sleep(Duration::from_millis(300)).await;
+    }
+
+    client
+        .post(&a.api, "/v1/d1/create", br#"{"name":"appdb"}"#.to_vec())
+        .await
+        .unwrap();
+
+    // Schema + rows (leader election happens under the hood; the
+    // client follows hints/retries).
+    client
+        .d1_exec(&a.api, "appdb", "CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)", serde_json::json!([]))
+        .await
+        .unwrap();
+    client
+        .d1_exec(&a.api, "appdb", "INSERT INTO t (v) VALUES (?1)", serde_json::json!(["one"]))
+        .await
+        .unwrap();
+    client
+        .d1_exec(&b.api, "appdb", "INSERT INTO t (v) VALUES (?1)", serde_json::json!(["two"]))
+        .await
+        .unwrap();
+
+    let count = client
+        .d1_exec(&a.api, "appdb", "SELECT COUNT(*) AS n FROM t", serde_json::json!([]))
+        .await
+        .unwrap();
+    assert_eq!(count["rows"][0]["n"], 2, "both writes visible: {count}");
+
+    // Find the LEADER (the node that answers a direct SELECT without
+    // a hint) and kill precisely it — the harshest failover case.
+    let mut leader_idx = None;
+    let probe = br#"{"sql":"SELECT 1 AS ok","params":[]}"#.to_vec();
+    for (i, n) in [&a, &b, &c].iter().enumerate() {
+        if let Ok(raw) = client.post(&n.api, "/v1/d1/appdb/exec", probe.clone()).await {
+            let v: serde_json::Value = serde_json::from_slice(&raw).unwrap();
+            if v["rows"][0]["ok"] == 1 {
+                leader_idx = Some(i);
+                break;
+            }
+        }
+    }
+    let leader_idx = leader_idx.expect("some node must be leader");
+    let mut nodes = [a, b, c];
+    nodes[leader_idx].child.kill().unwrap();
+    nodes[leader_idx].child.wait().unwrap();
+    let survivor = &nodes[(leader_idx + 1) % 3];
+
+    // The surviving majority elects a new leader and accepts writes;
+    // every acknowledged row is still there.
+    client
+        .d1_exec(&survivor.api, "appdb", "INSERT INTO t (v) VALUES (?1)", serde_json::json!(["three"]))
+        .await
+        .expect("write after leader loss");
+    let count = client
+        .d1_exec(&survivor.api, "appdb", "SELECT COUNT(*) AS n FROM t", serde_json::json!([]))
+        .await
+        .unwrap();
+    assert_eq!(count["rows"][0]["n"], 3, "acked writes survive leader loss: {count}");
+
+    for mut n in nodes {
+        n.child.kill().ok();
+        n.child.wait().ok();
+    }
 }
 
 #[tokio::test(flavor = "multi_thread")]

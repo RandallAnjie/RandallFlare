@@ -17,7 +17,7 @@ pub type NodeId = [u8; 32];
 /// Any public identity (node or operator) with verification helpers.
 /// Serde: hex string in human-readable formats (TOML/JSON), raw bytes
 /// in binary ones (postcard wire).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct PublicId(pub [u8; 32]);
 
 impl Serialize for PublicId {

@@ -433,6 +433,25 @@ impl Raft {
     }
 }
 
+/// Rendezvous hashing: pick the replica group for an object from the
+/// node universe — deterministic on every node, no coordinator, and
+/// adding nodes only moves ~1/n of objects.
+pub fn rendezvous_group(object: &str, universe: &[PublicId], size: usize) -> Vec<PublicId> {
+    use sha2::{Digest, Sha256};
+    let mut scored: Vec<([u8; 32], PublicId)> = universe
+        .iter()
+        .map(|node| {
+            let mut h = Sha256::new();
+            h.update(object.as_bytes());
+            h.update([0u8]);
+            h.update(node.0);
+            (h.finalize().into(), *node)
+        })
+        .collect();
+    scored.sort();
+    scored.into_iter().rev().take(size).map(|(_, n)| n).collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -669,6 +688,27 @@ mod tests {
             .filter(|id| net.nodes[&pid(**id)].is_leader())
             .count();
         assert!(leaders <= 1, "split vote must not elect two leaders in one epoch");
+    }
+
+    #[test]
+    fn rendezvous_is_stable_and_spreads() {
+        let universe: Vec<PublicId> = (1..=10u8).map(pid).collect();
+        let g1 = rendezvous_group("db-a", &universe, 3);
+        let g2 = rendezvous_group("db-a", &universe, 3);
+        assert_eq!(g1, g2);
+        assert_eq!(g1.len(), 3);
+        // Removing an unrelated node keeps the group when possible.
+        let smaller: Vec<PublicId> =
+            universe.iter().copied().filter(|p| !g1.contains(p)).chain(g1.clone()).collect();
+        let g3 = rendezvous_group("db-a", &smaller, 3);
+        assert_eq!(
+            g1.iter().collect::<std::collections::HashSet<_>>(),
+            g3.iter().collect::<std::collections::HashSet<_>>()
+        );
+        // Different objects land on different groups at least sometimes.
+        let spread: std::collections::HashSet<Vec<PublicId>> =
+            (0..20).map(|i| rendezvous_group(&format!("db-{i}"), &universe, 3)).collect();
+        assert!(spread.len() > 5);
     }
 
     #[test]

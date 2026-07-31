@@ -9,7 +9,7 @@
 //!   kv:         "ns\0key"            → KvEntry (postcard)
 
 use anyhow::{Context, Result};
-use redb::{Database, ReadableDatabase, TableDefinition};
+use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition};
 use rf_core::envelope::Envelope;
 use rf_core::kv::KvEntry;
 use std::path::Path;
@@ -17,6 +17,10 @@ use std::path::Path;
 const MANIFESTS: TableDefinition<&str, &[u8]> = TableDefinition::new("manifests");
 const CLAIMS: TableDefinition<&str, &[u8]> = TableDefinition::new("claims");
 const KV: TableDefinition<&str, &[u8]> = TableDefinition::new("kv");
+/// Per-database Raft durable state: meta = (epoch, voted_for),
+/// log keyed "name\0<seq zero-padded>" → postcard Entry.
+const D1META: TableDefinition<&str, &[u8]> = TableDefinition::new("d1_meta");
+const D1LOG: TableDefinition<&str, &[u8]> = TableDefinition::new("d1_log");
 /// Transparency log: every manifest envelope ever accepted, keyed
 /// "name\0<version zero-padded>" so range scans return version order.
 const LOG: TableDefinition<&str, &[u8]> = TableDefinition::new("manifest_log");
@@ -39,6 +43,8 @@ impl Store {
             tx.open_table(CLAIMS)?;
             tx.open_table(KV)?;
             tx.open_table(LOG)?;
+            tx.open_table(D1META)?;
+            tx.open_table(D1LOG)?;
         }
         tx.commit()?;
         Ok(Self { db })
@@ -131,6 +137,82 @@ impl Store {
         for item in t.range::<&str>(..)? {
             let (_, v) = item?;
             out.push(Envelope::from_bytes(v.value()).context("corrupt claim in store")?);
+        }
+        Ok(out)
+    }
+
+    // ---- d1 raft state ----
+
+    pub fn put_d1_meta(
+        &self,
+        name: &str,
+        epoch: u64,
+        voted_for: Option<rf_core::identity::PublicId>,
+    ) -> Result<()> {
+        let bytes = postcard::to_stdvec(&(epoch, voted_for))?;
+        let tx = self.db.begin_write()?;
+        {
+            let mut t = tx.open_table(D1META)?;
+            t.insert(name, bytes.as_slice())?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn load_d1_meta(
+        &self,
+        name: &str,
+    ) -> Result<(u64, Option<rf_core::identity::PublicId>)> {
+        let tx = self.db.begin_read()?;
+        let t = tx.open_table(D1META)?;
+        match t.get(name)? {
+            Some(v) => Ok(postcard::from_bytes(v.value()).context("corrupt d1 meta")?),
+            None => Ok((0, None)),
+        }
+    }
+
+    fn d1_log_key(name: &str, seq: u64) -> String {
+        format!("{name}\0{seq:020}")
+    }
+
+    /// Truncate the log from `from_seq` onward, then append `tail`.
+    pub fn put_d1_log(
+        &self,
+        name: &str,
+        from_seq: u64,
+        tail: &[rf_core::quorum::Entry],
+    ) -> Result<()> {
+        let tx = self.db.begin_write()?;
+        {
+            let mut t = tx.open_table(D1LOG)?;
+            // Remove everything at/after from_seq (conflict suffix).
+            let start = Self::d1_log_key(name, from_seq);
+            let end = format!("{name}\x01");
+            let stale: Vec<String> = t
+                .range::<&str>(start.as_str()..end.as_str())?
+                .map(|item| item.map(|(k, _)| k.value().to_string()))
+                .collect::<std::result::Result<_, _>>()?;
+            for k in stale {
+                t.remove(k.as_str())?;
+            }
+            for e in tail {
+                let bytes = postcard::to_stdvec(e)?;
+                t.insert(Self::d1_log_key(name, e.seq).as_str(), bytes.as_slice())?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn load_d1_log(&self, name: &str) -> Result<Vec<rf_core::quorum::Entry>> {
+        let tx = self.db.begin_read()?;
+        let t = tx.open_table(D1LOG)?;
+        let start = format!("{name}\0");
+        let end = format!("{name}\x01");
+        let mut out = Vec::new();
+        for item in t.range::<&str>(start.as_str()..end.as_str())? {
+            let (_, v) = item?;
+            out.push(postcard::from_bytes(v.value()).context("corrupt d1 log entry")?);
         }
         Ok(out)
     }

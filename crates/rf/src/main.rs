@@ -64,6 +64,11 @@ enum Cmd {
         #[command(subcommand)]
         cmd: KvCmd,
     },
+    /// Replicated SQLite (D1) operations.
+    D1 {
+        #[command(subcommand)]
+        cmd: D1Cmd,
+    },
     /// Fetch and verify a worker's transparency log (hash chain).
     Log {
         worker: String,
@@ -77,6 +82,31 @@ enum Cmd {
         operator: Option<String>,
         #[arg(long, env = "RF_OPERATOR_KEY")]
         key: Option<PathBuf>,
+    },
+}
+
+#[derive(Subcommand)]
+enum D1Cmd {
+    /// Create a database (replica group picked by rendezvous hash).
+    Create {
+        name: String,
+        #[arg(long, env = "RF_NODE")]
+        node: String,
+        #[arg(long, env = "RF_CLUSTER_SECRET")]
+        secret: String,
+    },
+    /// Execute SQL (writes replicate through the quorum; SELECTs run
+    /// on the leader).
+    Exec {
+        name: String,
+        sql: String,
+        /// JSON params, e.g. --params '[1, "two"]'
+        #[arg(long, default_value = "[]")]
+        params: String,
+        #[arg(long, env = "RF_NODE")]
+        node: String,
+        #[arg(long, env = "RF_CLUSTER_SECRET")]
+        secret: String,
     },
 }
 
@@ -168,6 +198,27 @@ async fn async_main(cli: Cli) -> Result<()> {
             KvCmd::Put { ns, key, value, node, secret } => {
                 let client = PeerClient::new(secret_bytes(&secret)?);
                 client.kv_put(&node, &ns, &key, value.into_bytes()).await?;
+                Ok(())
+            }
+        },
+        Cmd::D1 { cmd } => match cmd {
+            D1Cmd::Create { name, node, secret } => {
+                let client = PeerClient::new(secret_bytes(&secret)?);
+                let resp = client
+                    .post(
+                        &node,
+                        "/v1/d1/create",
+                        serde_json::json!({ "name": name }).to_string().into_bytes(),
+                    )
+                    .await?;
+                println!("{}", String::from_utf8_lossy(&resp));
+                Ok(())
+            }
+            D1Cmd::Exec { name, sql, params, node, secret } => {
+                let client = PeerClient::new(secret_bytes(&secret)?);
+                let params: serde_json::Value = serde_json::from_str(&params)?;
+                let out = client.d1_exec(&node, &name, &sql, params).await?;
+                println!("{}", serde_json::to_string_pretty(&out)?);
                 Ok(())
             }
         },
@@ -273,8 +324,10 @@ async fn run(config_path: PathBuf) -> Result<()> {
 
     let node = Arc::new(Node::open(cfg, keypair)?);
 
-    let api_addr = rf::peerapi::serve(node.clone()).await?;
+    let d1_registry: rf::d1::Registry = Default::default();
+    let api_addr = rf::peerapi::serve(node.clone(), d1_registry.clone()).await?;
     tracing::info!("peer api on {api_addr}");
+    rf::d1::spawn_manager(node.clone(), d1_registry);
 
     // KV binding backend for workerd — must be up before the runtime
     // writes any workerd config.

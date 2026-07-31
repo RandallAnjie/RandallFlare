@@ -147,6 +147,60 @@ impl PeerClient {
         self.post(base, &format!("/v1/kv/{ns}/{key}"), value).await?;
         Ok(())
     }
+
+    /// Execute SQL against a D1 database, following leader hints
+    /// (bounded) — callers can point at ANY cluster node.
+    pub async fn d1_exec(
+        &self,
+        base: &str,
+        db: &str,
+        sql: &str,
+        params: serde_json::Value,
+    ) -> Result<serde_json::Value> {
+        let body =
+            serde_json::json!({ "sql": sql, "params": params }).to_string().into_bytes();
+        let mut target = base.to_string();
+        for _ in 0..20 {
+            match self.post(&target, &format!("/v1/d1/{db}/exec"), body.clone()).await {
+                Ok(raw) => return Ok(serde_json::from_slice(&raw)?),
+                Err(e) => {
+                    // 421 responses carry a leader hint to retry.
+                    let text = e.to_string();
+                    if let Some(idx) = text.find("leader_hint") {
+                        if let Some(hint) = text[idx..]
+                            .split('"')
+                            .nth(2)
+                            .filter(|h| !h.is_empty() && *h != "null")
+                        {
+                            target = hint.to_string();
+                            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+                            continue;
+                        }
+                    }
+                    // No hint (election in progress) — brief retry.
+                    if text.contains("421") || text.contains("Misdirected") {
+                        tokio::time::sleep(std::time::Duration::from_millis(700)).await;
+                        continue;
+                    }
+                    // A hinted-at node may not have synced the db's
+                    // existence yet, or the hint may point at a node
+                    // that just died (stale leader) — back to the
+                    // original target and let the election finish.
+                    let cause = format!("{e:#}");
+                    if text.contains("no such database")
+                        || cause.contains("tcp connect error")
+                        || cause.contains("error sending request")
+                    {
+                        target = base.to_string();
+                        tokio::time::sleep(std::time::Duration::from_millis(700)).await;
+                        continue;
+                    }
+                    return Err(e);
+                }
+            }
+        }
+        anyhow::bail!("no leader found for {db} after retries")
+    }
 }
 
 pub fn encode_envelopes(envs: &[Envelope]) -> Vec<u8> {

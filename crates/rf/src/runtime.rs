@@ -24,7 +24,6 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::sync::Arc;
-use std::os::unix::process::CommandExt as _;
 use tokio::process::{Child, Command};
 
 pub struct Runtime {

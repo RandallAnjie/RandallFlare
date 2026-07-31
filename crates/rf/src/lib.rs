@@ -10,6 +10,7 @@ pub mod keys;
 pub mod kvbind;
 pub mod node;
 pub mod cron_driver;
+pub mod d1;
 pub mod deploy;
 pub mod dns;
 pub mod ingress;

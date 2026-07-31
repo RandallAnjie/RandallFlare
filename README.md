@@ -46,8 +46,16 @@ one node wins, orders via DNS-01 (Cloudflare TXT), and the issued cert
 replicates cluster-wide through KV (verified end-to-end against
 Let's Encrypt's pebble test server).
 
-v0.2 remaining: overlay transport for non-public nodes, self-update
-on. v0.3: per-object micro-quorums for D1/Durable Objects.
+**D1 (v0.3 phase 1)**: replicated SQLite over per-database
+micro-quorums. Each database gets a rendezvous-hashed 3-node Raft
+group — consensus is sharded per object, no node is special. Writes
+commit through a majority; killing the leader loses nothing
+(e2e-verified). `rf d1 create mydb`, `rf d1 exec mydb "INSERT …"
+--params '[…]'` against any node — requests chase the leader
+automatically.
+
+Remaining: overlay transport for non-public nodes, self-update on,
+Durable Objects on the same quorum layer (v0.3 phase 2).
 
 ## Build
 
