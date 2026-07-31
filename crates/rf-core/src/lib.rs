@@ -13,6 +13,7 @@ pub mod hlc;
 pub mod identity;
 pub mod kv;
 pub mod manifest;
+pub mod quorum;
 
 pub use hlc::Hlc;
 pub use identity::{NodeId, PublicId};
