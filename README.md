@@ -31,6 +31,11 @@ Working today, verified by a two-node e2e suite:
   API), with a partition guard
 - workerd process supervision (config generation + lifecycle)
 - Static stability: nodes boot and serve entirely from local disk
+- **Verifiable history**: per-worker manifest hash chain + transparency
+  log (`rf log` audits it offline), periodic anchor digests via a
+  claimed task (webhook-pluggable to any on-chain relayer), and
+  operators can be an **Ethereum wallet** (`rf keygen --eth`,
+  `operator = "0x…"`, EIP-191 signatures)
 
 v0.2: TLS/ACME via claims, native workerd kvNamespace bindings,
 overlay transport for non-public nodes, self-update on. v0.3:

@@ -11,7 +11,7 @@
 use crate::peers::PeerClient;
 use anyhow::{bail, Context, Result};
 use rf_core::envelope::Envelope;
-use rf_core::identity::Keypair;
+use rf_core::identity::AnyKeypair;
 use rf_core::manifest::{AssetFile, Module, ModuleKind, WorkerManifest};
 use serde::Deserialize;
 use std::collections::BTreeMap;
@@ -122,10 +122,11 @@ pub async fn deploy(
     bundle: &Bundle,
     client: &PeerClient,
     node_addr: &str,
-    operator: &Keypair,
+    operator: &AnyKeypair,
 ) -> Result<u64> {
-    let prior = client.worker_version(node_addr, &bundle.spec.name).await?;
-    let version = prior.unwrap_or(0) + 1;
+    let head = client.worker_head(node_addr, &bundle.spec.name).await?;
+    let version = head.map(|(v, _)| v).unwrap_or(0) + 1;
+    let prev = head.map(|(_, digest)| digest);
 
     let mut modules = Vec::new();
     for (path, bytes, kind) in &bundle.modules {
@@ -151,6 +152,7 @@ pub async fn deploy(
     let manifest = WorkerManifest {
         name: bundle.spec.name.clone(),
         version,
+        prev,
         deleted: false,
         main: bundle.spec.main.clone().unwrap_or_default(),
         modules,
@@ -162,7 +164,7 @@ pub async fn deploy(
         compatibility_date: bundle.spec.compatibility_date.clone(),
     };
     manifest.validate().map_err(|e| anyhow::anyhow!("invalid manifest: {e}"))?;
-    let env = Envelope::seal(&manifest, operator);
+    let env = Envelope::seal_any(&manifest, operator);
     client.post_manifest(node_addr, &env).await?;
     Ok(version)
 }
@@ -172,13 +174,14 @@ pub async fn delete_worker(
     name: &str,
     client: &PeerClient,
     node_addr: &str,
-    operator: &Keypair,
+    operator: &AnyKeypair,
 ) -> Result<u64> {
-    let prior = client.worker_version(node_addr, name).await?;
-    let Some(prior) = prior else { bail!("no such worker: {name}") };
+    let head = client.worker_head(node_addr, name).await?;
+    let Some((prior, prev_digest)) = head else { bail!("no such worker: {name}") };
     let manifest = WorkerManifest {
         name: name.to_string(),
         version: prior + 1,
+        prev: Some(prev_digest),
         deleted: true,
         main: String::new(),
         modules: vec![],
@@ -189,7 +192,7 @@ pub async fn delete_worker(
         crons: vec![],
         compatibility_date: String::new(),
     };
-    let env = Envelope::seal(&manifest, operator);
+    let env = Envelope::seal_any(&manifest, operator);
     client.post_manifest(node_addr, &env).await?;
     Ok(prior + 1)
 }

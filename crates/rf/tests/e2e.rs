@@ -12,7 +12,7 @@ use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
 use rf::peers::PeerClient;
-use rf_core::identity::Keypair;
+use rf_core::identity::{AnyKeypair, Keypair};
 
 fn free_port() -> u16 {
     TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port()
@@ -133,15 +133,27 @@ async fn two_node_deploy_kv_and_static_stability() {
     wait_ping(&b.api, Duration::from_secs(15)).await;
 
     // Deploy an assets-only worker (the merged Pages case) to A.
+    let op_any = AnyKeypair::Ed(operator.clone());
     let bundle_dir = make_bundle("site.test");
     let bundle = rf::deploy::read_bundle(&bundle_dir).unwrap();
-    let version = rf::deploy::deploy(&bundle, &client, &a.api, &operator).await.unwrap();
+    let version = rf::deploy::deploy(&bundle, &client, &a.api, &op_any).await.unwrap();
     assert_eq!(version, 1);
+
+    // Second deploy: exercises the hash chain (prev link) and version
+    // bump; then verify the transparency log end-to-end.
+    std::fs::write(bundle_dir.join("public/index.html"), "<h1>hello from rf v2</h1>").unwrap();
+    let bundle2 = rf::deploy::read_bundle(&bundle_dir).unwrap();
+    let v2 = rf::deploy::deploy(&bundle2, &client, &a.api, &op_any).await.unwrap();
+    assert_eq!(v2, 2);
+    let log = client.worker_log(&a.api, "site").await.unwrap();
+    let chain =
+        rf_core::manifest::verify_chain(&log, &op_any.signer_id()).expect("chain verifies");
+    assert_eq!(chain.iter().map(|m| m.version).collect::<Vec<_>>(), vec![1, 2]);
 
     // The manifest + blobs must reach B via gossip anti-entropy.
     let deadline = Instant::now() + Duration::from_secs(20);
     loop {
-        if let Ok(Some(1)) = client.worker_version(&b.api, "site").await {
+        if let Ok(Some(2)) = client.worker_version(&b.api, "site").await {
             // also require blobs to have arrived
             if let Ok(status) = client.status(&b.api).await {
                 if status["missing_blobs"].as_u64() == Some(0) {

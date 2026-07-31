@@ -303,6 +303,7 @@ mod tests {
         let m = WorkerManifest {
             name: "w".into(),
             version: 3,
+            prev: Some([1; 32]),
             deleted: false,
             main: "index.js".into(),
             modules: vec![Module {

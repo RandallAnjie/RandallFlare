@@ -129,6 +129,9 @@ impl Node {
                 ManifestIngest::Changed => {
                     let m: WorkerManifest = env.open(Some(&self.cfg.operator))?;
                     self.store.put_manifest(&m.name, env)?;
+                    // Transparency log: append-only history of every
+                    // accepted version.
+                    self.store.put_log(&m.name, m.version, env)?;
                     true
                 }
                 ManifestIngest::Stale => false,
@@ -342,6 +345,38 @@ impl Node {
 
     pub fn live_manifests(&self) -> Vec<WorkerManifest> {
         self.inner.lock().unwrap().manifests.live().map(|r| r.manifest.clone()).collect()
+    }
+
+    /// Transparency log for one worker (version-ascending envelopes).
+    pub fn manifest_log(&self, name: &str) -> Result<Vec<Envelope>> {
+        self.store.load_log(name)
+    }
+
+    /// Head record (version + envelope digest) for the deploy CLI's
+    /// hash-chain link.
+    pub fn manifest_head(&self, name: &str) -> Option<(u64, [u8; 32])> {
+        let inner = self.inner.lock().unwrap();
+        inner.manifests.get(name).map(|r| (r.manifest.version, r.digest))
+    }
+
+    /// Digest over all manifest heads — the anchoring payload. Stable
+    /// across nodes with converged manifest sets.
+    pub fn anchor_digest(&self) -> (String, usize) {
+        use sha2::Digest;
+        let inner = self.inner.lock().unwrap();
+        let mut heads: Vec<(String, u64, [u8; 32])> = inner
+            .manifests
+            .all()
+            .map(|r| (r.manifest.name.clone(), r.manifest.version, r.digest))
+            .collect();
+        heads.sort();
+        let mut h = sha2::Sha256::new();
+        for (name, version, digest) in &heads {
+            h.update(name.as_bytes());
+            h.update(version.to_le_bytes());
+            h.update(digest);
+        }
+        (hex::encode(h.finalize()), heads.len())
     }
 
     pub fn set_worker_ports(&self, ports: HashMap<String, u16>) {

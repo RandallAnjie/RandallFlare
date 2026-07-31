@@ -1,7 +1,7 @@
 //! Node configuration: one TOML file, everything else is derived.
 
 use anyhow::{Context, Result};
-use rf_core::identity::PublicId;
+use rf_core::identity::SignerId;
 use serde::Deserialize;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
@@ -17,8 +17,10 @@ pub struct NodeConfig {
     /// Human label for status output ("hk-1").
     #[serde(default)]
     pub label: String,
-    /// Operator public key (hex). The only key allowed to deploy.
-    pub operator: PublicId,
+    /// Operator identity — an ed25519 public key (64 hex chars) or an
+    /// Ethereum wallet address ("0x…"). The only identity allowed to
+    /// deploy.
+    pub operator: SignerId,
     /// Shared cluster secret (hex, 32 bytes) — authenticates the peer
     /// API and gates gossip membership.
     pub cluster_secret: String,
@@ -35,6 +37,28 @@ pub struct NodeConfig {
     pub dns: Option<DnsConfig>,
     #[serde(default)]
     pub runtime: RuntimeConfig,
+    #[serde(default)]
+    pub anchor: AnchorConfig,
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+pub struct AnchorConfig {
+    /// Periodically publish a digest of all manifest heads (claimed
+    /// task — one node per period wins).
+    #[serde(default)]
+    pub enabled: bool,
+    /// Hours between anchors (default 24).
+    #[serde(default = "default_anchor_hours")]
+    pub interval_hours: u64,
+    /// Optional webhook POSTed {period, digest, heads, node, ts_ms} —
+    /// point it at anything, including an on-chain relayer.
+    #[serde(default)]
+    pub webhook: Option<String>,
+}
+
+fn default_anchor_hours() -> u64 {
+    24
 }
 
 fn default_cluster_id() -> String {

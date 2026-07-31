@@ -54,6 +54,7 @@ pub fn router(api: Api) -> Router {
         .route("/v1/blob", post(blob_put))
         .route("/v1/manifest", post(manifest_post))
         .route("/v1/worker/{name}", get(worker_get))
+        .route("/v1/log/{name}", get(log_get))
         .route(
             "/v1/kv/{ns}/{*key}",
             get(kv_get).post(kv_put).delete(kv_delete),
@@ -265,13 +266,38 @@ async fn worker_get(
         return r;
     }
     match api.node.manifest(&name) {
-        Some(m) => axum::Json(serde_json::json!({
-            "name": m.name,
-            "version": m.version,
-            "deleted": m.deleted,
-        }))
-        .into_response(),
+        Some(m) => {
+            let digest = api.node.manifest_head(&name).map(|(_, d)| hex::encode(d));
+            axum::Json(serde_json::json!({
+                "name": m.name,
+                "version": m.version,
+                "deleted": m.deleted,
+                "digest": digest,
+                "prev": m.prev.map(hex::encode),
+            }))
+            .into_response()
+        }
         None => (StatusCode::NOT_FOUND, "no such worker").into_response(),
+    }
+}
+
+/// Transparency log: the full accepted manifest history of a worker,
+/// as an envelope list. Anyone with cluster access can audit the
+/// hash chain offline (`rf log <worker>`).
+async fn log_get(
+    State(api): State<Api>,
+    ConnectInfo(remote): ConnectInfo<SocketAddr>,
+    Path(name): Path<String>,
+    method: Method,
+    uri: Uri,
+    headers: HeaderMap,
+) -> Response {
+    if let Err(r) = check(&api, &remote, &headers, &method, &uri, b"") {
+        return r;
+    }
+    match api.node.manifest_log(&name) {
+        Ok(envs) => encode_envelopes(&envs).into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     }
 }
 

@@ -22,6 +22,10 @@ enum Cmd {
         /// Directory for operator.key (default ~/.rf)
         #[arg(long)]
         dir: Option<PathBuf>,
+        /// Generate an Ethereum-style secp256k1 key — the operator
+        /// identity becomes a 0x wallet address.
+        #[arg(long)]
+        eth: bool,
     },
     /// Run the node daemon.
     Run {
@@ -60,6 +64,20 @@ enum Cmd {
         #[command(subcommand)]
         cmd: KvCmd,
     },
+    /// Fetch and verify a worker's transparency log (hash chain).
+    Log {
+        worker: String,
+        #[arg(long, env = "RF_NODE")]
+        node: String,
+        #[arg(long, env = "RF_CLUSTER_SECRET")]
+        secret: String,
+        /// Operator identity to verify against (default: derived from
+        /// your operator key file).
+        #[arg(long)]
+        operator: Option<String>,
+        #[arg(long, env = "RF_OPERATOR_KEY")]
+        key: Option<PathBuf>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -88,12 +106,12 @@ fn secret_bytes(s: &str) -> Result<[u8; 32]> {
     b.try_into().map_err(|_| anyhow::anyhow!("cluster secret must be 32 bytes"))
 }
 
-fn operator_key(path: Option<PathBuf>) -> Result<rf_core::identity::Keypair> {
+fn operator_key(path: Option<PathBuf>) -> Result<rf_core::identity::AnyKeypair> {
     let path = path.unwrap_or_else(|| {
         let home = std::env::var_os("HOME").map(PathBuf::from).unwrap_or_default();
         home.join(".rf").join("operator.key")
     });
-    rf::keys::load(&path)
+    rf::keys::load_any(&path)
 }
 
 fn main() -> Result<()> {
@@ -109,7 +127,7 @@ fn main() -> Result<()> {
 
 async fn async_main(cli: Cli) -> Result<()> {
     match cli.cmd {
-        Cmd::Keygen { dir } => keygen(dir),
+        Cmd::Keygen { dir, eth } => keygen(dir, eth),
         Cmd::Run { config } => run(config).await,
         Cmd::Deploy { dir, node, key, secret } => {
             let client = PeerClient::new(secret_bytes(&secret)?);
@@ -153,10 +171,31 @@ async fn async_main(cli: Cli) -> Result<()> {
                 Ok(())
             }
         },
+        Cmd::Log { worker, node, secret, operator, key } => {
+            let client = PeerClient::new(secret_bytes(&secret)?);
+            let operator_id: rf_core::identity::SignerId = match operator {
+                Some(s) => s.parse().map_err(|e| anyhow::anyhow!("--operator: {e}"))?,
+                None => operator_key(key)?.signer_id(),
+            };
+            let envs = client.worker_log(&node, &worker).await?;
+            let chain = rf_core::manifest::verify_chain(&envs, &operator_id)
+                .map_err(|e| anyhow::anyhow!("chain verification FAILED: {e}"))?;
+            println!("transparency log for {worker} — {} entries, chain OK", chain.len());
+            for (m, env) in chain.iter().zip(&envs) {
+                println!(
+                    "  v{:<4} {}  {}{}",
+                    m.version,
+                    hex::encode(&env.digest()[..8]),
+                    if m.deleted { "[tombstone] " } else { "" },
+                    m.hostnames.join(",")
+                );
+            }
+            Ok(())
+        }
     }
 }
 
-fn keygen(dir: Option<PathBuf>) -> Result<()> {
+fn keygen(dir: Option<PathBuf>, eth: bool) -> Result<()> {
     let dir = dir.unwrap_or_else(|| {
         let home = std::env::var_os("HOME").map(PathBuf::from).unwrap_or_default();
         home.join(".rf")
@@ -165,18 +204,22 @@ fn keygen(dir: Option<PathBuf>) -> Result<()> {
     if path.exists() {
         anyhow::bail!("{} already exists — refusing to overwrite", path.display());
     }
-    let kp = rf::keys::generate();
-    rf::keys::save(&path, &kp)?;
+    let kp = if eth {
+        rf_core::identity::AnyKeypair::Eth(rf::keys::generate_eth())
+    } else {
+        rf_core::identity::AnyKeypair::Ed(rf::keys::generate())
+    };
+    rf::keys::save_any(&path, &kp)?;
     let mut secret = [0u8; 32];
     use rand::RngCore;
     rand::rngs::OsRng.fill_bytes(&mut secret);
     println!("operator key   : {}", path.display());
-    println!("operator public: {}", kp.public());
+    println!("operator id    : {}", kp.signer_id());
     println!();
     println!("suggested cluster_secret (same on every node):");
     println!("  {}", hex::encode(secret));
     println!();
-    println!("node config gets:  operator = \"{}\"", kp.public());
+    println!("node config gets:  operator = \"{}\"", kp.signer_id());
     Ok(())
 }
 
@@ -223,6 +266,8 @@ async fn run(config_path: PathBuf) -> Result<()> {
             ),
         }
     }
+
+    rf::anchor::spawn(node.clone(), node.cfg.anchor.clone());
 
     rf::selfupdate::spawn(false); // flips on once the repo is public
 

@@ -65,6 +65,35 @@ API — the entry point has to resolve somewhere) and the ACME CA. Both
 are consumed as claimed, idempotent tasks executed by whichever node
 grabs them.
 
+## Verifiability (the web3-adjacent part, without a chain)
+
+Three mechanisms give tamper-evident history without putting any
+consensus on the hot path:
+
+- **Manifest hash chain.** Every manifest links `prev` — the envelope
+  digest of its predecessor. v1 must have no prev; a v+1 successor
+  must link the exact envelope a node holds, or it's rejected. Every
+  accepted version is appended to a per-worker **transparency log**
+  (redb), servable to any auditor (`rf log <worker>` verifies the
+  chain offline). A stolen operator key can push new versions but
+  cannot rewrite history unnoticed.
+- **Anchoring.** A claimed task per period publishes the digest of all
+  manifest heads into the replicated `__rf` KV namespace and
+  optionally to a webhook — point that at an on-chain relayer /
+  OpenTimestamps for an external timestamp. One anchor per period,
+  chosen by 抢单; publishing is idempotent so duplicates are safe.
+- **Wallet operators.** The operator identity is either an ed25519
+  key or an **Ethereum address**: manifests may be signed secp256k1 /
+  EIP-191 (`personal_sign`-compatible), so the deploy authority can
+  live in a hardware wallet. Node identities stay ed25519.
+
+Deliberately NOT here: a blockchain in the coordination path. Chains
+buy Byzantine tolerance at seconds-to-minutes latency; this cluster's
+nodes are operator-enrolled, and its claims fire every minute. If the
+project ever opens to untrusted third-party nodes (DePIN territory),
+that becomes a separate design round: staking, proof-of-serving,
+BFT-sized quorums.
+
 ## Trust model
 
 No central database means authority comes from signatures:

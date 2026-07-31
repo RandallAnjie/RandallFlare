@@ -17,6 +17,9 @@ use std::path::Path;
 const MANIFESTS: TableDefinition<&str, &[u8]> = TableDefinition::new("manifests");
 const CLAIMS: TableDefinition<&str, &[u8]> = TableDefinition::new("claims");
 const KV: TableDefinition<&str, &[u8]> = TableDefinition::new("kv");
+/// Transparency log: every manifest envelope ever accepted, keyed
+/// "name\0<version zero-padded>" so range scans return version order.
+const LOG: TableDefinition<&str, &[u8]> = TableDefinition::new("manifest_log");
 
 pub struct Store {
     db: Database,
@@ -35,6 +38,7 @@ impl Store {
             tx.open_table(MANIFESTS)?;
             tx.open_table(CLAIMS)?;
             tx.open_table(KV)?;
+            tx.open_table(LOG)?;
         }
         tx.commit()?;
         Ok(Self { db })
@@ -59,6 +63,37 @@ impl Store {
         for item in t.range::<&str>(..)? {
             let (_, v) = item?;
             out.push(Envelope::from_bytes(v.value()).context("corrupt manifest in store")?);
+        }
+        Ok(out)
+    }
+
+    fn log_key(name: &str, version: u64) -> String {
+        format!("{name}\0{version:020}")
+    }
+
+    /// Append an accepted manifest envelope to the transparency log.
+    pub fn put_log(&self, name: &str, version: u64, env: &Envelope) -> Result<()> {
+        let tx = self.db.begin_write()?;
+        {
+            let mut t = tx.open_table(LOG)?;
+            t.insert(Self::log_key(name, version).as_str(), env.to_bytes().as_slice())?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Full accepted history for one worker, version-ascending.
+    pub fn load_log(&self, name: &str) -> Result<Vec<Envelope>> {
+        let tx = self.db.begin_read()?;
+        let t = tx.open_table(LOG)?;
+        let prefix = format!("{name}\0");
+        let mut out = Vec::new();
+        for item in t.range::<&str>(prefix.as_str()..)? {
+            let (k, v) = item?;
+            if !k.value().starts_with(&prefix) {
+                break;
+            }
+            out.push(Envelope::from_bytes(v.value()).context("corrupt log entry")?);
         }
         Ok(out)
     }

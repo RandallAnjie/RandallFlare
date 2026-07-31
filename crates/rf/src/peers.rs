@@ -102,13 +102,38 @@ impl PeerClient {
     }
 
     pub async fn worker_version(&self, base: &str, name: &str) -> Result<Option<u64>> {
+        Ok(self.worker_head(base, name).await?.map(|(v, _)| v))
+    }
+
+    /// (version, envelope digest) of a worker's head, for hash-chain
+    /// linking on deploy.
+    pub async fn worker_head(
+        &self,
+        base: &str,
+        name: &str,
+    ) -> Result<Option<(u64, [u8; 32])>> {
         match self.get(base, &format!("/v1/worker/{name}")).await {
             Ok(raw) => {
                 let v: serde_json::Value = serde_json::from_slice(&raw)?;
-                Ok(v.get("version").and_then(|x| x.as_u64()))
+                let Some(version) = v.get("version").and_then(|x| x.as_u64()) else {
+                    return Ok(None);
+                };
+                let digest = v
+                    .get("digest")
+                    .and_then(|x| x.as_str())
+                    .and_then(|s| hex::decode(s).ok())
+                    .and_then(|b| <[u8; 32]>::try_from(b).ok())
+                    .ok_or_else(|| anyhow::anyhow!("node returned head without digest"))?;
+                Ok(Some((version, digest)))
             }
             Err(_) => Ok(None),
         }
+    }
+
+    /// Full transparency log for a worker.
+    pub async fn worker_log(&self, base: &str, name: &str) -> Result<Vec<Envelope>> {
+        let raw = self.get(base, &format!("/v1/log/{name}")).await?;
+        decode_envelopes(&raw)
     }
 
     pub async fn kv_get(&self, base: &str, ns: &str, key: &str) -> Result<Option<Vec<u8>>> {

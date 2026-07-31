@@ -10,10 +10,19 @@
 //! wins; identical versions break ties by envelope digest (lower
 //! wins). Deletion is a tombstone manifest (`deleted: true`) with a
 //! higher version. Convergent regardless of gossip order.
+//!
+//! Transparency: every manifest carries `prev` — the envelope digest
+//! of its predecessor — forming a per-worker hash chain. Version 1
+//! must have `prev = None`; a version+1 successor must link the exact
+//! envelope we hold. A worker's full history is therefore verifiable
+//! offline (see [`verify_chain`]), and a stolen operator key cannot
+//! silently rewrite the past — a mismatching link is rejected, a fork
+//! at the same version resolves deterministically and leaves both
+//! branches visible in peers' logs.
 
 use crate::cron::CronExpr;
 use crate::envelope::{Envelope, EnvelopeError};
-use crate::identity::PublicId;
+use crate::identity::SignerId;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
 
@@ -48,6 +57,9 @@ pub struct WorkerManifest {
     pub name: String,
     /// Monotonic per worker; the operator's deploy tool bumps it.
     pub version: u64,
+    /// Envelope digest of the previous version (hash-chain link).
+    /// None iff version == 1.
+    pub prev: Option<[u8; 32]>,
     pub deleted: bool,
     /// Path of the main module. Empty string = assets-only worker
     /// (the merged "Pages" case) — ingress serves the asset tree
@@ -73,6 +85,9 @@ pub enum ManifestError {
     BadCron(String),
     BadHostname(String),
     DuplicatePath(String),
+    /// Hash-chain violation: v1 with a prev, or a v+1 successor whose
+    /// prev doesn't link the envelope we hold.
+    ChainBroken,
 }
 
 impl std::fmt::Display for ManifestError {
@@ -85,6 +100,7 @@ impl std::fmt::Display for ManifestError {
             ManifestError::BadCron(c) => write!(f, "invalid cron expression: {c}"),
             ManifestError::BadHostname(h) => write!(f, "invalid hostname: {h}"),
             ManifestError::DuplicatePath(p) => write!(f, "duplicate path in bundle: {p}"),
+            ManifestError::ChainBroken => f.write_str("manifest hash chain broken"),
         }
     }
 }
@@ -119,6 +135,9 @@ impl WorkerManifest {
     pub fn validate(&self) -> Result<(), ManifestError> {
         if !valid_name(&self.name) {
             return Err(ManifestError::BadName);
+        }
+        if (self.version == 1) != self.prev.is_none() {
+            return Err(ManifestError::ChainBroken);
         }
         if self.deleted {
             return Ok(()); // tombstones carry no content requirements
@@ -164,20 +183,21 @@ pub enum ManifestIngest {
     Stale,
 }
 
-/// All deployed workers, merged CRDT-style. The operator key pins who
-/// may deploy; multi-operator support later = a set of keys here.
+/// All deployed workers, merged CRDT-style. The operator identity
+/// (ed25519 key or wallet address) pins who may deploy;
+/// multi-operator support later = a set of identities here.
 #[derive(Debug)]
 pub struct ManifestSet {
-    operator: PublicId,
+    operator: SignerId,
     workers: HashMap<String, ManifestRecord>,
 }
 
 impl ManifestSet {
-    pub fn new(operator: PublicId) -> Self {
+    pub fn new(operator: SignerId) -> Self {
         Self { operator, workers: HashMap::new() }
     }
 
-    pub fn operator(&self) -> &PublicId {
+    pub fn operator(&self) -> &SignerId {
         &self.operator
     }
 
@@ -196,6 +216,15 @@ impl ManifestSet {
                         && digest < existing.digest);
                 if !newer {
                     return Ok(ManifestIngest::Stale);
+                }
+                // Chain check: a direct successor must link the exact
+                // envelope we hold. (A jump over versions we never saw
+                // is accepted — the transparency log lets an auditor
+                // verify the gap later.)
+                if manifest.version == existing.manifest.version + 1
+                    && manifest.prev != Some(existing.digest)
+                {
+                    return Err(ManifestError::ChainBroken);
                 }
             }
             None => {}
@@ -266,6 +295,37 @@ impl ManifestSet {
     }
 }
 
+/// Verify a worker's transparency log offline: contiguous versions,
+/// every envelope operator-signed, every `prev` linking the previous
+/// envelope's digest, and (when the log starts at v1) a None root.
+/// Returns the decoded manifests oldest-first.
+pub fn verify_chain(
+    envelopes: &[Envelope],
+    operator: &SignerId,
+) -> Result<Vec<WorkerManifest>, ManifestError> {
+    let mut out: Vec<WorkerManifest> = Vec::with_capacity(envelopes.len());
+    let mut prev_digest: Option<[u8; 32]> = None;
+    for env in envelopes {
+        let m: WorkerManifest = env.open(Some(operator)).map_err(|e| match e {
+            EnvelopeError::BadSignature => ManifestError::NotOperator,
+            other => ManifestError::Envelope(other),
+        })?;
+        if let Some(last) = out.last() {
+            if m.version != last.version + 1 || m.name != last.name {
+                return Err(ManifestError::ChainBroken);
+            }
+            if m.prev != prev_digest {
+                return Err(ManifestError::ChainBroken);
+            }
+        } else if m.version == 1 && m.prev.is_some() {
+            return Err(ManifestError::ChainBroken);
+        }
+        prev_digest = Some(env.digest());
+        out.push(m);
+    }
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -279,6 +339,7 @@ mod tests {
         WorkerManifest {
             name: name.into(),
             version,
+            prev: None,
             deleted: false,
             main: "index.js".into(),
             modules: vec![Module {
@@ -296,15 +357,25 @@ mod tests {
         }
     }
 
+    fn opid() -> SignerId {
+        SignerId::Ed(op().public())
+    }
+
+    /// Seal a chained successor: fills `prev` from the prior envelope.
+    fn seal_after(m: &mut WorkerManifest, prior: &Envelope, key: &Keypair) -> Envelope {
+        m.prev = Some(prior.digest());
+        Envelope::seal(m, key)
+    }
+
     #[test]
     fn higher_version_wins_any_order() {
         let op = op();
         let v1 = Envelope::seal(&mk("w", 1, &["a.example.com"]), &op);
-        let v2 = Envelope::seal(&mk("w", 2, &["a.example.com"]), &op);
-        let mut s1 = ManifestSet::new(op.public());
+        let v2 = seal_after(&mut mk("w", 2, &["a.example.com"]), &v1, &op);
+        let mut s1 = ManifestSet::new(opid());
         s1.ingest(&v1).unwrap();
         s1.ingest(&v2).unwrap();
-        let mut s2 = ManifestSet::new(op.public());
+        let mut s2 = ManifestSet::new(opid());
         s2.ingest(&v2).unwrap();
         assert_eq!(s2.ingest(&v1).unwrap(), ManifestIngest::Stale);
         assert_eq!(s1.get("w").unwrap().manifest.version, 2);
@@ -315,21 +386,34 @@ mod tests {
     fn non_operator_deploy_rejected() {
         let mallory = Keypair::from_seed([9u8; 32]);
         let env = Envelope::seal(&mk("w", 1, &[]), &mallory);
-        let mut s = ManifestSet::new(op().public());
+        let mut s = ManifestSet::new(opid());
         assert_eq!(s.ingest(&env).unwrap_err(), ManifestError::NotOperator);
+    }
+
+    #[test]
+    fn eth_operator_can_deploy() {
+        use crate::identity::{AnyKeypair, EthKeypair};
+        let wallet = AnyKeypair::Eth(EthKeypair::from_seed([8u8; 32]).unwrap());
+        let env = Envelope::seal_any(&mk("w", 1, &[]), &wallet);
+        let mut s = ManifestSet::new(wallet.signer_id());
+        assert_eq!(s.ingest(&env).unwrap(), ManifestIngest::Changed);
+        // The ed operator set rejects it.
+        let mut other = ManifestSet::new(opid());
+        assert_eq!(other.ingest(&env).unwrap_err(), ManifestError::NotOperator);
     }
 
     #[test]
     fn tombstone_removes_from_live_and_routes() {
         let op = op();
-        let mut s = ManifestSet::new(op.public());
-        s.ingest(&Envelope::seal(&mk("w", 1, &["a.example.com"]), &op)).unwrap();
+        let mut s = ManifestSet::new(opid());
+        let v1 = Envelope::seal(&mk("w", 1, &["a.example.com"]), &op);
+        s.ingest(&v1).unwrap();
         assert_eq!(s.routes().len(), 1);
         let mut dead = mk("w", 2, &[]);
         dead.deleted = true;
         dead.modules.clear();
         dead.main = String::new();
-        s.ingest(&Envelope::seal(&dead, &op)).unwrap();
+        s.ingest(&seal_after(&mut dead, &v1, &op)).unwrap();
         assert_eq!(s.live().count(), 0);
         assert!(s.routes().is_empty());
     }
@@ -339,13 +423,66 @@ mod tests {
         let op = op();
         let a = Envelope::seal(&mk("wa", 1, &["x.example.com"]), &op);
         let b = Envelope::seal(&mk("wb", 1, &["x.example.com"]), &op);
-        let mut s1 = ManifestSet::new(op.public());
+        let mut s1 = ManifestSet::new(opid());
         s1.ingest(&a).unwrap();
         s1.ingest(&b).unwrap();
-        let mut s2 = ManifestSet::new(op.public());
+        let mut s2 = ManifestSet::new(opid());
         s2.ingest(&b).unwrap();
         s2.ingest(&a).unwrap();
         assert_eq!(s1.routes(), s2.routes());
+    }
+
+    #[test]
+    fn chain_rules_enforced() {
+        let op = op();
+        let mut s = ManifestSet::new(opid());
+        // v1 with a prev is invalid.
+        let mut bad_root = mk("w", 1, &[]);
+        bad_root.prev = Some([1; 32]);
+        assert_eq!(
+            s.ingest(&Envelope::seal(&bad_root, &op)).unwrap_err(),
+            ManifestError::ChainBroken
+        );
+        // Proper root, then a v2 with a wrong link is rejected.
+        let v1 = Envelope::seal(&mk("w", 1, &[]), &op);
+        s.ingest(&v1).unwrap();
+        let mut forged = mk("w", 2, &[]);
+        forged.prev = Some([9; 32]);
+        assert_eq!(
+            s.ingest(&Envelope::seal(&forged, &op)).unwrap_err(),
+            ManifestError::ChainBroken
+        );
+        // Correct link accepted.
+        let v2 = seal_after(&mut mk("w", 2, &[]), &v1, &op);
+        assert_eq!(s.ingest(&v2).unwrap(), ManifestIngest::Changed);
+        // A jump (v4 while we hold v2) is accepted — auditable later.
+        let mut v4 = mk("w", 4, &[]);
+        v4.prev = Some([7; 32]);
+        assert_eq!(s.ingest(&Envelope::seal(&v4, &op)).unwrap(), ManifestIngest::Changed);
+    }
+
+    #[test]
+    fn verify_chain_walks_and_rejects_tampering() {
+        let op = op();
+        let v1 = Envelope::seal(&mk("w", 1, &[]), &op);
+        let v2 = seal_after(&mut mk("w", 2, &[]), &v1, &op);
+        let v3 = seal_after(&mut mk("w", 3, &[]), &v2, &op);
+        let chain = vec![v1.clone(), v2.clone(), v3.clone()];
+        let ms = verify_chain(&chain, &opid()).unwrap();
+        assert_eq!(ms.iter().map(|m| m.version).collect::<Vec<_>>(), vec![1, 2, 3]);
+        // Drop the middle link → broken.
+        assert_eq!(
+            verify_chain(&[v1.clone(), v3.clone()], &opid()).unwrap_err(),
+            ManifestError::ChainBroken
+        );
+        // Replace the middle with a re-signed variant → v3.prev no
+        // longer matches.
+        let mut alt2 = mk("w", 2, &["evil.example.com"]);
+        let alt2_env = seal_after(&mut alt2, &v1, &op);
+        assert_eq!(
+            verify_chain(&[v1, alt2_env, v3], &opid()).unwrap_err(),
+            ManifestError::ChainBroken
+        );
     }
 
     #[test]

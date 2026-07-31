@@ -16,7 +16,7 @@
 
 use crate::envelope::{Envelope, EnvelopeError};
 use crate::hlc::Hlc;
-use crate::identity::{Keypair, PublicId};
+use crate::identity::{Keypair, PublicId, SignerId};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
@@ -134,7 +134,7 @@ impl ClaimSet {
     /// Verify + fold one claim envelope in.
     pub fn ingest(&mut self, env: &Envelope) -> Result<Ingest, ClaimError> {
         let claim: Claim = env.open(None).map_err(ClaimError::Envelope)?;
-        if claim.holder != env.signer {
+        if SignerId::Ed(claim.holder) != env.signer {
             return Err(ClaimError::HolderMismatch);
         }
         if claim.renewed < claim.acquired {
