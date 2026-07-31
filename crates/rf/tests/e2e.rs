@@ -234,6 +234,63 @@ async fn module_worker_on_real_workerd() {
     n.child.wait().unwrap();
 }
 
+/// HTTPS ingress: drop a PEM pair into <data>/certs, boot, serve an
+/// assets worker over TLS with correct SNI resolution.
+#[tokio::test(flavor = "multi_thread")]
+async fn tls_ingress_serves_with_sni_cert() {
+    let operator = Keypair::from_seed([9u8; 32]);
+    let op_any = AnyKeypair::Ed(operator.clone());
+    let client = PeerClient::new(SECRET);
+
+    let dir = std::env::temp_dir().join(format!("rf-e2e-tls-{}", rand::random::<u32>()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let (gossip, api, ingress) = (free_port(), free_port(), free_port());
+    let https = free_port();
+    let mut cfg = std::fs::read_to_string(write_config(
+        &dir, &operator, gossip, api, ingress, &[], "tls",
+    ))
+    .unwrap();
+    cfg.push_str(&format!("https = \"127.0.0.1:{https}\"\n"));
+    std::fs::write(dir.join("rf.toml"), cfg).unwrap();
+
+    // Pre-drop a self-signed cert for the site hostname.
+    let certs_dir = dir.join("data").join("certs");
+    std::fs::create_dir_all(&certs_dir).unwrap();
+    let cert = rcgen::generate_simple_self_signed(vec!["tls.test".to_string()]).unwrap();
+    std::fs::write(certs_dir.join("tls.test.crt"), cert.cert.pem()).unwrap();
+    std::fs::write(certs_dir.join("tls.test.key"), cert.signing_key.serialize_pem()).unwrap();
+
+    let mut child = spawn_node(&dir, &dir.join("rf.toml"));
+    wait_ping(&format!("127.0.0.1:{api}"), Duration::from_secs(15)).await;
+
+    let bundle_dir = make_bundle("tls.test");
+    let bundle = rf::deploy::read_bundle(&bundle_dir).unwrap();
+    rf::deploy::deploy(&bundle, &client, &format!("127.0.0.1:{api}"), &op_any)
+        .await
+        .unwrap();
+
+    let https_client = reqwest::Client::builder()
+        .danger_accept_invalid_certs(true) // self-signed in test
+        .resolve("tls.test", format!("127.0.0.1:{https}").parse().unwrap())
+        .build()
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        match https_client.get(format!("https://tls.test:{https}/")).send().await {
+            Ok(r) if r.status() == 200 => {
+                assert!(r.text().await.unwrap().contains("hello from rf"));
+                break;
+            }
+            _ => {}
+        }
+        assert!(Instant::now() < deadline, "tls ingress never served the site");
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+
+    child.kill().unwrap();
+    child.wait().unwrap();
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn two_node_deploy_kv_and_static_stability() {
     let operator = Keypair::from_seed([7u8; 32]);

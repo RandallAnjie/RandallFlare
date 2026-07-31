@@ -224,6 +224,11 @@ fn keygen(dir: Option<PathBuf>, eth: bool) -> Result<()> {
 }
 
 async fn run(config_path: PathBuf) -> Result<()> {
+    // Both ring and aws-lc-rs sit in the dep tree (reqwest vs our
+    // rustls) — pick ring explicitly or rustls panics at first use.
+    rustls::crypto::ring::default_provider()
+        .install_default()
+        .map_err(|_| anyhow::anyhow!("rustls crypto provider already installed"))?;
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
@@ -255,6 +260,10 @@ async fn run(config_path: PathBuf) -> Result<()> {
     if let Some(http) = node.cfg.ingress.http {
         let addr = rf::ingress::serve(node.clone(), http).await?;
         tracing::info!("ingress on {addr}");
+    }
+    if let Some(https) = node.cfg.ingress.https {
+        rf::ingress::serve_tls(node.clone(), https).await?;
+        tracing::info!("tls ingress on {https}");
     }
 
     rf::cron_driver::spawn(node.clone());

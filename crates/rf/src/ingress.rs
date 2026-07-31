@@ -26,16 +26,18 @@ pub struct Ingress {
     http: reqwest::Client,
 }
 
-pub async fn serve(node: Arc<Node>, listen: SocketAddr) -> Result<SocketAddr> {
+fn app(node: Arc<Node>) -> Result<axum::Router> {
     let ingress = Ingress {
         node,
         http: reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(120))
             .build()?,
     };
-    let app = axum::Router::new()
-        .fallback(handle)
-        .with_state(ingress);
+    Ok(axum::Router::new().fallback(handle).with_state(ingress))
+}
+
+pub async fn serve(node: Arc<Node>, listen: SocketAddr) -> Result<SocketAddr> {
+    let app = app(node)?;
     let listener = tokio::net::TcpListener::bind(listen).await?;
     let addr = listener.local_addr()?;
     tokio::spawn(async move {
@@ -44,6 +46,24 @@ pub async fn serve(node: Arc<Node>, listen: SocketAddr) -> Result<SocketAddr> {
         }
     });
     Ok(addr)
+}
+
+/// HTTPS ingress: SNI cert store from <data>/certs (hot-reloaded),
+/// self-signed fallback for unknown hosts. Same router as HTTP.
+pub async fn serve_tls(node: Arc<Node>, listen: SocketAddr) -> Result<()> {
+    let store = crate::tls::spawn_store(node.cfg.data_dir.join("certs"))?;
+    let rustls_cfg = crate::tls::server_config(store);
+    let app = app(node)?;
+    let config = axum_server::tls_rustls::RustlsConfig::from_config(rustls_cfg);
+    tokio::spawn(async move {
+        if let Err(e) = axum_server::bind_rustls(listen, config)
+            .serve(app.into_make_service())
+            .await
+        {
+            tracing::error!("tls ingress died: {e}");
+        }
+    });
+    Ok(())
 }
 
 async fn handle(State(ingress): State<Ingress>, req: Request) -> Response {

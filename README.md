@@ -37,9 +37,13 @@ Working today, verified by a two-node e2e suite:
   operators can be an **Ethereum wallet** (`rf keygen --eth`,
   `operator = "0x…"`, EIP-191 signatures)
 
-v0.2: TLS/ACME via claims, native workerd kvNamespace bindings,
-overlay transport for non-public nodes, self-update on. v0.3:
-per-object micro-quorums for D1/Durable Objects.
+Also in: HTTPS ingress (SNI cert store, hot-reload, wildcard files,
+self-signed fallback) and **native workerd kvNamespace bindings** —
+`env.CACHE.get/put/list` verified against a real workerd binary.
+
+v0.2 remaining: ACME renewal as a claimed task, overlay transport for
+non-public nodes, self-update on. v0.3: per-object micro-quorums for
+D1/Durable Objects.
 
 ## Build
 
@@ -70,6 +74,10 @@ listen = "0.0.0.0:7382"
 
 [ingress]
 http = "0.0.0.0:80"
+https = "0.0.0.0:443"   # SNI certs from <data_dir>/certs/<host>.crt/.key
+                        # (certbot output works; hot-reloaded, wildcard
+                        # via _wildcard.<domain>.crt; self-signed
+                        # fallback until you drop certs in)
 
 [dns]                                # optional, public nodes
 hostname = "edge.example.com"
