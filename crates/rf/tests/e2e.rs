@@ -120,6 +120,120 @@ fn make_bundle(hostname: &str) -> PathBuf {
     dir
 }
 
+/// Full module-worker path against REAL workerd: deploy JS, runtime
+/// spawns workerd, ingress proxies to it, KV binding URL works from
+/// inside the worker. Skips (with a loud note) when workerd isn't on
+/// PATH — CI boxes without it still run the rest of the suite.
+#[tokio::test(flavor = "multi_thread")]
+async fn module_worker_on_real_workerd() {
+    let workerd_present = std::env::var_os("PATH")
+        .map(|p| std::env::split_paths(&p).any(|d| d.join("workerd").is_file()))
+        .unwrap_or(false);
+    if !workerd_present {
+        eprintln!("SKIP: workerd not on PATH — module-worker e2e not exercised");
+        return;
+    }
+
+    let operator = Keypair::from_seed([8u8; 32]);
+    let op_any = AnyKeypair::Ed(operator.clone());
+    let client = PeerClient::new(SECRET);
+    let http = reqwest::Client::new();
+
+    let mut n = start("wd", &operator, &[]);
+    wait_ping(&n.api, Duration::from_secs(15)).await;
+
+    // Seed a KV value the worker will read through its binding.
+    client.kv_put(&n.api, "ns1", "greet", b"kv-through-binding".to_vec()).await.unwrap();
+
+    // A module worker that echoes env + fetches its KV binding URL.
+    let dir = std::env::temp_dir().join(format!("rf-e2e-mod-{}", rand::random::<u32>()));
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("rf.json"),
+        r#"{"name":"api","main":"index.js","hostnames":["api.test"],
+            "env":{"GREETING":"hi from env"},"kv":{"CACHE":"ns1"}}"#,
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("index.js"),
+        r#"export default {
+  async fetch(req, env) {
+    const url = new URL(req.url);
+    if (url.pathname === "/env") return new Response(env.GREETING);
+    if (url.pathname === "/kv") return new Response(await env.CACHE.get("greet"));
+    if (url.pathname === "/kv-rw") {
+      await env.CACHE.put("written-by-worker", "worker-wrote-this", {expirationTtl: 3600});
+      const listed = await env.CACHE.list({prefix: "written"});
+      const val = await env.CACHE.get("written-by-worker");
+      const missing = await env.CACHE.get("no-such-key");
+      return new Response(JSON.stringify({val, missing, names: listed.keys.map(k => k.name)}));
+    }
+    return new Response("module worker up");
+  }
+};"#,
+    )
+    .unwrap();
+    let bundle = rf::deploy::read_bundle(&dir).unwrap();
+    rf::deploy::deploy(&bundle, &client, &n.api, &op_any).await.unwrap();
+
+    // Runtime reconciles on the manifest event; workerd needs a
+    // moment to boot. Poll through ingress.
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let ok = http
+            .get(format!("http://127.0.0.1:{}/", n.ingress))
+            .header("host", "api.test")
+            .send()
+            .await
+            .map(|r| r.status() == 200)
+            .unwrap_or(false);
+        if ok {
+            break;
+        }
+        assert!(Instant::now() < deadline, "module worker never came up via ingress");
+        tokio::time::sleep(Duration::from_millis(300)).await;
+    }
+
+    let env_resp = http
+        .get(format!("http://127.0.0.1:{}/env", n.ingress))
+        .header("host", "api.test")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(env_resp.text().await.unwrap(), "hi from env");
+
+    let kv_resp = http
+        .get(format!("http://127.0.0.1:{}/kv", n.ingress))
+        .header("host", "api.test")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(kv_resp.text().await.unwrap(), "kv-through-binding");
+
+    // Worker-side put/list/miss through the native binding.
+    let rw: serde_json::Value = http
+        .get(format!("http://127.0.0.1:{}/kv-rw", n.ingress))
+        .header("host", "api.test")
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(rw["val"], "worker-wrote-this");
+    assert_eq!(rw["missing"], serde_json::Value::Null);
+    assert_eq!(rw["names"][0], "written-by-worker");
+    // The worker's write is a real cluster KV write, visible via the
+    // peer API too.
+    assert_eq!(
+        client.kv_get(&n.api, "ns1", "written-by-worker").await.unwrap().unwrap(),
+        b"worker-wrote-this"
+    );
+
+    n.child.kill().unwrap();
+    n.child.wait().unwrap();
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn two_node_deploy_kv_and_static_stability() {
     let operator = Keypair::from_seed([7u8; 32]);

@@ -240,6 +240,12 @@ async fn run(config_path: PathBuf) -> Result<()> {
     let api_addr = rf::peerapi::serve(node.clone()).await?;
     tracing::info!("peer api on {api_addr}");
 
+    // KV binding backend for workerd — must be up before the runtime
+    // writes any workerd config.
+    let kvbind_port = rf::kvbind::serve(node.clone()).await?;
+    node.set_kvbind_port(kvbind_port);
+    tracing::info!("kvbind on 127.0.0.1:{kvbind_port}");
+
     let _gossip = rf::gossip::start(node.clone()).await?;
     rf::gossip::spawn_blob_fetcher(node.clone());
     tracing::info!("gossip on {}", node.cfg.gossip.listen);

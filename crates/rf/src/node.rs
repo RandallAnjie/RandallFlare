@@ -49,6 +49,8 @@ pub struct Inner {
     pub peers: BTreeMap<String, PeerView>,
     /// worker name → local workerd port (published by the runtime).
     pub worker_ports: HashMap<String, u16>,
+    /// Loopback port of the kvbind server (set at daemon start).
+    pub kvbind_port: u16,
 }
 
 pub struct Node {
@@ -78,6 +80,7 @@ impl Node {
             kv: HashMap::new(),
             peers: BTreeMap::new(),
             worker_ports: HashMap::new(),
+            kvbind_port: 0,
         };
         // Hydrate: static stability means booting entirely from disk.
         for env in store.load_manifests()? {
@@ -291,6 +294,41 @@ impl Node {
         }
     }
 
+    /// Paged listing for the workerd KV binding: (name, expiration_ms)
+    /// pairs after `cursor` (exclusive), plus list_complete + the next
+    /// cursor. The cursor is simply the last key returned — opaque
+    /// enough for CF parity, trivially resumable.
+    pub fn kv_list_page(
+        &self,
+        ns: &str,
+        prefix: &str,
+        limit: usize,
+        cursor: Option<&str>,
+    ) -> (Vec<(String, Option<u64>)>, bool, Option<String>) {
+        let inner = self.inner.lock().unwrap();
+        let Some(n) = inner.kv.get(ns) else {
+            return (Vec::new(), true, None);
+        };
+        let now = now_ms();
+        let mut out: Vec<(String, Option<u64>)> = Vec::new();
+        let mut more = false;
+        for key in n.list(prefix, now, usize::MAX) {
+            if let Some(c) = cursor {
+                if key <= c {
+                    continue;
+                }
+            }
+            if out.len() == limit {
+                more = true;
+                break;
+            }
+            let exp = n.entry(key).and_then(|e| e.expires_at_ms);
+            out.push((key.to_string(), exp));
+        }
+        let next = if more { out.last().map(|(k, _)| k.clone()) } else { None };
+        (out, !more, next)
+    }
+
     pub fn kv_merge_remote(&self, ns: &str, items: Vec<(String, KvEntry)>) -> Result<usize> {
         let mut applied = 0;
         {
@@ -385,6 +423,14 @@ impl Node {
 
     pub fn worker_port(&self, name: &str) -> Option<u16> {
         self.inner.lock().unwrap().worker_ports.get(name).copied()
+    }
+
+    pub fn set_kvbind_port(&self, port: u16) {
+        self.inner.lock().unwrap().kvbind_port = port;
+    }
+
+    pub fn kvbind_port(&self) -> u16 {
+        self.inner.lock().unwrap().kvbind_port
     }
 
     /// Periodic GC of dead claims + KV tombstones.

@@ -6,6 +6,7 @@ pub mod blob;
 pub mod config;
 pub mod gossip;
 pub mod keys;
+pub mod kvbind;
 pub mod node;
 pub mod cron_driver;
 pub mod deploy;

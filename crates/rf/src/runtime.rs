@@ -12,9 +12,10 @@
 //! (ingress still serves asset trees natively; the merged "Pages"
 //! path never needs workerd).
 //!
-//! KV bindings surface as env vars (RF_KV_<BINDING>_URL) pointing at
-//! the loopback peer API v0.1; native kvNamespace service bindings are
-//! v0.2 once verified against real workerd.
+//! KV bindings are native workerd `kvNamespace` bindings: each one
+//! points at an external service → the node's loopback kvbind server,
+//! with the namespace id attached via injectRequestHeaders. Protocol
+//! verified against workerd 2026-07-31 (see kvbind.rs).
 
 use crate::node::{Node, NodeEvent};
 use anyhow::{Context, Result};
@@ -23,6 +24,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::sync::Arc;
+use std::os::unix::process::CommandExt as _;
 use tokio::process::{Child, Command};
 
 pub struct Runtime {
@@ -150,20 +152,25 @@ impl Runtime {
     }
 
     fn alloc_port(&self, name: &str) -> u16 {
-        // Stable slot by name hash, linear probe over occupied ports.
+        // Stable slot by name hash, linear probe over ports that are
+        // taken by us OR by anything else on the host (a previous
+        // daemon's orphan, another service) — probed with a real bind.
         let mut slot = {
             let d = sha2::Sha256::digest(name.as_bytes());
             u16::from_le_bytes([d[0], d[1]]) % 1000
         };
         let used: std::collections::HashSet<u16> =
             self.running.values().map(|r| r.port).collect();
-        loop {
+        for _ in 0..1000 {
             let port = self.port_base + slot;
-            if !used.contains(&port) {
+            if !used.contains(&port)
+                && std::net::TcpListener::bind(("127.0.0.1", port)).is_ok()
+            {
                 return port;
             }
             slot = (slot + 1) % 1000;
         }
+        self.port_base // hopeless; spawn will fail loudly
     }
 
     async fn start_worker(&mut self, m: &WorkerManifest) -> Result<()> {
@@ -193,25 +200,59 @@ impl Runtime {
             let bytes = self.node.blobs.get(&module.sha256).context("module blob")?;
             std::fs::write(&path, bytes)?;
         }
-        let config = generate_config(m, port, self.node.cfg.peer_api.listen.port());
+        let config = generate_config(m, port, self.node.kvbind_port());
         std::fs::write(dir.join("config.capnp"), config)?;
 
-        // Kill the old version before binding the port again.
+        // Kill the old version and WAIT for it to exit — spawning the
+        // new one while the old still holds the port is a bind race.
         if let Some(rw) = self.running.get_mut(&m.name) {
             if let Some(child) = &mut rw.child {
                 let _ = child.start_kill();
+                let _ = tokio::time::timeout(
+                    std::time::Duration::from_secs(5),
+                    child.wait(),
+                )
+                .await;
             }
+            rw.child = None;
         }
 
-        let child = Command::new(workerd)
-            .arg("serve")
+        let mut cmd = Command::new(workerd);
+        cmd.arg("serve")
             .arg(dir.join("config.capnp"))
             .current_dir(&dir)
             .stdout(Stdio::null())
             .stderr(Stdio::inherit())
-            .kill_on_drop(true)
-            .spawn()
-            .with_context(|| format!("spawning workerd for {}", m.name))?;
+            .kill_on_drop(true);
+        // Die with the daemon: a SIGKILLed rf must not leave orphan
+        // workerds squatting on worker ports with stale code.
+        #[cfg(target_os = "linux")]
+        unsafe {
+            cmd.pre_exec(|| {
+                libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL);
+                Ok(())
+            });
+        }
+        let mut child =
+            cmd.spawn().with_context(|| format!("spawning workerd for {}", m.name))?;
+
+        // Wait until the socket actually answers (or the child dies) —
+        // a bind failure otherwise looks like success for 10 seconds.
+        let mut healthy = false;
+        for _ in 0..50 {
+            if let Ok(Some(status)) = child.try_wait() {
+                anyhow::bail!("workerd for {} exited during startup: {status}", m.name);
+            }
+            if tokio::net::TcpStream::connect(("127.0.0.1", port)).await.is_ok() {
+                healthy = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        if !healthy {
+            let _ = child.start_kill();
+            anyhow::bail!("workerd for {} never bound 127.0.0.1:{port}", m.name);
+        }
 
         tracing::info!("worker {} v{} on 127.0.0.1:{port}", m.name, m.version);
         self.running
@@ -234,7 +275,7 @@ fn which_workerd() -> Option<PathBuf> {
 }
 
 /// Emit the workerd capnp config for one worker.
-pub fn generate_config(m: &WorkerManifest, port: u16, peer_api_port: u16) -> String {
+pub fn generate_config(m: &WorkerManifest, port: u16, kvbind_port: u16) -> String {
     let mut modules = String::new();
     for module in &m.modules {
         let kind = match module.kind {
@@ -257,12 +298,18 @@ pub fn generate_config(m: &WorkerManifest, port: u16, peer_api_port: u16) -> Str
             capnp_string(v)
         ));
     }
+    // Native kvNamespace bindings: each one routes to the node's
+    // loopback kvbind server, namespace carried in an injected header.
+    let mut kv_services = String::new();
     for (binding, ns) in &m.kv_bindings {
         bindings.push_str(&format!(
-            "        (name = \"RF_KV_{}_URL\", text = \"http://127.0.0.1:{}/v1/kv/{}\"),\n",
-            binding.to_uppercase(),
-            peer_api_port,
-            ns
+            "        (name = \"{binding}\", kvNamespace = (name = \"kv-{binding}\")),\n"
+        ));
+        kv_services.push_str(&format!(
+            "    (name = \"kv-{binding}\", external = (address = \"127.0.0.1:{kvbind_port}\", \
+             http = (injectRequestHeaders = [(name = \"{ns_header}\", value = {ns_val})]))),\n",
+            ns_header = crate::kvbind::NS_HEADER,
+            ns_val = capnp_string(ns),
         ));
     }
     format!(
@@ -278,7 +325,7 @@ const config :Workerd.Config = (
       bindings = [
 {bindings}      ],
     )),
-  ],
+{kv_services}  ],
   sockets = [
     (name = "http", address = "127.0.0.1:{port}", http = (), service = "main"),
   ],
@@ -324,8 +371,9 @@ mod tests {
         assert!(cfg.contains("127.0.0.1:30111"));
         assert!(cfg.contains("GREETING"));
         assert!(cfg.contains("hi \\\"there\\\""));
-        assert!(cfg.contains("RF_KV_CACHE_URL"));
-        assert!(cfg.contains("/v1/kv/ns1"));
+        assert!(cfg.contains("(name = \"CACHE\", kvNamespace = (name = \"kv-CACHE\"))"));
+        assert!(cfg.contains("external = (address = \"127.0.0.1:7382\""));
+        assert!(cfg.contains("injectRequestHeaders = [(name = \"x-rf-kv-ns\", value = \"ns1\")]"));
         assert!(cfg.contains("compatibilityDate = \"2026-07-31\""));
     }
 }
