@@ -59,23 +59,71 @@ mod tests {
     fn valid_mac_verifies() {
         let secret = [7u8; 32];
         let m = mac_hex(&secret, 1000, "POST", "/v1/manifest", b"body");
-        assert!(verify(&secret, 1500, "1000", &m, "POST", "/v1/manifest", b"body"));
+        assert!(verify(
+            &secret,
+            1500,
+            "1000",
+            &m,
+            "POST",
+            "/v1/manifest",
+            b"body"
+        ));
     }
 
     #[test]
     fn tampered_fields_fail() {
         let secret = [7u8; 32];
         let m = mac_hex(&secret, 1000, "POST", "/v1/manifest", b"body");
-        assert!(!verify(&secret, 1500, "1000", &m, "POST", "/v1/manifest", b"evil"));
-        assert!(!verify(&secret, 1500, "1000", &m, "GET", "/v1/manifest", b"body"));
-        assert!(!verify(&secret, 1500, "1000", &m, "POST", "/v1/other", b"body"));
-        assert!(!verify(&[8u8; 32], 1500, "1000", &m, "POST", "/v1/manifest", b"body"));
+        assert!(!verify(
+            &secret,
+            1500,
+            "1000",
+            &m,
+            "POST",
+            "/v1/manifest",
+            b"evil"
+        ));
+        assert!(!verify(
+            &secret,
+            1500,
+            "1000",
+            &m,
+            "GET",
+            "/v1/manifest",
+            b"body"
+        ));
+        assert!(!verify(
+            &secret,
+            1500,
+            "1000",
+            &m,
+            "POST",
+            "/v1/other",
+            b"body"
+        ));
+        assert!(!verify(
+            &[8u8; 32],
+            1500,
+            "1000",
+            &m,
+            "POST",
+            "/v1/manifest",
+            b"body"
+        ));
     }
 
     #[test]
     fn stale_timestamp_fails() {
         let secret = [7u8; 32];
         let m = mac_hex(&secret, 1000, "GET", "/v1/ping", b"");
-        assert!(!verify(&secret, 1000 + MAX_SKEW_MS + 1, "1000", &m, "GET", "/v1/ping", b""));
+        assert!(!verify(
+            &secret,
+            1000 + MAX_SKEW_MS + 1,
+            "1000",
+            &m,
+            "GET",
+            "/v1/ping",
+            b""
+        ));
     }
 }

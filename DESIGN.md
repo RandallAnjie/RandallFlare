@@ -4,7 +4,7 @@ Cloudflare decentralizes the data plane but keeps a centralized control
 plane (core datacenters). RandallFlare removes the control plane
 entirely: **every node runs the same binary, no node is special.**
 Coordination is sharded and emergent — gossip, signed manifests,
-claim-based task scheduling, and (later) per-object micro-quorums.
+claim-based task scheduling, and per-object micro-quorums.
 
 The second design axiom: nodes are *cheap*. A 512 MB VPS must run V8
 workloads, so the coordination layer has a hard memory budget of
@@ -13,7 +13,7 @@ This is why the daemon is Rust.
 
 ## What a node is
 
-One static binary, `rf`. Every node runs:
+One daemon binary, `rf`. Every node runs:
 
 - **gossip** — SWIM-style membership + state dissemination (cluster PSK).
 - **manifest store** — operator-signed worker manifests, merged as a
@@ -54,11 +54,12 @@ afterward. That is safe exactly where duplicate execution is safe:
 
 What claims can NOT give you is a single writer for stateful storage
 (D1/Durable Objects): two writers during a partition create histories
-that cannot be merged. The plan there (later milestone) is **per-object
-micro-quorums**: each database/DO gets a 3-node replica group chosen by
-rendezvous hashing over the membership; writes need an epoch-fenced
-lease from a majority of that group. Consensus exists, but it is
-per-object and node-anonymous — still no distinguished node.
+that cannot be merged. Stateful resources therefore use **sharded
+micro-quorums**: each D1 database and each DO-bearing Worker gets a
+3-node replica group chosen by rendezvous hashing over the membership;
+writes need an epoch-fenced lease from a majority of that group.
+Consensus is resource-local and node-anonymous — still no distinguished
+node.
 
 External dependencies that remain by necessity: the DNS zone (Cloudflare
 API — the entry point has to resolve somewhere) and the ACME CA. Both
@@ -108,9 +109,10 @@ are signed so a compromised PSK alone cannot forge deploys.
 
 ## Update path
 
-Nodes self-update from GitHub Releases: check version, download the
-matching target, verify sha256, atomic rename + re-exec. Disabled until
-the repo is public.
+Nodes can self-update from GitHub Releases: check version, download the
+matching target, verify its sha256 sidecar, atomic rename + re-exec.
+It is opt-in through `[update] enabled = true` and repository/API settings
+are configurable.
 
 ## Crate layout
 
@@ -129,11 +131,9 @@ stays too thin to hide bugs.
 ## Milestones
 
 1. **v0.1** — gossip, manifests, blobs, claims, KV, workerd runtime,
-   ingress, cron, DNS tasks, deploy CLI, two-node e2e. (This tree.)
-2. **v0.2** — ACME via claims, overlay transport for inner nodes,
-   self-update on.
-3. **v0.3** — micro-quorum storage: D1 (SQLite home + WAL replication),
-   Durable Objects with epoch-fenced leases. Native workerd DO bindings
-   and local SQLite persistence are implemented behind an explicit
-   single-node gate; distributed activation remains blocked until the
-   lease owner and its SQLite snapshot are majority-fenced.
+   ingress, cron, DNS tasks, deploy CLI, two-node e2e. Complete.
+2. **v0.2** — ACME via claims, encrypted node transport, self-update.
+   Complete.
+3. **v0.3** — micro-quorum storage: replicated D1 and Durable Objects
+   with epoch-fenced ownership, cross-edge routing, compressed SQLite
+   snapshot commits, and owner-loss recovery. Complete.

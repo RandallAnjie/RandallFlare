@@ -28,6 +28,7 @@ use tokio::process::{Child, Command};
 
 pub struct Runtime {
     node: Arc<Node>,
+    durable: crate::durable::Coordinator,
     workerd: Option<PathBuf>,
     port_base: u16,
     running: HashMap<String, RunningWorker>,
@@ -44,20 +45,21 @@ struct RunningWorker {
 pub struct WorkerPort(pub u16);
 
 impl Runtime {
-    pub fn new(node: Arc<Node>) -> Self {
-        let workerd = node
-            .cfg
-            .runtime
-            .workerd
-            .clone()
-            .or_else(|| which_workerd());
+    pub fn new(node: Arc<Node>, durable: crate::durable::Coordinator) -> Self {
+        let workerd = node.cfg.runtime.workerd.clone().or_else(which_workerd);
         if workerd.is_none() {
             tracing::warn!(
                 "workerd binary not found — module workers disabled, assets still serve"
             );
         }
         let port_base = node.cfg.runtime.port_base;
-        Self { node, workerd, port_base, running: HashMap::new() }
+        Self {
+            node,
+            durable,
+            workerd,
+            port_base,
+            running: HashMap::new(),
+        }
     }
 
     /// Long-running reconcile loop.
@@ -75,7 +77,7 @@ impl Runtime {
                 },
                 // Re-check periodically: blobs may have arrived, or a
                 // child may have died.
-                _ = tokio::time::sleep(std::time::Duration::from_secs(10)) => {
+                _ = tokio::time::sleep(std::time::Duration::from_millis(500)) => {
                     self.reap();
                     self.reconcile().await;
                 }
@@ -111,17 +113,10 @@ impl Runtime {
             .into_iter()
             .filter(|m| !m.main.is_empty())
             .filter(|m| {
-                if !crate::deploy::durable_objects(m).is_empty()
-                    && !self.node.cfg.runtime.allow_local_durable_objects
-                {
-                    tracing::warn!(
-                        "worker {} declares Durable Objects but has no quorum-fenced owner; refusing to start",
-                        m.name
-                    );
-                    false
-                } else {
-                    true
-                }
+                let has_do = !crate::deploy::durable_objects(m).is_empty();
+                !has_do
+                    || self.node.cfg.runtime.allow_local_durable_objects
+                    || self.durable.is_owner(&m.name)
             })
             .collect();
 
@@ -149,7 +144,12 @@ impl Runtime {
             if current.map(|rw| rw.version) == Some(m.version) && up {
                 continue; // already running this version
             }
-            if self.node.missing_blobs().iter().any(|s| m.blob_refs().any(|r| r == *s)) {
+            if self
+                .node
+                .missing_blobs()
+                .iter()
+                .any(|s| m.blob_refs().any(|r| r == *s))
+            {
                 tracing::debug!("worker {} waiting for blobs", m.name);
                 continue;
             }
@@ -171,13 +171,10 @@ impl Runtime {
             let d = sha2::Sha256::digest(name.as_bytes());
             u16::from_le_bytes([d[0], d[1]]) % 1000
         };
-        let used: std::collections::HashSet<u16> =
-            self.running.values().map(|r| r.port).collect();
+        let used: std::collections::HashSet<u16> = self.running.values().map(|r| r.port).collect();
         for _ in 0..1000 {
             let port = self.port_base + slot;
-            if !used.contains(&port)
-                && std::net::TcpListener::bind(("127.0.0.1", port)).is_ok()
-            {
+            if !used.contains(&port) && std::net::TcpListener::bind(("127.0.0.1", port)).is_ok() {
                 return port;
             }
             slot = (slot + 1) % 1000;
@@ -214,22 +211,23 @@ impl Runtime {
         }
         let durable_dir = self.node.cfg.data_dir.join("durable").join(&m.name);
         std::fs::create_dir_all(&durable_dir)?;
-        let config = generate_config(m, port, self.node.kvbind_port(), &durable_dir);
-        std::fs::write(dir.join("config.capnp"), config)?;
 
-        // Kill the old version and WAIT for it to exit — spawning the
-        // new one while the old still holds the port is a bind race.
+        // Stop the old version before replacing a DO SQLite snapshot.
+        // workerd may keep WAL handles open even between requests.
         if let Some(rw) = self.running.get_mut(&m.name) {
             if let Some(child) = &mut rw.child {
                 let _ = child.start_kill();
-                let _ = tokio::time::timeout(
-                    std::time::Duration::from_secs(5),
-                    child.wait(),
-                )
-                .await;
+                let _ = tokio::time::timeout(std::time::Duration::from_secs(5), child.wait()).await;
             }
             rw.child = None;
         }
+        if !crate::deploy::durable_objects(m).is_empty()
+            && !self.node.cfg.runtime.allow_local_durable_objects
+        {
+            self.durable.restore(&m.name).await?;
+        }
+        let config = generate_config(m, port, self.node.kvbind_port(), &durable_dir);
+        std::fs::write(dir.join("config.capnp"), config)?;
 
         let mut cmd = Command::new(workerd);
         cmd.arg("serve");
@@ -250,8 +248,9 @@ impl Runtime {
                 Ok(())
             });
         }
-        let mut child =
-            cmd.spawn().with_context(|| format!("spawning workerd for {}", m.name))?;
+        let mut child = cmd
+            .spawn()
+            .with_context(|| format!("spawning workerd for {}", m.name))?;
 
         // Wait until the socket actually answers (or the child dies) —
         // a bind failure otherwise looks like success for 10 seconds.
@@ -260,7 +259,10 @@ impl Runtime {
             if let Ok(Some(status)) = child.try_wait() {
                 anyhow::bail!("workerd for {} exited during startup: {status}", m.name);
             }
-            if tokio::net::TcpStream::connect(("127.0.0.1", port)).await.is_ok() {
+            if tokio::net::TcpStream::connect(("127.0.0.1", port))
+                .await
+                .is_ok()
+            {
                 healthy = true;
                 break;
             }
@@ -272,8 +274,14 @@ impl Runtime {
         }
 
         tracing::info!("worker {} v{} on 127.0.0.1:{port}", m.name, m.version);
-        self.running
-            .insert(m.name.clone(), RunningWorker { version: m.version, port, child: Some(child) });
+        self.running.insert(
+            m.name.clone(),
+            RunningWorker {
+                version: m.version,
+                port,
+                child: Some(child),
+            },
+        );
         Ok(())
     }
 }
@@ -307,9 +315,11 @@ pub fn generate_config(
             ModuleKind::Text => "text",
             ModuleKind::Data => "data",
         };
+        let source = format!("src/{}", module.path);
         modules.push_str(&format!(
-            "        (name = \"{}\", {kind} = embed \"src/{}\"),\n",
-            module.path, module.path
+            "        (name = {}, {kind} = embed {}),\n",
+            capnp_string(&module.path),
+            capnp_string(&source),
         ));
     }
     let mut bindings = String::new();
@@ -318,8 +328,8 @@ pub fn generate_config(
             continue;
         }
         bindings.push_str(&format!(
-            "        (name = \"{}\", text = {}),\n",
-            k,
+            "        (name = {}, text = {}),\n",
+            capnp_string(k),
             capnp_string(v)
         ));
     }
@@ -327,12 +337,16 @@ pub fn generate_config(
     // loopback kvbind server, namespace carried in an injected header.
     let mut kv_services = String::new();
     for (binding, ns) in &m.kv_bindings {
+        let service = format!("kv-{binding}");
         bindings.push_str(&format!(
-            "        (name = \"{binding}\", kvNamespace = (name = \"kv-{binding}\")),\n"
+            "        (name = {binding}, kvNamespace = (name = {service})),\n",
+            binding = capnp_string(binding),
+            service = capnp_string(&service),
         ));
         kv_services.push_str(&format!(
-            "    (name = \"kv-{binding}\", external = (address = \"127.0.0.1:{kvbind_port}\", \
+            "    (name = {service}, external = (address = \"127.0.0.1:{kvbind_port}\", \
              http = (injectRequestHeaders = [(name = \"{ns_header}\", value = {ns_val})]))),\n",
+            service = capnp_string(&service),
             ns_header = crate::kvbind::NS_HEADER,
             ns_val = capnp_string(ns),
         ));
@@ -379,7 +393,7 @@ const config :Workerd.Config = (
     (name = "main", worker = (
       modules = [
 {modules}      ],
-      compatibilityDate = "{compat}",
+      compatibilityDate = {compat},
       bindings = [
 {bindings}      ],
 {durable_worker}    )),
@@ -389,12 +403,12 @@ const config :Workerd.Config = (
   ],
 );
 "#,
-        compat = m.compatibility_date,
+        compat = capnp_string(&m.compatibility_date),
     )
 }
 
 fn capnp_string(s: &str) -> String {
-    format!("\"{}\"", s.replace('\\', "\\\\").replace('"', "\\\""))
+    serde_json::to_string(s).expect("string serialization")
 }
 
 #[cfg(test)]
@@ -450,5 +464,10 @@ mod tests {
         assert!(cfg.contains("uniqueKey = \"rf--w--Counter\", enableSql = true"));
         assert!(cfg.contains("durableObjectStorage = (localDisk = \"do-storage\")"));
         assert!(cfg.contains("disk = (path = \"/tmp/rf-do\", writable = true)"));
+    }
+
+    #[test]
+    fn config_escapes_binding_names_and_control_characters() {
+        assert_eq!(capnp_string("a\"b\n"), "\"a\\\"b\\n\"");
     }
 }

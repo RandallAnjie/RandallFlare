@@ -162,11 +162,25 @@ impl ClaimSet {
                 } else {
                     return Err(ClaimError::AcquiredMoved);
                 }
-                per_task.insert(claim.holder, ClaimRecord { claim, digest, envelope: env.clone() });
+                per_task.insert(
+                    claim.holder,
+                    ClaimRecord {
+                        claim,
+                        digest,
+                        envelope: env.clone(),
+                    },
+                );
                 Ok(Ingest::Changed)
             }
             None => {
-                per_task.insert(claim.holder, ClaimRecord { claim, digest, envelope: env.clone() });
+                per_task.insert(
+                    claim.holder,
+                    ClaimRecord {
+                        claim,
+                        digest,
+                        envelope: env.clone(),
+                    },
+                );
                 Ok(Ingest::Changed)
             }
         }
@@ -174,19 +188,23 @@ impl ClaimSet {
 
     /// The current holder of `task`, if any live claim exists.
     pub fn winner(&self, task: &str, now_ms: u64) -> Option<&ClaimRecord> {
-        self.tasks.get(task)?.values().filter(|r| r.claim.live(now_ms)).min_by(
-            |a, b| {
+        self.tasks
+            .get(task)?
+            .values()
+            .filter(|r| r.claim.live(now_ms))
+            .min_by(|a, b| {
                 a.claim
                     .acquired
                     .cmp(&b.claim.acquired)
                     .then_with(|| a.digest.cmp(&b.digest))
-            },
-        )
+            })
     }
 
     /// Does `me` currently hold `task`?
     pub fn holds(&self, task: &str, me: &PublicId, now_ms: u64) -> bool {
-        self.winner(task, now_ms).map(|r| r.claim.holder == *me).unwrap_or(false)
+        self.winner(task, now_ms)
+            .map(|r| r.claim.holder == *me)
+            .unwrap_or(false)
     }
 
     /// Should a node try to grab `task`? True when nobody holds it.
@@ -257,10 +275,24 @@ mod tests {
     fn expired_holder_loses_to_live_later_claim() {
         let (a, b) = (kp(1), kp(2));
         let mut set = ClaimSet::new();
-        let claim_a =
-            ClaimSet::make_claim(&a, "t", Hlc { wall_ms: 1000, logical: 0 }, 10_000);
-        let claim_b =
-            ClaimSet::make_claim(&b, "t", Hlc { wall_ms: 2000, logical: 0 }, 300_000);
+        let claim_a = ClaimSet::make_claim(
+            &a,
+            "t",
+            Hlc {
+                wall_ms: 1000,
+                logical: 0,
+            },
+            10_000,
+        );
+        let claim_b = ClaimSet::make_claim(
+            &b,
+            "t",
+            Hlc {
+                wall_ms: 2000,
+                logical: 0,
+            },
+            300_000,
+        );
         set.ingest(&claim_a).unwrap();
         set.ingest(&claim_b).unwrap();
         // While A is live it wins…
@@ -274,17 +306,41 @@ mod tests {
     fn renewal_keeps_priority() {
         let a = kp(1);
         let mut set = ClaimSet::new();
-        let first = ClaimSet::make_claim(&a, "t", Hlc { wall_ms: 1000, logical: 0 }, 10_000);
+        let first = ClaimSet::make_claim(
+            &a,
+            "t",
+            Hlc {
+                wall_ms: 1000,
+                logical: 0,
+            },
+            10_000,
+        );
         set.ingest(&first).unwrap();
         let prior = set.mine("t", &a.public()).unwrap().claim.clone();
-        let renewed = ClaimSet::renew(&a, &prior, Hlc { wall_ms: 9000, logical: 0 }, false);
+        let renewed = ClaimSet::renew(
+            &a,
+            &prior,
+            Hlc {
+                wall_ms: 9000,
+                logical: 0,
+            },
+            false,
+        );
         assert_eq!(set.ingest(&renewed).unwrap(), Ingest::Changed);
         // Still live well past the original expiry.
         let now = 1000 + 10_000 + 5000;
         assert_eq!(set.winner("t", now).unwrap().claim.holder, a.public());
         // Acquired unchanged → still beats a later acquirer.
         let b = kp(2);
-        let cb = ClaimSet::make_claim(&b, "t", Hlc { wall_ms: 1500, logical: 0 }, 300_000);
+        let cb = ClaimSet::make_claim(
+            &b,
+            "t",
+            Hlc {
+                wall_ms: 1500,
+                logical: 0,
+            },
+            300_000,
+        );
         set.ingest(&cb).unwrap();
         assert_eq!(set.winner("t", now).unwrap().claim.holder, a.public());
     }
@@ -293,11 +349,27 @@ mod tests {
     fn release_frees_the_task() {
         let a = kp(1);
         let mut set = ClaimSet::new();
-        let first = ClaimSet::make_claim(&a, "t", Hlc { wall_ms: 1000, logical: 0 }, 60_000);
+        let first = ClaimSet::make_claim(
+            &a,
+            "t",
+            Hlc {
+                wall_ms: 1000,
+                logical: 0,
+            },
+            60_000,
+        );
         set.ingest(&first).unwrap();
         assert!(!set.open_for_claim("t", 2000));
         let prior = set.mine("t", &a.public()).unwrap().claim.clone();
-        let rel = ClaimSet::renew(&a, &prior, Hlc { wall_ms: 3000, logical: 0 }, true);
+        let rel = ClaimSet::renew(
+            &a,
+            &prior,
+            Hlc {
+                wall_ms: 3000,
+                logical: 0,
+            },
+            true,
+        );
         set.ingest(&rel).unwrap();
         assert!(set.open_for_claim("t", 4000));
     }
@@ -308,8 +380,14 @@ mod tests {
         let claim = Claim {
             task: "t".into(),
             holder: a.public(), // claims to be A…
-            acquired: Hlc { wall_ms: 1, logical: 0 },
-            renewed: Hlc { wall_ms: 1, logical: 0 },
+            acquired: Hlc {
+                wall_ms: 1,
+                logical: 0,
+            },
+            renewed: Hlc {
+                wall_ms: 1,
+                logical: 0,
+            },
             ttl_ms: 1000,
             released: false,
         };
@@ -322,9 +400,25 @@ mod tests {
     fn backdated_reacquisition_rejected() {
         let a = kp(1);
         let mut set = ClaimSet::new();
-        set.ingest(&ClaimSet::make_claim(&a, "t", Hlc { wall_ms: 5000, logical: 0 }, 1000))
-            .unwrap();
-        let back = ClaimSet::make_claim(&a, "t", Hlc { wall_ms: 100, logical: 0 }, 1000);
+        set.ingest(&ClaimSet::make_claim(
+            &a,
+            "t",
+            Hlc {
+                wall_ms: 5000,
+                logical: 0,
+            },
+            1000,
+        ))
+        .unwrap();
+        let back = ClaimSet::make_claim(
+            &a,
+            "t",
+            Hlc {
+                wall_ms: 100,
+                logical: 0,
+            },
+            1000,
+        );
         assert_eq!(set.ingest(&back).unwrap_err(), ClaimError::AcquiredMoved);
     }
 
@@ -333,7 +427,10 @@ mod tests {
         // Two claims with identical HLC: every node must pick the same
         // winner regardless of ingest order.
         let (a, b) = (kp(1), kp(2));
-        let t = Hlc { wall_ms: 1000, logical: 0 };
+        let t = Hlc {
+            wall_ms: 1000,
+            logical: 0,
+        };
         let ca = ClaimSet::make_claim(&a, "t", t, 60_000);
         let cb = ClaimSet::make_claim(&b, "t", t, 60_000);
         let mut s1 = ClaimSet::new();
@@ -352,8 +449,16 @@ mod tests {
     fn gc_prunes_long_dead_claims() {
         let a = kp(1);
         let mut set = ClaimSet::new();
-        set.ingest(&ClaimSet::make_claim(&a, "t", Hlc { wall_ms: 1000, logical: 0 }, 1000))
-            .unwrap();
+        set.ingest(&ClaimSet::make_claim(
+            &a,
+            "t",
+            Hlc {
+                wall_ms: 1000,
+                logical: 0,
+            },
+            1000,
+        ))
+        .unwrap();
         assert_eq!(set.gc(1000 + 1000 + SKEW_SLACK_MS + 10_000 + 1, 10_000), 1);
         assert_eq!(set.task_count(), 0);
     }

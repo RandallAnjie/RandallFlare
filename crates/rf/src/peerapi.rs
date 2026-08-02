@@ -8,7 +8,7 @@ use crate::peers::encode_envelopes;
 use crate::transport;
 use anyhow::Result;
 use axum::body::{to_bytes, Body, Bytes};
-use axum::extract::{ConnectInfo, Path, Query, State};
+use axum::extract::{ConnectInfo, DefaultBodyLimit, Path, Query, State};
 use axum::http::{HeaderMap, Method, Request, StatusCode, Uri};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
@@ -20,19 +20,27 @@ use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 
+const MAX_PEER_PAYLOAD: usize = 64 * 1024 * 1024;
+
 #[derive(Clone)]
 pub struct Api {
     pub node: Arc<Node>,
     pub d1: crate::d1::Registry,
+    pub durable: crate::durable::Coordinator,
     secret: [u8; 32],
     seen_nonces: Arc<Mutex<HashMap<String, u64>>>,
 }
 
-pub async fn serve(node: Arc<Node>, d1: crate::d1::Registry) -> Result<SocketAddr> {
+pub async fn serve(
+    node: Arc<Node>,
+    d1: crate::d1::Registry,
+    durable: crate::durable::Coordinator,
+) -> Result<SocketAddr> {
     let secret = node.cfg.cluster_secret_bytes()?;
     let api = Api {
         node: node.clone(),
         d1,
+        durable,
         secret,
         seen_nonces: Arc::new(Mutex::new(HashMap::new())),
     };
@@ -65,15 +73,21 @@ pub fn router(api: Api) -> Router {
         .route("/v1/manifest", post(manifest_post))
         .route("/v1/worker/{name}", get(worker_get))
         .route("/v1/log/{name}", get(log_get))
+        .route("/v1/kv/{ns}", get(kv_list))
         .route(
             "/v1/kv/{ns}/{*key}",
             get(kv_get).post(kv_put).delete(kv_delete),
         )
         .route("/v1/quorum/{db}", post(quorum_msg))
         .route("/v1/d1/create", post(d1_create))
-        .route("/v1/d1/{db}/exec", post(d1_exec));
+        .route("/v1/d1/{db}/exec", post(d1_exec))
+        .route("/v1/do/{worker}/proxy", post(do_proxy));
     routes
-        .layer(middleware::from_fn_with_state(api.clone(), encrypted_transport))
+        .layer(middleware::from_fn_with_state(
+            api.clone(),
+            encrypted_transport,
+        ))
+        .layer(DefaultBodyLimit::max(MAX_PEER_PAYLOAD + 16))
         .with_state(api)
 }
 
@@ -100,7 +114,10 @@ async fn encrypted_transport(
     // Ping is intentionally public and contains no cluster data.
     if !encrypted {
         if !loopback && request.uri().path() != "/v1/ping" {
-            return (StatusCode::UPGRADE_REQUIRED, "encrypted peer transport required")
+            return (
+                StatusCode::UPGRADE_REQUIRED,
+                "encrypted peer transport required",
+            )
                 .into_response();
         }
         return next.run(request).await;
@@ -118,17 +135,30 @@ async fn encrypted_transport(
         .and_then(|v| v.to_str().ok())
         .unwrap_or("")
         .to_string();
+    let target = request
+        .headers()
+        .get(transport::TARGET_HEADER)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_string();
+    if target != api.node.id_hex() {
+        return (
+            StatusCode::MISDIRECTED_REQUEST,
+            "encrypted request targets another node",
+        )
+            .into_response();
+    }
     let method = request.method().to_string();
-    let path = request.uri().path().to_string();
+    let path = request_target(request.uri()).to_string();
     let (parts, body) = request.into_parts();
-    let ciphertext = match to_bytes(body, usize::MAX).await {
+    let ciphertext = match to_bytes(body, MAX_PEER_PAYLOAD + 16).await {
         Ok(v) => v,
         Err(_) => return (StatusCode::PAYLOAD_TOO_LARGE, "peer payload too large").into_response(),
     };
     let plaintext = match transport::open(
         &api.secret,
         &nonce,
-        &transport::request_aad(&ts, &method, &path),
+        &transport::request_aad(&ts, &method, &path, &target),
         &ciphertext,
     ) {
         Ok(v) => v,
@@ -140,31 +170,41 @@ async fn encrypted_transport(
     // replay sent to another node still has to represent an operation
     // that the cluster protocols make idempotent.
     let now = now_ms();
-    {
+    let replayed = {
         let mut seen = api.seen_nonces.lock().unwrap();
         seen.retain(|_, at| now.saturating_sub(*at) <= auth::MAX_SKEW_MS);
         if seen.contains_key(&nonce) {
-            return (StatusCode::CONFLICT, "replayed encrypted peer request").into_response();
-        }
-        if seen.len() >= 8192 {
-            if let Some(oldest) = seen
-                .iter()
-                .min_by_key(|(_, at)| *at)
-                .map(|(n, _)| n.clone())
-            {
-                seen.remove(&oldest);
+            true
+        } else {
+            if seen.len() >= 8192 {
+                if let Some(oldest) = seen
+                    .iter()
+                    .min_by_key(|(_, at)| *at)
+                    .map(|(n, _)| n.clone())
+                {
+                    seen.remove(&oldest);
+                }
             }
+            seen.insert(nonce.clone(), now);
+            false
         }
-        seen.insert(nonce.clone(), now);
-    }
+    };
 
-    let response = next.run(Request::from_parts(parts, Body::from(plaintext))).await;
+    let response = if replayed {
+        (StatusCode::CONFLICT, "replayed encrypted peer request").into_response()
+    } else {
+        next.run(Request::from_parts(parts, Body::from(plaintext)))
+            .await
+    };
     let status = response.status();
     let (mut parts, body) = response.into_parts();
-    let plaintext = match to_bytes(body, usize::MAX).await {
+    let plaintext = match to_bytes(body, MAX_PEER_PAYLOAD).await {
         Ok(v) => v,
         Err(_) => {
-            return (StatusCode::INTERNAL_SERVER_ERROR, "failed to encode response")
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "failed to encode response",
+            )
                 .into_response()
         }
     };
@@ -175,7 +215,10 @@ async fn encrypted_transport(
     ) {
         Ok(v) => v,
         Err(_) => {
-            return (StatusCode::INTERNAL_SERVER_ERROR, "failed to encrypt response")
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "failed to encrypt response",
+            )
                 .into_response()
         }
     };
@@ -200,21 +243,41 @@ fn check(
     method: &Method,
     uri: &Uri,
     body: &[u8],
-) -> Result<(), Response> {
+) -> std::result::Result<(), (StatusCode, &'static str)> {
     if remote.ip().is_loopback() {
         return Ok(());
     }
-    let ts = headers.get(auth::TS_HEADER).and_then(|v| v.to_str().ok()).unwrap_or("");
-    let mac = headers.get(auth::MAC_HEADER).and_then(|v| v.to_str().ok()).unwrap_or("");
-    if auth::verify(&api.secret, now_ms(), ts, mac, method.as_str(), uri.path(), body) {
+    let ts = headers
+        .get(auth::TS_HEADER)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    let mac = headers
+        .get(auth::MAC_HEADER)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    if auth::verify(
+        &api.secret,
+        now_ms(),
+        ts,
+        mac,
+        method.as_str(),
+        request_target(uri),
+        body,
+    ) {
         Ok(())
     } else {
-        Err((StatusCode::UNAUTHORIZED, "bad or missing cluster MAC").into_response())
+        Err((StatusCode::UNAUTHORIZED, "bad or missing cluster MAC"))
     }
 }
 
-async fn ping() -> &'static str {
-    "rf\n"
+fn request_target(uri: &Uri) -> &str {
+    uri.path_and_query()
+        .map(|target| target.as_str())
+        .unwrap_or_else(|| uri.path())
+}
+
+async fn ping(State(api): State<Api>) -> String {
+    format!("rf {}\n", api.node.id_hex())
 }
 
 async fn status(
@@ -225,7 +288,7 @@ async fn status(
     headers: HeaderMap,
 ) -> Response {
     if let Err(r) = check(&api, &remote, &headers, &method, &uri, b"") {
-        return r;
+        return r.into_response();
     }
     let node = &api.node;
     let peers: Vec<serde_json::Value> = node
@@ -245,6 +308,12 @@ async fn status(
         .live_manifests()
         .into_iter()
         .map(|m| {
+            let has_do = !crate::deploy::durable_objects(&m).is_empty();
+            let do_owner = if has_do {
+                api.durable.leader(&m.name).map(|id| id.to_string())
+            } else {
+                None
+            };
             serde_json::json!({
                 "name": m.name,
                 "version": m.version,
@@ -252,6 +321,9 @@ async fn status(
                 "modules": m.modules.len(),
                 "assets": m.assets.len(),
                 "crons": m.crons,
+                "durable_objects": has_do,
+                "durable_owner": do_owner,
+                "durable_owned_here": has_do && api.durable.is_owner(&m.name),
             })
         })
         .collect();
@@ -275,7 +347,7 @@ async fn sync_manifests(
     headers: HeaderMap,
 ) -> Response {
     if let Err(r) = check(&api, &remote, &headers, &method, &uri, b"") {
-        return r;
+        return r.into_response();
     }
     encode_envelopes(&api.node.manifest_envelopes()).into_response()
 }
@@ -288,7 +360,7 @@ async fn sync_claims(
     headers: HeaderMap,
 ) -> Response {
     if let Err(r) = check(&api, &remote, &headers, &method, &uri, b"") {
-        return r;
+        return r.into_response();
     }
     encode_envelopes(&api.node.claim_envelopes()).into_response()
 }
@@ -301,7 +373,7 @@ async fn sync_kv_digests(
     headers: HeaderMap,
 ) -> Response {
     if let Err(r) = check(&api, &remote, &headers, &method, &uri, b"") {
-        return r;
+        return r.into_response();
     }
     axum::Json(api.node.kv_digests()).into_response()
 }
@@ -315,12 +387,12 @@ async fn sync_kv_dump(
     headers: HeaderMap,
 ) -> Response {
     if let Err(r) = check(&api, &remote, &headers, &method, &uri, b"") {
-        return r;
+        return r.into_response();
     }
     let dump = api.node.kv_dump(&ns);
-    postcard::to_stdvec(&dump).map(|b| b.into_response()).unwrap_or_else(|e| {
-        (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response()
-    })
+    postcard::to_stdvec(&dump)
+        .map(|b| b.into_response())
+        .unwrap_or_else(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response())
 }
 
 async fn blob_get(
@@ -332,7 +404,7 @@ async fn blob_get(
     headers: HeaderMap,
 ) -> Response {
     if let Err(r) = check(&api, &remote, &headers, &method, &uri, b"") {
-        return r;
+        return r.into_response();
     }
     let Ok(sha_bytes) = hex::decode(&sha_hex) else {
         return (StatusCode::BAD_REQUEST, "bad sha").into_response();
@@ -355,7 +427,7 @@ async fn blob_put(
     body: Bytes,
 ) -> Response {
     if let Err(r) = check(&api, &remote, &headers, &method, &uri, &body) {
-        return r;
+        return r.into_response();
     }
     match api.node.blobs.put(&body) {
         Ok(sha) => hex::encode(sha).into_response(),
@@ -372,13 +444,22 @@ async fn manifest_post(
     body: Bytes,
 ) -> Response {
     if let Err(r) = check(&api, &remote, &headers, &method, &uri, &body) {
-        return r;
+        return r.into_response();
     }
     let Ok(env) = Envelope::from_bytes(&body) else {
         return (StatusCode::BAD_REQUEST, "bad envelope").into_response();
     };
     match api.node.ingest_manifest(&env) {
-        Ok(changed) => axum::Json(serde_json::json!({ "changed": changed })).into_response(),
+        Ok(changed) => {
+            if let Ok(manifest) = env.open::<rf_core::manifest::WorkerManifest>(None) {
+                if !crate::deploy::durable_objects(&manifest).is_empty() {
+                    if let Err(e) = api.durable.ensure_worker(&manifest.name) {
+                        return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
+                    }
+                }
+            }
+            axum::Json(serde_json::json!({ "changed": changed })).into_response()
+        }
         Err(e) => (StatusCode::UNPROCESSABLE_ENTITY, e.to_string()).into_response(),
     }
 }
@@ -392,7 +473,7 @@ async fn worker_get(
     headers: HeaderMap,
 ) -> Response {
     if let Err(r) = check(&api, &remote, &headers, &method, &uri, b"") {
-        return r;
+        return r.into_response();
     }
     match api.node.manifest(&name) {
         Some(m) => {
@@ -422,7 +503,7 @@ async fn log_get(
     headers: HeaderMap,
 ) -> Response {
     if let Err(r) = check(&api, &remote, &headers, &method, &uri, b"") {
-        return r;
+        return r.into_response();
     }
     match api.node.manifest_log(&name) {
         Ok(envs) => encode_envelopes(&envs).into_response(),
@@ -436,6 +517,31 @@ struct KvPutQuery {
     ttl_ms: Option<u64>,
 }
 
+#[derive(Deserialize)]
+struct KvListQuery {
+    #[serde(default)]
+    prefix: String,
+    limit: Option<usize>,
+}
+
+async fn kv_list(
+    State(api): State<Api>,
+    ConnectInfo(remote): ConnectInfo<SocketAddr>,
+    Path(ns): Path<String>,
+    Query(q): Query<KvListQuery>,
+    method: Method,
+    uri: Uri,
+    headers: HeaderMap,
+) -> Response {
+    if let Err(r) = check(&api, &remote, &headers, &method, &uri, b"") {
+        return r.into_response();
+    }
+    let keys = api
+        .node
+        .kv_list(&ns, &q.prefix, q.limit.unwrap_or(1000).clamp(1, 10_000));
+    axum::Json(serde_json::json!({ "keys": keys })).into_response()
+}
+
 async fn kv_get(
     State(api): State<Api>,
     ConnectInfo(remote): ConnectInfo<SocketAddr>,
@@ -445,7 +551,7 @@ async fn kv_get(
     headers: HeaderMap,
 ) -> Response {
     if let Err(r) = check(&api, &remote, &headers, &method, &uri, b"") {
-        return r;
+        return r.into_response();
     }
     match api.node.kv_get(&ns, &key) {
         Some(v) => v.into_response(),
@@ -458,13 +564,22 @@ async fn kv_put(
     ConnectInfo(remote): ConnectInfo<SocketAddr>,
     Path((ns, key)): Path<(String, String)>,
     Query(q): Query<KvPutQuery>,
-    method: Method,
-    uri: Uri,
-    headers: HeaderMap,
-    body: Bytes,
+    request: Request<Body>,
 ) -> Response {
-    if let Err(r) = check(&api, &remote, &headers, &method, &uri, &body) {
-        return r;
+    let (parts, body) = request.into_parts();
+    let body = match to_bytes(body, MAX_PEER_PAYLOAD).await {
+        Ok(body) => body,
+        Err(_) => return (StatusCode::PAYLOAD_TOO_LARGE, "kv payload too large").into_response(),
+    };
+    if let Err(r) = check(
+        &api,
+        &remote,
+        &parts.headers,
+        &parts.method,
+        &parts.uri,
+        &body,
+    ) {
+        return r.into_response();
     }
     let expires = q.expires_at_ms.or_else(|| q.ttl_ms.map(|t| now_ms() + t));
     match api.node.kv_put(&ns, &key, Some(body.to_vec()), expires) {
@@ -486,7 +601,7 @@ async fn quorum_msg(
     body: Bytes,
 ) -> Response {
     if let Err(r) = check(&api, &remote, &headers, &method, &uri, &body) {
-        return r;
+        return r.into_response();
     }
     let Ok(wire) = postcard::from_bytes::<crate::d1::WireMsg>(&body) else {
         return (StatusCode::BAD_REQUEST, "bad quorum message").into_response();
@@ -518,7 +633,7 @@ async fn d1_create(
     body: Bytes,
 ) -> Response {
     if let Err(r) = check(&api, &remote, &headers, &method, &uri, &body) {
-        return r;
+        return r.into_response();
     }
     let Ok(req) = serde_json::from_slice::<D1CreateReq>(&body) else {
         return (StatusCode::BAD_REQUEST, "bad request").into_response();
@@ -530,24 +645,38 @@ async fn d1_create(
     if api.node.kv_get(crate::acme::NS, &key).is_some() {
         return (StatusCode::CONFLICT, "database exists").into_response();
     }
-    let mut universe: Vec<rf_core::identity::PublicId> = vec![api.node.id()];
-    for (id_hex, _) in api.node.peers() {
-        if let Ok(id) = id_hex.parse() {
-            universe.push(id);
-        }
-    }
-    let group = rf_core::quorum::rendezvous_group(&req.name, &universe, 3);
-    let meta = crate::d1::DbMeta { group: group.clone(), created_ms: now_ms() };
-    if let Err(e) =
-        api.node.kv_put(crate::acme::NS, &key, Some(serde_json::to_vec(&meta).unwrap()), None)
-    {
-        return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
-    }
+    let group = match crate::d1::ensure_database(&api.node, &req.name) {
+        Ok(group) => group,
+        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    };
     axum::Json(serde_json::json!({
         "name": req.name,
         "group": group.iter().map(|g| g.to_string()).collect::<Vec<_>>(),
     }))
     .into_response()
+}
+
+async fn do_proxy(
+    State(api): State<Api>,
+    ConnectInfo(remote): ConnectInfo<SocketAddr>,
+    Path(worker): Path<String>,
+    method: Method,
+    uri: Uri,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    if let Err(r) = check(&api, &remote, &headers, &method, &uri, &body) {
+        return r.into_response();
+    }
+    let Ok(request) = postcard::from_bytes::<crate::durable::ProxyRequest>(&body) else {
+        return (StatusCode::BAD_REQUEST, "bad DO proxy request").into_response();
+    };
+    match api.durable.proxy_on_owner(&worker, request).await {
+        Ok(response) => postcard::to_stdvec(&response)
+            .map(|raw| raw.into_response())
+            .unwrap_or_else(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response()),
+        Err(e) => (StatusCode::MISDIRECTED_REQUEST, e.to_string()).into_response(),
+    }
 }
 
 #[derive(serde::Deserialize)]
@@ -567,7 +696,7 @@ async fn d1_exec(
     body: Bytes,
 ) -> Response {
     if let Err(r) = check(&api, &remote, &headers, &method, &uri, &body) {
-        return r;
+        return r.into_response();
     }
     let Ok(req) = serde_json::from_slice::<D1ExecReq>(&body) else {
         return (StatusCode::BAD_REQUEST, "bad request").into_response();
@@ -579,7 +708,10 @@ async fn d1_exec(
             if let Ok(meta) = serde_json::from_slice::<crate::d1::DbMeta>(&raw) {
                 let peers = api.node.peers();
                 let hint = meta.group.iter().find_map(|g| {
-                    peers.get(&g.to_string()).and_then(|p| p.api_addr).map(|a| a.to_string())
+                    peers
+                        .get(&g.to_string())
+                        .and_then(|p| p.api_addr)
+                        .map(|a| a.to_string())
                 });
                 return (
                     StatusCode::MISDIRECTED_REQUEST,
@@ -592,7 +724,11 @@ async fn d1_exec(
     };
     let (resp_tx, resp_rx) = tokio::sync::oneshot::channel();
     if tx
-        .send(crate::d1::DriverCmd::Exec { sql: req.sql, params: req.params, resp: resp_tx })
+        .send(crate::d1::DriverCmd::Exec {
+            sql: req.sql,
+            params: req.params,
+            resp: resp_tx,
+        })
         .await
         .is_err()
     {
@@ -600,7 +736,9 @@ async fn d1_exec(
     }
     match tokio::time::timeout(std::time::Duration::from_secs(15), resp_rx).await {
         Ok(Ok(Ok(result))) => {
-            if result.leader_hint.is_some() || (result.rows.is_none() && result.rows_affected.is_none()) {
+            if result.leader_hint.is_some()
+                || (result.rows.is_none() && result.rows_affected.is_none())
+            {
                 (
                     StatusCode::MISDIRECTED_REQUEST,
                     axum::Json(serde_json::json!({ "leader_hint": result.leader_hint })),
@@ -629,10 +767,21 @@ async fn kv_delete(
     headers: HeaderMap,
 ) -> Response {
     if let Err(r) = check(&api, &remote, &headers, &method, &uri, b"") {
-        return r;
+        return r.into_response();
     }
     match api.node.kv_put(&ns, &key, None, None) {
         Ok(()) => StatusCode::OK.into_response(),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn authentication_target_includes_query_string() {
+        let uri: Uri = "/v1/kv/ns?prefix=a%20b&limit=5".parse().unwrap();
+        assert_eq!(request_target(&uri), "/v1/kv/ns?prefix=a%20b&limit=5");
     }
 }

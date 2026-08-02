@@ -11,15 +11,17 @@
 //!
 //! Digest mismatch against a peer triggers an HTTP anti-entropy pull;
 //! claim keys are ingested directly off the gossip state. Claims and
-//! manifests are self-authenticating (signed), so gossip integrity
-//! only affects liveness, not safety.
+//! manifests are self-authenticating (signed). The UDP transport is
+//! additionally encrypted and authenticated with the cluster PSK.
 
 use crate::node::{Node, NodeEvent, PeerView};
 use crate::peers::PeerClient;
 use anyhow::Result;
+use async_trait::async_trait;
 use base64::Engine;
-use chitchat::transport::UdpTransport;
+use chitchat::transport::{Socket, Transport};
 use chitchat::{spawn_chitchat, ChitchatConfig, ChitchatHandle, ChitchatId, FailureDetectorConfig};
+use chitchat::{ChitchatMessage, Deserializable, Serializable};
 use rf_core::envelope::Envelope;
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
@@ -41,13 +43,80 @@ pub struct Gossip {
     pub handle: ChitchatHandle,
 }
 
+const GOSSIP_MAGIC: &[u8; 4] = b"RFG1";
+const GOSSIP_AAD: &[u8] = b"randallflare/gossip/xchacha20poly1305/v1";
+
+struct EncryptedUdpTransport {
+    secret: [u8; 32],
+}
+
+struct EncryptedUdpSocket {
+    secret: [u8; 32],
+    socket: tokio::net::UdpSocket,
+    recv: Vec<u8>,
+}
+
+#[async_trait]
+impl Transport for EncryptedUdpTransport {
+    async fn open(&self, listen: std::net::SocketAddr) -> Result<Box<dyn Socket>> {
+        let socket = tokio::net::UdpSocket::bind(listen).await?;
+        Ok(Box::new(EncryptedUdpSocket {
+            secret: self.secret,
+            socket,
+            recv: vec![0u8; 65_507],
+        }))
+    }
+}
+
+#[async_trait]
+impl Socket for EncryptedUdpSocket {
+    async fn send(&mut self, to: std::net::SocketAddr, message: ChitchatMessage) -> Result<()> {
+        let mut plaintext = Vec::new();
+        message.serialize(&mut plaintext);
+        let nonce: [u8; 24] = rand::random();
+        let ciphertext = crate::transport::seal_raw(&self.secret, &nonce, GOSSIP_AAD, &plaintext)?;
+        let mut packet = Vec::with_capacity(4 + 24 + ciphertext.len());
+        packet.extend_from_slice(GOSSIP_MAGIC);
+        packet.extend_from_slice(&nonce);
+        packet.extend_from_slice(&ciphertext);
+        if packet.len() > 65_507 {
+            anyhow::bail!("encrypted gossip datagram exceeds UDP maximum");
+        }
+        self.socket.send_to(&packet, to).await?;
+        Ok(())
+    }
+
+    async fn recv(&mut self) -> Result<(std::net::SocketAddr, ChitchatMessage)> {
+        loop {
+            let (len, from) = self.socket.recv_from(&mut self.recv).await?;
+            if len < 4 + 24 + 16 || &self.recv[..4] != GOSSIP_MAGIC {
+                continue;
+            }
+            let nonce: [u8; 24] = self.recv[4..28].try_into().expect("checked length");
+            let Ok(plaintext) =
+                crate::transport::open_raw(&self.secret, &nonce, GOSSIP_AAD, &self.recv[28..len])
+            else {
+                continue;
+            };
+            let mut slice = plaintext.as_slice();
+            if let Ok(message) = ChitchatMessage::deserialize(&mut slice) {
+                if slice.is_empty() {
+                    return Ok((from, message));
+                }
+            }
+        }
+    }
+}
+
 pub async fn start(node: Arc<Node>) -> Result<Gossip> {
     let generation = crate::node::now_ms() / 1000;
-    let chitchat_id =
-        ChitchatId::new(node.id_hex(), generation, node.cfg.gossip_advertise());
+    let chitchat_id = ChitchatId::new(node.id_hex(), generation, node.cfg.gossip_advertise());
     let mut initial: Vec<(String, String)> = vec![
         (K_API.into(), node.cfg.peer_api_advertise().to_string()),
-        (K_PUBLIC.into(), if node.cfg.public { "1" } else { "0" }.into()),
+        (
+            K_PUBLIC.into(),
+            if node.cfg.public { "1" } else { "0" }.into(),
+        ),
         (K_LABEL.into(), node.cfg.label.clone()),
         (K_MDIG.into(), node.manifest_digest_hex()),
     ];
@@ -60,7 +129,10 @@ pub async fn start(node: Arc<Node>) -> Result<Gossip> {
         initial.push((format!("{K_KDIG_PREFIX}{ns}"), dig));
     }
     for (task, env) in node.own_claim_envelopes() {
-        initial.push((format!("{K_CLAIM_PREFIX}{task}"), b64().encode(env.to_bytes())));
+        initial.push((
+            format!("{K_CLAIM_PREFIX}{task}"),
+            b64().encode(env.to_bytes()),
+        ));
     }
 
     let config = ChitchatConfig {
@@ -74,7 +146,10 @@ pub async fn start(node: Arc<Node>) -> Result<Gossip> {
         catchup_callback: None,
         extra_liveness_predicate: None,
     };
-    let handle = spawn_chitchat(config, initial, &UdpTransport).await?;
+    let transport = EncryptedUdpTransport {
+        secret: node.cfg.cluster_secret_bytes()?,
+    };
+    let handle = spawn_chitchat(config, initial, &transport).await?;
 
     tokio::spawn(publisher(node.clone(), handle.chitchat()));
     tokio::spawn(observer(node, handle.chitchat()));
@@ -82,10 +157,7 @@ pub async fn start(node: Arc<Node>) -> Result<Gossip> {
 }
 
 /// Push local state changes into our chitchat node state.
-async fn publisher(
-    node: Arc<Node>,
-    chitchat: Arc<tokio::sync::Mutex<chitchat::Chitchat>>,
-) {
+async fn publisher(node: Arc<Node>, chitchat: Arc<tokio::sync::Mutex<chitchat::Chitchat>>) {
     let mut rx = node.subscribe();
     loop {
         let ev = match rx.recv().await {
@@ -111,7 +183,10 @@ async fn publisher(
                     .own_claim_envelopes()
                     .into_iter()
                     .map(|(task, env)| {
-                        (format!("{K_CLAIM_PREFIX}{task}"), b64().encode(env.to_bytes()))
+                        (
+                            format!("{K_CLAIM_PREFIX}{task}"),
+                            b64().encode(env.to_bytes()),
+                        )
                     })
                     .collect();
                 let stale: Vec<String> = state
@@ -134,10 +209,7 @@ async fn publisher(
 
 /// Scrape peers' chitchat state: membership view, claim ingestion,
 /// digest-triggered anti-entropy pulls.
-async fn observer(
-    node: Arc<Node>,
-    chitchat: Arc<tokio::sync::Mutex<chitchat::Chitchat>>,
-) {
+async fn observer(node: Arc<Node>, chitchat: Arc<tokio::sync::Mutex<chitchat::Chitchat>>) {
     let client = PeerClient::new(node.cfg.cluster_secret_bytes().expect("validated at load"));
     // Highest chitchat version already processed per (node, generation),
     // so we only decode/verify new claim keys.
@@ -156,7 +228,9 @@ async fn observer(
                 if id.node_id == self_id {
                     continue;
                 }
-                let Some(state) = cc.node_state(&id) else { continue };
+                let Some(state) = cc.node_state(&id) else {
+                    continue;
+                };
                 let mut view = PeerView {
                     generation: id.generation_id,
                     ..Default::default()
@@ -237,8 +311,7 @@ async fn observer(
 /// referenced blobs we don't have from any live peer.
 pub fn spawn_blob_fetcher(node: Arc<Node>) {
     tokio::spawn(async move {
-        let client =
-            PeerClient::new(node.cfg.cluster_secret_bytes().expect("validated at load"));
+        let client = PeerClient::new(node.cfg.cluster_secret_bytes().expect("validated at load"));
         let mut rx = node.subscribe();
         loop {
             // Wake on manifest change or every 15s.
@@ -260,15 +333,13 @@ pub fn spawn_blob_fetcher(node: Arc<Node>) {
                 for view in peers.values() {
                     let Some(api) = view.api_addr else { continue };
                     match client.fetch_blob(&api.to_string(), &sha).await {
-                        Ok(bytes) => {
-                            match node.blobs.put_verified(&sha, &bytes) {
-                                Ok(()) => {
-                                    tracing::info!("fetched blob {}", hex::encode(sha));
-                                    continue 'blobs;
-                                }
-                                Err(e) => tracing::warn!("peer sent bad blob: {e}"),
+                        Ok(bytes) => match node.blobs.put_verified(&sha, &bytes) {
+                            Ok(()) => {
+                                tracing::info!("fetched blob {}", hex::encode(sha));
+                                continue 'blobs;
                             }
-                        }
+                            Err(e) => tracing::warn!("peer sent bad blob: {e}"),
+                        },
                         Err(e) => tracing::debug!("blob fetch: {e}"),
                     }
                 }

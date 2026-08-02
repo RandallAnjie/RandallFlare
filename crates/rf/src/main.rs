@@ -9,7 +9,11 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 #[derive(Parser)]
-#[command(name = "rf", version, about = "RandallFlare — an edge platform with no control plane")]
+#[command(
+    name = "rf",
+    version,
+    about = "RandallFlare — an edge platform with no control plane"
+)]
 struct Cli {
     #[command(subcommand)]
     cmd: Cmd,
@@ -112,6 +116,15 @@ enum D1Cmd {
 
 #[derive(Subcommand)]
 enum KvCmd {
+    List {
+        ns: String,
+        #[arg(long, default_value = "")]
+        prefix: String,
+        #[arg(long, env = "RF_NODE")]
+        node: String,
+        #[arg(long, env = "RF_CLUSTER_SECRET")]
+        secret: String,
+    },
     Get {
         ns: String,
         key: String,
@@ -129,16 +142,27 @@ enum KvCmd {
         #[arg(long, env = "RF_CLUSTER_SECRET")]
         secret: String,
     },
+    Delete {
+        ns: String,
+        key: String,
+        #[arg(long, env = "RF_NODE")]
+        node: String,
+        #[arg(long, env = "RF_CLUSTER_SECRET")]
+        secret: String,
+    },
 }
 
 fn secret_bytes(s: &str) -> Result<[u8; 32]> {
     let b = hex::decode(s.trim()).context("cluster secret must be hex")?;
-    b.try_into().map_err(|_| anyhow::anyhow!("cluster secret must be 32 bytes"))
+    b.try_into()
+        .map_err(|_| anyhow::anyhow!("cluster secret must be 32 bytes"))
 }
 
 fn operator_key(path: Option<PathBuf>) -> Result<rf_core::identity::AnyKeypair> {
     let path = path.unwrap_or_else(|| {
-        let home = std::env::var_os("HOME").map(PathBuf::from).unwrap_or_default();
+        let home = std::env::var_os("HOME")
+            .map(PathBuf::from)
+            .unwrap_or_default();
         home.join(".rf").join("operator.key")
     });
     rf::keys::load_any(&path)
@@ -159,7 +183,12 @@ async fn async_main(cli: Cli) -> Result<()> {
     match cli.cmd {
         Cmd::Keygen { dir, eth } => keygen(dir, eth),
         Cmd::Run { config } => run(config).await,
-        Cmd::Deploy { dir, node, key, secret } => {
+        Cmd::Deploy {
+            dir,
+            node,
+            key,
+            secret,
+        } => {
             let client = PeerClient::new(secret_bytes(&secret)?);
             let op = operator_key(key)?;
             let bundle = rf::deploy::read_bundle(&dir)?;
@@ -173,7 +202,12 @@ async fn async_main(cli: Cli) -> Result<()> {
             println!("{}", serde_json::to_string_pretty(&status)?);
             Ok(())
         }
-        Cmd::WorkerDelete { name, node, key, secret } => {
+        Cmd::WorkerDelete {
+            name,
+            node,
+            key,
+            secret,
+        } => {
             let client = PeerClient::new(secret_bytes(&secret)?);
             let op = operator_key(key)?;
             let v = rf::deploy::delete_worker(&name, &client, &node, &op).await?;
@@ -181,7 +215,24 @@ async fn async_main(cli: Cli) -> Result<()> {
             Ok(())
         }
         Cmd::Kv { cmd } => match cmd {
-            KvCmd::Get { ns, key, node, secret } => {
+            KvCmd::List {
+                ns,
+                prefix,
+                node,
+                secret,
+            } => {
+                let client = PeerClient::new(secret_bytes(&secret)?);
+                for key in client.kv_list(&node, &ns, &prefix).await? {
+                    println!("{key}");
+                }
+                Ok(())
+            }
+            KvCmd::Get {
+                ns,
+                key,
+                node,
+                secret,
+            } => {
                 let client = PeerClient::new(secret_bytes(&secret)?);
                 match client.kv_get(&node, &ns, &key).await? {
                     Some(v) => {
@@ -195,9 +246,25 @@ async fn async_main(cli: Cli) -> Result<()> {
                     }
                 }
             }
-            KvCmd::Put { ns, key, value, node, secret } => {
+            KvCmd::Put {
+                ns,
+                key,
+                value,
+                node,
+                secret,
+            } => {
                 let client = PeerClient::new(secret_bytes(&secret)?);
                 client.kv_put(&node, &ns, &key, value.into_bytes()).await?;
+                Ok(())
+            }
+            KvCmd::Delete {
+                ns,
+                key,
+                node,
+                secret,
+            } => {
+                let client = PeerClient::new(secret_bytes(&secret)?);
+                client.kv_delete(&node, &ns, &key).await?;
                 Ok(())
             }
         },
@@ -214,7 +281,13 @@ async fn async_main(cli: Cli) -> Result<()> {
                 println!("{}", String::from_utf8_lossy(&resp));
                 Ok(())
             }
-            D1Cmd::Exec { name, sql, params, node, secret } => {
+            D1Cmd::Exec {
+                name,
+                sql,
+                params,
+                node,
+                secret,
+            } => {
                 let client = PeerClient::new(secret_bytes(&secret)?);
                 let params: serde_json::Value = serde_json::from_str(&params)?;
                 let out = client.d1_exec(&node, &name, &sql, params).await?;
@@ -222,7 +295,13 @@ async fn async_main(cli: Cli) -> Result<()> {
                 Ok(())
             }
         },
-        Cmd::Log { worker, node, secret, operator, key } => {
+        Cmd::Log {
+            worker,
+            node,
+            secret,
+            operator,
+            key,
+        } => {
             let client = PeerClient::new(secret_bytes(&secret)?);
             let operator_id: rf_core::identity::SignerId = match operator {
                 Some(s) => s.parse().map_err(|e| anyhow::anyhow!("--operator: {e}"))?,
@@ -231,7 +310,10 @@ async fn async_main(cli: Cli) -> Result<()> {
             let envs = client.worker_log(&node, &worker).await?;
             let chain = rf_core::manifest::verify_chain(&envs, &operator_id)
                 .map_err(|e| anyhow::anyhow!("chain verification FAILED: {e}"))?;
-            println!("transparency log for {worker} — {} entries, chain OK", chain.len());
+            println!(
+                "transparency log for {worker} — {} entries, chain OK",
+                chain.len()
+            );
             for (m, env) in chain.iter().zip(&envs) {
                 println!(
                     "  v{:<4} {}  {}{}",
@@ -265,7 +347,9 @@ async fn detect_public_ipv4() -> Result<String> {
 
 fn keygen(dir: Option<PathBuf>, eth: bool) -> Result<()> {
     let dir = dir.unwrap_or_else(|| {
-        let home = std::env::var_os("HOME").map(PathBuf::from).unwrap_or_default();
+        let home = std::env::var_os("HOME")
+            .map(PathBuf::from)
+            .unwrap_or_default();
         home.join(".rf")
     });
     let path = dir.join("operator.key");
@@ -325,9 +409,12 @@ async fn run(config_path: PathBuf) -> Result<()> {
     let node = Arc::new(Node::open(cfg, keypair)?);
 
     let d1_registry: rf::d1::Registry = Default::default();
-    let api_addr = rf::peerapi::serve(node.clone(), d1_registry.clone()).await?;
+    let d1_leadership: rf::d1::Leadership = Default::default();
+    let durable =
+        rf::durable::Coordinator::new(node.clone(), d1_registry.clone(), d1_leadership.clone());
+    let api_addr = rf::peerapi::serve(node.clone(), d1_registry.clone(), durable.clone()).await?;
     tracing::info!("peer api on {api_addr}");
-    rf::d1::spawn_manager(node.clone(), d1_registry);
+    rf::d1::spawn_manager(node.clone(), d1_registry, d1_leadership);
 
     // KV binding backend for workerd — must be up before the runtime
     // writes any workerd config.
@@ -336,18 +423,24 @@ async fn run(config_path: PathBuf) -> Result<()> {
     tracing::info!("kvbind on 127.0.0.1:{kvbind_port}");
 
     let _gossip = rf::gossip::start(node.clone()).await?;
+    durable.spawn_ensurer();
+    durable.spawn_checkpointer();
     rf::gossip::spawn_blob_fetcher(node.clone());
     tracing::info!("gossip on {}", node.cfg.gossip.listen);
 
-    tokio::spawn(rf::runtime::Runtime::new(node.clone()).run());
+    tokio::spawn(rf::runtime::Runtime::new(node.clone(), durable.clone()).run());
 
-    if let Some(http) = node.cfg.ingress.http {
-        let addr = rf::ingress::serve(node.clone(), http).await?;
-        tracing::info!("ingress on {addr}");
-    }
-    if let Some(https) = node.cfg.ingress.https {
-        rf::ingress::serve_tls(node.clone(), https).await?;
-        tracing::info!("tls ingress on {https}");
+    if node.cfg.public {
+        if let Some(http) = node.cfg.ingress.http {
+            let addr = rf::ingress::serve(node.clone(), durable.clone(), http).await?;
+            tracing::info!("ingress on {addr}");
+        }
+        if let Some(https) = node.cfg.ingress.https {
+            rf::ingress::serve_tls(node.clone(), durable.clone(), https).await?;
+            tracing::info!("tls ingress on {https}");
+        }
+    } else if node.cfg.ingress.http.is_some() || node.cfg.ingress.https.is_some() {
+        tracing::warn!("ingress is configured but disabled because public = false");
     }
 
     rf::cron_driver::spawn(node.clone());
@@ -378,7 +471,10 @@ async fn run(config_path: PathBuf) -> Result<()> {
             .clone()
             .or_else(|| node.cfg.dns.as_ref().map(|d| d.api_token_env.clone()))
             .unwrap_or_else(|| "CF_API_TOKEN".into());
-        match (zone, std::env::var(&token_env).ok().filter(|t| !t.is_empty())) {
+        match (
+            zone,
+            std::env::var(&token_env).ok().filter(|t| !t.is_empty()),
+        ) {
             (Some(zone), Some(token)) => {
                 let dns_api = match &acme_cfg.dns_api_base {
                     Some(base) => rf::dns::DnsApi::new(base.clone(), token, zone),
@@ -387,15 +483,15 @@ async fn run(config_path: PathBuf) -> Result<()> {
                 rf::acme::spawn_renewer(node.clone(), acme_cfg, dns_api);
                 tracing::info!("acme renewer armed");
             }
-            _ => tracing::warn!(
-                "acme configured but zone or {token_env} missing — renewer disabled"
-            ),
+            _ => {
+                tracing::warn!("acme configured but zone or {token_env} missing — renewer disabled")
+            }
         }
     }
 
     rf::anchor::spawn(node.clone(), node.cfg.anchor.clone());
 
-    rf::selfupdate::spawn(false); // flips on once the repo is public
+    rf::selfupdate::spawn(node.cfg.update.clone());
 
     // Periodic GC.
     {

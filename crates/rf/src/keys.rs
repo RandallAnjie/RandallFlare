@@ -18,17 +18,23 @@ pub fn load_or_create(path: &Path) -> Result<Keypair> {
 }
 
 pub fn load(path: &Path) -> Result<Keypair> {
-    let raw = std::fs::read_to_string(path)
-        .with_context(|| format!("reading key {}", path.display()))?;
+    let raw =
+        std::fs::read_to_string(path).with_context(|| format!("reading key {}", path.display()))?;
     let bytes = hex::decode(raw.trim()).context("key file is not hex")?;
-    let seed: [u8; 32] =
-        bytes.try_into().map_err(|_| anyhow::anyhow!("key file must hold 32 bytes"))?;
+    let seed: [u8; 32] = bytes
+        .try_into()
+        .map_err(|_| anyhow::anyhow!("key file must hold 32 bytes"))?;
     Ok(Keypair::from_seed(seed))
 }
 
 pub fn save(path: &Path, kp: &Keypair) -> Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700))?;
+        }
     }
     std::fs::write(path, hex::encode(kp.seed()))
         .with_context(|| format!("writing key {}", path.display()))?;
@@ -62,16 +68,17 @@ pub fn generate_eth() -> EthKeypair {
 }
 
 pub fn load_any(path: &Path) -> Result<AnyKeypair> {
-    let raw = std::fs::read_to_string(path)
-        .with_context(|| format!("reading key {}", path.display()))?;
+    let raw =
+        std::fs::read_to_string(path).with_context(|| format!("reading key {}", path.display()))?;
     let raw = raw.trim();
     let (scheme, hexpart) = match raw.split_once(':') {
         Some((s, h)) => (s, h),
         None => ("ed25519", raw),
     };
     let bytes = hex::decode(hexpart.trim()).context("key file is not hex")?;
-    let seed: [u8; 32] =
-        bytes.try_into().map_err(|_| anyhow::anyhow!("key file must hold 32 bytes"))?;
+    let seed: [u8; 32] = bytes
+        .try_into()
+        .map_err(|_| anyhow::anyhow!("key file must hold 32 bytes"))?;
     match scheme {
         "ed25519" => Ok(AnyKeypair::Ed(Keypair::from_seed(seed))),
         "secp256k1" => EthKeypair::from_seed(seed)
@@ -84,13 +91,17 @@ pub fn load_any(path: &Path) -> Result<AnyKeypair> {
 pub fn save_any(path: &Path, kp: &AnyKeypair) -> Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700))?;
+        }
     }
     let contents = match kp {
         AnyKeypair::Ed(k) => format!("ed25519:{}", hex::encode(k.seed())),
         AnyKeypair::Eth(k) => format!("secp256k1:{}", hex::encode(k.seed())),
     };
-    std::fs::write(path, contents)
-        .with_context(|| format!("writing key {}", path.display()))?;
+    std::fs::write(path, contents).with_context(|| format!("writing key {}", path.display()))?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;

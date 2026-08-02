@@ -87,7 +87,12 @@ impl Namespace {
         writer: PublicId,
         expires_at_ms: Option<u64>,
     ) -> KvEntry {
-        let entry = KvEntry { hlc, writer, value, expires_at_ms };
+        let entry = KvEntry {
+            hlc,
+            writer,
+            value,
+            expires_at_ms,
+        };
         self.entries.insert(key.to_string(), entry.clone());
         entry
     }
@@ -141,7 +146,7 @@ impl Namespace {
         h.finalize().into()
     }
 
-    /// Full dump for anti-entropy (v0.1: namespaces are small; delta
+    /// Full dump for anti-entropy (namespaces are expected to stay small; delta
     /// sync can come later without a wire change — the receiver merges
     /// entry-by-entry either way).
     pub fn dump(&self) -> impl Iterator<Item = (&String, &KvEntry)> {
@@ -197,13 +202,26 @@ mod tests {
     }
 
     fn hlc(w: u64, l: u32) -> Hlc {
-        Hlc { wall_ms: w, logical: l }
+        Hlc {
+            wall_ms: w,
+            logical: l,
+        }
     }
 
     #[test]
     fn later_hlc_wins_regardless_of_merge_order() {
-        let old = KvEntry { hlc: hlc(1, 0), writer: pid(1), value: Some(b"old".to_vec()), expires_at_ms: None };
-        let new = KvEntry { hlc: hlc(2, 0), writer: pid(2), value: Some(b"new".to_vec()), expires_at_ms: None };
+        let old = KvEntry {
+            hlc: hlc(1, 0),
+            writer: pid(1),
+            value: Some(b"old".to_vec()),
+            expires_at_ms: None,
+        };
+        let new = KvEntry {
+            hlc: hlc(2, 0),
+            writer: pid(2),
+            value: Some(b"new".to_vec()),
+            expires_at_ms: None,
+        };
         let mut a = Namespace::new();
         a.merge("k", old.clone());
         a.merge("k", new.clone());
@@ -234,8 +252,18 @@ mod tests {
 
     #[test]
     fn identical_hlc_ties_converge() {
-        let e1 = KvEntry { hlc: hlc(5, 0), writer: pid(1), value: Some(b"a".to_vec()), expires_at_ms: None };
-        let e2 = KvEntry { hlc: hlc(5, 0), writer: pid(2), value: Some(b"b".to_vec()), expires_at_ms: None };
+        let e1 = KvEntry {
+            hlc: hlc(5, 0),
+            writer: pid(1),
+            value: Some(b"a".to_vec()),
+            expires_at_ms: None,
+        };
+        let e2 = KvEntry {
+            hlc: hlc(5, 0),
+            writer: pid(2),
+            value: Some(b"b".to_vec()),
+            expires_at_ms: None,
+        };
         let mut a = Namespace::new();
         a.merge("k", e1.clone());
         a.merge("k", e2.clone());

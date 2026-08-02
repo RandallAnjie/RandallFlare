@@ -84,6 +84,7 @@ pub enum ManifestError {
     MainNotInModules,
     BadCron(String),
     BadHostname(String),
+    BadPath(String),
     DuplicatePath(String),
     /// Hash-chain violation: v1 with a prev, or a v+1 successor whose
     /// prev doesn't link the envelope we hold.
@@ -99,6 +100,7 @@ impl std::fmt::Display for ManifestError {
             ManifestError::MainNotInModules => f.write_str("main module not in modules list"),
             ManifestError::BadCron(c) => write!(f, "invalid cron expression: {c}"),
             ManifestError::BadHostname(h) => write!(f, "invalid hostname: {h}"),
+            ManifestError::BadPath(p) => write!(f, "unsafe worker bundle path: {p}"),
             ManifestError::DuplicatePath(p) => write!(f, "duplicate path in bundle: {p}"),
             ManifestError::ChainBroken => f.write_str("manifest hash chain broken"),
         }
@@ -112,7 +114,9 @@ pub fn valid_name(name: &str) -> bool {
         && name.len() <= 63
         && !name.starts_with('-')
         && !name.ends_with('-')
-        && name.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
 }
 
 fn valid_hostname(h: &str) -> bool {
@@ -131,6 +135,17 @@ fn valid_hostname(h: &str) -> bool {
         })
 }
 
+fn valid_bundle_path(path: &str) -> bool {
+    !path.is_empty()
+        && path.len() <= 1024
+        && !path.starts_with('/')
+        && !path.contains('\\')
+        && !path.as_bytes().iter().any(|b| b.is_ascii_control())
+        && path
+            .split('/')
+            .all(|part| !part.is_empty() && part != "." && part != "..")
+}
+
 impl WorkerManifest {
     pub fn validate(&self) -> Result<(), ManifestError> {
         if !valid_name(&self.name) {
@@ -146,7 +161,15 @@ impl WorkerManifest {
             return Err(ManifestError::MainNotInModules);
         }
         let mut seen = std::collections::HashSet::new();
-        for p in self.modules.iter().map(|m| &m.path).chain(self.assets.iter().map(|a| &a.path)) {
+        for p in self
+            .modules
+            .iter()
+            .map(|m| &m.path)
+            .chain(self.assets.iter().map(|a| &a.path))
+        {
+            if !valid_bundle_path(p) {
+                return Err(ManifestError::BadPath(p.clone()));
+            }
             if !seen.insert(p) {
                 return Err(ManifestError::DuplicatePath(p.clone()));
             }
@@ -166,7 +189,10 @@ impl WorkerManifest {
 
     /// Every blob this manifest needs on disk before it can serve.
     pub fn blob_refs(&self) -> impl Iterator<Item = [u8; 32]> + '_ {
-        self.modules.iter().map(|m| m.sha256).chain(self.assets.iter().map(|a| a.sha256))
+        self.modules
+            .iter()
+            .map(|m| m.sha256)
+            .chain(self.assets.iter().map(|a| a.sha256))
     }
 }
 
@@ -194,7 +220,10 @@ pub struct ManifestSet {
 
 impl ManifestSet {
     pub fn new(operator: SignerId) -> Self {
-        Self { operator, workers: HashMap::new() }
+        Self {
+            operator,
+            workers: HashMap::new(),
+        }
     }
 
     pub fn operator(&self) -> &SignerId {
@@ -202,36 +231,35 @@ impl ManifestSet {
     }
 
     pub fn ingest(&mut self, env: &Envelope) -> Result<ManifestIngest, ManifestError> {
-        let manifest: WorkerManifest =
-            env.open(Some(&self.operator)).map_err(|e| match e {
-                EnvelopeError::BadSignature => ManifestError::NotOperator,
-                other => ManifestError::Envelope(other),
-            })?;
+        let manifest: WorkerManifest = env.open(Some(&self.operator)).map_err(|e| match e {
+            EnvelopeError::BadSignature => ManifestError::NotOperator,
+            other => ManifestError::Envelope(other),
+        })?;
         manifest.validate()?;
         let digest = env.digest();
-        match self.workers.get(&manifest.name) {
-            Some(existing) => {
-                let newer = manifest.version > existing.manifest.version
-                    || (manifest.version == existing.manifest.version
-                        && digest < existing.digest);
-                if !newer {
-                    return Ok(ManifestIngest::Stale);
-                }
-                // Chain check: a direct successor must link the exact
-                // envelope we hold. (A jump over versions we never saw
-                // is accepted — the transparency log lets an auditor
-                // verify the gap later.)
-                if manifest.version == existing.manifest.version + 1
-                    && manifest.prev != Some(existing.digest)
-                {
-                    return Err(ManifestError::ChainBroken);
-                }
+        if let Some(existing) = self.workers.get(&manifest.name) {
+            let newer = manifest.version > existing.manifest.version
+                || (manifest.version == existing.manifest.version && digest < existing.digest);
+            if !newer {
+                return Ok(ManifestIngest::Stale);
             }
-            None => {}
+            // Chain check: a direct successor must link the exact
+            // envelope we hold. (A jump over versions we never saw
+            // is accepted — the transparency log lets an auditor
+            // verify the gap later.)
+            if manifest.version == existing.manifest.version + 1
+                && manifest.prev != Some(existing.digest)
+            {
+                return Err(ManifestError::ChainBroken);
+            }
         }
         self.workers.insert(
             manifest.name.clone(),
-            ManifestRecord { manifest, digest, envelope: env.clone() },
+            ManifestRecord {
+                manifest,
+                digest,
+                envelope: env.clone(),
+            },
         );
         Ok(ManifestIngest::Changed)
     }
@@ -267,7 +295,10 @@ impl ManifestSet {
                     .or_insert(rec);
             }
         }
-        by_host.into_iter().map(|(h, r)| (h, r.manifest.name.clone())).collect()
+        by_host
+            .into_iter()
+            .map(|(h, r)| (h, r.manifest.name.clone()))
+            .collect()
     }
 
     /// Order-independent digest over (name, version, digest) — cheap
@@ -495,7 +526,10 @@ mod tests {
         // A jump (v4 while we hold v2) is accepted — auditable later.
         let mut v4 = mk("w", 4, &[]);
         v4.prev = Some([7; 32]);
-        assert_eq!(s.ingest(&Envelope::seal(&v4, &op)).unwrap(), ManifestIngest::Changed);
+        assert_eq!(
+            s.ingest(&Envelope::seal(&v4, &op)).unwrap(),
+            ManifestIngest::Changed
+        );
     }
 
     #[test]
@@ -506,7 +540,10 @@ mod tests {
         let v3 = seal_after(&mut mk("w", 3, &[]), &v2, &op);
         let chain = vec![v1.clone(), v2.clone(), v3.clone()];
         let ms = verify_chain(&chain, &opid()).unwrap();
-        assert_eq!(ms.iter().map(|m| m.version).collect::<Vec<_>>(), vec![1, 2, 3]);
+        assert_eq!(
+            ms.iter().map(|m| m.version).collect::<Vec<_>>(),
+            vec![1, 2, 3]
+        );
         // Drop the middle link → broken.
         assert_eq!(
             verify_chain(&[v1.clone(), v3.clone()], &opid()).unwrap_err(),
@@ -527,16 +564,40 @@ mod tests {
         let mut m = mk("site", 1, &["s.example.com"]);
         m.modules.clear();
         m.main = String::new();
-        m.assets.push(AssetFile { path: "index.html".into(), sha256: [7; 32], size: 3 });
+        m.assets.push(AssetFile {
+            path: "index.html".into(),
+            sha256: [7; 32],
+            size: 3,
+        });
         assert!(m.validate().is_ok());
     }
 
     #[test]
     fn bad_names_rejected() {
-        for bad in ["", "UPPER", "has_underscore", "-lead", "trail-", &"x".repeat(64)] {
+        for bad in [
+            "",
+            "UPPER",
+            "has_underscore",
+            "-lead",
+            "trail-",
+            &"x".repeat(64),
+        ] {
             let mut m = mk("ok", 1, &[]);
             m.name = bad.to_string();
             assert!(m.validate().is_err(), "{bad:?} should be invalid");
+        }
+    }
+
+    #[test]
+    fn unsafe_bundle_paths_are_rejected() {
+        for bad in ["../secret", "/etc/passwd", "a/../../b", "a\\b", "a//b", "."] {
+            let mut m = mk("safe", 1, &[]);
+            m.main = bad.to_string();
+            m.modules[0].path = bad.to_string();
+            assert_eq!(
+                m.validate().unwrap_err(),
+                ManifestError::BadPath(bad.to_string())
+            );
         }
     }
 }

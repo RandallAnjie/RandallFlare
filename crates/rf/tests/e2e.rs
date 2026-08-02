@@ -1,4 +1,4 @@
-//! Two-node end-to-end: real `rf` binaries on loopback.
+//! Multi-process end-to-end tests with real `rf` binaries on loopback.
 //!
 //! Proves the three core properties:
 //!  1. deploy-to-one is deploy-to-all (manifest gossip + blob sync)
@@ -15,17 +15,60 @@ use rf::peers::PeerClient;
 use rf_core::identity::{AnyKeypair, Keypair};
 
 fn free_port() -> u16 {
-    TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port()
+    TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port()
 }
 
 const SECRET: [u8; 32] = [42u8; 32];
+// Each test launches real daemons after discovering ports with
+// bind(0). Serialize test scenarios so another scenario cannot claim
+// a released port before its child binds it; nodes within a scenario
+// still run concurrently and exercise the real distributed behavior.
+static E2E_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 struct TestNode {
-    child: Child,
+    child: TestChild,
     api: String,
     ingress: u16,
     gossip: u16,
     _dir: PathBuf,
+}
+
+struct TestChild(Child);
+
+impl std::ops::Deref for TestChild {
+    type Target = Child;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl std::ops::DerefMut for TestChild {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
+    }
+}
+
+impl Drop for TestChild {
+    fn drop(&mut self) {
+        self.0.kill().ok();
+        self.0.wait().ok();
+    }
+}
+
+impl Drop for TestNode {
+    fn drop(&mut self) {
+        // Fault-injection assertions can abort a test before its
+        // explicit cleanup. Always reap the node so later tests and CI
+        // jobs do not inherit live listeners from a failed run.
+        self.child.kill().ok();
+        self.child.wait().ok();
+        std::fs::remove_dir_all(&self._dir).ok();
+    }
 }
 
 fn write_config(
@@ -37,8 +80,7 @@ fn write_config(
     seeds: &[u16],
     label: &str,
 ) -> PathBuf {
-    let seeds_toml: Vec<String> =
-        seeds.iter().map(|p| format!("\"127.0.0.1:{p}\"")).collect();
+    let seeds_toml: Vec<String> = seeds.iter().map(|p| format!("\"127.0.0.1:{p}\"")).collect();
     let cfg = format!(
         r#"
 data_dir = "{data}"
@@ -68,20 +110,22 @@ http = "127.0.0.1:{ingress_port}"
     path
 }
 
-fn spawn_node(dir: &Path, config: &Path) -> Child {
+fn spawn_node(dir: &Path, config: &Path) -> TestChild {
     // tracing writes to stdout; workerd children inherit stderr —
     // both land in node.log.
     let log = std::fs::File::create(dir.join("node.log")).unwrap();
     let log2 = log.try_clone().unwrap();
-    Command::new(env!("CARGO_BIN_EXE_rf"))
-        .arg("run")
-        .arg("--config")
-        .arg(config)
-        .env("RUST_LOG", "info")
-        .stdout(Stdio::from(log))
-        .stderr(Stdio::from(log2))
-        .spawn()
-        .expect("spawn rf")
+    TestChild(
+        Command::new(env!("CARGO_BIN_EXE_rf"))
+            .arg("run")
+            .arg("--config")
+            .arg(config)
+            .env("RUST_LOG", "info")
+            .stdout(Stdio::from(log))
+            .stderr(Stdio::from(log2))
+            .spawn()
+            .expect("spawn rf"),
+    )
 }
 
 async fn wait_ping(api: &str, budget: Duration) {
@@ -93,7 +137,10 @@ async fn wait_ping(api: &str, budget: Duration) {
                 return;
             }
         }
-        assert!(Instant::now() < deadline, "node at {api} never answered ping");
+        assert!(
+            Instant::now() < deadline,
+            "node at {api} never answered ping"
+        );
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
 }
@@ -104,7 +151,13 @@ fn start(label: &str, operator: &Keypair, seeds: &[u16]) -> TestNode {
     let (gossip, api, ingress) = (free_port(), free_port(), free_port());
     let config = write_config(&dir, operator, gossip, api, ingress, seeds, label);
     let child = spawn_node(&dir, &config);
-    TestNode { child, api: format!("127.0.0.1:{api}"), ingress, gossip, _dir: dir }
+    TestNode {
+        child,
+        api: format!("127.0.0.1:{api}"),
+        ingress,
+        gossip,
+        _dir: dir,
+    }
 }
 
 fn make_bundle(hostname: &str) -> PathBuf {
@@ -128,6 +181,7 @@ fn make_bundle(hostname: &str) -> PathBuf {
 /// PATH — CI boxes without it still run the rest of the suite.
 #[tokio::test(flavor = "multi_thread")]
 async fn module_worker_on_real_workerd() {
+    let _scenario = E2E_LOCK.lock().await;
     let workerd_present = std::env::var_os("PATH")
         .map(|p| std::env::split_paths(&p).any(|d| d.join("workerd").is_file()))
         .unwrap_or(false);
@@ -145,7 +199,10 @@ async fn module_worker_on_real_workerd() {
     wait_ping(&n.api, Duration::from_secs(15)).await;
 
     // Seed a KV value the worker will read through its binding.
-    client.kv_put(&n.api, "ns1", "greet", b"kv-through-binding".to_vec()).await.unwrap();
+    client
+        .kv_put(&n.api, "ns1", "greet", b"kv-through-binding".to_vec())
+        .await
+        .unwrap();
 
     // A module worker that echoes env + fetches its KV binding URL.
     let dir = std::env::temp_dir().join(format!("rf-e2e-mod-{}", rand::random::<u32>()));
@@ -176,7 +233,9 @@ async fn module_worker_on_real_workerd() {
     )
     .unwrap();
     let bundle = rf::deploy::read_bundle(&dir).unwrap();
-    rf::deploy::deploy(&bundle, &client, &n.api, &op_any).await.unwrap();
+    rf::deploy::deploy(&bundle, &client, &n.api, &op_any)
+        .await
+        .unwrap();
 
     // Runtime reconciles on the manifest event; workerd needs a
     // moment to boot. Poll through ingress.
@@ -192,7 +251,10 @@ async fn module_worker_on_real_workerd() {
         if ok {
             break;
         }
-        assert!(Instant::now() < deadline, "module worker never came up via ingress");
+        assert!(
+            Instant::now() < deadline,
+            "module worker never came up via ingress"
+        );
         tokio::time::sleep(Duration::from_millis(300)).await;
     }
 
@@ -228,7 +290,11 @@ async fn module_worker_on_real_workerd() {
     // The worker's write is a real cluster KV write, visible via the
     // peer API too.
     assert_eq!(
-        client.kv_get(&n.api, "ns1", "written-by-worker").await.unwrap().unwrap(),
+        client
+            .kv_get(&n.api, "ns1", "written-by-worker")
+            .await
+            .unwrap()
+            .unwrap(),
         b"worker-wrote-this"
     );
 
@@ -236,10 +302,11 @@ async fn module_worker_on_real_workerd() {
     n.child.wait().unwrap();
 }
 
-/// Native workerd Durable Object API and SQLite persistence. This is
-/// explicitly local-only until rf's quorum owner fences execution.
+/// Native workerd Durable Object API plus quorum snapshot persistence
+/// across a complete rf/workerd restart.
 #[tokio::test(flavor = "multi_thread")]
 async fn durable_object_on_real_workerd() {
+    let _scenario = E2E_LOCK.lock().await;
     let workerd_present = std::env::var_os("PATH")
         .map(|p| std::env::split_paths(&p).any(|d| d.join("workerd").is_file()))
         .unwrap_or(false);
@@ -256,9 +323,6 @@ async fn durable_object_on_real_workerd() {
     std::fs::create_dir_all(&dir).unwrap();
     let (gossip, api, ingress) = (free_port(), free_port(), free_port());
     let config = write_config(&dir, &operator, gossip, api, ingress, &[], "do");
-    let mut cfg = std::fs::read_to_string(&config).unwrap();
-    cfg.push_str("\n[runtime]\nallow_local_durable_objects = true\n");
-    std::fs::write(&config, cfg).unwrap();
     let mut child = spawn_node(&dir, &config);
     let api_addr = format!("127.0.0.1:{api}");
     wait_ping(&api_addr, Duration::from_secs(15)).await;
@@ -282,6 +346,7 @@ async fn durable_object_on_real_workerd() {
     return new Response(String(value));
   }
 }
+
 export default {
   fetch(req, env) {
     const id = env.COUNTER.idFromName("global");
@@ -291,7 +356,9 @@ export default {
     )
     .unwrap();
     let bundle = rf::deploy::read_bundle(&bundle_dir).unwrap();
-    rf::deploy::deploy(&bundle, &client, &api_addr, &op_any).await.unwrap();
+    rf::deploy::deploy(&bundle, &client, &api_addr, &op_any)
+        .await
+        .unwrap();
 
     let call = || {
         http.get(format!("http://127.0.0.1:{ingress}/"))
@@ -305,7 +372,10 @@ export default {
                 break;
             }
         }
-        assert!(Instant::now() < deadline, "Durable Object worker never came up");
+        assert!(
+            Instant::now() < deadline,
+            "Durable Object worker never came up"
+        );
         tokio::time::sleep(Duration::from_millis(300)).await;
     }
     assert_eq!(call().await.unwrap().text().await.unwrap(), "2");
@@ -323,17 +393,179 @@ export default {
                 break;
             }
         }
-        assert!(Instant::now() < deadline, "Durable Object did not recover after restart");
+        assert!(
+            Instant::now() < deadline,
+            "Durable Object did not recover after restart"
+        );
         tokio::time::sleep(Duration::from_millis(300)).await;
     }
     child.kill().unwrap();
     child.wait().unwrap();
 }
 
+/// Three independent disks, no shared filesystem: every ingress
+/// follows the quorum-fenced DO owner. Killing that owner elects a new
+/// one which restores the last majority-committed SQLite snapshot.
+#[tokio::test(flavor = "multi_thread")]
+async fn durable_object_routes_and_survives_owner_loss() {
+    let _scenario = E2E_LOCK.lock().await;
+    let workerd_present = std::env::var_os("PATH")
+        .map(|p| std::env::split_paths(&p).any(|d| d.join("workerd").is_file()))
+        .unwrap_or(false);
+    if !workerd_present {
+        eprintln!("SKIP: workerd not on PATH — distributed DO e2e not exercised");
+        return;
+    }
+
+    let operator = Keypair::from_seed([28u8; 32]);
+    let op_any = AnyKeypair::Ed(operator.clone());
+    let client = PeerClient::new(SECRET);
+    let http = reqwest::Client::new();
+    let a = start("doa", &operator, &[]);
+    wait_ping(&a.api, Duration::from_secs(15)).await;
+    let b = start("dob", &operator, &[a.gossip]);
+    let c = start("doc", &operator, &[a.gossip]);
+    wait_ping(&b.api, Duration::from_secs(15)).await;
+    wait_ping(&c.api, Duration::from_secs(15)).await;
+    let deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        let status = client.status(&a.api).await.unwrap_or_default();
+        if status["peers"].as_array().map(|p| p.len()).unwrap_or(0) >= 2 {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "DO cluster membership never converged"
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+
+    let bundle_dir = std::env::temp_dir().join(format!(
+        "rf-e2e-do-cluster-bundle-{}",
+        rand::random::<u32>()
+    ));
+    std::fs::create_dir_all(&bundle_dir).unwrap();
+    std::fs::write(
+        bundle_dir.join("rf.json"),
+        r#"{"name":"global-counter","main":"index.js","hostnames":["global-counter.test"],
+            "durable_objects":{"COUNTER":{"class_name":"Counter"}}}"#,
+    )
+    .unwrap();
+    std::fs::write(
+        bundle_dir.join("index.js"),
+        r#"export class Counter {
+	  constructor(ctx) { this.ctx = ctx; }
+	  async fetch(req) {
+	    const path = new URL(req.url).pathname;
+	    let value = (await this.ctx.storage.get("count")) || 0;
+	    if (path === "/inc") {
+	      value++;
+	      await this.ctx.storage.put("count", value);
+	    }
+	    if (path === "/background") {
+	      this.ctx.waitUntil((async () => {
+	        await new Promise(resolve => setTimeout(resolve, 1000));
+	        await this.ctx.storage.put("count", value + 10);
+	      })());
+	      return new Response("scheduled");
+	    }
+	    return new Response(String(value));
+  }
+}
+export default {
+  fetch(req, env) {
+    return env.COUNTER.get(env.COUNTER.idFromName("global")).fetch(req);
+  }
+};"#,
+    )
+    .unwrap();
+    let bundle = rf::deploy::read_bundle(&bundle_dir).unwrap();
+    rf::deploy::deploy(&bundle, &client, &a.api, &op_any)
+        .await
+        .unwrap();
+
+    let call = |ingress: u16, path: &str| {
+        http.get(format!("http://127.0.0.1:{ingress}{path}"))
+            .header("host", "global-counter.test")
+            .send()
+    };
+    let deadline = Instant::now() + Duration::from_secs(40);
+    loop {
+        if let Ok(resp) = call(b.ingress, "/value").await {
+            if resp.status() == 200 && resp.text().await.unwrap() == "0" {
+                break;
+            }
+        }
+        assert!(
+            Instant::now() < deadline,
+            "distributed DO owner never became ready"
+        );
+        tokio::time::sleep(Duration::from_millis(300)).await;
+    }
+
+    for (expected, ingress) in [("1", a.ingress), ("2", b.ingress), ("3", c.ingress)] {
+        let response = call(ingress, "/inc").await.unwrap();
+        assert_eq!(response.status(), 200);
+        assert_eq!(response.text().await.unwrap(), expected);
+    }
+
+    // The response is committed before this waitUntil mutation runs.
+    // No later request reaches the object before the owner dies, so
+    // recovery of 13 proves the periodic background checkpointer
+    // replicated state changed by alarms/WebSockets/waitUntil work.
+    let response = call(b.ingress, "/background").await.unwrap();
+    assert_eq!(response.status(), 200);
+    assert_eq!(response.text().await.unwrap(), "scheduled");
+    tokio::time::sleep(Duration::from_secs(4)).await;
+
+    let mut nodes = [a, b, c];
+    let mut owner_idx = None;
+    for (idx, node) in nodes.iter().enumerate() {
+        let status = client.status(&node.api).await.unwrap();
+        let owned = status["workers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|w| w["name"] == "global-counter" && w["durable_owned_here"] == true);
+        if owned {
+            owner_idx = Some(idx);
+            break;
+        }
+    }
+    let owner_idx = owner_idx.expect("one node reports itself as DO owner");
+    nodes[owner_idx].child.kill().unwrap();
+    nodes[owner_idx].child.wait().unwrap();
+    let survivor_idx = (owner_idx + 1) % 3;
+
+    let deadline = Instant::now() + Duration::from_secs(40);
+    loop {
+        if let Ok(resp) = call(nodes[survivor_idx].ingress, "/value").await {
+            if resp.status() == 200 {
+                assert_eq!(resp.text().await.unwrap(), "13");
+                break;
+            }
+        }
+        assert!(
+            Instant::now() < deadline,
+            "DO did not fail over with committed state"
+        );
+        tokio::time::sleep(Duration::from_millis(300)).await;
+    }
+    let response = call(nodes[survivor_idx].ingress, "/inc").await.unwrap();
+    assert_eq!(response.status(), 200);
+    assert_eq!(response.text().await.unwrap(), "14");
+
+    for mut node in nodes {
+        node.child.kill().ok();
+        node.child.wait().ok();
+    }
+}
+
 /// HTTPS ingress: drop a PEM pair into <data>/certs, boot, serve an
 /// assets worker over TLS with correct SNI resolution.
 #[tokio::test(flavor = "multi_thread")]
 async fn tls_ingress_serves_with_sni_cert() {
+    let _scenario = E2E_LOCK.lock().await;
     let operator = Keypair::from_seed([9u8; 32]);
     let op_any = AnyKeypair::Ed(operator.clone());
     let client = PeerClient::new(SECRET);
@@ -343,7 +575,13 @@ async fn tls_ingress_serves_with_sni_cert() {
     let (gossip, api, ingress) = (free_port(), free_port(), free_port());
     let https = free_port();
     let mut cfg = std::fs::read_to_string(write_config(
-        &dir, &operator, gossip, api, ingress, &[], "tls",
+        &dir,
+        &operator,
+        gossip,
+        api,
+        ingress,
+        &[],
+        "tls",
     ))
     .unwrap();
     cfg.push_str(&format!("https = \"127.0.0.1:{https}\"\n"));
@@ -354,7 +592,11 @@ async fn tls_ingress_serves_with_sni_cert() {
     std::fs::create_dir_all(&certs_dir).unwrap();
     let cert = rcgen::generate_simple_self_signed(vec!["tls.test".to_string()]).unwrap();
     std::fs::write(certs_dir.join("tls.test.crt"), cert.cert.pem()).unwrap();
-    std::fs::write(certs_dir.join("tls.test.key"), cert.signing_key.serialize_pem()).unwrap();
+    std::fs::write(
+        certs_dir.join("tls.test.key"),
+        cert.signing_key.serialize_pem(),
+    )
+    .unwrap();
 
     let mut child = spawn_node(&dir, &dir.join("rf.toml"));
     wait_ping(&format!("127.0.0.1:{api}"), Duration::from_secs(15)).await;
@@ -372,14 +614,21 @@ async fn tls_ingress_serves_with_sni_cert() {
         .unwrap();
     let deadline = Instant::now() + Duration::from_secs(15);
     loop {
-        match https_client.get(format!("https://tls.test:{https}/")).send().await {
+        match https_client
+            .get(format!("https://tls.test:{https}/"))
+            .send()
+            .await
+        {
             Ok(r) if r.status() == 200 => {
                 assert!(r.text().await.unwrap().contains("hello from rf"));
                 break;
             }
             _ => {}
         }
-        assert!(Instant::now() < deadline, "tls ingress never served the site");
+        assert!(
+            Instant::now() < deadline,
+            "tls ingress never served the site"
+        );
         tokio::time::sleep(Duration::from_millis(200)).await;
     }
 
@@ -394,6 +643,7 @@ async fn tls_ingress_serves_with_sni_cert() {
 /// Skips when pebble isn't on PATH.
 #[tokio::test(flavor = "multi_thread")]
 async fn acme_issues_via_pebble_and_materializes() {
+    let _scenario = E2E_LOCK.lock().await;
     let pebble_present = std::env::var_os("PATH")
         .map(|p| std::env::split_paths(&p).any(|d| d.join("pebble").is_file()))
         .unwrap_or(false);
@@ -412,13 +662,11 @@ async fn acme_issues_via_pebble_and_materializes() {
     let ca = rcgen::CertifiedIssuer::self_signed(ca_params, ca_key).unwrap();
     std::fs::write(dir.join("ca.pem"), ca.pem()).unwrap();
     let server_key = rcgen::KeyPair::generate().unwrap();
-    let server_cert = rcgen::CertificateParams::new(vec![
-        "localhost".to_string(),
-        "127.0.0.1".to_string(),
-    ])
-    .unwrap()
-    .signed_by(&server_key, &ca)
-    .unwrap();
+    let server_cert =
+        rcgen::CertificateParams::new(vec!["localhost".to_string(), "127.0.0.1".to_string()])
+            .unwrap()
+            .signed_by(&server_key, &ca)
+            .unwrap();
     std::fs::write(dir.join("pebble.crt"), server_cert.pem()).unwrap();
     std::fs::write(dir.join("pebble.key"), server_key.serialize_pem()).unwrap();
 
@@ -442,15 +690,21 @@ async fn acme_issues_via_pebble_and_materializes() {
         .to_string(),
     )
     .unwrap();
-    let mut pebble = Command::new("pebble")
-        .arg("-config")
-        .arg(dir.join("pebble-config.json"))
-        .env("PEBBLE_VA_ALWAYS_VALID", "1")
-        .env("PEBBLE_WFE_NONCEREJECT", "0")
-        .stdout(Stdio::from(std::fs::File::create(dir.join("pebble.log")).unwrap()))
-        .stderr(Stdio::from(std::fs::File::create(dir.join("pebble.err")).unwrap()))
-        .spawn()
-        .expect("spawn pebble");
+    let mut pebble = TestChild(
+        Command::new("pebble")
+            .arg("-config")
+            .arg(dir.join("pebble-config.json"))
+            .env("PEBBLE_VA_ALWAYS_VALID", "1")
+            .env("PEBBLE_WFE_NONCEREJECT", "0")
+            .stdout(Stdio::from(
+                std::fs::File::create(dir.join("pebble.log")).unwrap(),
+            ))
+            .stderr(Stdio::from(
+                std::fs::File::create(dir.join("pebble.err")).unwrap(),
+            ))
+            .spawn()
+            .expect("spawn pebble"),
+    );
     // Wait for pebble's socket.
     let deadline = Instant::now() + Duration::from_secs(15);
     loop {
@@ -525,7 +779,13 @@ async fn acme_issues_via_pebble_and_materializes() {
     let operator = Keypair::from_seed([11u8; 32]);
     let (gossip, api, ingress) = (free_port(), free_port(), free_port());
     let mut cfg = std::fs::read_to_string(write_config(
-        &dir, &operator, gossip, api, ingress, &[], "acme",
+        &dir,
+        &operator,
+        gossip,
+        api,
+        ingress,
+        &[],
+        "acme",
     ))
     .unwrap();
     cfg.push_str(&format!(
@@ -565,7 +825,11 @@ dns_api_base = "{cf_base}"
     assert!(pem.contains("BEGIN CERTIFICATE"));
     assert!(crt.with_extension("key").exists());
     // Challenge TXT records were cleaned up.
-    assert!(txt.lock().unwrap().is_empty(), "TXT records not cleaned: {:?}", txt.lock().unwrap());
+    assert!(
+        txt.lock().unwrap().is_empty(),
+        "TXT records not cleaned: {:?}",
+        txt.lock().unwrap()
+    );
 
     child.kill().unwrap();
     child.wait().unwrap();
@@ -579,6 +843,7 @@ dns_api_base = "{cf_base}"
 /// must keep working through the surviving majority.
 #[tokio::test(flavor = "multi_thread")]
 async fn d1_quorum_replicates_and_survives_replica_loss() {
+    let _scenario = E2E_LOCK.lock().await;
     let operator = Keypair::from_seed([13u8; 32]);
     let client = PeerClient::new(SECRET);
 
@@ -608,30 +873,72 @@ async fn d1_quorum_replicates_and_survives_replica_loss() {
     // Schema + rows (leader election happens under the hood; the
     // client follows hints/retries).
     client
-        .d1_exec(&a.api, "appdb", "CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)", serde_json::json!([]))
+        .d1_exec(
+            &a.api,
+            "appdb",
+            "CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)",
+            serde_json::json!([]),
+        )
         .await
         .unwrap();
     client
-        .d1_exec(&a.api, "appdb", "INSERT INTO t (v) VALUES (?1)", serde_json::json!(["one"]))
+        .d1_exec(
+            &a.api,
+            "appdb",
+            "INSERT INTO t (v) VALUES (?1)",
+            serde_json::json!(["one"]),
+        )
         .await
         .unwrap();
     client
-        .d1_exec(&b.api, "appdb", "INSERT INTO t (v) VALUES (?1)", serde_json::json!(["two"]))
+        .d1_exec(
+            &b.api,
+            "appdb",
+            "INSERT INTO t (v) VALUES (?1)",
+            serde_json::json!(["two"]),
+        )
         .await
         .unwrap();
 
     let count = client
-        .d1_exec(&a.api, "appdb", "SELECT COUNT(*) AS n FROM t", serde_json::json!([]))
+        .d1_exec(
+            &a.api,
+            "appdb",
+            "SELECT COUNT(*) AS n FROM t",
+            serde_json::json!([]),
+        )
         .await
         .unwrap();
     assert_eq!(count["rows"][0]["n"], 2, "both writes visible: {count}");
+    let cte = client
+        .d1_exec(
+            &b.api,
+            "appdb",
+            "WITH total(n) AS (SELECT COUNT(*) FROM t) SELECT n FROM total",
+            serde_json::json!([]),
+        )
+        .await
+        .unwrap();
+    assert_eq!(cte["rows"][0]["n"], 2, "CTE reads stay read-only: {cte}");
+    client
+        .d1_exec(
+            &a.api,
+            "appdb",
+            "PRAGMA user_version = 7",
+            serde_json::json!([]),
+        )
+        .await
+        .unwrap();
 
     // Find the LEADER (the node that answers a direct SELECT without
     // a hint) and kill precisely it — the harshest failover case.
     let mut leader_idx = None;
     let probe = br#"{"sql":"SELECT 1 AS ok","params":[]}"#.to_vec();
     for (i, n) in [&a, &b, &c].iter().enumerate() {
-        if let Ok(raw) = client.post(&n.api, "/v1/d1/appdb/exec", probe.clone()).await {
+        if let Ok(raw) = client
+            .post(&n.api, "/v1/d1/appdb/exec", probe.clone())
+            .await
+        {
             let v: serde_json::Value = serde_json::from_slice(&raw).unwrap();
             if v["rows"][0]["ok"] == 1 {
                 leader_idx = Some(i);
@@ -648,14 +955,40 @@ async fn d1_quorum_replicates_and_survives_replica_loss() {
     // The surviving majority elects a new leader and accepts writes;
     // every acknowledged row is still there.
     client
-        .d1_exec(&survivor.api, "appdb", "INSERT INTO t (v) VALUES (?1)", serde_json::json!(["three"]))
+        .d1_exec(
+            &survivor.api,
+            "appdb",
+            "INSERT INTO t (v) VALUES (?1)",
+            serde_json::json!(["three"]),
+        )
         .await
         .expect("write after leader loss");
     let count = client
-        .d1_exec(&survivor.api, "appdb", "SELECT COUNT(*) AS n FROM t", serde_json::json!([]))
+        .d1_exec(
+            &survivor.api,
+            "appdb",
+            "SELECT COUNT(*) AS n FROM t",
+            serde_json::json!([]),
+        )
         .await
         .unwrap();
-    assert_eq!(count["rows"][0]["n"], 3, "acked writes survive leader loss: {count}");
+    assert_eq!(
+        count["rows"][0]["n"], 3,
+        "acked writes survive leader loss: {count}"
+    );
+    let pragma = client
+        .d1_exec(
+            &survivor.api,
+            "appdb",
+            "PRAGMA user_version",
+            serde_json::json!([]),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        pragma["rows"][0]["user_version"], 7,
+        "mutating PRAGMA replicated before failover: {pragma}"
+    );
 
     for mut n in nodes {
         n.child.kill().ok();
@@ -670,12 +1003,12 @@ async fn d1_quorum_replicates_and_survives_replica_loss() {
 /// majority.
 #[tokio::test(flavor = "multi_thread")]
 async fn d1_laggard_recovers_via_snapshot() {
+    let _scenario = E2E_LOCK.lock().await;
     let operator = Keypair::from_seed([17u8; 32]);
     let client = PeerClient::new(SECRET);
 
     let mk = |label: &str, seeds: &[u16]| -> TestNode {
-        let dir =
-            std::env::temp_dir().join(format!("rf-e2e-{label}-{}", rand::random::<u32>()));
+        let dir = std::env::temp_dir().join(format!("rf-e2e-{label}-{}", rand::random::<u32>()));
         std::fs::create_dir_all(&dir).unwrap();
         let (gossip, api, ingress) = (free_port(), free_port(), free_port());
         let mut cfg = std::fs::read_to_string(write_config(
@@ -685,7 +1018,13 @@ async fn d1_laggard_recovers_via_snapshot() {
         cfg.push_str("\n[d1]\ncompact_threshold = 12\nkeep_tail = 3\n");
         std::fs::write(dir.join("rf.toml"), cfg).unwrap();
         let child = spawn_node(&dir, &dir.join("rf.toml"));
-        TestNode { child, api: format!("127.0.0.1:{api}"), ingress, gossip, _dir: dir }
+        TestNode {
+            child,
+            api: format!("127.0.0.1:{api}"),
+            ingress,
+            gossip,
+            _dir: dir,
+        }
     };
 
     let mut a = mk("snapa", &[]);
@@ -704,15 +1043,28 @@ async fn d1_laggard_recovers_via_snapshot() {
         tokio::time::sleep(Duration::from_millis(300)).await;
     }
 
-    client.post(&a.api, "/v1/d1/create", br#"{"name":"snapdb"}"#.to_vec()).await.unwrap();
     client
-        .d1_exec(&a.api, "snapdb", "CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)", serde_json::json!([]))
+        .post(&a.api, "/v1/d1/create", br#"{"name":"snapdb"}"#.to_vec())
+        .await
+        .unwrap();
+    client
+        .d1_exec(
+            &a.api,
+            "snapdb",
+            "CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)",
+            serde_json::json!([]),
+        )
         .await
         .unwrap();
     // Make sure C's driver has joined (first write replicated) before
     // taking it down — we want it BEHIND, not UNKNOWN.
     client
-        .d1_exec(&a.api, "snapdb", "INSERT INTO t (v) VALUES ('seed')", serde_json::json!([]))
+        .d1_exec(
+            &a.api,
+            "snapdb",
+            "INSERT INTO t (v) VALUES ('seed')",
+            serde_json::json!([]),
+        )
         .await
         .unwrap();
     tokio::time::sleep(Duration::from_secs(2)).await;
@@ -743,25 +1095,45 @@ async fn d1_laggard_recovers_via_snapshot() {
     tokio::time::sleep(Duration::from_secs(4)).await;
     let probe = br#"{"sql":"SELECT 1 AS ok","params":[]}"#.to_vec();
     let mut leader_is_a = false;
-    if let Ok(raw) = client.post(&a.api, "/v1/d1/snapdb/exec", probe.clone()).await {
+    if let Ok(raw) = client
+        .post(&a.api, "/v1/d1/snapdb/exec", probe.clone())
+        .await
+    {
         let v: serde_json::Value = serde_json::from_slice(&raw).unwrap();
         leader_is_a = v["rows"][0]["ok"] == 1;
     }
-    let (dead, survivor) = if leader_is_a { (&mut a, &b) } else { (&mut b, &a) };
+    let (dead, survivor) = if leader_is_a {
+        (&mut a, &b)
+    } else {
+        (&mut b, &a)
+    };
     dead.child.kill().unwrap();
     dead.child.wait().unwrap();
 
     // Quorum now requires C. Writes + reads must still work, with all
     // 31 acknowledged rows present.
     client
-        .d1_exec(&survivor.api, "snapdb", "INSERT INTO t (v) VALUES ('post-recovery')", serde_json::json!([]))
+        .d1_exec(
+            &survivor.api,
+            "snapdb",
+            "INSERT INTO t (v) VALUES ('post-recovery')",
+            serde_json::json!([]),
+        )
         .await
         .expect("write with recovered laggard in the majority");
     let count = client
-        .d1_exec(&survivor.api, "snapdb", "SELECT COUNT(*) AS n FROM t", serde_json::json!([]))
+        .d1_exec(
+            &survivor.api,
+            "snapdb",
+            "SELECT COUNT(*) AS n FROM t",
+            serde_json::json!([]),
+        )
         .await
         .unwrap();
-    assert_eq!(count["rows"][0]["n"], 32, "all rows incl. snapshot-recovered: {count}");
+    assert_eq!(
+        count["rows"][0]["n"], 32,
+        "all rows incl. snapshot-recovered: {count}"
+    );
 
     for mut n in [a, b] {
         n.child.kill().ok();
@@ -773,6 +1145,7 @@ async fn d1_laggard_recovers_via_snapshot() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn two_node_deploy_kv_and_static_stability() {
+    let _scenario = E2E_LOCK.lock().await;
     let operator = Keypair::from_seed([7u8; 32]);
     let client = PeerClient::new(SECRET);
     let http = reqwest::Client::new();
@@ -783,23 +1156,80 @@ async fn two_node_deploy_kv_and_static_stability() {
     let mut b = start("b", &operator, &[a.gossip]);
     wait_ping(&b.api, Duration::from_secs(15)).await;
 
+    // A captured request is valid only for its intended node. The
+    // original node also returns replay rejection through the same
+    // encrypted response envelope expected by clients.
+    let a_id = client.status(&a.api).await.unwrap()["node"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let replay_path = "/v1/kv/ns1/replay-proof";
+    let replay_body = b"once";
+    let replay_ts = rf::node::now_ms();
+    let replay_mac = rf::auth::mac_hex(&SECRET, replay_ts, "POST", replay_path, replay_body);
+    let (replay_nonce, replay_ciphertext) = rf::transport::seal(
+        &SECRET,
+        &rf::transport::request_aad(&replay_ts.to_string(), "POST", replay_path, &a_id),
+        replay_body,
+    )
+    .unwrap();
+    let send_capture = |api: &str| {
+        http.post(format!("http://{api}{replay_path}"))
+            .header(rf::auth::TS_HEADER, replay_ts.to_string())
+            .header(rf::auth::MAC_HEADER, &replay_mac)
+            .header(rf::transport::ENC_HEADER, rf::transport::VERSION)
+            .header(rf::transport::NONCE_HEADER, &replay_nonce)
+            .header(rf::transport::TARGET_HEADER, &a_id)
+            .body(replay_ciphertext.clone())
+            .send()
+    };
+    let first = send_capture(&a.api).await.unwrap();
+    assert_eq!(first.status(), 200);
+    assert_eq!(
+        first
+            .headers()
+            .get(rf::transport::ENC_HEADER)
+            .and_then(|v| v.to_str().ok()),
+        Some(rf::transport::VERSION)
+    );
+    let replay = send_capture(&a.api).await.unwrap();
+    assert_eq!(replay.status(), 409);
+    assert_eq!(
+        replay
+            .headers()
+            .get(rf::transport::ENC_HEADER)
+            .and_then(|v| v.to_str().ok()),
+        Some(rf::transport::VERSION)
+    );
+    assert_eq!(send_capture(&b.api).await.unwrap().status(), 421);
+
     // Deploy an assets-only worker (a pure static site) to A.
     let op_any = AnyKeypair::Ed(operator.clone());
     let bundle_dir = make_bundle("site.test");
     let bundle = rf::deploy::read_bundle(&bundle_dir).unwrap();
-    let version = rf::deploy::deploy(&bundle, &client, &a.api, &op_any).await.unwrap();
+    let version = rf::deploy::deploy(&bundle, &client, &a.api, &op_any)
+        .await
+        .unwrap();
     assert_eq!(version, 1);
 
     // Second deploy: exercises the hash chain (prev link) and version
     // bump; then verify the transparency log end-to-end.
-    std::fs::write(bundle_dir.join("public/index.html"), "<h1>hello from rf v2</h1>").unwrap();
+    std::fs::write(
+        bundle_dir.join("public/index.html"),
+        "<h1>hello from rf v2</h1>",
+    )
+    .unwrap();
     let bundle2 = rf::deploy::read_bundle(&bundle_dir).unwrap();
-    let v2 = rf::deploy::deploy(&bundle2, &client, &a.api, &op_any).await.unwrap();
+    let v2 = rf::deploy::deploy(&bundle2, &client, &a.api, &op_any)
+        .await
+        .unwrap();
     assert_eq!(v2, 2);
     let log = client.worker_log(&a.api, "site").await.unwrap();
-    let chain =
-        rf_core::manifest::verify_chain(&log, &op_any.signer_id()).expect("chain verifies");
-    assert_eq!(chain.iter().map(|m| m.version).collect::<Vec<_>>(), vec![1, 2]);
+    let chain = rf_core::manifest::verify_chain(&log, &op_any.signer_id()).expect("chain verifies");
+    assert_eq!(
+        chain.iter().map(|m| m.version).collect::<Vec<_>>(),
+        vec![1, 2]
+    );
 
     // The manifest + blobs must reach B via gossip anti-entropy.
     let deadline = Instant::now() + Duration::from_secs(20);
@@ -812,7 +1242,10 @@ async fn two_node_deploy_kv_and_static_stability() {
                 }
             }
         }
-        assert!(Instant::now() < deadline, "manifest/blobs never reached node B");
+        assert!(
+            Instant::now() < deadline,
+            "manifest/blobs never reached node B"
+        );
         tokio::time::sleep(Duration::from_millis(200)).await;
     }
 
@@ -844,7 +1277,10 @@ async fn two_node_deploy_kv_and_static_stability() {
     assert!(missing.text().await.unwrap().contains("custom 404"));
 
     // KV: write on A, converge to B.
-    client.kv_put(&a.api, "ns1", "greet", b"hola".to_vec()).await.unwrap();
+    client
+        .kv_put(&a.api, "ns1", "greet", b"hola".to_vec())
+        .await
+        .unwrap();
     let deadline = Instant::now() + Duration::from_secs(15);
     loop {
         if let Ok(Some(v)) = client.kv_get(&b.api, "ns1", "greet").await {
@@ -854,6 +1290,46 @@ async fn two_node_deploy_kv_and_static_stability() {
         assert!(Instant::now() < deadline, "kv write never reached node B");
         tokio::time::sleep(Duration::from_millis(200)).await;
     }
+
+    // Query-string authentication, percent-encoded namespace/key,
+    // list, and tombstone paths all work through the encrypted API.
+    client
+        .kv_put(&a.api, "ns/special", "greet?one", b"encoded-key".to_vec())
+        .await
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        if client
+            .kv_get(&b.api, "ns/special", "greet?one")
+            .await
+            .ok()
+            .flatten()
+            .as_deref()
+            == Some(b"encoded-key")
+        {
+            break;
+        }
+        assert!(Instant::now() < deadline, "encoded kv key never converged");
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    assert_eq!(
+        client
+            .kv_list(&b.api, "ns/special", "greet?")
+            .await
+            .unwrap(),
+        vec!["greet?one"]
+    );
+    client
+        .kv_delete(&b.api, "ns/special", "greet?one")
+        .await
+        .unwrap();
+    assert_eq!(
+        client
+            .kv_get(&b.api, "ns/special", "greet?one")
+            .await
+            .unwrap(),
+        None
+    );
 
     // Static stability: kill A entirely; B keeps serving.
     a.child.kill().unwrap();
@@ -887,7 +1363,10 @@ async fn two_node_deploy_kv_and_static_stability() {
         if ok {
             break;
         }
-        assert!(Instant::now() < deadline, "restarted B never served from disk");
+        assert!(
+            Instant::now() < deadline,
+            "restarted B never served from disk"
+        );
         tokio::time::sleep(Duration::from_millis(200)).await;
     }
 

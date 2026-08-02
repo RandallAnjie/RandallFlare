@@ -1,7 +1,7 @@
 # RandallFlare
 
 An edge platform with **no control plane**. Every node runs the same
-~6 MB static binary (~7 MB RSS at runtime); coordination happens
+~12 MB release binary (7–10 MB idle RSS on x86_64 Linux); coordination happens
 through gossip, operator-signed manifests, and claim-based (抢单)
 scheduling. Built to leave every spare MB of a cheap VPS to V8.
 
@@ -13,9 +13,9 @@ others keep serving (and evict its DNS record via a claimed task).
 See [DESIGN.md](./DESIGN.md) for the architecture and consistency
 model.
 
-## Status: v0.1 (pre-release)
+## Status: v0.3 (pre-release)
 
-Working today, verified by a two-node e2e suite:
+Working today, verified by multi-process fault-injection e2e tests:
 
 - SWIM gossip membership (chitchat) + HMAC-authed anti-entropy sync
 - Operator-signed worker manifests as a convergent CRDT
@@ -54,20 +54,24 @@ commit through a majority; killing the leader loses nothing
 --params '[…]'` against any node — requests chase the leader
 automatically.
 
-**Durable Objects (v0.3 phase 2, groundwork)**: manifests and `rf.json`
-can declare native workerd Durable Object namespaces, including SQLite
-storage. Local-disk persistence is verified against real workerd across
-an rf restart. It is deliberately opt-in (the
-`allow_local_durable_objects = true` setting under `[runtime]`) and intended only for a single-node
-development cluster until quorum ownership and snapshot replication land;
-multi-node execution without fencing would permit split-brain objects.
+**Durable Objects (v0.3 phase 2)**: native workerd namespaces and SQLite
+storage run under a per-Worker 3-node micro-quorum. Only the epoch-fenced
+owner runs workerd; every other ingress forwards to it. Before a response
+is acknowledged, rf checkpoints and compresses the DO SQLite directory and
+commits it to a majority. Killing the owner elects another node, restores
+the committed snapshot on its independent disk, and continues without
+losing acknowledged state (real three-node workerd e2e).
 
 ## Build
 
 ```bash
 cargo build --release          # → target/release/rf (musl-friendly, no C deps beyond zstd)
-cargo test                     # 60 tests incl. a real two-node e2e
+cargo test                     # unit, chaos, and real multi-process e2e tests
 ```
+
+Tagged releases build a static `x86_64-unknown-linux-musl` artifact named
+`rf-linux-x86_64` plus its `.sha256` sidecar. Those names are also the
+self-updater's contract.
 
 ## Run a cluster
 
@@ -84,10 +88,12 @@ public = true                        # false = inner node (no DNS/ingress)
 
 [gossip]
 listen = "0.0.0.0:7381"
+advertise = "203.0.113.7:7381"       # dialable public/overlay address
 seeds = ["node-a.example.com:7381"]  # any existing node(s); empty on the first
 
 [peer_api]
 listen = "0.0.0.0:7382"
+advertise = "203.0.113.7:7382"
 
 [ingress]
 http = "0.0.0.0:80"
@@ -109,17 +115,26 @@ hostnames = ["edge.example.com", "*.edge.example.com"]
 # orders via DNS-01, and the cert replicates to every node's
 # <data_dir>/certs through cluster KV.
 
+[update]                             # optional self-update from releases
+enabled = true
+# repo = "RandallAnjie/RandallFlare"
+# interval_minutes = 30
+
 rf run --config rf.toml
 ```
 
 As a service: `infra/rf.service` (put `CF_API_TOKEN=…` in `/etc/rf.env`,
-config at `/etc/rf.toml`, binary at `/usr/local/bin/rf`).
+config at `/etc/rf.toml`, binary at `/usr/local/bin/rf`). Keep the config
+and env file mode `0600` because they contain cluster credentials.
 
-> The peer API encrypts every remote request and response with
+> Gossip datagrams and every peer API request/response are encrypted with
 > XChaCha20-Poly1305 using a key derived from the cluster secret. A
 > per-request nonce, metadata-bound AEAD, HMAC clock window, and replay
 > cache protect worker env, KV, D1, blobs, and snapshots on untrusted
 > networks. Only the public `/v1/ping` health check remains plaintext.
+> Transport v2 binds captured requests to the intended node identity;
+> upgrade all nodes together because older plaintext/v1 peers are not
+> accepted by a v0.3 node.
 
 ## Deploy a worker
 
@@ -135,6 +150,8 @@ export RF_NODE=any-node:7382 RF_CLUSTER_SECRET=…
 rf deploy ./my-worker            # deploy to one node = deploy to all
 rf status
 rf kv put ns1 greeting hello
+rf kv list ns1 --prefix greet
+rf kv delete ns1 greeting
 rf worker-delete site
 ```
 
@@ -151,7 +168,8 @@ optional and receives a stable deployment-derived value:
 }
 ```
 
-For current single-node development only, enable the safety gate:
+Distributed quorum ownership is the default. For isolated development
+only, the local-disk escape hatch bypasses quorum fencing:
 
 ```toml
 [runtime]

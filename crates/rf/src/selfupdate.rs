@@ -9,8 +9,6 @@
 
 use anyhow::{bail, Context, Result};
 
-pub const REPO: &str = "RandallAnjie/RandallFlare";
-
 pub fn target_asset_name() -> String {
     format!("rf-{}-{}", std::env::consts::OS, std::env::consts::ARCH)
 }
@@ -21,7 +19,11 @@ pub fn is_newer(latest: &str, current: &str) -> bool {
     fn parse(v: &str) -> Option<[u64; 3]> {
         let v = v.trim().trim_start_matches('v');
         let mut it = v.split('.').map(|p| p.parse::<u64>());
-        Some([it.next()?.ok()?, it.next()?.ok()?, it.next().and_then(|r| r.ok()).unwrap_or(0)])
+        Some([
+            it.next()?.ok()?,
+            it.next()?.ok()?,
+            it.next().and_then(|r| r.ok()).unwrap_or(0),
+        ])
     }
     match (parse(latest), parse(current)) {
         (Some(l), Some(c)) => l > c,
@@ -35,9 +37,9 @@ pub struct Release {
     pub sha_url: Option<String>,
 }
 
-pub async fn fetch_latest(http: &reqwest::Client, api_base: &str) -> Result<Release> {
+pub async fn fetch_latest(http: &reqwest::Client, api_base: &str, repo: &str) -> Result<Release> {
     let v: serde_json::Value = http
-        .get(format!("{api_base}/repos/{REPO}/releases/latest"))
+        .get(format!("{api_base}/repos/{repo}/releases/latest"))
         .header("user-agent", "rf-selfupdate")
         .send()
         .await?
@@ -62,16 +64,40 @@ pub async fn fetch_latest(http: &reqwest::Client, api_base: &str) -> Result<Rele
             }
         }
     }
-    Ok(Release { tag, asset_url, sha_url })
+    Ok(Release {
+        tag,
+        asset_url,
+        sha_url,
+    })
 }
 
 pub async fn apply(http: &reqwest::Client, release: &Release) -> Result<()> {
     let (Some(asset_url), Some(sha_url)) = (&release.asset_url, &release.sha_url) else {
-        bail!("release {} lacks an asset for {}", release.tag, target_asset_name());
+        bail!(
+            "release {} lacks an asset for {}",
+            release.tag,
+            target_asset_name()
+        );
     };
-    let bytes = http.get(asset_url).send().await?.error_for_status()?.bytes().await?;
-    let sha_line = http.get(sha_url).send().await?.error_for_status()?.text().await?;
-    let expected = sha_line.split_whitespace().next().unwrap_or_default().to_lowercase();
+    let bytes = http
+        .get(asset_url)
+        .send()
+        .await?
+        .error_for_status()?
+        .bytes()
+        .await?;
+    let sha_line = http
+        .get(sha_url)
+        .send()
+        .await?
+        .error_for_status()?
+        .text()
+        .await?;
+    let expected = sha_line
+        .split_whitespace()
+        .next()
+        .unwrap_or_default()
+        .to_lowercase();
     let actual = crate::blob::sha256_hex(&bytes);
     if expected != actual {
         bail!("update rejected: sha mismatch (expected {expected}, got {actual})");
@@ -101,16 +127,17 @@ pub async fn apply(http: &reqwest::Client, release: &Release) -> Result<()> {
 }
 
 /// Background loop; no-op unless enabled.
-pub fn spawn(enabled: bool) {
-    if !enabled {
+pub fn spawn(config: crate::config::UpdateConfig) {
+    if !config.enabled {
         return;
     }
     tokio::spawn(async move {
         let http = reqwest::Client::new();
         loop {
-            let jitter = rand::random::<u64>() % 600;
-            tokio::time::sleep(std::time::Duration::from_secs(1800 + jitter)).await;
-            match fetch_latest(&http, "https://api.github.com").await {
+            let base = config.interval_minutes.max(1) * 60;
+            let jitter = rand::random::<u64>() % (base / 3).max(1);
+            tokio::time::sleep(std::time::Duration::from_secs(base + jitter)).await;
+            match fetch_latest(&http, &config.api_base, &config.repo).await {
                 Ok(rel) if is_newer(&rel.tag, env!("CARGO_PKG_VERSION")) => {
                     if let Err(e) = apply(&http, &rel).await {
                         tracing::warn!("self-update failed: {e:#}");

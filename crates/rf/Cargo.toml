@@ -23,8 +23,10 @@ postcard = { version = "1", features = ["use-std"] }
 sha2 = "0.10"
 hmac = "0.12"
 chacha20poly1305 = "0.10"
+async-trait = "0.1"
 hex = "0.4"
 base64 = "0.22"
+futures-util = "0.3"
 rand = "0.8"
 clap = { version = "4", features = ["derive", "env"] }
 tracing = "0.1"
@@ -32,7 +34,8 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 anyhow = "1"
 toml = "0.8"
 mime_guess = "2"
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
+percent-encoding = "2"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "stream"] }
 libc = "0.2.189"
 axum-server = { version = "0.8.0", features = ["tls-rustls"] }
 rcgen = "0.14.8"
@@ -40,3 +43,4 @@ rustls = "0.23.43"
 rustls-pemfile = "2.2.0"
 instant-acme = "0.8.5"
 rusqlite = { version = "0.40.1", features = ["bundled"] }
+zstd = "0.13"

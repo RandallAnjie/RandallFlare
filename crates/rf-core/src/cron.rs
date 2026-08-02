@@ -8,11 +8,11 @@
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CronExpr {
-    minute: u64,  // bitmask 0..=59
-    hour: u32,    // bitmask 0..=23
-    dom: u32,     // bitmask 1..=31
-    month: u16,   // bitmask 1..=12
-    dow: u8,      // bitmask 0..=6 (0 = Sunday)
+    minute: u64, // bitmask 0..=59
+    hour: u32,   // bitmask 0..=23
+    dom: u32,    // bitmask 1..=31
+    month: u16,  // bitmask 1..=12
+    dow: u8,     // bitmask 0..=6 (0 = Sunday)
     dom_star: bool,
     dow_star: bool,
 }
@@ -47,12 +47,17 @@ fn parse_field(field: &str, min: u32, max: u32) -> Result<(u64, bool), CronParse
         let (lo, hi) = if range == "*" {
             (min, max)
         } else if let Some((a, b)) = range.split_once('-') {
-            let lo = a.parse().map_err(|_| CronParseError(format!("bad range in {part:?}")))?;
-            let hi = b.parse().map_err(|_| CronParseError(format!("bad range in {part:?}")))?;
+            let lo = a
+                .parse()
+                .map_err(|_| CronParseError(format!("bad range in {part:?}")))?;
+            let hi = b
+                .parse()
+                .map_err(|_| CronParseError(format!("bad range in {part:?}")))?;
             (lo, hi)
         } else {
-            let v: u32 =
-                range.parse().map_err(|_| CronParseError(format!("bad value {range:?}")))?;
+            let v: u32 = range
+                .parse()
+                .map_err(|_| CronParseError(format!("bad value {range:?}")))?;
             (v, v)
         };
         if lo < min || hi > max || lo > hi {
@@ -72,7 +77,7 @@ fn parse_field(field: &str, min: u32, max: u32) -> Result<(u64, bool), CronParse
 
 /// (year, month 1-12, day 1-31, weekday 0=Sun) from days since epoch.
 fn civil(days: i64) -> (i64, u32, u32, u32) {
-    let dow = ((days % 7 + 7) % 7 + 4) % 7; // 1970-01-01 was Thursday (4)
+    let dow = (days.rem_euclid(7) + 4) % 7; // 1970-01-01 was Thursday (4)
     let z = days + 719_468;
     let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
     let doe = z - era * 146_097;
@@ -199,7 +204,14 @@ mod tests {
 
     #[test]
     fn rejects_garbage() {
-        for bad in ["", "* * * *", "60 * * * *", "* 24 * * *", "*/0 * * * *", "a * * * *"] {
+        for bad in [
+            "",
+            "* * * *",
+            "60 * * * *",
+            "* 24 * * *",
+            "*/0 * * * *",
+            "a * * * *",
+        ] {
             assert!(CronExpr::parse(bad).is_err(), "{bad:?} should fail");
         }
     }

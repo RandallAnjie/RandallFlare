@@ -52,7 +52,11 @@ impl Envelope {
         let bytes =
             postcard::to_stdvec(payload).expect("postcard encode is infallible for our types");
         let sig = key.sign(&bytes);
-        Envelope { payload: bytes, signer: key.signer_id(), sig }
+        Envelope {
+            payload: bytes,
+            signer: key.signer_id(),
+            sig,
+        }
     }
 
     /// Verify the signature and decode. `expected_signer` pins who is
@@ -107,17 +111,41 @@ mod tests {
     #[test]
     fn seal_open_roundtrip_ed() {
         let kp = Keypair::from_seed([1u8; 32]);
-        let env = Envelope::seal(&Payload { a: 7, b: "x".into() }, &kp);
+        let env = Envelope::seal(
+            &Payload {
+                a: 7,
+                b: "x".into(),
+            },
+            &kp,
+        );
         let got: Payload = env.open(Some(&SignerId::Ed(kp.public()))).unwrap();
-        assert_eq!(got, Payload { a: 7, b: "x".into() });
+        assert_eq!(
+            got,
+            Payload {
+                a: 7,
+                b: "x".into()
+            }
+        );
     }
 
     #[test]
     fn seal_open_roundtrip_eth() {
         let kp = AnyKeypair::Eth(EthKeypair::from_seed([2u8; 32]).unwrap());
-        let env = Envelope::seal_any(&Payload { a: 9, b: "y".into() }, &kp);
+        let env = Envelope::seal_any(
+            &Payload {
+                a: 9,
+                b: "y".into(),
+            },
+            &kp,
+        );
         let got: Payload = env.open(Some(&kp.signer_id())).unwrap();
-        assert_eq!(got, Payload { a: 9, b: "y".into() });
+        assert_eq!(
+            got,
+            Payload {
+                a: 9,
+                b: "y".into()
+            }
+        );
     }
 
     #[test]
@@ -126,9 +154,18 @@ mod tests {
             AnyKeypair::Ed(Keypair::from_seed([1u8; 32])),
             AnyKeypair::Eth(EthKeypair::from_seed([2u8; 32]).unwrap()),
         ] {
-            let mut env = Envelope::seal_any(&Payload { a: 7, b: "x".into() }, &kp);
+            let mut env = Envelope::seal_any(
+                &Payload {
+                    a: 7,
+                    b: "x".into(),
+                },
+                &kp,
+            );
             env.payload[0] ^= 1;
-            assert_eq!(env.open::<Payload>(None).unwrap_err(), EnvelopeError::BadSignature);
+            assert_eq!(
+                env.open::<Payload>(None).unwrap_err(),
+                EnvelopeError::BadSignature
+            );
         }
     }
 
@@ -136,9 +173,16 @@ mod tests {
     fn wrong_signer_rejected() {
         let kp = Keypair::from_seed([1u8; 32]);
         let other = Keypair::from_seed([2u8; 32]);
-        let env = Envelope::seal(&Payload { a: 7, b: "x".into() }, &kp);
+        let env = Envelope::seal(
+            &Payload {
+                a: 7,
+                b: "x".into(),
+            },
+            &kp,
+        );
         assert_eq!(
-            env.open::<Payload>(Some(&SignerId::Ed(other.public()))).unwrap_err(),
+            env.open::<Payload>(Some(&SignerId::Ed(other.public())))
+                .unwrap_err(),
             EnvelopeError::BadSignature
         );
     }
@@ -147,7 +191,13 @@ mod tests {
     fn cross_scheme_signer_mismatch_rejected() {
         let ed = Keypair::from_seed([1u8; 32]);
         let eth = AnyKeypair::Eth(EthKeypair::from_seed([2u8; 32]).unwrap());
-        let env = Envelope::seal(&Payload { a: 1, b: "z".into() }, &ed);
+        let env = Envelope::seal(
+            &Payload {
+                a: 1,
+                b: "z".into(),
+            },
+            &ed,
+        );
         assert_eq!(
             env.open::<Payload>(Some(&eth.signer_id())).unwrap_err(),
             EnvelopeError::BadSignature
@@ -157,7 +207,13 @@ mod tests {
     #[test]
     fn wire_roundtrip_preserves_digest() {
         let kp = AnyKeypair::Eth(EthKeypair::from_seed([3u8; 32]).unwrap());
-        let env = Envelope::seal_any(&Payload { a: 1, b: "y".into() }, &kp);
+        let env = Envelope::seal_any(
+            &Payload {
+                a: 1,
+                b: "y".into(),
+            },
+            &kp,
+        );
         let back = Envelope::from_bytes(&env.to_bytes()).unwrap();
         assert_eq!(env.digest(), back.digest());
     }

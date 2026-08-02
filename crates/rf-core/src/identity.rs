@@ -39,7 +39,8 @@ impl<'de> Deserialize<'de> for PublicId {
         } else {
             let b: serde_bytes_shim::Bytes = Deserialize::deserialize(d)?;
             let arr: [u8; 32] =
-                b.0.try_into().map_err(|_| D::Error::custom("expected 32 bytes"))?;
+                b.0.try_into()
+                    .map_err(|_| D::Error::custom("expected 32 bytes"))?;
             Ok(PublicId(arr))
         }
     }
@@ -103,8 +104,9 @@ impl std::str::FromStr for PublicId {
     type Err = String;
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         let bytes = hex::decode(s.trim()).map_err(|e| e.to_string())?;
-        let arr: [u8; 32] =
-            bytes.try_into().map_err(|_| "expected 32 hex-encoded bytes".to_string())?;
+        let arr: [u8; 32] = bytes
+            .try_into()
+            .map_err(|_| "expected 32 hex-encoded bytes".to_string())?;
         Ok(PublicId(arr))
     }
 }
@@ -118,7 +120,9 @@ pub struct Keypair {
 
 impl Keypair {
     pub fn from_seed(seed: [u8; 32]) -> Self {
-        Self { signing: SigningKey::from_bytes(&seed) }
+        Self {
+            signing: SigningKey::from_bytes(&seed),
+        }
     }
 
     pub fn seed(&self) -> [u8; 32] {
@@ -166,7 +170,9 @@ pub fn eip191_hash(payload: &[u8]) -> [u8; 32] {
 
 impl EthKeypair {
     pub fn from_seed(seed: [u8; 32]) -> Option<Self> {
-        k256::ecdsa::SigningKey::from_bytes((&seed).into()).ok().map(|sk| Self { sk })
+        k256::ecdsa::SigningKey::from_bytes((&seed).into())
+            .ok()
+            .map(|sk| Self { sk })
     }
 
     pub fn seed(&self) -> [u8; 32] {
@@ -246,8 +252,9 @@ impl std::str::FromStr for SignerId {
         let s = s.trim();
         if let Some(hexpart) = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")) {
             let bytes = hex::decode(hexpart).map_err(|e| e.to_string())?;
-            let arr: [u8; 20] =
-                bytes.try_into().map_err(|_| "eth address must be 20 bytes".to_string())?;
+            let arr: [u8; 20] = bytes
+                .try_into()
+                .map_err(|_| "eth address must be 20 bytes".to_string())?;
             Ok(SignerId::Eth(arr))
         } else {
             Ok(SignerId::Ed(s.parse()?))
@@ -262,9 +269,7 @@ impl Serialize for SignerId {
         } else {
             match self {
                 SignerId::Ed(pk) => s.serialize_newtype_variant("SignerId", 0, "Ed", pk),
-                SignerId::Eth(addr) => {
-                    s.serialize_newtype_variant("SignerId", 1, "Eth", addr)
-                }
+                SignerId::Eth(addr) => s.serialize_newtype_variant("SignerId", 1, "Eth", addr),
             }
         }
     }

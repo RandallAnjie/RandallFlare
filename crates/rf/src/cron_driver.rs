@@ -36,7 +36,9 @@ pub fn spawn(node: Arc<Node>) {
             let minute_epoch_secs = next_minute / 1000;
             for m in node.live_manifests() {
                 for expr_src in &m.crons {
-                    let Ok(expr) = CronExpr::parse(expr_src) else { continue };
+                    let Ok(expr) = CronExpr::parse(expr_src) else {
+                        continue;
+                    };
                     if !expr.matches(minute_epoch_secs) {
                         continue;
                     }

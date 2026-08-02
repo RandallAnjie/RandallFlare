@@ -56,30 +56,101 @@ pub struct ExecResult {
 
 pub enum DriverCmd {
     Net(WireMsg),
-    Exec { sql: String, params: Vec<serde_json::Value>, resp: oneshot::Sender<Result<ExecResult>> },
+    Exec {
+        sql: String,
+        params: Vec<serde_json::Value>,
+        resp: oneshot::Sender<Result<ExecResult>>,
+    },
 }
 
 /// db name → driver inbox; peerapi routes into this.
 pub type Registry = Arc<Mutex<HashMap<String, mpsc::Sender<DriverCmd>>>>;
+/// Database name → most recently observed Raft leader. Followers learn
+/// this from Append heartbeats; runtimes use it for fenced ownership.
+pub type Leadership = Arc<Mutex<HashMap<String, PublicId>>>;
 
 pub fn kv_key(name: &str) -> String {
     format!("d1/{name}")
 }
 
-fn is_read(sql: &str) -> bool {
-    let s = sql.trim_start().to_ascii_uppercase();
-    s.starts_with("SELECT") || s.starts_with("PRAGMA") || s.starts_with("EXPLAIN")
+/// Create a fixed micro-quorum record if absent. The caller should do
+/// this after membership has converged; the group is immutable once
+/// published, exactly like user-created D1 databases.
+pub fn ensure_database(node: &Node, name: &str) -> Result<Vec<PublicId>> {
+    let key = kv_key(name);
+    if let Some(raw) = node.kv_get(acme_ns(), &key) {
+        let meta: DbMeta = serde_json::from_slice(&raw)?;
+        return Ok(meta.group);
+    }
+    let mut universe = vec![node.id()];
+    for (id_hex, _) in node.peers() {
+        if let Ok(id) = id_hex.parse() {
+            universe.push(id);
+        }
+    }
+    universe.sort();
+    universe.dedup();
+    let group = rf_core::quorum::rendezvous_group(name, &universe, 3);
+    let meta = DbMeta {
+        group: group.clone(),
+        created_ms: crate::node::now_ms(),
+    };
+    node.kv_put(acme_ns(), &key, Some(serde_json::to_vec(&meta)?), None)?;
+    Ok(group)
+}
+
+/// Execute directly against a local driver. This is used by the DO
+/// owner after Leadership says this node is the fenced leader.
+pub async fn exec_local(
+    registry: &Registry,
+    name: &str,
+    sql: impl Into<String>,
+    params: Vec<serde_json::Value>,
+) -> Result<ExecResult> {
+    let tx = registry
+        .lock()
+        .unwrap()
+        .get(name)
+        .cloned()
+        .ok_or_else(|| anyhow::anyhow!("quorum driver {name} is not local"))?;
+    let (resp_tx, resp_rx) = oneshot::channel();
+    tx.send(DriverCmd::Exec {
+        sql: sql.into(),
+        params,
+        resp: resp_tx,
+    })
+    .await
+    .map_err(|_| anyhow::anyhow!("quorum driver {name} stopped"))?;
+    let result = tokio::time::timeout(Duration::from_secs(30), resp_rx)
+        .await
+        .context("quorum commit timed out")?
+        .context("quorum driver dropped response")??;
+    if result.leader_hint.is_some() || (result.rows.is_none() && result.rows_affected.is_none()) {
+        anyhow::bail!("local node is not leader for {name}");
+    }
+    Ok(result)
+}
+
+fn is_read(conn: &rusqlite::Connection, sql: &str) -> Result<bool> {
+    // Let SQLite classify the compiled statement. Prefix matching
+    // gets CTE reads wrong and, more dangerously, treats mutating
+    // PRAGMAs as leader-local reads.
+    Ok(conn.prepare(sql)?.readonly())
 }
 
 /// Manager: watches the KV for databases whose group includes us and
 /// spawns a driver per db.
-pub fn spawn_manager(node: Arc<Node>, registry: Registry) {
+pub fn spawn_manager(node: Arc<Node>, registry: Registry, leadership: Leadership) {
     tokio::spawn(async move {
         loop {
             for key in node.kv_list(acme_ns(), "d1/", 10_000) {
                 let name = key.trim_start_matches("d1/").to_string();
-                let Some(raw) = node.kv_get(acme_ns(), &key) else { continue };
-                let Ok(meta) = serde_json::from_slice::<DbMeta>(&raw) else { continue };
+                let Some(raw) = node.kv_get(acme_ns(), &key) else {
+                    continue;
+                };
+                let Ok(meta) = serde_json::from_slice::<DbMeta>(&raw) else {
+                    continue;
+                };
                 if !meta.group.contains(&node.id()) {
                     continue;
                 }
@@ -90,7 +161,12 @@ pub fn spawn_manager(node: Arc<Node>, registry: Registry) {
                 let (tx, rx) = mpsc::channel(256);
                 reg.insert(name.clone(), tx);
                 drop(reg);
-                match Driver::open(node.clone(), name.clone(), meta.group.clone()) {
+                match Driver::open(
+                    node.clone(),
+                    name.clone(),
+                    meta.group.clone(),
+                    leadership.clone(),
+                ) {
                     Ok(driver) => {
                         tokio::spawn(driver.run(rx));
                         tracing::info!("d1: driver up for {name}");
@@ -117,6 +193,7 @@ struct Driver {
     pending: HashMap<u64, oneshot::Sender<Result<ExecResult>>>,
     /// seq → tag for entries we proposed.
     my_entries: HashMap<u64, u64>,
+    leadership: Leadership,
 }
 
 fn acme_ns() -> &'static str {
@@ -124,7 +201,12 @@ fn acme_ns() -> &'static str {
 }
 
 impl Driver {
-    fn open(node: Arc<Node>, name: String, group: Vec<PublicId>) -> Result<Self> {
+    fn open(
+        node: Arc<Node>,
+        name: String,
+        group: Vec<PublicId>,
+        leadership: Leadership,
+    ) -> Result<Self> {
         let dir = node.cfg.data_dir.join("d1");
         std::fs::create_dir_all(&dir)?;
         let sql = rusqlite::Connection::open(dir.join(format!("{name}.sqlite")))?;
@@ -140,13 +222,27 @@ impl Driver {
         let (epoch, voted_for, base_seq, base_epoch) = node.store.load_d1_meta(&name)?;
         let log = node.store.load_d1_log(&name)?;
         let raft = Raft::restore(
-            node.id(), group, epoch, voted_for, base_seq, base_epoch, log, applied,
+            node.id(),
+            group,
+            epoch,
+            voted_for,
+            base_seq,
+            base_epoch,
+            log,
+            applied,
         );
         let client = PeerClient::new(node.cfg.cluster_secret_bytes()?);
         let path = dir.join(format!("{name}.sqlite"));
         Ok(Self {
-            node, name, raft, sql, path, client,
-            pending: HashMap::new(), my_entries: HashMap::new(),
+            node,
+            name,
+            raft,
+            sql,
+            path,
+            client,
+            pending: HashMap::new(),
+            my_entries: HashMap::new(),
+            leadership,
         })
     }
 
@@ -199,12 +295,23 @@ impl Driver {
     ) {
         if !self.raft.is_leader() {
             let hint = self.leader_api_addr();
-            let _ = resp.send(Ok(ExecResult { rows: None, rows_affected: None, leader_hint: hint }));
+            let _ = resp.send(Ok(ExecResult {
+                rows: None,
+                rows_affected: None,
+                leader_hint: hint,
+            }));
             return;
         }
-        if is_read(&sql) {
-            let _ = resp.send(run_query(&self.sql, &sql, &params));
-            return;
+        match is_read(&self.sql, &sql) {
+            Ok(true) => {
+                let _ = resp.send(run_query(&self.sql, &sql, &params));
+                return;
+            }
+            Ok(false) => {}
+            Err(e) => {
+                let _ = resp.send(Err(e));
+                return;
+            }
         }
         let tag: u64 = rand::random();
         let cmd = Cmd { sql, params, tag };
@@ -217,7 +324,11 @@ impl Driver {
             }
             Err(_) => {
                 let hint = self.leader_api_addr();
-                let _ = resp.send(Ok(ExecResult { rows: None, rows_affected: None, leader_hint: hint }));
+                let _ = resp.send(Ok(ExecResult {
+                    rows: None,
+                    rows_affected: None,
+                    leader_hint: hint,
+                }));
             }
         }
     }
@@ -227,7 +338,11 @@ impl Driver {
         if hint == self.node.id() {
             return None;
         }
-        self.node.peers().get(&hint.to_string()).and_then(|p| p.api_addr).map(|a| a.to_string())
+        self.node
+            .peers()
+            .get(&hint.to_string())
+            .and_then(|p| p.api_addr)
+            .map(|a| a.to_string())
     }
 
     async fn execute(&mut self, actions: Vec<Action>) {
@@ -265,7 +380,10 @@ impl Driver {
                     else {
                         continue; // peer offline; retried on next pulse
                     };
-                    let wire = WireMsg { from: self.node.id(), msg };
+                    let wire = WireMsg {
+                        from: self.node.id(),
+                        msg,
+                    };
                     let body = postcard::to_stdvec(&wire).expect("wire encode");
                     let client = self.client.clone();
                     let name = self.name.clone();
@@ -277,44 +395,43 @@ impl Driver {
                     });
                 }
                 Action::Apply(entry) => self.apply(entry),
-                Action::NeedSnapshot { to } => {
-                    match self.capture_snapshot() {
-                        Ok(data) => {
-                            let (last_seq, last_epoch) = self.raft.snapshot_point();
-                            let msg = Msg::InstallSnapshot {
-                                epoch: self.raft.epoch,
-                                last_seq,
-                                last_epoch,
-                                data,
-                            };
-                            let wire = WireMsg { from: self.node.id(), msg };
-                            let Some(peer) = self
-                                .node
-                                .peers()
-                                .get(&to.to_string())
-                                .and_then(|p| p.api_addr)
-                            else {
-                                continue;
-                            };
-                            let body = postcard::to_stdvec(&wire).expect("wire encode");
-                            let client = self.client.clone();
-                            let name = self.name.clone();
-                            tokio::spawn(async move {
-                                let path = format!("/v1/quorum/{name}");
-                                if let Err(e) =
-                                    client.post(&peer.to_string(), &path, body).await
-                                {
-                                    tracing::debug!("d1 {name}: snapshot to {peer}: {e}");
-                                }
-                            });
-                            tracing::info!(
-                                "d1 {}: shipping snapshot (seq {last_seq}) to laggard",
-                                self.name
-                            );
-                        }
-                        Err(e) => tracing::warn!("d1 {}: snapshot capture: {e:#}", self.name),
+                Action::NeedSnapshot { to } => match self.capture_snapshot() {
+                    Ok(data) => {
+                        let (last_seq, last_epoch) = self.raft.snapshot_point();
+                        let msg = Msg::InstallSnapshot {
+                            epoch: self.raft.epoch,
+                            last_seq,
+                            last_epoch,
+                            data,
+                        };
+                        let wire = WireMsg {
+                            from: self.node.id(),
+                            msg,
+                        };
+                        let Some(peer) = self
+                            .node
+                            .peers()
+                            .get(&to.to_string())
+                            .and_then(|p| p.api_addr)
+                        else {
+                            continue;
+                        };
+                        let body = postcard::to_stdvec(&wire).expect("wire encode");
+                        let client = self.client.clone();
+                        let name = self.name.clone();
+                        tokio::spawn(async move {
+                            let path = format!("/v1/quorum/{name}");
+                            if let Err(e) = client.post(&peer.to_string(), &path, body).await {
+                                tracing::debug!("d1 {name}: snapshot to {peer}: {e}");
+                            }
+                        });
+                        tracing::info!(
+                            "d1 {}: shipping snapshot (seq {last_seq}) to laggard",
+                            self.name
+                        );
                     }
-                }
+                    Err(e) => tracing::warn!("d1 {}: snapshot capture: {e:#}", self.name),
+                },
                 Action::ApplySnapshot { seq, data } => {
                     if let Err(e) = self.install_snapshot(seq, &data) {
                         tracing::error!("d1 {}: snapshot install: {e:#}", self.name);
@@ -340,6 +457,12 @@ impl Driver {
             }
         }
         self.maybe_compact();
+        let mut leaders = self.leadership.lock().unwrap();
+        if let Some(leader) = self.raft.leader_hint() {
+            leaders.insert(self.name.clone(), leader);
+        } else {
+            leaders.remove(&self.name);
+        }
     }
 
     /// Read the SQLite file as a complete snapshot: checkpoint the
@@ -384,13 +507,25 @@ impl Driver {
     /// Compact the in-memory + stored log once it outgrows the
     /// configured threshold.
     fn maybe_compact(&mut self) {
-        let threshold = self.node.cfg.d1.compact_threshold;
-        let keep = self.node.cfg.d1.keep_tail;
+        let (threshold, keep) = if self.name.starts_with("rfdo-") {
+            // Each DO entry contains a compressed SQLite directory
+            // snapshot and is much larger than an ordinary SQL command.
+            (8, 1)
+        } else {
+            (
+                self.node.cfg.d1.compact_threshold,
+                self.node.cfg.d1.keep_tail,
+            )
+        };
         if (self.raft.log.len() as u64) <= threshold {
             return;
         }
         if self.raft.compact(keep) {
-            if let Err(e) = self.node.store.compact_d1_log(&self.name, self.raft.base_seq) {
+            if let Err(e) = self
+                .node
+                .store
+                .compact_d1_log(&self.name, self.raft.base_seq)
+            {
                 tracing::error!("d1 {}: compact store: {e:#}", self.name);
             }
             if let Err(e) = self.node.store.put_d1_meta(
@@ -419,7 +554,10 @@ impl Driver {
                 bind_params(&mut stmt, &cmd.params)?;
                 stmt.raw_execute()? as u64
             };
-            tx.execute("UPDATE _rf_applied SET seq = ?1 WHERE id = 0", [entry.seq as i64])?;
+            tx.execute(
+                "UPDATE _rf_applied SET seq = ?1 WHERE id = 0",
+                [entry.seq as i64],
+            )?;
             tx.commit()?;
             Ok(affected)
         })();
@@ -479,9 +617,7 @@ fn run_query(
                 rusqlite::types::ValueRef::Null => serde_json::Value::Null,
                 rusqlite::types::ValueRef::Integer(n) => n.into(),
                 rusqlite::types::ValueRef::Real(f) => serde_json::json!(f),
-                rusqlite::types::ValueRef::Text(t) => {
-                    String::from_utf8_lossy(t).to_string().into()
-                }
+                rusqlite::types::ValueRef::Text(t) => String::from_utf8_lossy(t).to_string().into(),
                 rusqlite::types::ValueRef::Blob(b) => {
                     use base64::Engine;
                     base64::engine::general_purpose::STANDARD.encode(b).into()
@@ -491,5 +627,23 @@ fn run_query(
         }
         rows_out.push(obj);
     }
-    Ok(ExecResult { rows: Some(rows_out), rows_affected: None, leader_hint: None })
+    Ok(ExecResult {
+        rows: Some(rows_out),
+        rows_affected: None,
+        leader_hint: None,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sqlite_classifies_ctes_and_mutating_pragmas() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        assert!(is_read(&conn, "WITH n(v) AS (VALUES (1)) SELECT v FROM n").unwrap());
+        assert!(is_read(&conn, "PRAGMA user_version").unwrap());
+        assert!(!is_read(&conn, "PRAGMA user_version = 7").unwrap());
+        assert!(!is_read(&conn, "CREATE TABLE t (id INTEGER)").unwrap());
+    }
 }

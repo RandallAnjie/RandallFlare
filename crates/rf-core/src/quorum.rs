@@ -74,17 +74,24 @@ pub enum Action {
     /// Durably store (epoch, voted_for) BEFORE any subsequent send.
     PersistMeta,
     /// Durably store the log from `from_seq` onward (truncate + append).
-    PersistLog { from_seq: u64 },
+    PersistLog {
+        from_seq: u64,
+    },
     Send(PublicId, Msg),
     /// Entry is committed — apply to the state machine (in order).
     Apply(Entry),
     /// Replace the whole state machine with this snapshot (jump the
     /// applied mark to `seq`), then persist meta+log.
-    ApplySnapshot { seq: u64, data: Vec<u8> },
+    ApplySnapshot {
+        seq: u64,
+        data: Vec<u8>,
+    },
     /// The driver must capture the current state machine and send
     /// `Msg::InstallSnapshot` to this peer (the entries it needs are
     /// compacted away).
-    NeedSnapshot { to: PublicId },
+    NeedSnapshot {
+        to: PublicId,
+    },
     /// Signals for the driver's bookkeeping.
     BecameLeader,
     LostLeadership,
@@ -93,8 +100,13 @@ pub enum Action {
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Role {
     Follower,
-    Candidate { votes: Vec<PublicId> },
-    Leader { next: Vec<(PublicId, u64)>, matched: Vec<(PublicId, u64)> },
+    Candidate {
+        votes: Vec<PublicId>,
+    },
+    Leader {
+        next: Vec<(PublicId, u64)>,
+        matched: Vec<(PublicId, u64)>,
+    },
 }
 
 #[derive(Debug)]
@@ -127,7 +139,7 @@ impl Raft {
         if !group.contains(&me) {
             group.push(me);
         }
-        group.sort_by(|a, b| a.0.cmp(&b.0));
+        group.sort_by_key(|a| a.0);
         Self {
             me,
             group,
@@ -175,7 +187,9 @@ impl Raft {
         let epoch = if self.applied == self.base_seq {
             self.base_epoch
         } else {
-            self.entry(self.applied).map(|e| e.epoch).unwrap_or(self.base_epoch)
+            self.entry(self.applied)
+                .map(|e| e.epoch)
+                .unwrap_or(self.base_epoch)
         };
         (self.applied, epoch)
     }
@@ -188,7 +202,9 @@ impl Raft {
         if new_base <= self.base_seq {
             return false;
         }
-        let Some(e) = self.entry(new_base) else { return false };
+        let Some(e) = self.entry(new_base) else {
+            return false;
+        };
         let new_base_epoch = e.epoch;
         let drop_count = (new_base - self.base_seq) as usize;
         self.log.drain(..drop_count);
@@ -247,13 +263,19 @@ impl Raft {
         }
         self.epoch += 1;
         self.voted_for = Some(self.me);
-        self.role = Role::Candidate { votes: vec![self.me] };
+        self.role = Role::Candidate {
+            votes: vec![self.me],
+        };
         let (last_epoch, last_seq) = self.last();
         let mut actions = vec![Action::PersistMeta];
         for peer in self.others() {
             actions.push(Action::Send(
                 peer,
-                Msg::VoteReq { epoch: self.epoch, last_epoch, last_seq },
+                Msg::VoteReq {
+                    epoch: self.epoch,
+                    last_epoch,
+                    last_seq,
+                },
             ));
         }
         // Single-member group: win instantly.
@@ -272,10 +294,16 @@ impl Raft {
     /// Propose a command. Returns its seq; committed once Apply fires.
     pub fn propose(&mut self, cmd: Vec<u8>) -> Result<(u64, Vec<Action>), NotLeader> {
         if !self.is_leader() {
-            return Err(NotLeader { hint: self.leader_hint() });
+            return Err(NotLeader {
+                hint: self.leader_hint(),
+            });
         }
         let seq = self.last().1 + 1;
-        let entry = Entry { epoch: self.epoch, seq, cmd };
+        let entry = Entry {
+            epoch: self.epoch,
+            seq,
+            cmd,
+        };
         self.log.push(entry);
         let mut actions = vec![Action::PersistLog { from_seq: seq }];
         actions.extend(self.replicate_all());
@@ -303,7 +331,9 @@ impl Raft {
     }
 
     fn try_win(&mut self) -> Vec<Action> {
-        let Role::Candidate { votes } = &self.role else { return vec![] };
+        let Role::Candidate { votes } = &self.role else {
+            return vec![];
+        };
         if votes.len() < self.majority() {
             return vec![];
         }
@@ -324,7 +354,9 @@ impl Raft {
         let commit = self.commit;
         let epoch = self.epoch;
         let base_seq = self.base_seq;
-        let Role::Leader { next, .. } = &self.role else { return vec![] };
+        let Role::Leader { next, .. } = &self.role else {
+            return vec![];
+        };
         let mut actions = vec![];
         for (peer, next_seq) in next.clone() {
             let prev_seq = next_seq - 1;
@@ -335,11 +367,21 @@ impl Raft {
                 continue;
             }
             let prev_epoch = self.epoch_at(prev_seq).unwrap_or(0);
-            let entries: Vec<Entry> =
-                self.log.iter().filter(|e| e.seq >= next_seq).cloned().collect();
+            let entries: Vec<Entry> = self
+                .log
+                .iter()
+                .filter(|e| e.seq >= next_seq)
+                .cloned()
+                .collect();
             actions.push(Action::Send(
                 peer,
-                Msg::Append { epoch, prev_seq, prev_epoch, entries, commit },
+                Msg::Append {
+                    epoch,
+                    prev_seq,
+                    prev_epoch,
+                    entries,
+                    commit,
+                },
             ));
         }
         actions
@@ -349,13 +391,14 @@ impl Raft {
         let me_last = self.last().1;
         let epoch = self.epoch;
         let majority = self.majority();
-        let Role::Leader { matched, .. } = &self.role else { return vec![] };
+        let Role::Leader { matched, .. } = &self.role else {
+            return vec![];
+        };
         // Highest N replicated on a majority (counting ourselves)
         // with log[N].epoch == current epoch (Raft's commit rule).
         let mut candidate = self.commit;
         for n in (self.commit + 1)..=me_last {
-            let replicas =
-                1 + matched.iter().filter(|(_, m)| *m >= n).count();
+            let replicas = 1 + matched.iter().filter(|(_, m)| *m >= n).count();
             if replicas >= majority {
                 if self.entry(n).map(|e| e.epoch) == Some(epoch) {
                     candidate = n;
@@ -391,7 +434,11 @@ impl Raft {
 
     pub fn handle(&mut self, from: PublicId, msg: Msg) -> Vec<Action> {
         match msg {
-            Msg::VoteReq { epoch, last_epoch, last_seq } => {
+            Msg::VoteReq {
+                epoch,
+                last_epoch,
+                last_seq,
+            } => {
                 let mut actions = vec![];
                 if epoch > self.epoch {
                     actions.extend(self.become_follower(epoch));
@@ -406,7 +453,10 @@ impl Raft {
                 }
                 actions.push(Action::Send(
                     from,
-                    Msg::VoteResp { epoch: self.epoch, granted },
+                    Msg::VoteResp {
+                        epoch: self.epoch,
+                        granted,
+                    },
                 ));
                 actions
             }
@@ -424,11 +474,21 @@ impl Raft {
                 }
                 self.try_win()
             }
-            Msg::Append { epoch, prev_seq, prev_epoch, entries, commit } => {
+            Msg::Append {
+                epoch,
+                prev_seq,
+                prev_epoch,
+                entries,
+                commit,
+            } => {
                 if epoch < self.epoch {
                     return vec![Action::Send(
                         from,
-                        Msg::AppendResp { epoch: self.epoch, match_seq: 0, ok: false },
+                        Msg::AppendResp {
+                            epoch: self.epoch,
+                            match_seq: 0,
+                            ok: false,
+                        },
                     )];
                 }
                 let mut actions = self.become_follower(epoch);
@@ -445,10 +505,18 @@ impl Raft {
                     || prev_seq < self.base_seq
                     || self.epoch_at(prev_seq) == Some(prev_epoch);
                 if !prev_ok {
-                    let hint = self.last().1.min(prev_seq.saturating_sub(1)).max(self.base_seq);
+                    let hint = self
+                        .last()
+                        .1
+                        .min(prev_seq.saturating_sub(1))
+                        .max(self.base_seq);
                     actions.push(Action::Send(
                         from,
-                        Msg::AppendResp { epoch: self.epoch, match_seq: hint, ok: false },
+                        Msg::AppendResp {
+                            epoch: self.epoch,
+                            match_seq: hint,
+                            ok: false,
+                        },
                     ));
                     return actions;
                 }
@@ -478,15 +546,28 @@ impl Raft {
                 }
                 actions.push(Action::Send(
                     from,
-                    Msg::AppendResp { epoch: self.epoch, match_seq, ok: true },
+                    Msg::AppendResp {
+                        epoch: self.epoch,
+                        match_seq,
+                        ok: true,
+                    },
                 ));
                 actions
             }
-            Msg::InstallSnapshot { epoch, last_seq, last_epoch, data } => {
+            Msg::InstallSnapshot {
+                epoch,
+                last_seq,
+                last_epoch,
+                data,
+            } => {
                 if epoch < self.epoch {
                     return vec![Action::Send(
                         from,
-                        Msg::AppendResp { epoch: self.epoch, match_seq: 0, ok: false },
+                        Msg::AppendResp {
+                            epoch: self.epoch,
+                            match_seq: 0,
+                            ok: false,
+                        },
                     )];
                 }
                 let mut actions = self.become_follower(epoch);
@@ -511,16 +592,29 @@ impl Raft {
                 self.base_epoch = last_epoch;
                 self.commit = last_seq;
                 self.applied = last_seq;
-                actions.push(Action::ApplySnapshot { seq: last_seq, data });
+                actions.push(Action::ApplySnapshot {
+                    seq: last_seq,
+                    data,
+                });
                 actions.push(Action::PersistMeta);
-                actions.push(Action::PersistLog { from_seq: last_seq + 1 });
+                actions.push(Action::PersistLog {
+                    from_seq: last_seq + 1,
+                });
                 actions.push(Action::Send(
                     from,
-                    Msg::AppendResp { epoch: self.epoch, match_seq: last_seq, ok: true },
+                    Msg::AppendResp {
+                        epoch: self.epoch,
+                        match_seq: last_seq,
+                        ok: true,
+                    },
                 ));
                 actions
             }
-            Msg::AppendResp { epoch, match_seq, ok } => {
+            Msg::AppendResp {
+                epoch,
+                match_seq,
+                ok,
+            } => {
                 if epoch > self.epoch {
                     return self.become_follower(epoch);
                 }
@@ -578,7 +672,12 @@ pub fn rendezvous_group(object: &str, universe: &[PublicId], size: usize) -> Vec
         })
         .collect();
     scored.sort();
-    scored.into_iter().rev().take(size).map(|(_, n)| n).collect()
+    scored
+        .into_iter()
+        .rev()
+        .take(size)
+        .map(|(_, n)| n)
+        .collect()
 }
 
 #[cfg(test)]
@@ -628,14 +727,17 @@ mod tests {
                         let node = &self.nodes[&me];
                         let (last_seq, last_epoch) = node.snapshot_point();
                         let epoch = node.epoch;
-                        let data = postcard::to_stdvec(
-                            self.applied.get(&me).unwrap_or(&vec![]),
-                        )
-                        .unwrap();
+                        let data =
+                            postcard::to_stdvec(self.applied.get(&me).unwrap_or(&vec![])).unwrap();
                         self.queues.push_back((
                             me,
                             to,
-                            Msg::InstallSnapshot { epoch, last_seq, last_epoch, data },
+                            Msg::InstallSnapshot {
+                                epoch,
+                                last_seq,
+                                last_epoch,
+                                data,
+                            },
                         ));
                     }
                     Action::ApplySnapshot { seq, data } => {
@@ -676,8 +778,12 @@ mod tests {
 
         fn propose(&mut self, id: u8, cmd: &[u8]) -> u64 {
             let me = pid(id);
-            let (seq, actions) =
-                self.nodes.get_mut(&me).unwrap().propose(cmd.to_vec()).expect("is leader");
+            let (seq, actions) = self
+                .nodes
+                .get_mut(&me)
+                .unwrap()
+                .propose(cmd.to_vec())
+                .expect("is leader");
             self.absorb(me, actions);
             self.deliver_all();
             seq
@@ -720,7 +826,11 @@ mod tests {
         net.propose(1, b"a");
         net.propose(1, b"b");
         for id in [1, 2, 3] {
-            assert_eq!(net.applied_cmds(id), vec![b"a".to_vec(), b"b".to_vec()], "node {id}");
+            assert_eq!(
+                net.applied_cmds(id),
+                vec![b"a".to_vec(), b"b".to_vec()],
+                "node {id}"
+            );
         }
     }
 
@@ -737,8 +847,12 @@ mod tests {
         // The stale leader accepts a proposal locally but can commit
         // nothing (no majority reachable).
         let me = pid(1);
-        let (_seq, actions) =
-            net.nodes.get_mut(&me).unwrap().propose(b"stale".to_vec()).unwrap();
+        let (_seq, actions) = net
+            .nodes
+            .get_mut(&me)
+            .unwrap()
+            .propose(b"stale".to_vec())
+            .unwrap();
         net.absorb(me, actions);
         net.deliver_all();
         assert!(!net.applied_cmds(1).contains(&b"stale".to_vec()));
@@ -748,7 +862,11 @@ mod tests {
         net.heartbeat(2); // real leader converges everyone
         assert!(!net.nodes[&pid(1)].is_leader());
         for id in [1, 2, 3] {
-            assert_eq!(net.applied_cmds(id), vec![b"a".to_vec(), b"b".to_vec()], "node {id}");
+            assert_eq!(
+                net.applied_cmds(id),
+                vec![b"a".to_vec(), b"b".to_vec()],
+                "node {id}"
+            );
             assert!(!net.applied_cmds(id).contains(&b"stale".to_vec()));
         }
     }
@@ -802,17 +920,26 @@ mod tests {
         // replicating it.
         net.isolate(1);
         let me = pid(1);
-        let (_seq, actions) = net.nodes.get_mut(&me).unwrap().propose(b"lost".to_vec()).unwrap();
+        let (_seq, actions) = net
+            .nodes
+            .get_mut(&me)
+            .unwrap()
+            .propose(b"lost".to_vec())
+            .unwrap();
         net.absorb(me, actions);
         net.deliver_all(); // all its sends are cut
-        // New leader commits a different entry at that seq.
+                           // New leader commits a different entry at that seq.
         net.elect(3);
         net.propose(3, b"kept");
         net.heal();
         net.heartbeat(3);
         // Node 1's uncommitted "lost" is gone; everyone has a, kept.
         for id in [1, 2, 3] {
-            assert_eq!(net.applied_cmds(id), vec![b"a".to_vec(), b"kept".to_vec()], "node {id}");
+            assert_eq!(
+                net.applied_cmds(id),
+                vec![b"a".to_vec(), b"kept".to_vec()],
+                "node {id}"
+            );
         }
         // And "lost" was never applied anywhere.
         for id in [1, 2, 3] {
@@ -841,7 +968,10 @@ mod tests {
             .iter()
             .filter(|id| net.nodes[&pid(**id)].is_leader())
             .count();
-        assert!(leaders <= 1, "split vote must not elect two leaders in one epoch");
+        assert!(
+            leaders <= 1,
+            "split vote must not elect two leaders in one epoch"
+        );
     }
 
     #[test]
@@ -852,16 +982,21 @@ mod tests {
         assert_eq!(g1, g2);
         assert_eq!(g1.len(), 3);
         // Removing an unrelated node keeps the group when possible.
-        let smaller: Vec<PublicId> =
-            universe.iter().copied().filter(|p| !g1.contains(p)).chain(g1.clone()).collect();
+        let smaller: Vec<PublicId> = universe
+            .iter()
+            .copied()
+            .filter(|p| !g1.contains(p))
+            .chain(g1.clone())
+            .collect();
         let g3 = rendezvous_group("db-a", &smaller, 3);
         assert_eq!(
             g1.iter().collect::<std::collections::HashSet<_>>(),
             g3.iter().collect::<std::collections::HashSet<_>>()
         );
         // Different objects land on different groups at least sometimes.
-        let spread: std::collections::HashSet<Vec<PublicId>> =
-            (0..20).map(|i| rendezvous_group(&format!("db-{i}"), &universe, 3)).collect();
+        let spread: std::collections::HashSet<Vec<PublicId>> = (0..20)
+            .map(|i| rendezvous_group(&format!("db-{i}"), &universe, 3))
+            .collect();
         assert!(spread.len() > 5);
     }
 
@@ -888,7 +1023,7 @@ mod tests {
             for step in 0..400 {
                 match rng.gen_range(0..100) {
                     0..=9 => {
-                        let id = *[1u8, 2, 3].iter().nth(rng.gen_range(0..3)).unwrap();
+                        let id = *[1u8, 2, 3].get(rng.gen_range(0..3)).unwrap();
                         let me = pid(id);
                         let actions = net.nodes.get_mut(&me).unwrap().tick_election();
                         net.absorb(me, actions);
@@ -912,7 +1047,7 @@ mod tests {
                     40..=49 => {
                         // Random partition flip.
                         if net.cut.is_empty() {
-                            let id = *[1u8, 2, 3].iter().nth(rng.gen_range(0..3)).unwrap();
+                            let id = *[1u8, 2, 3].get(rng.gen_range(0..3)).unwrap();
                             net.isolate(id);
                         } else {
                             net.heal();
@@ -931,8 +1066,7 @@ mod tests {
                             let idx = rng.gen_range(0..net.queues.len());
                             let (from, to, msg) = net.queues.remove(idx).unwrap();
                             if !net.cut.contains(&(from, to)) {
-                                let actions =
-                                    net.nodes.get_mut(&to).unwrap().handle(from, msg);
+                                let actions = net.nodes.get_mut(&to).unwrap().handle(from, msg);
                                 net.absorb(to, actions);
                             }
                         }
@@ -1011,7 +1145,7 @@ mod tests {
             for _ in 0..300 {
                 match rng.gen_range(0..100) {
                     0..=7 => {
-                        let id = *[1u8, 2, 3].iter().nth(rng.gen_range(0..3)).unwrap();
+                        let id = *[1u8, 2, 3].get(rng.gen_range(0..3)).unwrap();
                         let me = pid(id);
                         let actions = net.nodes.get_mut(&me).unwrap().tick_election();
                         net.absorb(me, actions);
@@ -1033,13 +1167,13 @@ mod tests {
                     }
                     36..=45 => {
                         // Random compaction on a random node.
-                        let id = *[1u8, 2, 3].iter().nth(rng.gen_range(0..3)).unwrap();
+                        let id = *[1u8, 2, 3].get(rng.gen_range(0..3)).unwrap();
                         let keep = rng.gen_range(0..3);
                         net.nodes.get_mut(&pid(id)).unwrap().compact(keep);
                     }
                     46..=55 => {
                         if net.cut.is_empty() {
-                            let id = *[1u8, 2, 3].iter().nth(rng.gen_range(0..3)).unwrap();
+                            let id = *[1u8, 2, 3].get(rng.gen_range(0..3)).unwrap();
                             net.isolate(id);
                         } else {
                             net.heal();
@@ -1056,8 +1190,7 @@ mod tests {
                             let idx = rng.gen_range(0..net.queues.len());
                             let (from, to, msg) = net.queues.remove(idx).unwrap();
                             if !net.cut.contains(&(from, to)) {
-                                let actions =
-                                    net.nodes.get_mut(&to).unwrap().handle(from, msg);
+                                let actions = net.nodes.get_mut(&to).unwrap().handle(from, msg);
                                 net.absorb(to, actions);
                             }
                         }

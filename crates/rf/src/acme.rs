@@ -74,7 +74,9 @@ pub fn spawn_materializer(node: Arc<Node>) {
         let mut rx = node.subscribe();
         loop {
             for key in node.kv_list(NS, "cert/", 10_000) {
-                let Some(raw) = node.kv_get(NS, &key) else { continue };
+                let Some(raw) = node.kv_get(NS, &key) else {
+                    continue;
+                };
                 let Ok(rec) = serde_json::from_slice::<CertRecord>(&raw) else {
                     continue;
                 };
@@ -186,24 +188,27 @@ async fn issue(node: &Node, cfg: &AcmeConfig, dns: &DnsApi, hostname: &str) -> R
 
     // TXT records we created, for cleanup.
     let mut txt_created: Vec<(String, String)> = Vec::new();
-    let mut authorizations = order.authorizations();
-    while let Some(result) = authorizations.next().await {
-        let mut authz = result?;
-        match authz.status {
-            AuthorizationStatus::Pending => {}
-            AuthorizationStatus::Valid => continue,
-            other => bail!("unexpected authorization status {other:?}"),
+    {
+        let mut authorizations = order.authorizations();
+        while let Some(result) = authorizations.next().await {
+            let mut authz = result?;
+            match authz.status {
+                AuthorizationStatus::Pending => {}
+                AuthorizationStatus::Valid => continue,
+                other => bail!("unexpected authorization status {other:?}"),
+            }
+            let mut challenge = authz
+                .challenge(ChallengeType::Dns01)
+                .ok_or_else(|| anyhow::anyhow!("no dns-01 challenge offered"))?;
+            let record = format!("_acme-challenge.{}", challenge.identifier());
+            let value = challenge.key_authorization().dns_value();
+            dns.create_txt_record(&record, &value)
+                .await
+                .context("creating TXT")?;
+            txt_created.push((record, value));
+            challenge.set_ready().await?;
         }
-        let mut challenge = authz
-            .challenge(ChallengeType::Dns01)
-            .ok_or_else(|| anyhow::anyhow!("no dns-01 challenge offered"))?;
-        let record = format!("_acme-challenge.{}", challenge.identifier());
-        let value = challenge.key_authorization().dns_value();
-        dns.create_txt_record(&record, &value).await.context("creating TXT")?;
-        txt_created.push((record, value));
-        challenge.set_ready().await?;
     }
-    drop(authorizations);
 
     let result = async {
         order.poll_ready(&RetryPolicy::default()).await?;
@@ -229,7 +234,12 @@ async fn issue(node: &Node, cfg: &AcmeConfig, dns: &DnsApi, hostname: &str) -> R
         issued_ms: now,
         expires_ms: now + LIFETIME_MS,
     };
-    node.kv_put(NS, &cert_kv_key(hostname), Some(serde_json::to_vec(&rec)?), None)?;
+    node.kv_put(
+        NS,
+        &cert_kv_key(hostname),
+        Some(serde_json::to_vec(&rec)?),
+        None,
+    )?;
     Ok(())
 }
 
@@ -240,7 +250,10 @@ mod tests {
     #[test]
     fn stems() {
         assert_eq!(file_stem("a.example.com"), "a.example.com");
-        assert_eq!(file_stem("*.edge.example.com"), "_wildcard.edge.example.com");
+        assert_eq!(
+            file_stem("*.edge.example.com"),
+            "_wildcard.edge.example.com"
+        );
         assert_eq!(cert_kv_key("*.x.y"), "cert/_wildcard.x.y");
     }
 }

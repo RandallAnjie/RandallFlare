@@ -24,11 +24,13 @@ use std::sync::Arc;
 pub struct Ingress {
     node: Arc<Node>,
     http: reqwest::Client,
+    durable: crate::durable::Coordinator,
 }
 
-fn app(node: Arc<Node>) -> Result<axum::Router> {
+fn app(node: Arc<Node>, durable: crate::durable::Coordinator) -> Result<axum::Router> {
     let ingress = Ingress {
         node,
+        durable,
         http: reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(120))
             .build()?,
@@ -36,8 +38,12 @@ fn app(node: Arc<Node>) -> Result<axum::Router> {
     Ok(axum::Router::new().fallback(handle).with_state(ingress))
 }
 
-pub async fn serve(node: Arc<Node>, listen: SocketAddr) -> Result<SocketAddr> {
-    let app = app(node)?;
+pub async fn serve(
+    node: Arc<Node>,
+    durable: crate::durable::Coordinator,
+    listen: SocketAddr,
+) -> Result<SocketAddr> {
+    let app = app(node, durable)?;
     let listener = tokio::net::TcpListener::bind(listen).await?;
     let addr = listener.local_addr()?;
     tokio::spawn(async move {
@@ -50,10 +56,14 @@ pub async fn serve(node: Arc<Node>, listen: SocketAddr) -> Result<SocketAddr> {
 
 /// HTTPS ingress: SNI cert store from <data>/certs (hot-reloaded),
 /// self-signed fallback for unknown hosts. Same router as HTTP.
-pub async fn serve_tls(node: Arc<Node>, listen: SocketAddr) -> Result<()> {
+pub async fn serve_tls(
+    node: Arc<Node>,
+    durable: crate::durable::Coordinator,
+    listen: SocketAddr,
+) -> Result<()> {
     let store = crate::tls::spawn_store(node.cfg.data_dir.join("certs"))?;
     let rustls_cfg = crate::tls::server_config(store);
-    let app = app(node)?;
+    let app = app(node, durable)?;
     let config = axum_server::tls_rustls::RustlsConfig::from_config(rustls_cfg);
     tokio::spawn(async move {
         if let Err(e) = axum_server::bind_rustls(listen, config)
@@ -76,7 +86,10 @@ async fn handle(State(ingress): State<Ingress>, req: Request) -> Response {
 
     let routes = ingress.node.routes();
     let Some(worker_name) = routes.get(&host) else {
-        return (StatusCode::NOT_FOUND, format!("no worker bound to {host}\n"))
+        return (
+            StatusCode::NOT_FOUND,
+            format!("no worker bound to {host}\n"),
+        )
             .into_response();
     };
     let Some(manifest) = ingress.node.manifest(worker_name) else {
@@ -100,6 +113,21 @@ async fn handle(State(ingress): State<Ingress>, req: Request) -> Response {
         return not_found_page(&ingress.node, &manifest);
     }
 
+    if !crate::deploy::durable_objects(&manifest).is_empty() {
+        let wire = match request_to_wire(req).await {
+            Ok(wire) => wire,
+            Err(response) => return response,
+        };
+        return match ingress.durable.dispatch(&manifest.name, wire).await {
+            Ok(response) => wire_to_response(response),
+            Err(e) => (
+                StatusCode::SERVICE_UNAVAILABLE,
+                format!("Durable Object owner unavailable: {e}\n"),
+            )
+                .into_response(),
+        };
+    }
+
     // Module worker: proxy to local workerd.
     let Some(port) = ingress.node.worker_port(&manifest.name) else {
         return (
@@ -109,6 +137,41 @@ async fn handle(State(ingress): State<Ingress>, req: Request) -> Response {
             .into_response();
     };
     proxy(&ingress.http, req, port).await
+}
+
+async fn request_to_wire(
+    req: Request,
+) -> std::result::Result<crate::durable::ProxyRequest, Response> {
+    let path_and_query = req
+        .uri()
+        .path_and_query()
+        .map(|pq| pq.as_str().to_string())
+        .unwrap_or_else(|| "/".into());
+    let (parts, body) = req.into_parts();
+    let body = axum::body::to_bytes(body, 64 * 1024 * 1024)
+        .await
+        .map_err(|e| (StatusCode::PAYLOAD_TOO_LARGE, e.to_string()).into_response())?;
+    let headers = parts
+        .headers
+        .iter()
+        .map(|(name, value)| (name.to_string(), value.as_bytes().to_vec()))
+        .collect();
+    Ok(crate::durable::ProxyRequest {
+        method: parts.method.to_string(),
+        path_and_query,
+        headers,
+        body: body.to_vec(),
+    })
+}
+
+fn wire_to_response(response: crate::durable::ProxyResponse) -> Response {
+    let mut builder = Response::builder().status(response.status);
+    for (name, value) in response.headers {
+        builder = builder.header(name, value);
+    }
+    builder
+        .body(Body::from(response.body))
+        .unwrap_or_else(|_| StatusCode::BAD_GATEWAY.into_response())
 }
 
 fn serve_asset(node: &Node, m: &WorkerManifest, path: &str) -> Option<Response> {
@@ -173,7 +236,7 @@ async fn proxy(client: &reqwest::Client, req: Request, port: u16) -> Response {
     };
     let mut builder = client.request(method, &url).body(body_bytes.to_vec());
     for (name, value) in parts.headers.iter() {
-        if name == axum::http::header::HOST {
+        if name == axum::http::header::HOST || is_hop_header(name.as_str()) {
             continue; // workerd sees its loopback host; original in X-Forwarded-Host
         }
         builder = builder.header(name.as_str(), value.as_bytes());
@@ -187,17 +250,29 @@ async fn proxy(client: &reqwest::Client, req: Request, port: u16) -> Response {
                 StatusCode::from_u16(resp.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
             let mut out = Response::builder().status(status);
             for (name, value) in resp.headers().iter() {
-                out = out.header(name.as_str(), value.as_bytes());
+                if !is_hop_header(name.as_str()) {
+                    out = out.header(name.as_str(), value.as_bytes());
+                }
             }
-            match resp.bytes().await {
-                Ok(bytes) => out
-                    .body(Body::from(bytes))
-                    .unwrap_or_else(|_| StatusCode::BAD_GATEWAY.into_response()),
-                Err(e) => (StatusCode::BAD_GATEWAY, e.to_string()).into_response(),
-            }
+            out.body(Body::from_stream(resp.bytes_stream()))
+                .unwrap_or_else(|_| StatusCode::BAD_GATEWAY.into_response())
         }
         Err(e) => (StatusCode::BAD_GATEWAY, format!("upstream: {e}\n")).into_response(),
     }
+}
+
+fn is_hop_header(name: &str) -> bool {
+    matches!(
+        name.to_ascii_lowercase().as_str(),
+        "connection"
+            | "keep-alive"
+            | "proxy-authenticate"
+            | "proxy-authorization"
+            | "te"
+            | "trailer"
+            | "transfer-encoding"
+            | "upgrade"
+    )
 }
 
 // Silence unused-import when compiled without the uri helper in play.

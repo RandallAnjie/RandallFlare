@@ -15,7 +15,7 @@
 use crate::node::{now_ms, Node};
 use anyhow::Result;
 use axum::body::Bytes;
-use axum::extract::{ConnectInfo, Path, Query, State};
+use axum::extract::{ConnectInfo, DefaultBodyLimit, Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
@@ -47,18 +47,22 @@ pub fn router(node: Arc<Node>) -> Router {
     Router::new()
         .route("/", get(list))
         .route("/{*key}", get(kget).put(kput).delete(kdelete))
+        .layer(DefaultBodyLimit::max(25 * 1024 * 1024))
         .with_state(node)
 }
 
-fn ns_of(headers: &HeaderMap, remote: &SocketAddr) -> Result<String, Response> {
+fn ns_of(
+    headers: &HeaderMap,
+    remote: &SocketAddr,
+) -> std::result::Result<String, (StatusCode, &'static str)> {
     if !remote.ip().is_loopback() {
-        return Err((StatusCode::FORBIDDEN, "loopback only").into_response());
+        return Err((StatusCode::FORBIDDEN, "loopback only"));
     }
     headers
         .get(NS_HEADER)
         .and_then(|v| v.to_str().ok())
         .map(|s| s.to_string())
-        .ok_or_else(|| (StatusCode::BAD_REQUEST, "missing kv namespace header").into_response())
+        .ok_or((StatusCode::BAD_REQUEST, "missing kv namespace header"))
 }
 
 #[derive(Deserialize)]
@@ -82,7 +86,7 @@ async fn kget(
 ) -> Response {
     let ns = match ns_of(&headers, &remote) {
         Ok(ns) => ns,
-        Err(r) => return r,
+        Err(r) => return r.into_response(),
     };
     match node.kv_get(&ns, &key) {
         Some(v) => v.into_response(),
@@ -100,7 +104,7 @@ async fn kput(
 ) -> Response {
     let ns = match ns_of(&headers, &remote) {
         Ok(ns) => ns,
-        Err(r) => return r,
+        Err(r) => return r.into_response(),
     };
     let expires_at_ms = q
         .expiration
@@ -120,7 +124,7 @@ async fn kdelete(
 ) -> Response {
     let ns = match ns_of(&headers, &remote) {
         Ok(ns) => ns,
-        Err(r) => return r,
+        Err(r) => return r.into_response(),
     };
     match node.kv_put(&ns, &key, None, None) {
         Ok(()) => StatusCode::OK.into_response(),
@@ -136,7 +140,7 @@ async fn list(
 ) -> Response {
     let ns = match ns_of(&headers, &remote) {
         Ok(ns) => ns,
-        Err(r) => return r,
+        Err(r) => return r.into_response(),
     };
     let limit = q.limit.unwrap_or(1000).clamp(1, 1000);
     let (keys, complete, cursor) = node.kv_list_page(

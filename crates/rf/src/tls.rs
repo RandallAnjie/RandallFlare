@@ -56,16 +56,14 @@ impl ResolvesServerCert for SniStore {
 }
 
 fn load_pem_pair(crt: &Path, key: &Path) -> Result<CertifiedKey> {
-    let certs: Vec<CertificateDer<'static>> = rustls_pemfile::certs(
-        &mut std::io::BufReader::new(std::fs::File::open(crt)?),
-    )
-    .collect::<std::result::Result<_, _>>()
-    .context("parsing cert chain")?;
-    let key_der: PrivateKeyDer<'static> = rustls_pemfile::private_key(
-        &mut std::io::BufReader::new(std::fs::File::open(key)?),
-    )
-    .context("parsing key")?
-    .ok_or_else(|| anyhow::anyhow!("no private key in {}", key.display()))?;
+    let certs: Vec<CertificateDer<'static>> =
+        rustls_pemfile::certs(&mut std::io::BufReader::new(std::fs::File::open(crt)?))
+            .collect::<std::result::Result<_, _>>()
+            .context("parsing cert chain")?;
+    let key_der: PrivateKeyDer<'static> =
+        rustls_pemfile::private_key(&mut std::io::BufReader::new(std::fs::File::open(key)?))
+            .context("parsing key")?
+            .ok_or_else(|| anyhow::anyhow!("no private key in {}", key.display()))?;
     let signing = any_supported_type(&key_der).context("unsupported key type")?;
     Ok(CertifiedKey::new(certs, signing))
 }
@@ -80,7 +78,10 @@ fn scan_dir(dir: &Path) -> HashMap<String, Arc<CertifiedKey>> {
         if path.extension().and_then(|e| e.to_str()) != Some("crt") {
             continue;
         }
-        let Some(host) = path.file_stem().and_then(|s| s.to_str()).map(str::to_string)
+        let Some(host) = path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .map(str::to_string)
         else {
             continue;
         };
@@ -148,8 +149,11 @@ mod tests {
         let cert = rcgen::generate_simple_self_signed(vec![host.to_string()]).unwrap();
         std::fs::create_dir_all(dir).unwrap();
         std::fs::write(dir.join(format!("{host}.crt")), cert.cert.pem()).unwrap();
-        std::fs::write(dir.join(format!("{host}.key")), cert.signing_key.serialize_pem())
-            .unwrap();
+        std::fs::write(
+            dir.join(format!("{host}.key")),
+            cert.signing_key.serialize_pem(),
+        )
+        .unwrap();
     }
 
     #[test]

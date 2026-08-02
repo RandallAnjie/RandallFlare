@@ -1,5 +1,6 @@
 # RandallFlare node. Install:
 #   cp infra/rf.service /etc/systemd/system/rf.service
+#   install -m600 rf.toml /etc/rf.toml
 #   install -m600 /dev/null /etc/rf.env    # CF_API_TOKEN=... (optional)
 #   systemctl daemon-reload && systemctl enable --now rf
 [Unit]
@@ -12,6 +13,7 @@ ExecStart=/usr/local/bin/rf run --config /etc/rf.toml
 EnvironmentFile=-/etc/rf.env
 Restart=always
 RestartSec=3
+UMask=0077
 
 # The node needs to write its data_dir and spawn workerd; keep
 # hardening compatible with that.
@@ -20,6 +22,9 @@ ProtectSystem=full
 ProtectHome=read-only
 PrivateTmp=true
 LimitNOFILE=65536
+# Self-update uses an atomic rename beside /usr/local/bin/rf. Remove
+# this exception if [update] is disabled and upgrades are external.
+ReadWritePaths=/usr/local/bin
 
 [Install]
 WantedBy=multi-user.target

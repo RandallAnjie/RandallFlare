@@ -43,6 +43,44 @@ pub struct NodeConfig {
     pub acme: Option<AcmeConfig>,
     #[serde(default)]
     pub d1: D1Config,
+    #[serde(default)]
+    pub update: UpdateConfig,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UpdateConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default = "default_update_repo")]
+    pub repo: String,
+    #[serde(default = "default_update_api")]
+    pub api_base: String,
+    #[serde(default = "default_update_interval")]
+    pub interval_minutes: u64,
+}
+
+impl Default for UpdateConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            repo: default_update_repo(),
+            api_base: default_update_api(),
+            interval_minutes: default_update_interval(),
+        }
+    }
+}
+
+fn default_update_repo() -> String {
+    "RandallAnjie/RandallFlare".into()
+}
+
+fn default_update_api() -> String {
+    "https://api.github.com".into()
+}
+
+fn default_update_interval() -> u64 {
+    30
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -164,7 +202,8 @@ pub struct IngressConfig {
     /// HTTP listen ("0.0.0.0:80"); None = ingress off (inner node).
     #[serde(default)]
     pub http: Option<SocketAddr>,
-    /// HTTPS listen; requires certs (v0.2 — ACME via claims).
+    /// HTTPS listen; ACME/manual certs hot-load, with a self-signed
+    /// fallback while no matching certificate exists.
     #[serde(default)]
     pub https: Option<SocketAddr>,
 }
@@ -181,7 +220,7 @@ pub struct DnsConfig {
     #[serde(default = "default_cf_token_env")]
     pub api_token_env: String,
     /// This node's public IPv4 for its own A record. None = derive
-    /// from the first non-private interface... not yet; explicit for v0.1.
+    /// from a public-IP discovery service when omitted.
     #[serde(default)]
     pub my_ipv4: Option<String>,
 }
@@ -200,9 +239,9 @@ pub struct RuntimeConfig {
     /// First local port for per-worker workerd sockets.
     #[serde(default = "default_port_base")]
     pub port_base: u16,
-    /// Permit native workerd local-disk Durable Objects. This is
-    /// intentionally opt-in until quorum fencing is wired: enabling
-    /// it on more than one node would create split-brain objects.
+    /// Bypass distributed DO fencing and use local disk directly.
+    /// Development/emergency escape hatch only; never enable on more
+    /// than one node serving the same Worker.
     #[serde(default)]
     pub allow_local_durable_objects: bool,
 }
@@ -227,12 +266,53 @@ impl NodeConfig {
             .with_context(|| format!("reading config {}", path.display()))?;
         let cfg: NodeConfig = toml::from_str(&raw).context("parsing config TOML")?;
         cfg.cluster_secret_bytes().context("cluster_secret")?;
+        cfg.validate()?;
         Ok(cfg)
+    }
+
+    fn validate(&self) -> Result<()> {
+        if self.cluster_id.trim().is_empty() {
+            anyhow::bail!("cluster_id must not be empty");
+        }
+        if self.gossip.interval_ms == 0 {
+            anyhow::bail!("gossip.interval_ms must be greater than zero");
+        }
+        if self
+            .gossip
+            .advertise
+            .map(|a| a.ip().is_unspecified())
+            .unwrap_or_else(|| self.gossip.listen.ip().is_unspecified())
+        {
+            anyhow::bail!("gossip.advertise is required when gossip.listen uses 0.0.0.0 or [::]");
+        }
+        if self
+            .peer_api
+            .advertise
+            .map(|a| a.ip().is_unspecified())
+            .unwrap_or_else(|| self.peer_api.listen.ip().is_unspecified())
+        {
+            anyhow::bail!(
+                "peer_api.advertise is required when peer_api.listen uses 0.0.0.0 or [::]"
+            );
+        }
+        if self.runtime.port_base > u16::MAX - 999 {
+            anyhow::bail!("runtime.port_base must be at most {}", u16::MAX - 999);
+        }
+        if self.d1.compact_threshold == 0 || self.d1.keep_tail >= self.d1.compact_threshold {
+            anyhow::bail!("d1.keep_tail must be smaller than a non-zero d1.compact_threshold");
+        }
+        if self.update.enabled
+            && (self.update.repo.trim().is_empty() || self.update.api_base.trim().is_empty())
+        {
+            anyhow::bail!("enabled update.repo and update.api_base must not be empty");
+        }
+        Ok(())
     }
 
     pub fn cluster_secret_bytes(&self) -> Result<[u8; 32]> {
         let b = hex::decode(self.cluster_secret.trim()).context("hex decode")?;
-        b.try_into().map_err(|_| anyhow::anyhow!("cluster_secret must be 32 hex-encoded bytes"))
+        b.try_into()
+            .map_err(|_| anyhow::anyhow!("cluster_secret must be 32 hex-encoded bytes"))
     }
 
     pub fn gossip_advertise(&self) -> SocketAddr {
@@ -282,5 +362,22 @@ mod tests {
         )
         .unwrap();
         assert!(cfg.cluster_secret_bytes().is_err());
+    }
+
+    #[test]
+    fn wildcard_listeners_require_dialable_advertise_addresses() {
+        let cfg: NodeConfig = toml::from_str(
+            r#"
+            data_dir = "/var/lib/rf"
+            operator = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+            cluster_secret = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+            [gossip]
+            listen = "0.0.0.0:7381"
+            [peer_api]
+            listen = "0.0.0.0:7382"
+            "#,
+        )
+        .unwrap();
+        assert!(cfg.validate().is_err());
     }
 }

@@ -79,8 +79,13 @@ fn walk(dir: &Path) -> Result<Vec<PathBuf>> {
     let mut stack = vec![dir.to_path_buf()];
     while let Some(d) = stack.pop() {
         for entry in std::fs::read_dir(&d)? {
-            let path = entry?.path();
-            if path.is_dir() {
+            let entry = entry?;
+            let path = entry.path();
+            let kind = entry.file_type()?;
+            if kind.is_symlink() {
+                bail!("bundle contains symlink: {}", path.display());
+            }
+            if kind.is_dir() {
                 stack.push(path);
             } else {
                 out.push(path);
@@ -106,6 +111,18 @@ pub fn read_bundle(dir: &Path) -> Result<Bundle> {
     let spec: DeploySpec = serde_json::from_str(&raw).context("parsing rf.json")?;
     if spec.env.contains_key(DO_METADATA_ENV) {
         bail!("env key {DO_METADATA_ENV} is reserved by rf");
+    }
+
+    if let Some(assets) = &spec.assets {
+        let path = Path::new(assets);
+        if assets.is_empty()
+            || assets.contains('\\')
+            || path
+                .components()
+                .any(|part| !matches!(part, std::path::Component::Normal(_)))
+        {
+            bail!("assets must be a safe relative directory");
+        }
     }
 
     let assets_dir = spec.assets.as_ref().map(|a| dir.join(a));
@@ -137,7 +154,11 @@ pub fn read_bundle(dir: &Path) -> Result<Bundle> {
     } else if assets.is_empty() {
         bail!("worker has neither a main module nor assets");
     }
-    Ok(Bundle { spec, modules, assets })
+    Ok(Bundle {
+        spec,
+        modules,
+        assets,
+    })
 }
 
 /// Upload all blobs + submit the signed manifest. Returns the new
@@ -202,11 +223,17 @@ pub async fn deploy(
             }
             if let Some(prior) = classes.insert(&object.class_name, &object.unique_key) {
                 if prior != &object.unique_key {
-                    bail!("Durable Object class {:?} has conflicting unique keys", object.class_name);
+                    bail!(
+                        "Durable Object class {:?} has conflicting unique keys",
+                        object.class_name
+                    );
                 }
             }
         }
-        env.insert(DO_METADATA_ENV.into(), serde_json::to_string(&durable_objects)?);
+        env.insert(
+            DO_METADATA_ENV.into(),
+            serde_json::to_string(&durable_objects)?,
+        );
     }
     let manifest = WorkerManifest {
         name: bundle.spec.name.clone(),
@@ -216,13 +243,20 @@ pub async fn deploy(
         main: bundle.spec.main.clone().unwrap_or_default(),
         modules,
         assets,
-        hostnames: bundle.spec.hostnames.iter().map(|h| h.to_ascii_lowercase()).collect(),
+        hostnames: bundle
+            .spec
+            .hostnames
+            .iter()
+            .map(|h| h.to_ascii_lowercase())
+            .collect(),
         env,
         kv_bindings: bundle.spec.kv.clone(),
         crons: bundle.spec.crons.clone(),
         compatibility_date: bundle.spec.compatibility_date.clone(),
     };
-    manifest.validate().map_err(|e| anyhow::anyhow!("invalid manifest: {e}"))?;
+    manifest
+        .validate()
+        .map_err(|e| anyhow::anyhow!("invalid manifest: {e}"))?;
     let env = Envelope::seal_any(&manifest, operator);
     client.post_manifest(node_addr, &env).await?;
     Ok(version)
@@ -236,7 +270,9 @@ pub async fn delete_worker(
     operator: &AnyKeypair,
 ) -> Result<u64> {
     let head = client.worker_head(node_addr, name).await?;
-    let Some((prior, prev_digest)) = head else { bail!("no such worker: {name}") };
+    let Some((prior, prev_digest)) = head else {
+        bail!("no such worker: {name}")
+    };
     let manifest = WorkerManifest {
         name: name.to_string(),
         version: prior + 1,
@@ -258,7 +294,9 @@ pub async fn delete_worker(
 
 fn decode_sha(hex_str: &str) -> Result<[u8; 32]> {
     let bytes = hex::decode(hex_str.trim()).context("node returned bad sha")?;
-    bytes.try_into().map_err(|_| anyhow::anyhow!("node returned bad sha length"))
+    bytes
+        .try_into()
+        .map_err(|_| anyhow::anyhow!("node returned bad sha length"))
 }
 
 #[cfg(test)]
@@ -312,5 +350,21 @@ mod tests {
         write_bundle(&dir2, r#"{"name":"empty"}"#, &[]);
         assert!(read_bundle(&dir2).is_err());
         std::fs::remove_dir_all(&dir2).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bundle_symlinks_are_rejected() {
+        use std::os::unix::fs::symlink;
+
+        let dir = std::env::temp_dir().join(format!("rf-bundle-{}", rand::random::<u32>()));
+        write_bundle(
+            &dir,
+            r#"{"name":"w","main":"index.js"}"#,
+            &[("index.js", "export default {}")],
+        );
+        symlink("/etc/passwd", dir.join("secret.txt")).unwrap();
+        assert!(read_bundle(&dir).is_err());
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

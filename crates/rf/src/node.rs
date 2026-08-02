@@ -17,6 +17,8 @@ use std::net::SocketAddr;
 use std::sync::Mutex;
 use tokio::sync::broadcast;
 
+pub type KvListPage = (Vec<(String, Option<u64>)>, bool, Option<String>);
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum NodeEvent {
     /// A manifest changed — runtime must reconcile, gossip must
@@ -71,6 +73,12 @@ pub fn now_ms() -> u64 {
 
 impl Node {
     pub fn open(cfg: NodeConfig, keypair: Keypair) -> Result<Self> {
+        std::fs::create_dir_all(&cfg.data_dir)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&cfg.data_dir, std::fs::Permissions::from_mode(0o700))?;
+        }
         let store = Store::open(&cfg.data_dir.join("state.redb"))?;
         let blobs = BlobStore::open(cfg.data_dir.join("blobs"))?;
         let mut inner = Inner {
@@ -98,7 +106,14 @@ impl Node {
             inner.kv.entry(ns).or_default().merge(&key, entry);
         }
         let (events, _) = broadcast::channel(256);
-        Ok(Self { cfg, keypair, store, blobs, inner: Mutex::new(inner), events })
+        Ok(Self {
+            cfg,
+            keypair,
+            store,
+            blobs,
+            inner: Mutex::new(inner),
+            events,
+        })
     }
 
     pub fn id(&self) -> PublicId {
@@ -151,7 +166,13 @@ impl Node {
     }
 
     pub fn manifest_envelopes(&self) -> Vec<Envelope> {
-        self.inner.lock().unwrap().manifests.all().map(|r| r.envelope.clone()).collect()
+        self.inner
+            .lock()
+            .unwrap()
+            .manifests
+            .all()
+            .map(|r| r.envelope.clone())
+            .collect()
     }
 
     /// Blob hashes referenced by live manifests but absent on disk.
@@ -214,7 +235,11 @@ impl Node {
     }
 
     pub fn holds(&self, task: &str) -> bool {
-        self.inner.lock().unwrap().claims.holds(task, &self.id(), now_ms())
+        self.inner
+            .lock()
+            .unwrap()
+            .claims
+            .holds(task, &self.id(), now_ms())
     }
 
     /// Renew or release our claim on `task`.
@@ -252,7 +277,12 @@ impl Node {
 
     pub fn claim_envelopes(&self) -> Vec<Envelope> {
         let inner = self.inner.lock().unwrap();
-        inner.claims.live_envelopes(now_ms()).into_iter().cloned().collect()
+        inner
+            .claims
+            .live_envelopes(now_ms())
+            .into_iter()
+            .cloned()
+            .collect()
     }
 
     // ---- kv ----
@@ -289,7 +319,10 @@ impl Node {
     pub fn kv_list(&self, ns: &str, prefix: &str, limit: usize) -> Vec<String> {
         let inner = self.inner.lock().unwrap();
         match inner.kv.get(ns) {
-            Some(n) => n.list(prefix, now_ms(), limit).map(|s| s.to_string()).collect(),
+            Some(n) => n
+                .list(prefix, now_ms(), limit)
+                .map(|s| s.to_string())
+                .collect(),
             None => Vec::new(),
         }
     }
@@ -304,7 +337,7 @@ impl Node {
         prefix: &str,
         limit: usize,
         cursor: Option<&str>,
-    ) -> (Vec<(String, Option<u64>)>, bool, Option<String>) {
+    ) -> KvListPage {
         let inner = self.inner.lock().unwrap();
         let Some(n) = inner.kv.get(ns) else {
             return (Vec::new(), true, None);
@@ -325,7 +358,11 @@ impl Node {
             let exp = n.entry(key).and_then(|e| e.expires_at_ms);
             out.push((key.to_string(), exp));
         }
-        let next = if more { out.last().map(|(k, _)| k.clone()) } else { None };
+        let next = if more {
+            out.last().map(|(k, _)| k.clone())
+        } else {
+            None
+        };
         (out, !more, next)
     }
 
@@ -335,7 +372,11 @@ impl Node {
             let mut inner = self.inner.lock().unwrap();
             for (key, entry) in items {
                 inner.clock.observe(entry.hlc, now_ms());
-                if inner.kv.entry(ns.to_string()).or_default().merge(&key, entry.clone())
+                if inner
+                    .kv
+                    .entry(ns.to_string())
+                    .or_default()
+                    .merge(&key, entry.clone())
                     == Merge::Applied
                 {
                     self.store.put_kv(ns, &key, &entry)?;
@@ -351,7 +392,11 @@ impl Node {
 
     pub fn kv_digests(&self) -> BTreeMap<String, String> {
         let inner = self.inner.lock().unwrap();
-        inner.kv.iter().map(|(ns, n)| (ns.clone(), hex::encode(n.digest()))).collect()
+        inner
+            .kv
+            .iter()
+            .map(|(ns, n)| (ns.clone(), hex::encode(n.digest())))
+            .collect()
     }
 
     pub fn kv_dump(&self, ns: &str) -> Vec<(String, KvEntry)> {
@@ -378,11 +423,22 @@ impl Node {
     }
 
     pub fn manifest(&self, name: &str) -> Option<WorkerManifest> {
-        self.inner.lock().unwrap().manifests.get(name).map(|r| r.manifest.clone())
+        self.inner
+            .lock()
+            .unwrap()
+            .manifests
+            .get(name)
+            .map(|r| r.manifest.clone())
     }
 
     pub fn live_manifests(&self) -> Vec<WorkerManifest> {
-        self.inner.lock().unwrap().manifests.live().map(|r| r.manifest.clone()).collect()
+        self.inner
+            .lock()
+            .unwrap()
+            .manifests
+            .live()
+            .map(|r| r.manifest.clone())
+            .collect()
     }
 
     /// Transparency log for one worker (version-ascending envelopes).
@@ -394,7 +450,10 @@ impl Node {
     /// hash-chain link.
     pub fn manifest_head(&self, name: &str) -> Option<(u64, [u8; 32])> {
         let inner = self.inner.lock().unwrap();
-        inner.manifests.get(name).map(|r| (r.manifest.version, r.digest))
+        inner
+            .manifests
+            .get(name)
+            .map(|r| (r.manifest.version, r.digest))
     }
 
     /// Digest over all manifest heads — the anchoring payload. Stable

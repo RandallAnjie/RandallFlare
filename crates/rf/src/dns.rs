@@ -45,11 +45,20 @@ impl DnsApi {
             .timeout(Duration::from_secs(20))
             .build()
             .expect("reqwest client");
-        Self { http, base, token, zone_name }
+        Self {
+            http,
+            base,
+            token,
+            zone_name,
+        }
     }
 
     pub fn cloudflare(token: String, zone_name: String) -> Self {
-        Self::new("https://api.cloudflare.com/client/v4".into(), token, zone_name)
+        Self::new(
+            "https://api.cloudflare.com/client/v4".into(),
+            token,
+            zone_name,
+        )
     }
 
     async fn zone_id(&self) -> Result<String> {
@@ -86,7 +95,10 @@ impl DnsApi {
         if let Some(items) = v["result"].as_array() {
             for r in items {
                 if let (Some(id), Some(content)) = (r["id"].as_str(), r["content"].as_str()) {
-                    out.push(ARecord { id: id.into(), content: content.into() });
+                    out.push(ARecord {
+                        id: id.into(),
+                        content: content.into(),
+                    });
                 }
             }
         }
@@ -210,7 +222,11 @@ pub fn spawn(node: Arc<Node>, api: DnsApi, cfg: DnsConfig) {
 }
 
 async fn tick(node: &Arc<Node>, api: &DnsApi, cfg: &DnsConfig) -> Result<()> {
-    let my_ip = if node.cfg.public { cfg.my_ipv4.clone() } else { None };
+    let my_ip = if node.cfg.public {
+        cfg.my_ipv4.clone()
+    } else {
+        None
+    };
 
     // Mechanism 2: hold (or try to grab) the reconcile lease.
     let holding = if node.holds(RECONCILE_TASK) {
@@ -228,13 +244,15 @@ async fn tick(node: &Arc<Node>, api: &DnsApi, cfg: &DnsConfig) -> Result<()> {
     };
 
     let peers = node.peers();
-    let live_public_ips: BTreeSet<String> =
-        peers.values().filter(|p| p.public).filter_map(|p| p.ipv4.clone()).collect();
+    let live_public_ips: BTreeSet<String> = peers
+        .values()
+        .filter(|p| p.public)
+        .filter_map(|p| p.ipv4.clone())
+        .collect();
     let i_see_peers = !live_public_ips.is_empty();
 
     let records = api.list_a_records(&cfg.hostname).await?;
-    let (deletions, need_create) =
-        plan(&records, my_ip.as_deref(), &live_public_ips, i_see_peers);
+    let (deletions, need_create) = plan(&records, my_ip.as_deref(), &live_public_ips, i_see_peers);
 
     // Mechanism 1: my own record, no claim needed.
     if need_create {
@@ -261,7 +279,10 @@ mod tests {
     use std::sync::Mutex;
 
     fn rec(id: &str, ip: &str) -> ARecord {
-        ARecord { id: id.into(), content: ip.into() }
+        ARecord {
+            id: id.into(),
+            content: ip.into(),
+        }
     }
 
     /// Minimal in-memory Cloudflare API double.
@@ -273,9 +294,7 @@ mod tests {
         let app = axum::Router::new()
             .route(
                 "/zones",
-                get(|| async {
-                    axum::Json(serde_json::json!({"result": [{"id": "z1"}]}))
-                }),
+                get(|| async { axum::Json(serde_json::json!({"result": [{"id": "z1"}]})) }),
             )
             .route(
                 "/zones/z1/dns_records",
@@ -306,13 +325,15 @@ mod tests {
             )
             .route(
                 "/zones/z1/dns_records/{id}",
-                axum_delete(move |axum::extract::Path(id): axum::extract::Path<String>| {
-                    let r = r3.clone();
-                    async move {
-                        r.lock().unwrap().retain(|x| x.id != id);
-                        axum::Json(serde_json::json!({"result": {}}))
-                    }
-                }),
+                axum_delete(
+                    move |axum::extract::Path(id): axum::extract::Path<String>| {
+                        let r = r3.clone();
+                        async move {
+                            r.lock().unwrap().retain(|x| x.id != id);
+                            axum::Json(serde_json::json!({"result": {}}))
+                        }
+                    },
+                ),
             );
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -326,8 +347,12 @@ mod tests {
     async fn dns_api_roundtrip_against_mock() {
         let (base, records) = mock_cf().await;
         let api = DnsApi::new(base, "tok".into(), "example.com".into());
-        api.create_a_record("edge.example.com", "10.0.0.1").await.unwrap();
-        api.create_a_record("edge.example.com", "10.0.0.2").await.unwrap();
+        api.create_a_record("edge.example.com", "10.0.0.1")
+            .await
+            .unwrap();
+        api.create_a_record("edge.example.com", "10.0.0.2")
+            .await
+            .unwrap();
         let listed = api.list_a_records("edge.example.com").await.unwrap();
         assert_eq!(listed.len(), 2);
         let stray = listed.iter().find(|r| r.content == "10.0.0.2").unwrap();
@@ -338,8 +363,12 @@ mod tests {
 
     #[test]
     fn creates_own_ip_when_missing() {
-        let (del, create) =
-            plan(&[rec("1", "10.0.0.1")], Some("10.0.0.2"), &BTreeSet::new(), false);
+        let (del, create) = plan(
+            &[rec("1", "10.0.0.1")],
+            Some("10.0.0.2"),
+            &BTreeSet::new(),
+            false,
+        );
         assert!(create);
         assert!(del.is_empty()); // partition guard: no peers seen
     }
@@ -348,7 +377,11 @@ mod tests {
     fn removes_dead_ip_when_peers_visible() {
         let live: BTreeSet<String> = ["10.0.0.3".to_string()].into();
         let (del, create) = plan(
-            &[rec("1", "10.0.0.1"), rec("2", "10.0.0.2"), rec("3", "10.0.0.3")],
+            &[
+                rec("1", "10.0.0.1"),
+                rec("2", "10.0.0.2"),
+                rec("3", "10.0.0.3"),
+            ],
             Some("10.0.0.1"),
             &live,
             true,

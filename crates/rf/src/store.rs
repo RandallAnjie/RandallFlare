@@ -36,6 +36,11 @@ impl Store {
         }
         let db = Database::create(path)
             .with_context(|| format!("opening redb at {}", path.display()))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+        }
         // Ensure tables exist so first reads don't error.
         let tx = db.begin_write()?;
         {
@@ -82,7 +87,10 @@ impl Store {
         let tx = self.db.begin_write()?;
         {
             let mut t = tx.open_table(LOG)?;
-            t.insert(Self::log_key(name, version).as_str(), env.to_bytes().as_slice())?;
+            t.insert(
+                Self::log_key(name, version).as_str(),
+                env.to_bytes().as_slice(),
+            )?;
         }
         tx.commit()?;
         Ok(())
@@ -114,7 +122,10 @@ impl Store {
         let tx = self.db.begin_write()?;
         {
             let mut t = tx.open_table(CLAIMS)?;
-            t.insert(Self::claim_key(task, holder_hex).as_str(), env.to_bytes().as_slice())?;
+            t.insert(
+                Self::claim_key(task, holder_hex).as_str(),
+                env.to_bytes().as_slice(),
+            )?;
         }
         tx.commit()?;
         Ok(())
@@ -317,7 +328,10 @@ mod tests {
         let path = tmp();
         let store = Store::open(&path).unwrap();
         let e = KvEntry {
-            hlc: Hlc { wall_ms: 5, logical: 0 },
+            hlc: Hlc {
+                wall_ms: 5,
+                logical: 0,
+            },
             writer: PublicId([2; 32]),
             value: Some(b"v".to_vec()),
             expires_at_ms: None,
@@ -335,7 +349,9 @@ mod tests {
         {
             let store = Store::open(&path).unwrap();
             let kp = Keypair::from_seed([1; 32]);
-            store.put_claim("t", "aa", &Envelope::seal(&"c".to_string(), &kp)).unwrap();
+            store
+                .put_claim("t", "aa", &Envelope::seal(&"c".to_string(), &kp))
+                .unwrap();
         }
         let store = Store::open(&path).unwrap();
         assert_eq!(store.load_claims().unwrap().len(), 1);

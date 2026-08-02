@@ -32,7 +32,10 @@ impl Clock {
     /// Timestamp a local event at wall time `wall_ms`.
     pub fn now(&mut self, wall_ms: u64) -> Hlc {
         if wall_ms > self.last.wall_ms {
-            self.last = Hlc { wall_ms, logical: 0 };
+            self.last = Hlc {
+                wall_ms,
+                logical: 0,
+            };
         } else {
             self.last.logical += 1;
         }
@@ -49,7 +52,10 @@ impl Clock {
             // if now() is called with a stale wall clock.
             base
         } else {
-            Hlc { wall_ms: base.wall_ms, logical: base.logical + 1 }
+            Hlc {
+                wall_ms: base.wall_ms,
+                logical: base.logical + 1,
+            }
         };
     }
 
@@ -75,7 +81,10 @@ mod tests {
     fn observe_pulls_ahead_of_remote() {
         let mut c = Clock::new();
         c.now(100);
-        let remote = Hlc { wall_ms: 5000, logical: 7 };
+        let remote = Hlc {
+            wall_ms: 5000,
+            logical: 7,
+        };
         c.observe(remote, 100);
         assert!(c.now(100) > remote);
     }
@@ -87,15 +96,33 @@ mod tests {
             c.now(100);
         }
         let t = c.now(200);
-        assert_eq!(t, Hlc { wall_ms: 200, logical: 0 });
+        assert_eq!(
+            t,
+            Hlc {
+                wall_ms: 200,
+                logical: 0
+            }
+        );
     }
 
     #[test]
     fn observe_then_real_time_advances() {
         let mut c = Clock::new();
-        c.observe(Hlc { wall_ms: 500, logical: 3 }, 100);
+        c.observe(
+            Hlc {
+                wall_ms: 500,
+                logical: 3,
+            },
+            100,
+        );
         let t = c.now(600);
-        assert_eq!(t, Hlc { wall_ms: 600, logical: 0 });
+        assert_eq!(
+            t,
+            Hlc {
+                wall_ms: 600,
+                logical: 0
+            }
+        );
         let t2 = c.now(600);
         assert!(t2 > t);
     }
