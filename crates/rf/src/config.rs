@@ -200,11 +200,20 @@ pub struct RuntimeConfig {
     /// First local port for per-worker workerd sockets.
     #[serde(default = "default_port_base")]
     pub port_base: u16,
+    /// Permit native workerd local-disk Durable Objects. This is
+    /// intentionally opt-in until quorum fencing is wired: enabling
+    /// it on more than one node would create split-brain objects.
+    #[serde(default)]
+    pub allow_local_durable_objects: bool,
 }
 
 impl Default for RuntimeConfig {
     fn default() -> Self {
-        Self { workerd: None, port_base: default_port_base() }
+        Self {
+            workerd: None,
+            port_base: default_port_base(),
+            allow_local_durable_objects: false,
+        }
     }
 }
 

@@ -133,4 +133,7 @@ stays too thin to hide bugs.
 2. **v0.2** — ACME via claims, overlay transport for inner nodes,
    self-update on.
 3. **v0.3** — micro-quorum storage: D1 (SQLite home + WAL replication),
-   Durable Objects with epoch-fenced leases.
+   Durable Objects with epoch-fenced leases. Native workerd DO bindings
+   and local SQLite persistence are implemented behind an explicit
+   single-node gate; distributed activation remains blocked until the
+   lease owner and its SQLite snapshot are majority-fenced.

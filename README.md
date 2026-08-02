@@ -54,8 +54,13 @@ commit through a majority; killing the leader loses nothing
 --params '[…]'` against any node — requests chase the leader
 automatically.
 
-Remaining: overlay transport for non-public nodes, self-update on,
-Durable Objects on the same quorum layer (v0.3 phase 2).
+**Durable Objects (v0.3 phase 2, groundwork)**: manifests and `rf.json`
+can declare native workerd Durable Object namespaces, including SQLite
+storage. Local-disk persistence is verified against real workerd across
+an rf restart. It is deliberately opt-in (the
+`allow_local_durable_objects = true` setting under `[runtime]`) and intended only for a single-node
+development cluster until quorum ownership and snapshot replication land;
+multi-node execution without fencing would permit split-brain objects.
 
 ## Build
 
@@ -131,4 +136,24 @@ rf deploy ./my-worker            # deploy to one node = deploy to all
 rf status
 rf kv put ns1 greeting hello
 rf worker-delete site
+```
+
+Durable Object bindings use the exported class name; `unique_key` is
+optional and receives a stable deployment-derived value:
+
+```json
+{
+  "name": "counter",
+  "main": "index.js",
+  "durable_objects": {
+    "COUNTER": { "class_name": "Counter", "enable_sql": true }
+  }
+}
+```
+
+For current single-node development only, enable the safety gate:
+
+```toml
+[runtime]
+allow_local_durable_objects = true
 ```

@@ -13,9 +13,27 @@ use anyhow::{bail, Context, Result};
 use rf_core::envelope::Envelope;
 use rf_core::identity::AnyKeypair;
 use rf_core::manifest::{AssetFile, Module, ModuleKind, WorkerManifest};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+
+pub const DO_METADATA_ENV: &str = "__RF_DURABLE_OBJECTS_V1";
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DurableObjectBinding {
+    pub class_name: String,
+    #[serde(default)]
+    pub unique_key: String,
+    #[serde(default)]
+    pub enable_sql: bool,
+}
+
+pub fn durable_objects(m: &WorkerManifest) -> BTreeMap<String, DurableObjectBinding> {
+    m.env
+        .get(DO_METADATA_ENV)
+        .and_then(|raw| serde_json::from_str(raw).ok())
+        .unwrap_or_default()
+}
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -30,6 +48,9 @@ pub struct DeploySpec {
     /// binding name → kv namespace id.
     #[serde(default)]
     pub kv: BTreeMap<String, String>,
+    /// binding name → Durable Object class configuration.
+    #[serde(default)]
+    pub durable_objects: BTreeMap<String, DurableObjectBinding>,
     #[serde(default)]
     pub crons: Vec<String>,
     /// Relative dir of static assets.
@@ -83,6 +104,9 @@ pub fn read_bundle(dir: &Path) -> Result<Bundle> {
     let raw = std::fs::read_to_string(&spec_path)
         .with_context(|| format!("reading {}", spec_path.display()))?;
     let spec: DeploySpec = serde_json::from_str(&raw).context("parsing rf.json")?;
+    if spec.env.contains_key(DO_METADATA_ENV) {
+        bail!("env key {DO_METADATA_ENV} is reserved by rf");
+    }
 
     let assets_dir = spec.assets.as_ref().map(|a| dir.join(a));
     let mut modules = Vec::new();
@@ -149,6 +173,41 @@ pub async fn deploy(
         });
     }
 
+    let mut durable_objects = bundle.spec.durable_objects.clone();
+    for binding in durable_objects.values_mut() {
+        if binding.unique_key.is_empty() {
+            binding.unique_key = format!("rf--{}--{}", bundle.spec.name, binding.class_name);
+        }
+    }
+    let mut env = bundle.spec.env.clone();
+    if !durable_objects.is_empty() {
+        let identifier = |s: &str| {
+            let mut chars = s.chars();
+            chars
+                .next()
+                .map(|c| c.is_ascii_alphabetic() || c == '_' || c == '$')
+                .unwrap_or(false)
+                && chars.all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '$')
+        };
+        let mut classes = BTreeMap::new();
+        for (binding, object) in &durable_objects {
+            if !identifier(binding)
+                || !identifier(&object.class_name)
+                || object.unique_key.contains('/')
+                || object.unique_key.contains('\\')
+                || object.unique_key == "."
+                || object.unique_key == ".."
+            {
+                bail!("invalid Durable Object binding {binding:?}");
+            }
+            if let Some(prior) = classes.insert(&object.class_name, &object.unique_key) {
+                if prior != &object.unique_key {
+                    bail!("Durable Object class {:?} has conflicting unique keys", object.class_name);
+                }
+            }
+        }
+        env.insert(DO_METADATA_ENV.into(), serde_json::to_string(&durable_objects)?);
+    }
     let manifest = WorkerManifest {
         name: bundle.spec.name.clone(),
         version,
@@ -158,7 +217,7 @@ pub async fn deploy(
         modules,
         assets,
         hostnames: bundle.spec.hostnames.iter().map(|h| h.to_ascii_lowercase()).collect(),
-        env: bundle.spec.env.clone(),
+        env,
         kv_bindings: bundle.spec.kv.clone(),
         crons: bundle.spec.crons.clone(),
         compatibility_date: bundle.spec.compatibility_date.clone(),

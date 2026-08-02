@@ -361,6 +361,43 @@ mod tests {
         SignerId::Ed(op().public())
     }
 
+    #[test]
+    fn frozen_v03_manifest_wire_decodes() {
+        #[derive(Serialize)]
+        struct LegacyManifest {
+            name: String,
+            version: u64,
+            prev: Option<[u8; 32]>,
+            deleted: bool,
+            main: String,
+            modules: Vec<Module>,
+            assets: Vec<AssetFile>,
+            hostnames: Vec<String>,
+            env: BTreeMap<String, String>,
+            kv_bindings: BTreeMap<String, String>,
+            crons: Vec<String>,
+            compatibility_date: String,
+        }
+        let m = mk("legacy", 1, &[]);
+        let old = LegacyManifest {
+            name: m.name.clone(),
+            version: m.version,
+            prev: m.prev,
+            deleted: m.deleted,
+            main: m.main.clone(),
+            modules: m.modules.clone(),
+            assets: m.assets.clone(),
+            hostnames: m.hostnames.clone(),
+            env: m.env.clone(),
+            kv_bindings: m.kv_bindings.clone(),
+            crons: m.crons.clone(),
+            compatibility_date: m.compatibility_date.clone(),
+        };
+        let raw = postcard::to_stdvec(&old).unwrap();
+        let decoded: WorkerManifest = postcard::from_bytes(&raw).unwrap();
+        assert_eq!(decoded.name, "legacy");
+    }
+
     /// Seal a chained successor: fills `prev` from the prior envelope.
     fn seal_after(m: &mut WorkerManifest, prior: &Envelope, key: &Keypair) -> Envelope {
         m.prev = Some(prior.digest());

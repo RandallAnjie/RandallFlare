@@ -236,6 +236,100 @@ async fn module_worker_on_real_workerd() {
     n.child.wait().unwrap();
 }
 
+/// Native workerd Durable Object API and SQLite persistence. This is
+/// explicitly local-only until rf's quorum owner fences execution.
+#[tokio::test(flavor = "multi_thread")]
+async fn durable_object_on_real_workerd() {
+    let workerd_present = std::env::var_os("PATH")
+        .map(|p| std::env::split_paths(&p).any(|d| d.join("workerd").is_file()))
+        .unwrap_or(false);
+    if !workerd_present {
+        eprintln!("SKIP: workerd not on PATH — Durable Object e2e not exercised");
+        return;
+    }
+
+    let operator = Keypair::from_seed([18u8; 32]);
+    let op_any = AnyKeypair::Ed(operator.clone());
+    let client = PeerClient::new(SECRET);
+    let http = reqwest::Client::new();
+    let dir = std::env::temp_dir().join(format!("rf-e2e-do-{}", rand::random::<u32>()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let (gossip, api, ingress) = (free_port(), free_port(), free_port());
+    let config = write_config(&dir, &operator, gossip, api, ingress, &[], "do");
+    let mut cfg = std::fs::read_to_string(&config).unwrap();
+    cfg.push_str("\n[runtime]\nallow_local_durable_objects = true\n");
+    std::fs::write(&config, cfg).unwrap();
+    let mut child = spawn_node(&dir, &config);
+    let api_addr = format!("127.0.0.1:{api}");
+    wait_ping(&api_addr, Duration::from_secs(15)).await;
+
+    let bundle_dir = dir.join("bundle");
+    std::fs::create_dir_all(&bundle_dir).unwrap();
+    std::fs::write(
+        bundle_dir.join("rf.json"),
+        r#"{"name":"counter","main":"index.js","hostnames":["counter.test"],
+            "durable_objects":{"COUNTER":{"class_name":"Counter","enable_sql":true}}}"#,
+    )
+    .unwrap();
+    std::fs::write(
+        bundle_dir.join("index.js"),
+        r#"export class Counter {
+  constructor(ctx) { this.ctx = ctx; }
+  async fetch() {
+    const old = (await this.ctx.storage.get("count")) || 0;
+    const value = old + 1;
+    await this.ctx.storage.put("count", value);
+    return new Response(String(value));
+  }
+}
+export default {
+  fetch(req, env) {
+    const id = env.COUNTER.idFromName("global");
+    return env.COUNTER.get(id).fetch(req);
+  }
+};"#,
+    )
+    .unwrap();
+    let bundle = rf::deploy::read_bundle(&bundle_dir).unwrap();
+    rf::deploy::deploy(&bundle, &client, &api_addr, &op_any).await.unwrap();
+
+    let call = || {
+        http.get(format!("http://127.0.0.1:{ingress}/"))
+            .header("host", "counter.test")
+            .send()
+    };
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        if let Ok(resp) = call().await {
+            if resp.status() == 200 && resp.text().await.unwrap() == "1" {
+                break;
+            }
+        }
+        assert!(Instant::now() < deadline, "Durable Object worker never came up");
+        tokio::time::sleep(Duration::from_millis(300)).await;
+    }
+    assert_eq!(call().await.unwrap().text().await.unwrap(), "2");
+
+    // Restart rf/workerd and prove local SQLite state survives.
+    child.kill().unwrap();
+    child.wait().unwrap();
+    let mut child = spawn_node(&dir, &config);
+    wait_ping(&api_addr, Duration::from_secs(15)).await;
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        if let Ok(resp) = call().await {
+            if resp.status() == 200 {
+                assert_eq!(resp.text().await.unwrap(), "3");
+                break;
+            }
+        }
+        assert!(Instant::now() < deadline, "Durable Object did not recover after restart");
+        tokio::time::sleep(Duration::from_millis(300)).await;
+    }
+    child.kill().unwrap();
+    child.wait().unwrap();
+}
+
 /// HTTPS ingress: drop a PEM pair into <data>/certs, boot, serve an
 /// assets worker over TLS with correct SNI resolution.
 #[tokio::test(flavor = "multi_thread")]
@@ -489,10 +583,10 @@ async fn d1_quorum_replicates_and_survives_replica_loss() {
     let client = PeerClient::new(SECRET);
 
     // Three-node cluster: b and c seed off a.
-    let mut a = start("d1a", &operator, &[]);
+    let a = start("d1a", &operator, &[]);
     wait_ping(&a.api, Duration::from_secs(15)).await;
-    let mut b = start("d1b", &operator, &[a.gossip]);
-    let mut c = start("d1c", &operator, &[a.gossip]);
+    let b = start("d1b", &operator, &[a.gossip]);
+    let c = start("d1c", &operator, &[a.gossip]);
     wait_ping(&b.api, Duration::from_secs(15)).await;
     wait_ping(&c.api, Duration::from_secs(15)).await;
     // Let membership settle so the replica group sees all three.
