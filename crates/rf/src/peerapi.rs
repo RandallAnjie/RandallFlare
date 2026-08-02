@@ -5,28 +5,37 @@
 use crate::auth;
 use crate::node::{now_ms, Node};
 use crate::peers::encode_envelopes;
+use crate::transport;
 use anyhow::Result;
-use axum::body::Bytes;
+use axum::body::{to_bytes, Body, Bytes};
 use axum::extract::{ConnectInfo, Path, Query, State};
-use axum::http::{HeaderMap, Method, StatusCode, Uri};
+use axum::http::{HeaderMap, Method, Request, StatusCode, Uri};
+use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::Router;
 use rf_core::envelope::Envelope;
 use serde::Deserialize;
+use std::collections::HashMap;
 use std::net::SocketAddr;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 #[derive(Clone)]
 pub struct Api {
     pub node: Arc<Node>,
     pub d1: crate::d1::Registry,
     secret: [u8; 32],
+    seen_nonces: Arc<Mutex<HashMap<String, u64>>>,
 }
 
 pub async fn serve(node: Arc<Node>, d1: crate::d1::Registry) -> Result<SocketAddr> {
     let secret = node.cfg.cluster_secret_bytes()?;
-    let api = Api { node: node.clone(), d1, secret };
+    let api = Api {
+        node: node.clone(),
+        d1,
+        secret,
+        seen_nonces: Arc::new(Mutex::new(HashMap::new())),
+    };
     let app = router(api);
     let listener = tokio::net::TcpListener::bind(node.cfg.peer_api.listen).await?;
     let addr = listener.local_addr()?;
@@ -44,7 +53,7 @@ pub async fn serve(node: Arc<Node>, d1: crate::d1::Registry) -> Result<SocketAdd
 }
 
 pub fn router(api: Api) -> Router {
-    Router::new()
+    let routes = Router::new()
         .route("/v1/ping", get(ping))
         .route("/v1/status", get(status))
         .route("/v1/sync/manifests", get(sync_manifests))
@@ -62,8 +71,124 @@ pub fn router(api: Api) -> Router {
         )
         .route("/v1/quorum/{db}", post(quorum_msg))
         .route("/v1/d1/create", post(d1_create))
-        .route("/v1/d1/{db}/exec", post(d1_exec))
+        .route("/v1/d1/{db}/exec", post(d1_exec));
+    routes
+        .layer(middleware::from_fn_with_state(api.clone(), encrypted_transport))
         .with_state(api)
+}
+
+/// Decrypt encrypted peer/CLI requests before handlers see them and
+/// encrypt the complete response on the way out. Loopback callers may
+/// stay plaintext (workerd bindings); encrypted loopback is accepted
+/// so the same PeerClient path is exercised by local tests and CLIs.
+async fn encrypted_transport(
+    State(api): State<Api>,
+    request: Request<Body>,
+    next: Next,
+) -> Response {
+    let encrypted = request
+        .headers()
+        .get(transport::ENC_HEADER)
+        .and_then(|v| v.to_str().ok())
+        == Some(transport::VERSION);
+    let remote = request
+        .extensions()
+        .get::<ConnectInfo<SocketAddr>>()
+        .map(|c| c.0);
+    let loopback = remote.map(|a| a.ip().is_loopback()).unwrap_or(true);
+
+    // Ping is intentionally public and contains no cluster data.
+    if !encrypted {
+        if !loopback && request.uri().path() != "/v1/ping" {
+            return (StatusCode::UPGRADE_REQUIRED, "encrypted peer transport required")
+                .into_response();
+        }
+        return next.run(request).await;
+    }
+
+    let ts = request
+        .headers()
+        .get(auth::TS_HEADER)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_string();
+    let nonce = request
+        .headers()
+        .get(transport::NONCE_HEADER)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_string();
+    let method = request.method().to_string();
+    let path = request.uri().path().to_string();
+    let (parts, body) = request.into_parts();
+    let ciphertext = match to_bytes(body, usize::MAX).await {
+        Ok(v) => v,
+        Err(_) => return (StatusCode::PAYLOAD_TOO_LARGE, "peer payload too large").into_response(),
+    };
+    let plaintext = match transport::open(
+        &api.secret,
+        &nonce,
+        &transport::request_aad(&ts, &method, &path),
+        &ciphertext,
+    ) {
+        Ok(v) => v,
+        Err(_) => return (StatusCode::UNAUTHORIZED, "bad encrypted peer payload").into_response(),
+    };
+
+    // Reject exact ciphertext replays inside the otherwise-valid HMAC
+    // clock window. The bounded cache is process-local by design: a
+    // replay sent to another node still has to represent an operation
+    // that the cluster protocols make idempotent.
+    let now = now_ms();
+    {
+        let mut seen = api.seen_nonces.lock().unwrap();
+        seen.retain(|_, at| now.saturating_sub(*at) <= auth::MAX_SKEW_MS);
+        if seen.contains_key(&nonce) {
+            return (StatusCode::CONFLICT, "replayed encrypted peer request").into_response();
+        }
+        if seen.len() >= 8192 {
+            if let Some(oldest) = seen
+                .iter()
+                .min_by_key(|(_, at)| *at)
+                .map(|(n, _)| n.clone())
+            {
+                seen.remove(&oldest);
+            }
+        }
+        seen.insert(nonce.clone(), now);
+    }
+
+    let response = next.run(Request::from_parts(parts, Body::from(plaintext))).await;
+    let status = response.status();
+    let (mut parts, body) = response.into_parts();
+    let plaintext = match to_bytes(body, usize::MAX).await {
+        Ok(v) => v,
+        Err(_) => {
+            return (StatusCode::INTERNAL_SERVER_ERROR, "failed to encode response")
+                .into_response()
+        }
+    };
+    let (nonce, ciphertext) = match transport::seal(
+        &api.secret,
+        &transport::response_aad(&nonce, status.as_u16()),
+        &plaintext,
+    ) {
+        Ok(v) => v,
+        Err(_) => {
+            return (StatusCode::INTERNAL_SERVER_ERROR, "failed to encrypt response")
+                .into_response()
+        }
+    };
+    parts.headers.remove(axum::http::header::CONTENT_LENGTH);
+    parts.headers.insert(
+        transport::ENC_HEADER,
+        axum::http::HeaderValue::from_static(transport::VERSION),
+    );
+    parts.headers.insert(
+        transport::NONCE_HEADER,
+        axum::http::HeaderValue::from_str(&nonce).expect("hex nonce is a header value"),
+    );
+    Response::from_parts(parts, Body::from(ciphertext))
 }
 
 /// Auth gate. Loopback (workerd bindings, same-host CLI) is trusted;
@@ -343,7 +468,9 @@ async fn kv_put(
     }
     let expires = q.expires_at_ms.or_else(|| q.ttl_ms.map(|t| now_ms() + t));
     match api.node.kv_put(&ns, &key, Some(body.to_vec()), expires) {
-        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        // Encrypted transport needs to carry an AEAD tag in the body;
+        // HTTP forbids bodies on 204 responses.
+        Ok(()) => StatusCode::OK.into_response(),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     }
 }
@@ -368,7 +495,7 @@ async fn quorum_msg(
     match tx {
         Some(tx) => {
             let _ = tx.send(crate::d1::DriverCmd::Net(wire)).await;
-            StatusCode::NO_CONTENT.into_response()
+            StatusCode::OK.into_response()
         }
         None => (StatusCode::NOT_FOUND, "not a member of this db's group").into_response(),
     }
@@ -505,7 +632,7 @@ async fn kv_delete(
         return r;
     }
     match api.node.kv_put(&ns, &key, None, None) {
-        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Ok(()) => StatusCode::OK.into_response(),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     }
 }

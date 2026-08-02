@@ -1,8 +1,7 @@
 //! Peer API auth: HMAC-SHA256 over (timestamp, method, path, body
 //! hash) with the cluster secret. Keeps strangers off the API without
-//! a PKI; confidentiality on the wire is v0.2 (overlay/mTLS) — nothing
-//! secret travels in v0.1 requests except worker env vars, so deploy
-//! from a trusted network or over the overlay until then.
+//! a PKI. The transport module encrypts the authenticated plaintext
+//! with a dedicated key derived from the same cluster secret.
 //!
 //! Loopback requests skip auth: workerd bindings and same-host CLI
 //! calls come from 127.0.0.1 and hold no cluster secret. A node is a

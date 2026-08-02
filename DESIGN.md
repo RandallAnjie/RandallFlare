@@ -98,7 +98,7 @@ BFT-sized quorums.
 
 No central database means authority comes from signatures:
 
-- **cluster PSK** — encrypts gossip, gates membership.
+- **cluster PSK** — encrypts gossip and peer API payloads, gates membership.
 - **node keys** (ed25519) — sign claims and heartbeat-ish state.
 - **operator key** (ed25519) — signs manifests and (later) user/token
   certificates. Verification is offline; no node needs to phone home.

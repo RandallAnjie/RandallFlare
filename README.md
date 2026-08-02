@@ -110,10 +110,11 @@ rf run --config rf.toml
 As a service: `infra/rf.service` (put `CF_API_TOKEN=…` in `/etc/rf.env`,
 config at `/etc/rf.toml`, binary at `/usr/local/bin/rf`).
 
-> Security note (v0.2): the peer API authenticates with a cluster HMAC
-> but is not yet encrypted on the wire — deploy over a trusted path
-> (same DC, WireGuard, SSH tunnel) and avoid real secrets in worker
-> `env` until the overlay transport lands.
+> The peer API encrypts every remote request and response with
+> XChaCha20-Poly1305 using a key derived from the cluster secret. A
+> per-request nonce, metadata-bound AEAD, HMAC clock window, and replay
+> cache protect worker env, KV, D1, blobs, and snapshots on untrusted
+> networks. Only the public `/v1/ping` health check remains plaintext.
 
 ## Deploy a worker
 

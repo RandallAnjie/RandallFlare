@@ -1,8 +1,10 @@
 //! HTTP client for the peer API — used by gossip-driven anti-entropy
 //! (manifest/claim/KV sync, blob fetch) and by the CLI (deploy, kv,
-//! status). All requests carry the cluster-secret HMAC.
+//! status). All requests carry the cluster-secret HMAC and an
+//! XChaCha20-Poly1305 encrypted body; responses are encrypted too.
 
 use crate::auth;
+use crate::transport;
 use anyhow::{bail, Context, Result};
 use rf_core::envelope::Envelope;
 use rf_core::kv::KvEntry;
@@ -28,36 +30,78 @@ impl PeerClient {
     async fn get(&self, base: &str, path: &str) -> Result<Vec<u8>> {
         let ts = crate::node::now_ms();
         let mac = auth::mac_hex(&self.secret, ts, "GET", path, b"");
+        let (nonce, body) = transport::seal(
+            &self.secret,
+            &transport::request_aad(&ts.to_string(), "GET", path),
+            b"",
+        )?;
         let resp = self
             .http
             .get(format!("http://{base}{path}"))
             .header(auth::TS_HEADER, ts.to_string())
             .header(auth::MAC_HEADER, mac)
+            .header(transport::ENC_HEADER, transport::VERSION)
+            .header(transport::NONCE_HEADER, &nonce)
+            .body(body)
             .send()
             .await
             .with_context(|| format!("GET {base}{path}"))?;
-        if !resp.status().is_success() {
-            bail!("GET {base}{path} → {}", resp.status());
-        }
-        Ok(resp.bytes().await?.to_vec())
+        self.decode_response("GET", path, &nonce, resp).await
     }
 
     pub async fn post(&self, base: &str, path: &str, body: Vec<u8>) -> Result<Vec<u8>> {
         let ts = crate::node::now_ms();
         let mac = auth::mac_hex(&self.secret, ts, "POST", path, &body);
+        let (nonce, ciphertext) = transport::seal(
+            &self.secret,
+            &transport::request_aad(&ts.to_string(), "POST", path),
+            &body,
+        )?;
         let resp = self
             .http
             .post(format!("http://{base}{path}"))
             .header(auth::TS_HEADER, ts.to_string())
             .header(auth::MAC_HEADER, mac)
-            .body(body)
+            .header(transport::ENC_HEADER, transport::VERSION)
+            .header(transport::NONCE_HEADER, &nonce)
+            .body(ciphertext)
             .send()
             .await
             .with_context(|| format!("POST {base}{path}"))?;
+        self.decode_response("POST", path, &nonce, resp).await
+    }
+
+    async fn decode_response(
+        &self,
+        method: &str,
+        path: &str,
+        request_nonce: &str,
+        resp: reqwest::Response,
+    ) -> Result<Vec<u8>> {
         let status = resp.status();
-        let bytes = resp.bytes().await?.to_vec();
+        let encrypted = resp
+            .headers()
+            .get(transport::ENC_HEADER)
+            .and_then(|v| v.to_str().ok())
+            == Some(transport::VERSION);
+        let nonce = resp
+            .headers()
+            .get(transport::NONCE_HEADER)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("")
+            .to_string();
+        let wire = resp.bytes().await?.to_vec();
+        if !encrypted {
+            bail!("{method} response from peer was not encrypted (status {status})");
+        }
+        let bytes = transport::open(
+            &self.secret,
+            &nonce,
+            &transport::response_aad(request_nonce, status.as_u16()),
+            &wire,
+        )?;
         if !status.is_success() {
-            bail!("POST {base}{path} → {status}: {}", String::from_utf8_lossy(&bytes));
+            bail!("{method} {path} → {status}: {}", String::from_utf8_lossy(&bytes));
         }
         Ok(bytes)
     }
