@@ -1,0 +1,14 @@
+# Ubuntu 24.04 restricts unprivileged user namespaces through AppArmor. This
+# named profile lets bubblewrap create its user namespace; filesystem, PID,
+# IPC, UTS and cgroup isolation remain defined by the bubblewrap invocation.
+# No global user-namespace sysctl is changed.
+
+abi <abi/4.0>,
+include <tunables/global>
+
+profile rf-bwrap /usr/bin/bwrap flags=(unconfined) {
+  userns,
+
+  # Site-specific additions and overrides.
+  include if exists <local/rf-bwrap>
+}

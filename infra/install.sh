@@ -9,6 +9,7 @@ Options:
   --config PATH       Install this node config. Required on first install.
   --env PATH          Install an EnvironmentFile (for CF_API_TOKEN, etc.).
   --workerd PATH      Install an already-downloaded workerd executable.
+  --apparmor PATH     Ubuntu AppArmor profile for bubblewrap builds.
   --skip-workerd      Do not download workerd when it is not installed.
   --health-node ADDR  Peer API health address (default 127.0.0.1:7382).
   --no-start          Install and validate, but do not enable/start systemd.
@@ -24,19 +25,21 @@ binary_source=""
 config_source=""
 env_source=""
 workerd_source=""
+apparmor_source=""
 health_node="127.0.0.1:7382"
 skip_workerd=0
 no_start=0
 
 while (($#)); do
   case "$1" in
-    --binary|--config|--env|--workerd|--health-node)
+    --binary|--config|--env|--workerd|--apparmor|--health-node)
       [[ $# -ge 2 ]] || { echo "$1 requires a value" >&2; exit 2; }
       case "$1" in
         --binary) binary_source=$2 ;;
         --config) config_source=$2 ;;
         --env) env_source=$2 ;;
         --workerd) workerd_source=$2 ;;
+        --apparmor) apparmor_source=$2 ;;
         --health-node) health_node=$2 ;;
       esac
       shift 2
@@ -77,6 +80,10 @@ done
   echo "workerd file not found: $workerd_source" >&2
   exit 2
 }
+[[ -z "$apparmor_source" || -f "$apparmor_source" ]] || {
+  echo "AppArmor profile not found: $apparmor_source" >&2
+  exit 2
+}
 
 destdir=${DESTDIR:-}
 if [[ "$destdir" == "/" ]]; then
@@ -99,6 +106,7 @@ workerd_bin=$(path_in_root /usr/local/bin/workerd)
 config_target=$(path_in_root /etc/rf.toml)
 env_target=$(path_in_root /etc/rf.env)
 service_target=$(path_in_root /etc/systemd/system/rf.service)
+apparmor_target=$(path_in_root /etc/apparmor.d/rf-bwrap)
 state_dir=$(path_in_root /var/lib/rf)
 rf_candidate="${rf_bin}.install.$$"
 workerd_candidate="${workerd_bin}.install.$$"
@@ -178,6 +186,22 @@ elif [[ ! -e "$env_target" ]]; then
   install -m 0640 /dev/null "$env_target"
 fi
 install -m 0644 "$script_dir/rf.service" "$service_target"
+
+# Ubuntu 24.04's AppArmor user-namespace restriction otherwise sends bwrap to
+# the generic unprivileged_userns profile, which cannot populate uid_map. Load
+# a path-scoped bwrap profile instead of disabling the host-wide restriction.
+if [[ -n "$apparmor_source" ]]; then
+  apparmor_restriction=$(path_in_root /proc/sys/kernel/apparmor_restrict_unprivileged_userns)
+  if [[ -f "$apparmor_restriction" && "$(cat "$apparmor_restriction")" == "1" ]]; then
+    command -v apparmor_parser >/dev/null || {
+      echo "AppArmor restricts user namespaces but apparmor_parser is unavailable" >&2
+      exit 1
+    }
+    install -d -m 0755 "$(dirname -- "$apparmor_target")"
+    install -m 0644 "$apparmor_source" "$apparmor_target"
+    apparmor_parser -r "$apparmor_target"
+  fi
+fi
 
 if [[ -z "$destdir" ]]; then
   chown root:rf "$config_target" "$env_target"

@@ -10,7 +10,7 @@ machine, verifies its SHA-256 sidecar, and delegates to the hardened installer.
 No locally-built binary is uploaded.
 
 Options:
-  --version TAG       Exact release tag, for example v0.6.1 (required).
+  --version TAG       Exact release tag, for example v0.6.2 (required).
   --repo OWNER/REPO   GitHub repository (default RandallAnjie/RandallFlare).
   --config PATH       Install this node config. Required on first install.
   --env PATH          Install an EnvironmentFile.
@@ -53,7 +53,7 @@ while (($#)); do
 done
 
 [[ "$version" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]+)?$ ]] || {
-  echo "--version must be an exact release tag such as v0.6.1" >&2
+  echo "--version must be an exact release tag such as v0.6.2" >&2
   exit 2
 }
 [[ "$repo" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]] || {
@@ -88,7 +88,7 @@ curl --fail --location --proto '=https' --tlsv1.2 \
 curl --fail --location --proto '=https' --tlsv1.2 \
   --output "$release_dir/rf-linux-x86_64.sha256" \
   "$release_base/rf-linux-x86_64.sha256"
-for file in install.sh fetch-workerd.sh rf.service; do
+for file in install.sh fetch-workerd.sh rf.service rf-bwrap.apparmor; do
   curl --fail --location --proto '=https' --tlsv1.2 \
     --output "$release_dir/$file" "$source_base/$file"
 done
@@ -114,6 +114,7 @@ reported_version=$("$release_dir/rf-linux-x86_64" --version)
 
 install_args=(
   --binary "$release_dir/rf-linux-x86_64"
+  --apparmor "$release_dir/rf-bwrap.apparmor"
   --health-node "$health_node"
 )
 [[ -z "$config" ]] || install_args+=(--config "$config")
