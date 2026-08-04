@@ -245,6 +245,17 @@ pub fn router(state: ConsoleState) -> Router {
         )
         .route("/api/analytics/{name}/stats", get(analytics_stats))
         .route("/api/analytics/{name}/group", get(analytics_group))
+        .route("/api/pipelines", get(pipeline_list).post(pipeline_apply))
+        .route("/api/pipelines/{name}", delete(pipeline_delete))
+        .route("/api/pipelines/{name}/tokens", post(pipeline_token_mint))
+        .route(
+            "/api/pipelines/{name}/tokens/{id}",
+            delete(pipeline_token_revoke),
+        )
+        .route("/api/pipelines/{name}/events", post(pipeline_ingest))
+        .route("/api/pipelines/{name}/status", get(pipeline_status))
+        .route("/api/pipelines/{name}/batches", get(pipeline_batches))
+        .route("/api/pipelines/{name}/flush", post(pipeline_flush))
         .route("/api/auth/logout", post(logout))
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
@@ -717,6 +728,8 @@ struct WorkerSettingsRequest {
     #[serde(default)]
     analytics_bindings: Option<BTreeMap<String, String>>,
     #[serde(default)]
+    pipeline_bindings: Option<BTreeMap<String, String>>,
+    #[serde(default)]
     crons: Option<Vec<String>>,
     #[serde(default)]
     compatibility_date: Option<String>,
@@ -772,11 +785,13 @@ async fn worker_get(
     env.remove(deploy::D1_METADATA_ENV);
     env.remove(deploy::QUEUE_METADATA_ENV);
     env.remove(deploy::ANALYTICS_METADATA_ENV);
+    env.remove(deploy::PIPELINE_METADATA_ENV);
     let durable_objects = deploy::durable_objects(&manifest);
     let r2_bindings = deploy::r2_bindings(&manifest);
     let d1_bindings = deploy::d1_bindings(&manifest);
     let queue_bindings = deploy::queue_bindings(&manifest);
     let analytics_bindings = deploy::analytics_bindings(&manifest);
+    let pipeline_bindings = deploy::pipeline_bindings(&manifest);
     let source = match &state.mode {
         ConsoleMode::Public { node, .. } => crate::build::source_head(node, &name)
             .filter(|record| !record.source.deleted)
@@ -829,6 +844,7 @@ async fn worker_get(
             "d1_bindings": d1_bindings,
             "queue_bindings": queue_bindings,
             "analytics_bindings": analytics_bindings,
+            "pipeline_bindings": pipeline_bindings,
             "crons": manifest.crons,
             "compatibility_date": manifest.compatibility_date,
             "durable_objects": durable_objects,
@@ -1073,6 +1089,7 @@ fn apply_worker_settings(
         d1_bindings,
         queue_bindings,
         analytics_bindings,
+        pipeline_bindings,
         crons,
         compatibility_date,
     } = request;
@@ -1083,6 +1100,7 @@ fn apply_worker_settings(
         && d1_bindings.is_none()
         && queue_bindings.is_none()
         && analytics_bindings.is_none()
+        && pipeline_bindings.is_none()
         && crons.is_none()
         && compatibility_date.is_none()
     {
@@ -1107,6 +1125,7 @@ fn apply_worker_settings(
             || env.contains_key(deploy::D1_METADATA_ENV)
             || env.contains_key(deploy::QUEUE_METADATA_ENV)
             || env.contains_key(deploy::ANALYTICS_METADATA_ENV)
+            || env.contains_key(deploy::PIPELINE_METADATA_ENV)
         {
             return Err(ApiError::bad_request(
                 "不能修改 RandallFlare 保留的环境变量",
@@ -1127,6 +1146,9 @@ fn apply_worker_settings(
         }
         if let Some(analytics) = manifest.env.get(deploy::ANALYTICS_METADATA_ENV).cloned() {
             env.insert(deploy::ANALYTICS_METADATA_ENV.into(), analytics);
+        }
+        if let Some(pipelines) = manifest.env.get(deploy::PIPELINE_METADATA_ENV).cloned() {
+            env.insert(deploy::PIPELINE_METADATA_ENV.into(), pipelines);
         }
         manifest.env = env;
     }
@@ -1242,6 +1264,32 @@ fn apply_worker_settings(
             );
         }
     }
+    if let Some(pipeline_bindings) = pipeline_bindings {
+        validate_settings_map(&pipeline_bindings, "Pipeline 绑定")?;
+        let identifier = |value: &str| {
+            let mut chars = value.chars();
+            chars.next().is_some_and(|character| {
+                character.is_ascii_alphabetic() || matches!(character, '_' | '$')
+            }) && chars.all(|character| {
+                character.is_ascii_alphanumeric() || matches!(character, '_' | '$')
+            })
+        };
+        for (binding, pipeline) in &pipeline_bindings {
+            if !identifier(binding) || !valid_name(pipeline) {
+                return Err(ApiError::bad_request(format!(
+                    "Pipeline 绑定 {binding} 或 Pipeline 名称无效"
+                )));
+            }
+        }
+        if pipeline_bindings.is_empty() {
+            manifest.env.remove(deploy::PIPELINE_METADATA_ENV);
+        } else {
+            manifest.env.insert(
+                deploy::PIPELINE_METADATA_ENV.into(),
+                serde_json::to_string(&pipeline_bindings)?,
+            );
+        }
+    }
     if let Some(crons) = crons {
         if crons.len() > 256 {
             return Err(ApiError::bad_request(
@@ -1272,6 +1320,7 @@ fn apply_worker_settings(
         .chain(deploy::d1_bindings(&manifest).keys())
         .chain(deploy::queue_bindings(&manifest).keys())
         .chain(deploy::analytics_bindings(&manifest).keys())
+        .chain(deploy::pipeline_bindings(&manifest).keys())
     {
         if !binding_names.insert(name.clone()) {
             return Err(ApiError::bad_request(format!("绑定名称 {name} 被重复使用")));
@@ -2437,6 +2486,362 @@ async fn analytics_group(
     Ok(Json(json!({ "groups": groups })))
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PipelineRequest {
+    name: String,
+    #[serde(default)]
+    description: String,
+    output_bucket: String,
+    #[serde(default = "pipeline_default_key_template")]
+    output_key_template: String,
+    #[serde(default = "pipeline_default_batch_bytes")]
+    batch_max_bytes: u64,
+    #[serde(default = "pipeline_default_batch_seconds")]
+    batch_max_seconds: u64,
+    #[serde(default)]
+    schema: Option<Value>,
+    #[serde(default)]
+    suspended: bool,
+    #[serde(default)]
+    suspend_reason: String,
+    #[serde(default)]
+    hostnames: Vec<String>,
+}
+
+fn pipeline_default_key_template() -> String {
+    "{pipeline}/year={yyyy}/month={mm}/day={dd}/hour={hh}/{agent}-{batchId}.jsonl.gz".into()
+}
+
+fn pipeline_default_batch_bytes() -> u64 {
+    crate::pipeline::DEFAULT_BATCH_BYTES
+}
+
+fn pipeline_default_batch_seconds() -> u64 {
+    crate::pipeline::DEFAULT_BATCH_SECONDS
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PipelineTokenRequest {
+    #[serde(default)]
+    label: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PipelineIngestRequest {
+    events: Vec<Value>,
+}
+
+#[derive(Debug, Deserialize)]
+struct PipelineBatchQuery {
+    limit: Option<usize>,
+}
+
+fn pipeline_spec_view(spec: &crate::pipeline::PipelineSpec) -> Value {
+    json!({
+        "description": spec.description,
+        "output_bucket": spec.output_bucket,
+        "output_key_template": spec.output_key_template,
+        "batch_max_bytes": spec.batch_max_bytes,
+        "batch_max_seconds": spec.batch_max_seconds,
+        "schema": spec.schema,
+        "suspended": spec.suspended,
+        "suspend_reason": spec.suspend_reason,
+        "hostnames": spec.hostnames,
+        "tokens": spec.tokens.iter().map(|token| json!({
+            "id": token.id,
+            "label": token.label,
+            "last_four": token.last_four,
+            "created_at_ms": token.created_at_ms,
+        })).collect::<Vec<_>>(),
+    })
+}
+
+async fn pipeline_list(State(state): State<ConsoleState>) -> ApiResult<Json<Value>> {
+    let records = state
+        .client
+        .resource_heads(&state.node, Some(crate::pipeline::PIPELINE_KIND))
+        .await?;
+    let mut pipelines = Vec::new();
+    for view in records.into_iter().filter(|view| !view.resource.deleted) {
+        let spec = crate::pipeline::pipeline_spec(&view.resource)?;
+        let status = state
+            .client
+            .pipeline_status(&state.node, &view.resource.name)
+            .await
+            .ok();
+        let default_hostname = match &state.mode {
+            ConsoleMode::Public { node, .. } => node.default_pipeline_hostname(&view.resource.name),
+            ConsoleMode::Local { .. } => None,
+        };
+        let hostnames = match &state.mode {
+            ConsoleMode::Public { node, .. } => {
+                node.effective_pipeline_hostnames(&view.resource.name, &spec)
+            }
+            ConsoleMode::Local { .. } => spec.hostnames.clone(),
+        };
+        pipelines.push(json!({
+            "name": view.resource.name,
+            "version": view.resource.version,
+            "digest": view.digest,
+            "spec": pipeline_spec_view(&spec),
+            "status": status,
+            "default_hostname": default_hostname,
+            "hostnames": hostnames,
+        }));
+    }
+    Ok(Json(json!({ "pipelines": pipelines })))
+}
+
+async fn pipeline_apply(
+    State(state): State<ConsoleState>,
+    Extension(principal): Extension<ConsolePrincipal>,
+    Json(request): Json<PipelineRequest>,
+) -> ApiResult<Json<Value>> {
+    state.require_mutation()?;
+    let bucket = state
+        .client
+        .resource_head(&state.node, crate::r2::BUCKET_KIND, &request.output_bucket)
+        .await?
+        .filter(|view| !view.resource.deleted)
+        .ok_or_else(|| ApiError::bad_request("Pipeline 输出 R2 bucket 不存在"))?;
+    crate::r2::bucket_spec(&bucket.resource)?;
+    let head = state
+        .client
+        .resource_head(&state.node, crate::pipeline::PIPELINE_KIND, &request.name)
+        .await?;
+    let tokens = head
+        .as_ref()
+        .filter(|view| !view.resource.deleted)
+        .map(|view| crate::pipeline::pipeline_spec(&view.resource))
+        .transpose()?
+        .map(|spec| spec.tokens)
+        .unwrap_or_default();
+    let mut hostnames: Vec<String> = request
+        .hostnames
+        .into_iter()
+        .map(|hostname| hostname.trim().trim_end_matches('.').to_ascii_lowercase())
+        .filter(|hostname| !hostname.is_empty())
+        .collect();
+    hostnames.sort();
+    hostnames.dedup();
+    let spec = crate::pipeline::PipelineSpec {
+        description: request.description,
+        output_bucket: request.output_bucket,
+        output_key_template: request.output_key_template,
+        batch_max_bytes: request.batch_max_bytes,
+        batch_max_seconds: request.batch_max_seconds,
+        schema: request.schema,
+        suspended: request.suspended,
+        suspend_reason: request.suspend_reason,
+        hostnames,
+        tokens,
+    };
+    let record =
+        crate::pipeline::prepare_pipeline_after(&request.name, spec, false, head.as_ref())?;
+    match &state.mode {
+        ConsoleMode::Local { .. } => {
+            let envelope = rf_core::envelope::Envelope::seal_any(&record, state.operator()?);
+            state.client.post_resource(&state.node, &envelope).await?;
+            Ok(Json(
+                json!({ "ok": true, "name": record.name, "version": record.version }),
+            ))
+        }
+        ConsoleMode::Public { node, .. } => {
+            let approval = node.management.create_resource(
+                principal.session_id,
+                &record,
+                format!("创建或更新 Pipeline {} v{}", record.name, record.version),
+            )?;
+            Ok(Json(json!({
+                "ok": true,
+                "pending_approval": true,
+                "name": record.name,
+                "version": record.version,
+                "approval": approval,
+                "approve_node": node.cfg.peer_api_advertise().to_string(),
+            })))
+        }
+    }
+}
+
+async fn pipeline_delete(
+    State(state): State<ConsoleState>,
+    Extension(principal): Extension<ConsolePrincipal>,
+    Path(name): Path<String>,
+) -> ApiResult<Json<Value>> {
+    state.require_mutation()?;
+    let head = state
+        .client
+        .resource_head(&state.node, crate::pipeline::PIPELINE_KIND, &name)
+        .await?
+        .filter(|view| !view.resource.deleted)
+        .ok_or_else(|| ApiError::not_found("Pipeline 不存在"))?;
+    let spec = crate::pipeline::pipeline_spec(&head.resource)?;
+    let record = crate::pipeline::prepare_pipeline_after(&name, spec, true, Some(&head))?;
+    match &state.mode {
+        ConsoleMode::Local { .. } => {
+            let envelope = rf_core::envelope::Envelope::seal_any(&record, state.operator()?);
+            state.client.post_resource(&state.node, &envelope).await?;
+            Ok(Json(json!({ "ok": true, "name": name })))
+        }
+        ConsoleMode::Public { node, .. } => {
+            let approval = node.management.create_resource(
+                principal.session_id,
+                &record,
+                format!("删除 Pipeline {}（生成 v{} 墓碑）", name, record.version),
+            )?;
+            Ok(Json(json!({
+                "ok": true,
+                "pending_approval": true,
+                "name": name,
+                "version": record.version,
+                "approval": approval,
+                "approve_node": node.cfg.peer_api_advertise().to_string(),
+            })))
+        }
+    }
+}
+
+async fn pipeline_token_mint(
+    State(state): State<ConsoleState>,
+    Extension(principal): Extension<ConsolePrincipal>,
+    Path(name): Path<String>,
+    Json(request): Json<PipelineTokenRequest>,
+) -> ApiResult<Json<Value>> {
+    state.require_mutation()?;
+    let head = state
+        .client
+        .resource_head(&state.node, crate::pipeline::PIPELINE_KIND, &name)
+        .await?
+        .filter(|view| !view.resource.deleted)
+        .ok_or_else(|| ApiError::not_found("Pipeline 不存在"))?;
+    let mut spec = crate::pipeline::pipeline_spec(&head.resource)?;
+    let (token, plaintext) = crate::pipeline::mint_token(request.label)?;
+    spec.tokens.push(token.clone());
+    let record = crate::pipeline::prepare_pipeline_after(&name, spec, false, Some(&head))?;
+    match &state.mode {
+        ConsoleMode::Local { .. } => {
+            let envelope = rf_core::envelope::Envelope::seal_any(&record, state.operator()?);
+            state.client.post_resource(&state.node, &envelope).await?;
+            Ok(Json(json!({
+                "ok": true,
+                "name": name,
+                "version": record.version,
+                "token": plaintext,
+                "token_id": token.id,
+            })))
+        }
+        ConsoleMode::Public { node, .. } => {
+            let approval = node.management.create_resource(
+                principal.session_id,
+                &record,
+                format!("为 Pipeline {} 创建接收令牌 {}", name, token.label),
+            )?;
+            Ok(Json(json!({
+                "ok": true,
+                "pending_approval": true,
+                "name": name,
+                "version": record.version,
+                "token": plaintext,
+                "token_id": token.id,
+                "approval": approval,
+                "approve_node": node.cfg.peer_api_advertise().to_string(),
+            })))
+        }
+    }
+}
+
+async fn pipeline_token_revoke(
+    State(state): State<ConsoleState>,
+    Extension(principal): Extension<ConsolePrincipal>,
+    Path((name, id)): Path<(String, String)>,
+) -> ApiResult<Json<Value>> {
+    state.require_mutation()?;
+    let head = state
+        .client
+        .resource_head(&state.node, crate::pipeline::PIPELINE_KIND, &name)
+        .await?
+        .filter(|view| !view.resource.deleted)
+        .ok_or_else(|| ApiError::not_found("Pipeline 不存在"))?;
+    let mut spec = crate::pipeline::pipeline_spec(&head.resource)?;
+    let before = spec.tokens.len();
+    spec.tokens.retain(|token| token.id != id);
+    if spec.tokens.len() == before {
+        return Err(ApiError::not_found("Pipeline 令牌不存在"));
+    }
+    let record = crate::pipeline::prepare_pipeline_after(&name, spec, false, Some(&head))?;
+    match &state.mode {
+        ConsoleMode::Local { .. } => {
+            let envelope = rf_core::envelope::Envelope::seal_any(&record, state.operator()?);
+            state.client.post_resource(&state.node, &envelope).await?;
+            Ok(Json(
+                json!({ "ok": true, "name": name, "version": record.version }),
+            ))
+        }
+        ConsoleMode::Public { node, .. } => {
+            let approval = node.management.create_resource(
+                principal.session_id,
+                &record,
+                format!("撤销 Pipeline {} 接收令牌 {}", name, id),
+            )?;
+            Ok(Json(json!({
+                "ok": true,
+                "pending_approval": true,
+                "name": name,
+                "version": record.version,
+                "approval": approval,
+                "approve_node": node.cfg.peer_api_advertise().to_string(),
+            })))
+        }
+    }
+}
+
+async fn pipeline_ingest(
+    State(state): State<ConsoleState>,
+    Path(name): Path<String>,
+    Json(request): Json<PipelineIngestRequest>,
+) -> ApiResult<Json<Value>> {
+    state.require_mutation()?;
+    let accepted = state
+        .client
+        .pipeline_ingest(&state.node, &name, &request.events)
+        .await?;
+    Ok(Json(json!({ "ok": true, "accepted": accepted })))
+}
+
+async fn pipeline_status(
+    State(state): State<ConsoleState>,
+    Path(name): Path<String>,
+) -> ApiResult<Json<Value>> {
+    Ok(Json(serde_json::to_value(
+        state.client.pipeline_status(&state.node, &name).await?,
+    )?))
+}
+
+async fn pipeline_batches(
+    State(state): State<ConsoleState>,
+    Path(name): Path<String>,
+    Query(query): Query<PipelineBatchQuery>,
+) -> ApiResult<Json<Value>> {
+    let batches = state
+        .client
+        .pipeline_batches(&state.node, &name, query.limit.unwrap_or(100))
+        .await?;
+    Ok(Json(json!({ "batches": batches })))
+}
+
+async fn pipeline_flush(
+    State(state): State<ConsoleState>,
+    Path(name): Path<String>,
+) -> ApiResult<Json<Value>> {
+    state.require_mutation()?;
+    let batch = state.client.pipeline_flush(&state.node, &name).await?;
+    Ok(Json(json!({ "ok": true, "batch": batch })))
+}
+
 async fn r2_object_list(
     State(state): State<ConsoleState>,
     Path(bucket): Path<String>,
@@ -2674,6 +3079,10 @@ mod tests {
             deploy::ANALYTICS_METADATA_ENV.into(),
             r#"{"OLD_METRICS":"archive"}"#.into(),
         );
+        env.insert(
+            deploy::PIPELINE_METADATA_ENV.into(),
+            r#"{"OLD_PIPE":"archive"}"#.into(),
+        );
         let manifest = WorkerManifest {
             name: "demo".into(),
             version: 4,
@@ -2702,6 +3111,7 @@ mod tests {
                     "METRICS".into(),
                     "web-metrics".into(),
                 )])),
+                pipeline_bindings: Some(BTreeMap::from([("ARCHIVE".into(), "event-pipe".into())])),
                 crons: Some(vec!["*/5 * * * *".into()]),
                 compatibility_date: Some("2026-08-04".into()),
             },
@@ -2719,8 +3129,31 @@ mod tests {
             deploy::analytics_bindings(&updated)["METRICS"],
             "web-metrics"
         );
+        assert_eq!(deploy::pipeline_bindings(&updated)["ARCHIVE"], "event-pipe");
         assert_eq!(updated.kv_bindings["CACHE"], "shared");
         assert_eq!(updated.crons, vec!["*/5 * * * *"]);
+    }
+
+    #[test]
+    fn pipeline_console_view_never_exposes_token_hashes() {
+        let (token, plaintext) = crate::pipeline::mint_token("生产采集器").unwrap();
+        let digest = token.sha256.clone();
+        let spec = crate::pipeline::PipelineSpec {
+            description: String::new(),
+            output_bucket: "archive".into(),
+            output_key_template: "events/{batchId}.jsonl.gz".into(),
+            batch_max_bytes: crate::pipeline::DEFAULT_BATCH_BYTES,
+            batch_max_seconds: crate::pipeline::DEFAULT_BATCH_SECONDS,
+            schema: None,
+            suspended: false,
+            suspend_reason: String::new(),
+            hostnames: vec![],
+            tokens: vec![token],
+        };
+        let view = pipeline_spec_view(&spec).to_string();
+        assert!(!view.contains(&digest));
+        assert!(!view.contains(&plaintext));
+        assert!(view.contains("生产采集器"));
     }
 
     fn public_state(secure: bool) -> (ConsoleState, Arc<Node>, AnyKeypair) {

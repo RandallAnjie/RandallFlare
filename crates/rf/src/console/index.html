@@ -62,6 +62,9 @@
           <button class="nav-item" data-view="analytics">
             <span class="nav-glyph">⌁</span><span>Analytics</span><span id="analytics-nav-count" class="count">0</span>
           </button>
+          <button class="nav-item" data-view="pipelines">
+            <span class="nav-glyph">⋙</span><span>Pipeline</span><span id="pipeline-nav-count" class="count">0</span>
+          </button>
         </nav>
         <div class="sidebar-foot">
           <p class="sidebar-tagline">一次构建，一次验证，处处运行。</p>
@@ -97,6 +100,7 @@
             <article class="metric"><span>R2 bucket</span><strong id="metric-r2">—</strong><small id="metric-r2-backend">内容寻址对象存储</small></article>
             <article class="metric"><span>队列</span><strong id="metric-queues">—</strong><small>多数派租约与死信</small></article>
             <article class="metric"><span>Analytics 数据集</span><strong id="metric-analytics">—</strong><small>时序事件与维度聚合</small></article>
+            <article class="metric"><span>Pipeline</span><strong id="metric-pipelines">—</strong><small>持久批次与 R2 输出</small></article>
             <article class="metric"><span>内容块状态</span><strong id="metric-blobs">—</strong><small>本地缺失数</small></article>
           </div>
 
@@ -248,7 +252,7 @@
           </div>
 
           <div id="project-tab-bindings" class="project-tab">
-            <article class="panel settings-panel"><div class="settings-copy"><p class="eyebrow">运行配置</p><h2>变量与绑定</h2><p class="muted">环境变量与平台绑定会随签名清单复制。敏感凭据请使用节点侧密钥能力，不要写入普通变量。</p></div><form id="project-bindings-form" class="settings-form"><label><span>环境变量 <em>每行 KEY=value</em></span><textarea id="project-env" class="code-input" rows="8"></textarea></label><label><span>KV 绑定 <em>每行 BINDING=namespace</em></span><textarea id="project-kv-bindings" class="code-input" rows="6"></textarea></label><label><span>R2 绑定 <em>每行 BINDING=bucket</em></span><textarea id="project-r2-bindings" class="code-input" rows="5"></textarea></label><label><span>D1 绑定 <em>每行 BINDING=database</em></span><textarea id="project-d1-bindings" class="code-input" rows="5"></textarea></label><label><span>Queue 生产者绑定 <em>每行 BINDING=queue</em></span><textarea id="project-queue-bindings" class="code-input" rows="5"></textarea></label><label><span>Analytics Engine 绑定 <em>每行 BINDING=dataset</em></span><textarea id="project-analytics-bindings" class="code-input" rows="5"></textarea></label><button class="primary" type="submit">保存变量与绑定</button></form></article>
+            <article class="panel settings-panel"><div class="settings-copy"><p class="eyebrow">运行配置</p><h2>变量与绑定</h2><p class="muted">环境变量与平台绑定会随签名清单复制。敏感凭据请使用节点侧密钥能力，不要写入普通变量。</p></div><form id="project-bindings-form" class="settings-form"><label><span>环境变量 <em>每行 KEY=value</em></span><textarea id="project-env" class="code-input" rows="8"></textarea></label><label><span>KV 绑定 <em>每行 BINDING=namespace</em></span><textarea id="project-kv-bindings" class="code-input" rows="6"></textarea></label><label><span>R2 绑定 <em>每行 BINDING=bucket</em></span><textarea id="project-r2-bindings" class="code-input" rows="5"></textarea></label><label><span>D1 绑定 <em>每行 BINDING=database</em></span><textarea id="project-d1-bindings" class="code-input" rows="5"></textarea></label><label><span>Queue 生产者绑定 <em>每行 BINDING=queue</em></span><textarea id="project-queue-bindings" class="code-input" rows="5"></textarea></label><label><span>Analytics Engine 绑定 <em>每行 BINDING=dataset</em></span><textarea id="project-analytics-bindings" class="code-input" rows="5"></textarea></label><label><span>Pipeline 绑定 <em>每行 BINDING=pipeline</em></span><textarea id="project-pipeline-bindings" class="code-input" rows="5"></textarea></label><button class="primary" type="submit">保存变量与绑定</button></form></article>
           </div>
 
           <div id="project-tab-triggers" class="project-tab">
@@ -451,6 +455,65 @@
               <article class="panel">
                 <div class="panel-head"><div><p class="eyebrow">原始事件</p><h2>最近写入</h2></div></div>
                 <div id="analytics-events" class="build-list empty-state">暂无事件。</div>
+              </article>
+            </div>
+          </div>
+        </section>
+
+        <section id="view-pipelines" class="view" aria-labelledby="section-title">
+          <div class="projects-header">
+            <div><p class="eyebrow">数据传输</p><h2>Pipeline</h2><p class="muted">先写入 D1 多数派，再以确定性批次压缩成 gzip JSONL 输出到 R2；bucket 使用 rclone 时无需更改 Pipeline。</p></div>
+            <span id="pipeline-count" class="badge">0 条 Pipeline</span>
+          </div>
+          <div class="grid r2-grid">
+            <div class="r2-sidebar-stack">
+              <article class="panel">
+                <div class="panel-head"><div><p class="eyebrow">签名资源</p><h2>创建或编辑 Pipeline</h2></div><span class="badge">可恢复</span></div>
+                <form id="pipeline-form" class="stack-form">
+                  <label><span>名称</span><input id="pipeline-name" pattern="[a-z0-9-]{1,63}" placeholder="event-archive" required></label>
+                  <label><span>说明</span><input id="pipeline-description" placeholder="归档应用事件"></label>
+                  <label><span>输出 R2 bucket</span><input id="pipeline-bucket" pattern="[a-z0-9-]{1,63}" placeholder="data-lake" required></label>
+                  <label><span>对象键模板 <em>必须包含 {batchId}</em></span><input id="pipeline-key-template" class="code-input" value="{pipeline}/year={yyyy}/month={mm}/day={dd}/hour={hh}/{agent}-{batchId}.jsonl.gz" required></label>
+                  <div class="form-grid">
+                    <label><span>批次上限（MiB）</span><input id="pipeline-batch-mib" type="number" min="0.001" max="512" step="0.001" value="64" required></label>
+                    <label><span>最长等待（秒）</span><input id="pipeline-batch-seconds" type="number" min="1" max="3600" value="60" required></label>
+                  </div>
+                  <label><span>接收域名 <em>每行一个；默认域名自动分配</em></span><textarea id="pipeline-hostnames" class="code-input" rows="3"></textarea></label>
+                  <label><span>JSON Schema <em>留空则接受任意 JSON</em></span><textarea id="pipeline-schema" class="code-input" rows="7" placeholder='{"type":"object","required":["event"]}'></textarea></label>
+                  <label class="check-label"><input id="pipeline-suspended" type="checkbox"><span>暂停接收与自动刷新</span></label>
+                  <label><span>暂停原因</span><input id="pipeline-suspend-reason" placeholder="维护窗口"></label>
+                  <button class="primary" type="submit">保存 Pipeline</button>
+                </form>
+              </article>
+              <article class="panel">
+                <div class="panel-head"><div><p class="eyebrow">Pipeline 目录</p><h2>全部 Pipeline</h2></div></div>
+                <div id="pipeline-list" class="database-list empty-state">暂无 Pipeline。</div>
+              </article>
+            </div>
+            <div class="r2-sidebar-stack">
+              <article class="panel">
+                <div class="panel-head"><div><p class="eyebrow">传输状态</p><h2 id="pipeline-active-name">请选择 Pipeline</h2><p id="pipeline-endpoint" class="muted compact-copy">选择后显示接收端点和运行状态。</p></div><button id="pipeline-delete" class="danger ghost hidden" type="button">删除</button></div>
+                <div class="metrics compact-metrics">
+                  <article class="metric"><span>待处理事件</span><strong id="pipeline-queued-events">—</strong></article>
+                  <article class="metric"><span>待处理字节</span><strong id="pipeline-queued-bytes">—</strong></article>
+                  <article class="metric"><span>成功批次</span><strong id="pipeline-completed">—</strong></article>
+                  <article class="metric"><span>失败批次</span><strong id="pipeline-failed">—</strong></article>
+                </div>
+                <div class="button-row"><button id="pipeline-flush" class="secondary hidden" type="button">立即刷新批次</button></div>
+              </article>
+              <article class="panel">
+                <div class="panel-head"><div><p class="eyebrow">接收凭据</p><h2>Bearer 令牌</h2><p class="muted compact-copy">明文只显示一次；平台资源仅保存 SHA-256。</p></div></div>
+                <form id="pipeline-token-form" class="inline-form hidden"><label><span>令牌标签</span><input id="pipeline-token-label" placeholder="生产采集器"></label><span></span><button class="secondary" type="submit">创建令牌</button></form>
+                <div id="pipeline-token-reveal" class="hidden"><p class="banner warning">请立即复制并安全保存，此令牌不会再次显示。</p><pre id="pipeline-new-token" class="result"></pre><button id="pipeline-copy-token" class="secondary compact" type="button">复制令牌</button></div>
+                <div id="pipeline-token-list" class="build-list empty-state">暂无接收令牌。</div>
+              </article>
+              <article class="panel">
+                <div class="panel-head"><div><p class="eyebrow">调试接收</p><h2>发送事件</h2></div></div>
+                <form id="pipeline-ingest-form" class="stack-form hidden"><label><span>事件数组（JSON）</span><textarea id="pipeline-events" class="code-input" rows="6">[{"event":"pageview","path":"/"}]</textarea></label><button class="secondary" type="submit">写入 Pipeline</button></form>
+              </article>
+              <article class="panel">
+                <div class="panel-head"><div><p class="eyebrow">输出审计</p><h2>最近批次</h2></div><button id="pipeline-refresh" class="secondary compact" type="button">刷新</button></div>
+                <div id="pipeline-batches" class="build-list empty-state">暂无输出批次。</div>
               </article>
             </div>
           </div>

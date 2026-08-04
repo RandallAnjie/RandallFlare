@@ -88,6 +88,7 @@ pub struct Inner {
     pub d1bind_port: u16,
     pub qbind_port: u16,
     pub analyticsbind_port: u16,
+    pub pbind_port: u16,
     /// Per-process unguessable tokens used only for rf → workerd event
     /// delivery. They are regenerated on every Worker start and never gossip.
     pub worker_event_tokens: HashMap<String, String>,
@@ -104,6 +105,7 @@ pub struct Node {
     r2_schemas: Mutex<HashSet<String>>,
     queue_schemas: Mutex<HashSet<String>>,
     analytics_schemas: Mutex<HashSet<String>>,
+    pipeline_schemas: Mutex<HashSet<String>>,
     events: broadcast::Sender<NodeEvent>,
 }
 
@@ -146,6 +148,7 @@ impl Node {
             d1bind_port: 0,
             qbind_port: 0,
             analyticsbind_port: 0,
+            pbind_port: 0,
             worker_event_tokens: HashMap::new(),
         };
         // Hydrate: static stability means booting entirely from disk.
@@ -175,6 +178,7 @@ impl Node {
             r2_schemas: Mutex::new(HashSet::new()),
             queue_schemas: Mutex::new(HashSet::new()),
             analytics_schemas: Mutex::new(HashSet::new()),
+            pipeline_schemas: Mutex::new(HashSet::new()),
             events,
         })
     }
@@ -565,6 +569,29 @@ impl Node {
             .map(|domain| format!("r2-{bucket}.{domain}"))
     }
 
+    pub fn default_pipeline_hostname(&self, pipeline: &str) -> Option<String> {
+        self.cfg
+            .default_worker_domain()
+            .map(|domain| format!("pipe-{pipeline}.{domain}"))
+    }
+
+    pub fn effective_pipeline_hostnames(
+        &self,
+        pipeline: &str,
+        spec: &crate::pipeline::PipelineSpec,
+    ) -> Vec<String> {
+        let mut hostnames = Vec::with_capacity(spec.hostnames.len() + 1);
+        if let Some(default) = self.default_pipeline_hostname(pipeline) {
+            hostnames.push(default);
+        }
+        for hostname in &spec.hostnames {
+            if !hostnames.contains(hostname) {
+                hostnames.push(hostname.clone());
+            }
+        }
+        hostnames
+    }
+
     pub fn effective_r2_hostnames(
         &self,
         bucket: &str,
@@ -839,6 +866,14 @@ impl Node {
         self.inner.lock().unwrap().analyticsbind_port
     }
 
+    pub fn set_pbind_port(&self, port: u16) {
+        self.inner.lock().unwrap().pbind_port = port;
+    }
+
+    pub fn pbind_port(&self) -> u16 {
+        self.inner.lock().unwrap().pbind_port
+    }
+
     pub fn set_worker_event_token(&self, worker: &str, token: String) {
         self.inner
             .lock()
@@ -886,6 +921,14 @@ impl Node {
 
     pub(crate) fn mark_analytics_schema_ready(&self, database: String) {
         self.analytics_schemas.lock().unwrap().insert(database);
+    }
+
+    pub(crate) fn pipeline_schema_ready(&self, database: &str) -> bool {
+        self.pipeline_schemas.lock().unwrap().contains(database)
+    }
+
+    pub(crate) fn mark_pipeline_schema_ready(&self, database: String) {
+        self.pipeline_schemas.lock().unwrap().insert(database);
     }
 
     /// Periodic GC of dead claims + KV tombstones.

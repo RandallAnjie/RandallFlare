@@ -438,7 +438,8 @@ async fn module_worker_on_real_workerd() {
         r#"{"name":"api","main":"index.js","hostnames":["api.test"],
             "env":{"GREETING":"hi from env"},"kv":{"CACHE":"ns1"},
             "d1":{"DB":"worker-db"},"queues":{"EVENTS":"events"},
-            "analytics":{"METRICS":"web-metrics"}}"#,
+            "analytics":{"METRICS":"web-metrics"},
+            "pipelines":{"ARCHIVE":"events-pipe"}}"#,
     )
     .unwrap();
     std::fs::write(
@@ -497,6 +498,13 @@ async fn module_worker_on_real_workerd() {
       });
       return new Response("recorded");
     }
+    if (url.pathname === "/pipeline") {
+      await env.ARCHIVE.send([
+        { kind: "worker", sequence: 1 },
+        { kind: "worker", sequence: 2 },
+      ]);
+      return new Response("accepted");
+    }
     return new Response("module worker up");
   },
   async queue(batch, env, context) {
@@ -542,6 +550,65 @@ async fn module_worker_on_real_workerd() {
         )
         .await
         .unwrap();
+    let bucket_record = rf::resource::prepare_after(
+        rf::r2::BUCKET_KIND,
+        "pipeline-output",
+        serde_json::to_value(rf::r2::BucketSpec {
+            description: "Pipeline 输出".into(),
+            public_access: false,
+            storage: rf::objectstore::StorageLocation::Local,
+            max_bytes: None,
+            max_objects: None,
+            expire_objects_after_days: None,
+            cors_origins: vec![],
+            hostnames: vec![],
+        })
+        .unwrap(),
+        false,
+        None,
+    )
+    .unwrap();
+    client
+        .post_resource(
+            &n.api,
+            &rf_core::envelope::Envelope::seal_any(&bucket_record, &op_any),
+        )
+        .await
+        .unwrap();
+    let (pipeline_token, pipeline_plaintext) = rf::pipeline::mint_token("e2e-ingest").unwrap();
+    let pipeline_record = rf::pipeline::prepare_pipeline_after(
+        "events-pipe",
+        rf::pipeline::PipelineSpec {
+            description: "真实 workerd Pipeline".into(),
+            output_bucket: "pipeline-output".into(),
+            output_key_template: "events-pipe/{batchId}.jsonl.gz".into(),
+            batch_max_bytes: 1_024,
+            batch_max_seconds: 1,
+            schema: Some(serde_json::json!({
+                "type": "object",
+                "required": ["kind", "sequence"],
+                "properties": {
+                    "kind": {"type": "string"},
+                    "sequence": {"type": "integer"}
+                }
+            })),
+            suspended: false,
+            suspend_reason: String::new(),
+            hostnames: vec!["pipe.test".into()],
+            tokens: vec![pipeline_token],
+        },
+        false,
+        None,
+    )
+    .unwrap();
+    assert!(!pipeline_record.spec_json.contains(&pipeline_plaintext));
+    client
+        .post_resource(
+            &n.api,
+            &rf_core::envelope::Envelope::seal_any(&pipeline_record, &op_any),
+        )
+        .await
+        .unwrap();
     let analytics_record = rf::analytics::prepare_dataset_after(
         "web-metrics",
         rf::analytics::DatasetSpec {
@@ -582,6 +649,84 @@ async fn module_worker_on_real_workerd() {
             "module worker never came up via ingress"
         );
         tokio::time::sleep(Duration::from_millis(300)).await;
+    }
+    let pipeline_response = http
+        .get(format!("http://127.0.0.1:{}/pipeline", n.ingress))
+        .header("host", "api.test")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(pipeline_response.text().await.unwrap(), "accepted");
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        let objects = client
+            .r2_list(&n.api, "pipeline-output", "events-pipe/", None, 10)
+            .await
+            .unwrap();
+        if let Some(object) = objects.objects.first() {
+            let (_, compressed) = client
+                .r2_get(&n.api, "pipeline-output", &object.key)
+                .await
+                .unwrap()
+                .unwrap();
+            let mut decoder = flate2::read::GzDecoder::new(compressed.as_slice());
+            let mut jsonl = String::new();
+            std::io::Read::read_to_string(&mut decoder, &mut jsonl).unwrap();
+            let events: Vec<serde_json::Value> = jsonl
+                .lines()
+                .map(|line| serde_json::from_str(line).unwrap())
+                .collect();
+            assert_eq!(events.len(), 2);
+            assert_eq!(events[0]["kind"], "worker");
+            assert_eq!(events[1]["sequence"], 2);
+            let status = client.pipeline_status(&n.api, "events-pipe").await.unwrap();
+            assert_eq!(status.queued_events, 0);
+            assert_eq!(status.completed_batches, 1);
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "Pipeline driver did not publish a gzip JSONL batch to R2"
+        );
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+    let unauthorized = http
+        .post(format!("http://127.0.0.1:{}/send", n.ingress))
+        .header("host", "pipe.test")
+        .header("content-type", "application/x-ndjson")
+        .body("{\"kind\":\"public\",\"sequence\":3}\n")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(unauthorized.status(), 401);
+    let public_ingest: serde_json::Value = http
+        .post(format!("http://127.0.0.1:{}/send", n.ingress))
+        .header("host", "pipe.test")
+        .bearer_auth(&pipeline_plaintext)
+        .header("content-type", "application/x-ndjson")
+        .body("{\"kind\":\"public\",\"sequence\":3}\n{\"kind\":\"public\",\"sequence\":4}\n")
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(public_ingest["accepted"], 2);
+    let invalid_schema = http
+        .post(format!("http://127.0.0.1:{}/send", n.ingress))
+        .header("host", "pipe.test")
+        .bearer_auth(&pipeline_plaintext)
+        .json(&serde_json::json!({"kind":"missing-sequence"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(invalid_schema.status(), 422);
+    let flushed = client.pipeline_flush(&n.api, "events-pipe").await.unwrap();
+    if let Some(batch) = flushed {
+        assert_eq!(batch.event_count, 2);
+        assert_eq!(batch.state, "completed");
     }
 
     let env_resp = http

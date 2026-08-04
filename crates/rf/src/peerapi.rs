@@ -110,6 +110,10 @@ pub fn router(api: Api) -> Router {
         )
         .route("/v1/analytics/{dataset}/stats", get(analytics_stats))
         .route("/v1/analytics/{dataset}/group", get(analytics_group))
+        .route("/v1/pipeline/{pipeline}/events", post(pipeline_ingest))
+        .route("/v1/pipeline/{pipeline}/status", get(pipeline_status))
+        .route("/v1/pipeline/{pipeline}/batches", get(pipeline_batches))
+        .route("/v1/pipeline/{pipeline}/flush", post(pipeline_flush))
         .route("/v1/do/{worker}/proxy", post(do_proxy))
         .route("/v1/r2/{bucket}", get(r2_list))
         .route("/v1/r2-blob/{sha}", get(r2_blob_get))
@@ -415,6 +419,7 @@ async fn status(
                 && !name.starts_with("rfdo-")
                 && !name.starts_with("queue-")
                 && !name.starts_with("analytics-")
+                && !name.starts_with("pipeline-")
         })
         .collect();
     let buckets: Vec<serde_json::Value> = crate::r2::bucket_records(node)
@@ -450,6 +455,17 @@ async fn status(
             })
         })
         .collect();
+    let pipelines: Vec<serde_json::Value> = crate::pipeline::pipeline_records(node)
+        .into_iter()
+        .map(|(view, spec)| {
+            serde_json::json!({
+                "name": view.resource.name,
+                "version": view.resource.version,
+                "digest": view.digest,
+                "spec": spec,
+            })
+        })
+        .collect();
     axum::Json(serde_json::json!({
         "node": node.id_hex(),
         "label": node.cfg.label,
@@ -464,6 +480,7 @@ async fn status(
         "r2_buckets": buckets,
         "queues": queues,
         "analytics_datasets": analytics_datasets,
+        "pipelines": pipelines,
         "storage": {
             "local": true,
             "rclone": node.cfg.storage.rclone_binary.is_some(),
@@ -1203,6 +1220,91 @@ async fn analytics_group(
     .await
     {
         Ok(groups) => axum::Json(serde_json::json!({ "groups": groups })).into_response(),
+        Err(error) => (StatusCode::UNPROCESSABLE_ENTITY, error.to_string()).into_response(),
+    }
+}
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PipelineIngestReq {
+    events: Vec<serde_json::Value>,
+}
+
+#[derive(serde::Deserialize)]
+struct PipelineBatchQuery {
+    limit: Option<usize>,
+}
+
+async fn pipeline_ingest(
+    State(api): State<Api>,
+    ConnectInfo(remote): ConnectInfo<SocketAddr>,
+    Path(pipeline): Path<String>,
+    method: Method,
+    uri: Uri,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    if let Err(response) = check(&api, &remote, &headers, &method, &uri, &body) {
+        return response.into_response();
+    }
+    let Ok(request) = serde_json::from_slice::<PipelineIngestReq>(&body) else {
+        return (StatusCode::BAD_REQUEST, "bad Pipeline ingest request").into_response();
+    };
+    match crate::pipeline::ingest(&api.node, &pipeline, request.events).await {
+        Ok(accepted) => axum::Json(serde_json::json!({ "accepted": accepted })).into_response(),
+        Err(error) => (StatusCode::UNPROCESSABLE_ENTITY, error.to_string()).into_response(),
+    }
+}
+
+async fn pipeline_status(
+    State(api): State<Api>,
+    ConnectInfo(remote): ConnectInfo<SocketAddr>,
+    Path(pipeline): Path<String>,
+    method: Method,
+    uri: Uri,
+    headers: HeaderMap,
+) -> Response {
+    if let Err(response) = check(&api, &remote, &headers, &method, &uri, b"") {
+        return response.into_response();
+    }
+    match crate::pipeline::status(&api.node, &pipeline).await {
+        Ok(status) => axum::Json(status).into_response(),
+        Err(error) => (StatusCode::UNPROCESSABLE_ENTITY, error.to_string()).into_response(),
+    }
+}
+
+async fn pipeline_batches(
+    State(api): State<Api>,
+    ConnectInfo(remote): ConnectInfo<SocketAddr>,
+    Path(pipeline): Path<String>,
+    Query(query): Query<PipelineBatchQuery>,
+    method: Method,
+    uri: Uri,
+    headers: HeaderMap,
+) -> Response {
+    if let Err(response) = check(&api, &remote, &headers, &method, &uri, b"") {
+        return response.into_response();
+    }
+    match crate::pipeline::batches(&api.node, &pipeline, query.limit.unwrap_or(100)).await {
+        Ok(batches) => axum::Json(serde_json::json!({ "batches": batches })).into_response(),
+        Err(error) => (StatusCode::UNPROCESSABLE_ENTITY, error.to_string()).into_response(),
+    }
+}
+
+async fn pipeline_flush(
+    State(api): State<Api>,
+    ConnectInfo(remote): ConnectInfo<SocketAddr>,
+    Path(pipeline): Path<String>,
+    method: Method,
+    uri: Uri,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    if let Err(response) = check(&api, &remote, &headers, &method, &uri, &body) {
+        return response.into_response();
+    }
+    match crate::pipeline::flush_once(&api.node, &pipeline, true).await {
+        Ok(batch) => axum::Json(serde_json::json!({ "batch": batch })).into_response(),
         Err(error) => (StatusCode::UNPROCESSABLE_ENTITY, error.to_string()).into_response(),
     }
 }

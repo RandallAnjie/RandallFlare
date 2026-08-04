@@ -102,6 +102,20 @@ async fn handle(State(ingress): State<Ingress>, req: Request) -> Response {
             .unwrap_or_else(|never| match never {});
     }
 
+    if let Some((pipeline, spec)) = crate::pipeline::pipeline_records(&ingress.node)
+        .into_iter()
+        .find_map(|(view, spec)| {
+            ingress
+                .node
+                .effective_pipeline_hostnames(&view.resource.name, &spec)
+                .iter()
+                .any(|candidate| candidate == &host)
+                .then_some((view.resource.name, spec))
+        })
+    {
+        return serve_pipeline_ingress(&ingress.node, req, &pipeline, &spec).await;
+    }
+
     if let Some((bucket, spec)) = crate::r2::bucket_records(&ingress.node)
         .into_iter()
         .find_map(|(view, spec)| {
@@ -170,6 +184,73 @@ async fn handle(State(ingress): State<Ingress>, req: Request) -> Response {
             .into_response();
     };
     proxy(&ingress.http, req, port).await
+}
+
+async fn serve_pipeline_ingress(
+    node: &Node,
+    req: Request,
+    pipeline: &str,
+    spec: &crate::pipeline::PipelineSpec,
+) -> Response {
+    let path = req.uri().path();
+    if req.method() == Method::GET && path == "/status" {
+        if !pipeline_bearer_authorized(req.headers(), spec) {
+            return pipeline_unauthorized();
+        }
+        return match crate::pipeline::status(node, pipeline).await {
+            Ok(status) => axum::Json(status).into_response(),
+            Err(error) => (StatusCode::SERVICE_UNAVAILABLE, error.to_string()).into_response(),
+        };
+    }
+    if req.method() != Method::POST || !matches!(path, "/" | "/send" | "/v1/events") {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+    if !pipeline_bearer_authorized(req.headers(), spec) {
+        return pipeline_unauthorized();
+    }
+    let content_type = req
+        .headers()
+        .get(axum::http::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("application/octet-stream")
+        .to_string();
+    let body = match axum::body::to_bytes(req.into_body(), crate::pipeline::MAX_INGEST_BYTES).await
+    {
+        Ok(body) => body,
+        Err(error) => return (StatusCode::PAYLOAD_TOO_LARGE, error.to_string()).into_response(),
+    };
+    let events = match crate::pipeline::parse_payload(&content_type, &body) {
+        Ok(events) => events,
+        Err(error) => return (StatusCode::BAD_REQUEST, error.to_string()).into_response(),
+    };
+    match crate::pipeline::ingest(node, pipeline, events).await {
+        Ok(accepted) => (
+            StatusCode::ACCEPTED,
+            axum::Json(serde_json::json!({ "accepted": accepted })),
+        )
+            .into_response(),
+        Err(error) => (StatusCode::UNPROCESSABLE_ENTITY, error.to_string()).into_response(),
+    }
+}
+
+fn pipeline_bearer_authorized(
+    headers: &axum::http::HeaderMap,
+    spec: &crate::pipeline::PipelineSpec,
+) -> bool {
+    headers
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.strip_prefix("Bearer "))
+        .is_some_and(|token| crate::pipeline::token_matches(spec, token.trim()))
+}
+
+fn pipeline_unauthorized() -> Response {
+    let mut response = (StatusCode::UNAUTHORIZED, "Pipeline 接收令牌无效\n").into_response();
+    response.headers_mut().insert(
+        axum::http::header::WWW_AUTHENTICATE,
+        HeaderValue::from_static("Bearer realm=\"RandallFlare Pipeline\""),
+    );
+    response
 }
 
 async fn serve_public_r2(

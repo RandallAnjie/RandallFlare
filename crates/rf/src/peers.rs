@@ -657,6 +657,83 @@ impl PeerClient {
         )?)
     }
 
+    pub async fn pipeline_ingest(
+        &self,
+        base: &str,
+        pipeline: &str,
+        events: &[serde_json::Value],
+    ) -> Result<usize> {
+        let raw = self
+            .post(
+                base,
+                &format!("/v1/pipeline/{}/events", component(pipeline)),
+                serde_json::to_vec(&serde_json::json!({ "events": events }))?,
+            )
+            .await?;
+        let response: serde_json::Value = serde_json::from_slice(&raw)?;
+        Ok(response["accepted"].as_u64().unwrap_or(0) as usize)
+    }
+
+    pub async fn pipeline_status(
+        &self,
+        base: &str,
+        pipeline: &str,
+    ) -> Result<crate::pipeline::PipelineStatus> {
+        let raw = self
+            .get(
+                base,
+                &format!("/v1/pipeline/{}/status", component(pipeline)),
+            )
+            .await?;
+        Ok(serde_json::from_slice(&raw)?)
+    }
+
+    pub async fn pipeline_batches(
+        &self,
+        base: &str,
+        pipeline: &str,
+        limit: usize,
+    ) -> Result<Vec<crate::pipeline::PipelineBatch>> {
+        let raw = self
+            .get(
+                base,
+                &format!(
+                    "/v1/pipeline/{}/batches?limit={}",
+                    component(pipeline),
+                    limit.clamp(1, 1_000)
+                ),
+            )
+            .await?;
+        let response: serde_json::Value = serde_json::from_slice(&raw)?;
+        Ok(serde_json::from_value(
+            response
+                .get("batches")
+                .cloned()
+                .unwrap_or_else(|| serde_json::json!([])),
+        )?)
+    }
+
+    pub async fn pipeline_flush(
+        &self,
+        base: &str,
+        pipeline: &str,
+    ) -> Result<Option<crate::pipeline::PipelineBatch>> {
+        let raw = self
+            .post(
+                base,
+                &format!("/v1/pipeline/{}/flush", component(pipeline)),
+                vec![],
+            )
+            .await?;
+        let response: serde_json::Value = serde_json::from_slice(&raw)?;
+        Ok(serde_json::from_value(
+            response
+                .get("batch")
+                .cloned()
+                .unwrap_or(serde_json::Value::Null),
+        )?)
+    }
+
     /// Execute SQL against a D1 database, following leader hints
     /// (bounded) — callers can point at ANY cluster node.
     pub async fn d1_exec(

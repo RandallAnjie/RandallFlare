@@ -68,6 +68,13 @@ Working today, verified by multi-process fault-injection e2e tests:
   counters and dimension/value aggregations are available in the CLI and
   Chinese console. The binding's `waitUntil` path is verified against real
   workerd.
+- **Durable Pipelines**: authenticated JSON, JSON-array, NDJSON and plain-text
+  ingest is JSON-Schema validated and committed to a per-Pipeline D1 quorum
+  before delivery. Quorum leases produce deterministic, retry-safe gzip JSONL
+  batches in R2, including buckets backed by rclone. Only bearer-token hashes
+  are signed; plaintext is shown once. Public/custom ingest domains, automatic
+  TLS discovery, Worker `env.ARCHIVE.send()`, status/batch audit, CLI and the
+  Chinese console are covered by real-workerd and public-ingress tests.
 
 Also in: HTTPS ingress (SNI cert store, hot-reload, wildcard files,
 self-signed fallback) and **native workerd kvNamespace bindings** —
@@ -275,7 +282,9 @@ my-worker/
                    #  "hostnames":["site.example.com"],"crons":["*/5 * * * *"],
                    #  "env":{"K":"V"},"kv":{"CACHE":"ns1"},
                    #  "r2":{"OBJECTS":"assets"},"d1":{"DB":"mydb"},
-                   #  "queues":{"EVENTS":"events"}}
+                   #  "queues":{"EVENTS":"events"},
+                   #  "analytics":{"METRICS":"web-metrics"},
+                   #  "pipelines":{"ARCHIVE":"event-archive"}}
   index.js         # omit "main" entirely for a pure static site
   public/…
 

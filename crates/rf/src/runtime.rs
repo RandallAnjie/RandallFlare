@@ -293,6 +293,7 @@ impl Runtime {
                 d1: self.node.d1bind_port(),
                 queue: self.node.qbind_port(),
                 analytics: self.node.analyticsbind_port(),
+                pipeline: self.node.pbind_port(),
             },
             &durable_dir,
         );
@@ -441,6 +442,12 @@ fn rf_entry_source(
             .collect::<Vec<_>>(),
     )
     .expect("Analytics binding names are serializable");
+    let pipeline_names = serde_json::to_string(
+        &crate::deploy::pipeline_bindings(manifest)
+            .keys()
+            .collect::<Vec<_>>(),
+    )
+    .expect("Pipeline binding names are serializable");
     let event_token = serde_json::to_string(event_token).expect("event token is serializable");
     let mut durable_wrappers = String::new();
     let mut seen = std::collections::BTreeSet::new();
@@ -457,6 +464,7 @@ fn rf_entry_source(
         .replace("__RF_D1_BINDING_NAMES__", &binding_names)
         .replace("__RF_QUEUE_BINDING_NAMES__", &queue_names)
         .replace("__RF_ANALYTICS_BINDING_NAMES__", &analytics_names)
+        .replace("__RF_PIPELINE_BINDING_NAMES__", &pipeline_names)
         .replace("__RF_EVENT_TOKEN__", &event_token)
         .replace("__RF_DURABLE_WRAPPERS__", &durable_wrappers)
 }
@@ -568,9 +576,29 @@ class RandallFlareAnalyticsDataset {
   }
 }
 
+class RandallFlarePipeline {
+  constructor(service, context) { this._service = service; this._context = context; }
+  send(events) {
+    const normalized = Array.isArray(events) ? events : [events];
+    if (normalized.length === 0) throw new TypeError("Pipeline send() expects at least one event");
+    const pending = (async () => {
+      const response = await this._service.fetch("http://pipeline-binding/", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ events: normalized }),
+      });
+      if (!response.ok) throw new Error("PIPELINE_ERROR: " + response.status + " " + await response.text());
+      return await response.json();
+    })();
+    if (this._context && typeof this._context.waitUntil === "function") this._context.waitUntil(pending);
+    return pending;
+  }
+}
+
 const __rfD1Names = __RF_D1_BINDING_NAMES__;
 const __rfQueueNames = __RF_QUEUE_BINDING_NAMES__;
 const __rfAnalyticsNames = __RF_ANALYTICS_BINDING_NAMES__;
+const __rfPipelineNames = __RF_PIPELINE_BINDING_NAMES__;
 const __rfEventToken = __RF_EVENT_TOKEN__;
 function __rfWrapEnv(env, context) {
   const wrapped = Object.create(env);
@@ -587,6 +615,11 @@ function __rfWrapEnv(env, context) {
   for (const name of __rfAnalyticsNames) {
     Object.defineProperty(wrapped, name, {
       value: new RandallFlareAnalyticsDataset(env[name], context), enumerable: true, configurable: false,
+    });
+  }
+  for (const name of __rfPipelineNames) {
+    Object.defineProperty(wrapped, name, {
+      value: new RandallFlarePipeline(env[name], context), enumerable: true, configurable: false,
     });
   }
   return wrapped;
@@ -682,6 +715,7 @@ pub struct BindingPorts {
     pub d1: u16,
     pub queue: u16,
     pub analytics: u16,
+    pub pipeline: u16,
 }
 
 pub fn generate_config(
@@ -696,6 +730,7 @@ pub fn generate_config(
         d1: d1bind_port,
         queue: qbind_port,
         analytics: analyticsbind_port,
+        pipeline: pbind_port,
     } = binding_ports;
     let mut modules = String::new();
     modules
@@ -722,6 +757,7 @@ pub fn generate_config(
             || k == crate::deploy::D1_METADATA_ENV
             || k == crate::deploy::QUEUE_METADATA_ENV
             || k == crate::deploy::ANALYTICS_METADATA_ENV
+            || k == crate::deploy::PIPELINE_METADATA_ENV
         {
             continue;
         }
@@ -813,6 +849,22 @@ pub fn generate_config(
             dataset = capnp_string(&dataset),
         ));
     }
+    let mut pipeline_services = String::new();
+    for (binding, pipeline) in crate::deploy::pipeline_bindings(m) {
+        let service = format!("pipeline-{binding}");
+        bindings.push_str(&format!(
+            "        (name = {binding}, service = {service}),\n",
+            binding = capnp_string(&binding),
+            service = capnp_string(&service),
+        ));
+        pipeline_services.push_str(&format!(
+            "    (name = {service}, external = (address = \"127.0.0.1:{pbind_port}\", \
+             http = (injectRequestHeaders = [(name = \"{pipeline_header}\", value = {pipeline})]))),\n",
+            service = capnp_string(&service),
+            pipeline_header = crate::pbind::PIPELINE_HEADER,
+            pipeline = capnp_string(&pipeline),
+        ));
+    }
     let durable_objects = crate::deploy::durable_objects(m);
     let mut durable_namespaces = String::new();
     let mut seen_durable = std::collections::BTreeSet::new();
@@ -859,7 +911,7 @@ const config :Workerd.Config = (
       bindings = [
 {bindings}      ],
 {durable_worker}    )),
-{kv_services}{r2_services}{d1_services}{queue_services}{analytics_services}{durable_service}  ],
+{kv_services}{r2_services}{d1_services}{queue_services}{analytics_services}{pipeline_services}{durable_service}  ],
   sockets = [
     (name = "http", address = "127.0.0.1:{port}", http = (), service = "main"),
   ],
@@ -945,6 +997,14 @@ mod tests {
             )]))
             .unwrap(),
         );
+        m.env.insert(
+            crate::deploy::PIPELINE_METADATA_ENV.into(),
+            serde_json::to_string(&BTreeMap::from([(
+                "EVENT_PIPE".to_string(),
+                "event-archive".to_string(),
+            )]))
+            .unwrap(),
+        );
         let cfg = generate_config(
             &m,
             30111,
@@ -954,6 +1014,7 @@ mod tests {
                 d1: 7384,
                 queue: 7385,
                 analytics: 7386,
+                pipeline: 7387,
             },
             std::path::Path::new("/tmp/rf-do"),
         );
@@ -977,6 +1038,9 @@ mod tests {
         assert!(cfg.contains("(name = \"METRICS\", service = \"analytics-METRICS\")"));
         assert!(cfg.contains("address = \"127.0.0.1:7386\""));
         assert!(cfg.contains("x-rf-analytics-dataset\", value = \"web-metrics\""));
+        assert!(cfg.contains("(name = \"EVENT_PIPE\", service = \"pipeline-EVENT_PIPE\")"));
+        assert!(cfg.contains("address = \"127.0.0.1:7387\""));
+        assert!(cfg.contains("x-rf-pipeline\", value = \"event-archive\""));
         assert!(cfg.contains("compatibilityDate = \"2026-07-31\""));
         assert!(cfg.contains("durableObjectNamespace = (className = \"Counter\")"));
         assert!(cfg.contains("uniqueKey = \"rf--w--Counter\", enableSql = true"));
@@ -1022,6 +1086,14 @@ mod tests {
             )]))
             .unwrap(),
         );
+        manifest.env.insert(
+            crate::deploy::PIPELINE_METADATA_ENV.into(),
+            serde_json::to_string(&BTreeMap::from([(
+                "PIPE".to_string(),
+                "archive".to_string(),
+            )]))
+            .unwrap(),
+        );
         let source = rf_entry_source(
             &manifest,
             &crate::deploy::d1_bindings(&manifest),
@@ -1030,6 +1102,7 @@ mod tests {
         assert!(source.contains("new RandallFlareD1Database(env[name])"));
         assert!(source.contains("new RandallFlareQueue(env[name])"));
         assert!(source.contains("new RandallFlareAnalyticsDataset(env[name], context)"));
+        assert!(source.contains("new RandallFlarePipeline(env[name], context)"));
         assert!(source.contains("test-token"));
         assert!(source.contains("/.rf/internal/queue"));
         assert!(source.contains("export class Counter extends __rfUserModule.Counter"));

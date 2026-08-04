@@ -61,7 +61,7 @@ surface yet.
 | runtime/build logs and cluster distribution | done | request logs, analytics and retention |
 | previews and pull-request deployments | planned | deterministic preview hostnames and cleanup |
 | service bindings and placement tags | planned | loopback/mesh service router |
-| R2, D1, Queue, Analytics, Pipeline, Email, Binary bindings | partial | native R2, CF-shaped D1, Queue producer/consumer and Analytics Engine bindings + console editors done; remaining event-product bindings remain |
+| R2, D1, Queue, Analytics, Pipeline, Email, Binary bindings | partial | native R2, CF-shaped D1, Queue producer/consumer, Analytics Engine and Pipeline bindings + console editors done; remaining event-product bindings remain |
 
 ### Data and storage
 
@@ -84,7 +84,7 @@ surface yet.
 | --- | --- | --- |
 | Queues | partial | signed definitions, per-queue D1 ledger, delayed JSON send/sendBatch binding, concurrent batching, quorum visibility leases, retry budget, 30-day dead letters, redrive, CLI/API and Chinese console are real-workerd tested; binary/v8 payload encoding, pause-aware producer policy and multi-node fault soak remain |
 | Analytics Engine | partial | signed datasets, independent D1 ledger, 20-slot blobs/doubles/indexes data points, 100-point/1-MiB batching, retention, `writeDataPoint` waitUntil binding, encrypted API, CLI, hour/day counters, recent events, grouping/value aggregates and Chinese console are real-workerd tested; SQL-compatible query language, sampling and multi-node fault soak remain |
-| Pipelines | planned | authenticated ingest, JSON-schema validation, gzip JSONL batches to R2 |
+| Pipelines | partial | signed definitions, one-time bearer tokens stored only as SHA-256, default/custom domains, ACME discovery, 32-MiB JSON/array/events/NDJSON/text ingest, Draft JSON Schema validation, D1 durable staging, quorum leases, deterministic retry-safe keys, gzip JSONL, direct/multipart R2 output over local or rclone buckets, Worker binding, encrypted API, CLI, status/batch audit and Chinese console are real-workerd/public-ingress tested; streaming request bodies, transform stages and multi-node crash-point soak remain |
 | Workflow | planned | idempotent instances, replayed steps, sleep, signals, retry/cancel/heartbeat |
 | visual Flow | planned | versioned DAG, credentials, run history and built-in nodes |
 | Binary Deliver | planned | signed binaries, content cache, sandboxed execution and bindings |

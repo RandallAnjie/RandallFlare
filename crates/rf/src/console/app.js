@@ -33,6 +33,9 @@ const state = {
   analyticsActive: null,
   analyticsEvents: [],
   analyticsGroups: [],
+  pipelines: [],
+  pipelineActive: null,
+  pipelineBatches: [],
 };
 
 const titles = {
@@ -45,6 +48,7 @@ const titles = {
   d1: ["分布式 SQLite", "D1 数据库"],
   queues: ["事件驱动", "队列"],
   analytics: ["可观测数据", "Analytics Engine"],
+  pipelines: ["数据传输", "Pipeline"],
 };
 
 function escapeHtml(value) {
@@ -213,6 +217,7 @@ function renderOverview(data) {
   const buckets = Array.isArray(data.r2_buckets) ? data.r2_buckets : [];
   const queues = Array.isArray(data.queues) ? data.queues : [];
   const analyticsDatasets = Array.isArray(data.analytics_datasets) ? data.analytics_datasets : [];
+  const pipelines = Array.isArray(data.pipelines) ? data.pipelines : [];
   const allNodes = [
     {
       id: data.node,
@@ -235,6 +240,8 @@ function renderOverview(data) {
   $("#queue-nav-count").textContent = String(queues.length);
   $("#metric-analytics").textContent = String(analyticsDatasets.length);
   $("#analytics-nav-count").textContent = String(analyticsDatasets.length);
+  $("#metric-pipelines").textContent = String(pipelines.length);
+  $("#pipeline-nav-count").textContent = String(pipelines.length);
   $("#metric-r2-backend").textContent = data.storage?.rclone ? "本地副本与 rclone 已就绪" : "集群本地多数派副本";
   $("#r2-nav-count").textContent = String(buckets.length);
   $("#metric-blobs").textContent = String(data.missing_blobs ?? 0);
@@ -519,6 +526,7 @@ function renderWorkerDetail(data) {
     <div><dt>D1 绑定</dt><dd>${escapeHtml(Object.keys(worker.d1_bindings || {}).length)} 项</dd></div>
     <div><dt>Queue 绑定</dt><dd>${escapeHtml(Object.keys(worker.queue_bindings || {}).length)} 项</dd></div>
     <div><dt>Analytics 绑定</dt><dd>${escapeHtml(Object.keys(worker.analytics_bindings || {}).length)} 项</dd></div>
+    <div><dt>Pipeline 绑定</dt><dd>${escapeHtml(Object.keys(worker.pipeline_bindings || {}).length)} 项</dd></div>
     <div><dt>定时任务</dt><dd>${escapeHtml(worker.crons?.length || 0)} 条</dd></div>`;
   $("#detail-distribution-count").textContent = `${distribution.ready}/${distribution.total} 个节点`;
   $("#detail-distribution").innerHTML = (distribution.nodes || []).map((node) => {
@@ -535,6 +543,7 @@ function renderWorkerDetail(data) {
   $("#project-d1-bindings").value = mapToLines(worker.d1_bindings);
   $("#project-queue-bindings").value = mapToLines(worker.queue_bindings);
   $("#project-analytics-bindings").value = mapToLines(worker.analytics_bindings);
+  $("#project-pipeline-bindings").value = mapToLines(worker.pipeline_bindings);
   $("#project-crons").value = (worker.crons || []).join("\n");
   $("#project-compatibility-date").value = worker.compatibility_date;
   $("#project-source-repository").value = source?.repository?.replace(/\.git$/, "") || "";
@@ -659,6 +668,7 @@ async function saveProjectBindings(event) {
       d1_bindings: linesToMap($("#project-d1-bindings").value, "D1 绑定"),
       queue_bindings: linesToMap($("#project-queue-bindings").value, "Queue 绑定"),
       analytics_bindings: linesToMap($("#project-analytics-bindings").value, "Analytics 绑定"),
+      pipeline_bindings: linesToMap($("#project-pipeline-bindings").value, "Pipeline 绑定"),
     };
     await updateWorkerSettings(payload, `更新 ${state.activeWorker} 的变量与绑定。`);
   } catch (error) {
@@ -1444,6 +1454,248 @@ async function deleteAnalytics() {
   }
 }
 
+function pipelineStatusCopy(status) {
+  if (!status) return "状态正在收敛";
+  return `${status.queued_events || 0} 待处理 · ${status.completed_batches || 0} 成功 · ${status.failed_batches || 0} 失败`;
+}
+
+function renderPipelines() {
+  $("#pipeline-count").textContent = `${state.pipelines.length} 条 Pipeline`;
+  $("#pipeline-nav-count").textContent = String(state.pipelines.length);
+  const list = $("#pipeline-list");
+  list.classList.toggle("empty-state", state.pipelines.length === 0);
+  list.innerHTML = state.pipelines.length
+    ? state.pipelines.map((pipeline) => {
+      const active = pipeline.name === state.pipelineActive ? " active" : "";
+      const stateCopy = pipeline.spec?.suspended ? "已暂停" : pipelineStatusCopy(pipeline.status);
+      return `<button class="database-item${active}" type="button" data-pipeline="${escapeHtml(pipeline.name)}"><span><strong>${escapeHtml(pipeline.name)}</strong><small>${escapeHtml(pipeline.spec?.output_bucket || "未配置 bucket")} · ${escapeHtml(stateCopy)}</small></span><span>${pipeline.spec?.suspended ? "已暂停" : "打开 →"}</span></button>`;
+    }).join("")
+    : "暂无 Pipeline。";
+}
+
+function fillPipelineForm(pipeline) {
+  const spec = pipeline?.spec || {};
+  $("#pipeline-name").value = pipeline?.name || "";
+  $("#pipeline-description").value = spec.description || "";
+  $("#pipeline-bucket").value = spec.output_bucket || "";
+  $("#pipeline-key-template").value = spec.output_key_template || "{pipeline}/year={yyyy}/month={mm}/day={dd}/hour={hh}/{agent}-{batchId}.jsonl.gz";
+  $("#pipeline-batch-mib").value = Number(spec.batch_max_bytes || 64 * 1024 * 1024) / 1024 / 1024;
+  $("#pipeline-batch-seconds").value = spec.batch_max_seconds || 60;
+  $("#pipeline-hostnames").value = (spec.hostnames || []).join("\n");
+  $("#pipeline-schema").value = spec.schema == null ? "" : JSON.stringify(spec.schema, null, 2);
+  $("#pipeline-suspended").checked = Boolean(spec.suspended);
+  $("#pipeline-suspend-reason").value = spec.suspend_reason || "";
+}
+
+function renderPipelineTokens(pipeline) {
+  const tokens = pipeline?.spec?.tokens || [];
+  const list = $("#pipeline-token-list");
+  list.classList.toggle("empty-state", tokens.length === 0);
+  list.innerHTML = tokens.length
+    ? tokens.map((token) => `<article class="build-row"><span class="pipeline-state success"></span><div><strong>${escapeHtml(token.label || "未命名令牌")}</strong><small>尾号 ${escapeHtml(token.last_four)} · ${escapeHtml(new Date(token.created_at_ms).toLocaleString("zh-CN"))}</small><code>${escapeHtml(token.id)}</code></div><button class="mini-button danger" data-pipeline-token-revoke="${escapeHtml(token.id)}">撤销</button></article>`).join("")
+    : "暂无接收令牌。";
+}
+
+function renderPipelineBatches() {
+  const list = $("#pipeline-batches");
+  list.classList.toggle("empty-state", state.pipelineBatches.length === 0);
+  list.innerHTML = state.pipelineBatches.length
+    ? state.pipelineBatches.map((batch) => `<article class="build-row ${batch.state === "failed" ? "failed" : "success"}"><span class="pipeline-state ${batch.state === "failed" ? "failed" : "success"}"></span><div><strong>${escapeHtml(batch.object_key || batch.id)}</strong><small>${escapeHtml(batch.event_count)} 个事件 · ${escapeHtml(formatBytes(batch.compressed_bytes))} gzip · ${escapeHtml(new Date(batch.created_at_ms).toLocaleString("zh-CN"))}</small><code>${escapeHtml(batch.sha256 || batch.id)}</code></div><div><span class="badge">${batch.state === "completed" ? "已输出" : "失败"}</span><small>${escapeHtml(batch.error || "")}</small></div></article>`).join("")
+    : "暂无输出批次。";
+}
+
+async function loadPipelines({ quiet = false } = {}) {
+  try {
+    const data = await api("/api/pipelines");
+    state.pipelines = data.pipelines || [];
+    if (state.pipelineActive && !state.pipelines.some((item) => item.name === state.pipelineActive)) {
+      state.pipelineActive = null;
+      state.pipelineBatches = [];
+      $("#pipeline-active-name").textContent = "请选择 Pipeline";
+      $("#pipeline-endpoint").textContent = "选择后显示接收端点和运行状态。";
+      $("#pipeline-token-form").classList.add("hidden");
+      $("#pipeline-ingest-form").classList.add("hidden");
+      $("#pipeline-delete").classList.add("hidden");
+      $("#pipeline-flush").classList.add("hidden");
+      renderPipelineBatches();
+      renderPipelineTokens(null);
+    }
+    renderPipelines();
+    if (!quiet) toast("Pipeline 已刷新");
+  } catch (error) {
+    if (!quiet) toast(error.message, true);
+  }
+}
+
+async function selectPipeline(name) {
+  const pipeline = state.pipelines.find((item) => item.name === name);
+  if (!pipeline) return;
+  if (state.pipelineActive !== name) {
+    $("#pipeline-new-token").textContent = "";
+    $("#pipeline-token-reveal").classList.add("hidden");
+  }
+  state.pipelineActive = name;
+  fillPipelineForm(pipeline);
+  renderPipelines();
+  renderPipelineTokens(pipeline);
+  $("#pipeline-active-name").textContent = name;
+  const endpointHost = pipeline.hostnames?.[0];
+  $("#pipeline-endpoint").textContent = endpointHost
+    ? `接收端点：${location.protocol}//${endpointHost}/send`
+    : "尚未配置可访问的接收域名；Worker 绑定仍可在节点内写入。";
+  $("#pipeline-token-form").classList.remove("hidden");
+  $("#pipeline-ingest-form").classList.remove("hidden");
+  $("#pipeline-delete").classList.remove("hidden");
+  $("#pipeline-flush").classList.remove("hidden");
+  try {
+    const [status, batches] = await Promise.all([
+      api(`/api/pipelines/${encodeURIComponent(name)}/status`),
+      api(`/api/pipelines/${encodeURIComponent(name)}/batches?limit=100`),
+    ]);
+    if (state.pipelineActive !== name) return;
+    $("#pipeline-queued-events").textContent = String(status.queued_events || 0);
+    $("#pipeline-queued-bytes").textContent = formatBytes(status.queued_bytes || 0);
+    $("#pipeline-completed").textContent = String(status.completed_batches || 0);
+    $("#pipeline-failed").textContent = String(status.failed_batches || 0);
+    state.pipelineBatches = batches.batches || [];
+    renderPipelineBatches();
+  } catch (error) {
+    toast(error.message, true);
+  }
+}
+
+async function savePipeline(event) {
+  event.preventDefault();
+  let schema = null;
+  try {
+    const raw = $("#pipeline-schema").value.trim();
+    if (raw) schema = JSON.parse(raw);
+  } catch (error) {
+    toast(`JSON Schema 不是有效 JSON：${error.message}`, true);
+    return;
+  }
+  const payload = {
+    name: $("#pipeline-name").value.trim(),
+    description: $("#pipeline-description").value.trim(),
+    output_bucket: $("#pipeline-bucket").value.trim(),
+    output_key_template: $("#pipeline-key-template").value.trim(),
+    batch_max_bytes: Math.round(Number($("#pipeline-batch-mib").value) * 1024 * 1024),
+    batch_max_seconds: Number($("#pipeline-batch-seconds").value),
+    schema,
+    suspended: $("#pipeline-suspended").checked,
+    suspend_reason: $("#pipeline-suspend-reason").value.trim(),
+    hostnames: $("#pipeline-hostnames").value.split(/\r?\n/).map((value) => value.trim()).filter(Boolean),
+  };
+  try {
+    const result = await api("/api/pipelines", { method: "POST", body: JSON.stringify(payload) });
+    const complete = async () => {
+      await loadPipelines({ quiet: true });
+      await selectPipeline(payload.name);
+    };
+    if (result.pending_approval) {
+      showApproval(result, `批准后，Pipeline ${payload.name} 的签名配置将传播到集群。`, complete);
+    } else {
+      toast(`Pipeline ${payload.name} 已保存`);
+      await complete();
+    }
+  } catch (error) {
+    toast(error.message, true);
+  }
+}
+
+async function mintPipelineToken(event) {
+  event.preventDefault();
+  if (!state.pipelineActive) return;
+  try {
+    const result = await api(`/api/pipelines/${encodeURIComponent(state.pipelineActive)}/tokens`, {
+      method: "POST",
+      body: JSON.stringify({ label: $("#pipeline-token-label").value.trim() }),
+    });
+    $("#pipeline-new-token").textContent = result.token;
+    $("#pipeline-token-reveal").classList.remove("hidden");
+    $("#pipeline-token-label").value = "";
+    const complete = async () => {
+      await loadPipelines({ quiet: true });
+      await selectPipeline(state.pipelineActive);
+    };
+    if (result.pending_approval) {
+      showApproval(result, "批准后令牌才会生效；当前明文仍只显示这一次。", complete);
+    } else {
+      toast("Pipeline 接收令牌已创建，请立即保存");
+      await complete();
+    }
+  } catch (error) {
+    toast(error.message, true);
+  }
+}
+
+async function revokePipelineToken(id) {
+  if (!state.pipelineActive || !window.confirm("要撤销这个 Pipeline 接收令牌吗？使用它的采集器会立即失去访问权限。")) return;
+  try {
+    const result = await api(`/api/pipelines/${encodeURIComponent(state.pipelineActive)}/tokens/${encodeURIComponent(id)}`, { method: "DELETE" });
+    const complete = async () => {
+      await loadPipelines({ quiet: true });
+      await selectPipeline(state.pipelineActive);
+    };
+    if (result.pending_approval) showApproval(result, "批准后该接收令牌将失效。", complete);
+    else await complete();
+  } catch (error) {
+    toast(error.message, true);
+  }
+}
+
+async function ingestPipelineEvents(event) {
+  event.preventDefault();
+  if (!state.pipelineActive) return;
+  let events;
+  try {
+    events = JSON.parse($("#pipeline-events").value);
+    if (!Array.isArray(events)) events = [events];
+  } catch (error) {
+    toast(`事件不是有效 JSON：${error.message}`, true);
+    return;
+  }
+  try {
+    const result = await api(`/api/pipelines/${encodeURIComponent(state.pipelineActive)}/events`, {
+      method: "POST",
+      body: JSON.stringify({ events }),
+    });
+    toast(`已接收 ${result.accepted} 个事件`);
+    await selectPipeline(state.pipelineActive);
+  } catch (error) {
+    toast(error.message, true);
+  }
+}
+
+async function flushPipeline() {
+  if (!state.pipelineActive) return;
+  try {
+    const result = await api(`/api/pipelines/${encodeURIComponent(state.pipelineActive)}/flush`, { method: "POST", body: "{}" });
+    toast(result.batch ? `批次 ${shortId(result.batch.id, 18)} 已输出` : "当前没有待刷新的事件");
+    await loadPipelines({ quiet: true });
+    await selectPipeline(state.pipelineActive);
+  } catch (error) {
+    toast(error.message, true);
+  }
+}
+
+async function deletePipeline() {
+  const name = state.pipelineActive;
+  if (!name || !window.confirm(`要删除 Pipeline“${name}”吗？批次审计与 R2 对象不会被删除。`)) return;
+  try {
+    const result = await api(`/api/pipelines/${encodeURIComponent(name)}`, { method: "DELETE" });
+    const complete = async () => {
+      state.pipelineActive = null;
+      fillPipelineForm(null);
+      await loadPipelines({ quiet: true });
+    };
+    if (result.pending_approval) showApproval(result, `批准后，Pipeline ${name} 将写入可验证的墓碑版本。`, complete);
+    else await complete();
+  } catch (error) {
+    toast(error.message, true);
+  }
+}
+
 async function loadOverview({ quiet = false } = {}) {
   try {
     const data = await api("/api/overview");
@@ -1758,7 +2010,7 @@ async function boot() {
     $("#security-copy").innerHTML = consoleMode === "public"
       ? "此节点不保存<br>任何私钥。"
       : "密钥仅保留在本地<br>控制台进程中。";
-    $$("#deploy-form button, #source-form button, #kv-editor-form button, #d1-create-form button, #d1-exec-form button, #r2-bucket-form button, #r2-upload-form button, #r2-delete-bucket, #queue-form button, #queue-send-form button, #queue-delete, #analytics-form button, #analytics-write-form button, #analytics-delete, #project-domain-add-form button, #project-bindings-form button, #project-triggers-form button, #project-settings-form button, #project-source-form button, #project-redeploy, #project-delete")
+    $$("#deploy-form button, #source-form button, #kv-editor-form button, #d1-create-form button, #d1-exec-form button, #r2-bucket-form button, #r2-upload-form button, #r2-delete-bucket, #queue-form button, #queue-send-form button, #queue-delete, #analytics-form button, #analytics-write-form button, #analytics-delete, #pipeline-form button, #pipeline-token-form button, #pipeline-ingest-form button, #pipeline-flush, #pipeline-delete, #project-domain-add-form button, #project-bindings-form button, #project-triggers-form button, #project-settings-form button, #project-source-form button, #project-redeploy, #project-delete")
       .forEach((button) => { button.disabled = state.session.read_only; });
     await loadOverview({ quiet: true });
     await loadWorkerOps();
@@ -1766,6 +2018,7 @@ async function boot() {
     await loadR2({ quiet: true });
     await loadQueues({ quiet: true });
     await loadAnalytics({ quiet: true });
+    await loadPipelines({ quiet: true });
   } catch (error) {
     if (consoleMode === "public" && error.status === 401) {
       state.session = null;
@@ -1819,6 +2072,7 @@ $("#refresh").addEventListener("click", async () => {
   await loadR2({ quiet: true });
   await loadQueues({ quiet: true });
   await loadAnalytics({ quiet: true });
+  await loadPipelines({ quiet: true });
 });
 $("#deploy-form").addEventListener("submit", deployWorker);
 $("#deploy-file-picker").addEventListener("click", () => $("#deploy-files").click());
@@ -1850,6 +2104,13 @@ $("#analytics-group-form").addEventListener("submit", (event) => {
 });
 $("#analytics-refresh").addEventListener("click", () => state.analyticsActive && selectAnalytics(state.analyticsActive));
 $("#analytics-delete").addEventListener("click", deleteAnalytics);
+$("#pipeline-form").addEventListener("submit", savePipeline);
+$("#pipeline-token-form").addEventListener("submit", mintPipelineToken);
+$("#pipeline-ingest-form").addEventListener("submit", ingestPipelineEvents);
+$("#pipeline-flush").addEventListener("click", flushPipeline);
+$("#pipeline-refresh").addEventListener("click", () => state.pipelineActive && selectPipeline(state.pipelineActive));
+$("#pipeline-delete").addEventListener("click", deletePipeline);
+$("#pipeline-copy-token").addEventListener("click", () => copyText($("#pipeline-new-token").textContent, $("#pipeline-copy-token")));
 $("#r2-object-file").addEventListener("change", () => {
   const file = $("#r2-object-file").files?.[0];
   if (file && !$("#r2-object-key").value) $("#r2-object-key").value = file.name;
@@ -1871,6 +2132,8 @@ $("#logout").addEventListener("click", async () => {
     toast(error.message, true);
   }
   state.session = null;
+  $("#pipeline-new-token").textContent = "";
+  $("#pipeline-token-reveal").classList.add("hidden");
   await beginAuthorization();
 });
 $("#workers-table").addEventListener("click", (event) => {
@@ -1931,6 +2194,14 @@ $("#analytics-list").addEventListener("click", (event) => {
   const button = event.target.closest("button[data-analytics]");
   if (button) selectAnalytics(button.dataset.analytics);
 });
+$("#pipeline-list").addEventListener("click", (event) => {
+  const button = event.target.closest("button[data-pipeline]");
+  if (button) selectPipeline(button.dataset.pipeline);
+});
+$("#pipeline-token-list").addEventListener("click", (event) => {
+  const button = event.target.closest("button[data-pipeline-token-revoke]");
+  if (button) revokePipelineToken(button.dataset.pipelineTokenRevoke);
+});
 
 setInterval(() => {
   if (state.session) {
@@ -1940,6 +2211,9 @@ setInterval(() => {
     if (state.view === "queues") loadQueues({ quiet: true });
     if (state.view === "analytics") loadAnalytics({ quiet: true }).then(() => {
       if (state.analyticsActive) selectAnalytics(state.analyticsActive);
+    });
+    if (state.view === "pipelines") loadPipelines({ quiet: true }).then(() => {
+      if (state.pipelineActive) selectPipeline(state.pipelineActive);
     });
   }
 }, 10_000);

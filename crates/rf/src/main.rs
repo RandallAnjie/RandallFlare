@@ -125,6 +125,11 @@ enum Cmd {
         #[command(subcommand)]
         cmd: AnalyticsCmd,
     },
+    /// Durable Pipeline ingest and R2 batch operations.
+    Pipeline {
+        #[command(subcommand)]
+        cmd: PipelineCmd,
+    },
     /// Fetch and verify a worker's transparency log (hash chain).
     Log {
         worker: String,
@@ -472,6 +477,117 @@ enum AnalyticsCmd {
         since: u64,
         #[arg(long, default_value_t = 20)]
         limit: usize,
+        #[arg(long, env = "RF_NODE")]
+        node: String,
+        #[arg(long, env = "RF_CLUSTER_SECRET")]
+        secret: String,
+    },
+}
+
+#[derive(Subcommand)]
+enum PipelineCmd {
+    /// List signed Pipelines and their current queue depth.
+    List {
+        #[arg(long, env = "RF_NODE")]
+        node: String,
+        #[arg(long, env = "RF_CLUSTER_SECRET")]
+        secret: String,
+    },
+    /// Create or update a signed Pipeline.
+    Create {
+        name: String,
+        #[arg(long)]
+        bucket: String,
+        #[arg(long, default_value = "")]
+        description: String,
+        #[arg(
+            long,
+            default_value = "{pipeline}/year={yyyy}/month={mm}/day={dd}/hour={hh}/{agent}-{batchId}.jsonl.gz"
+        )]
+        key_template: String,
+        #[arg(long, default_value_t = rf::pipeline::DEFAULT_BATCH_BYTES)]
+        batch_max_bytes: u64,
+        #[arg(long, default_value_t = rf::pipeline::DEFAULT_BATCH_SECONDS)]
+        batch_max_seconds: u64,
+        /// Inline JSON Schema.
+        #[arg(long)]
+        schema: Option<String>,
+        #[arg(long)]
+        hostname: Vec<String>,
+        #[arg(long)]
+        suspended: bool,
+        #[arg(long, default_value = "")]
+        suspend_reason: String,
+        #[arg(long, env = "RF_NODE")]
+        node: String,
+        #[arg(long, env = "RF_OPERATOR_KEY")]
+        key: Option<PathBuf>,
+        #[arg(long, env = "RF_CLUSTER_SECRET")]
+        secret: String,
+    },
+    /// Tombstone a Pipeline definition.
+    Delete {
+        name: String,
+        #[arg(long, env = "RF_NODE")]
+        node: String,
+        #[arg(long, env = "RF_OPERATOR_KEY")]
+        key: Option<PathBuf>,
+        #[arg(long, env = "RF_CLUSTER_SECRET")]
+        secret: String,
+    },
+    /// Mint a bearer token. The plaintext is printed once.
+    TokenCreate {
+        name: String,
+        #[arg(long, default_value = "")]
+        label: String,
+        #[arg(long, env = "RF_NODE")]
+        node: String,
+        #[arg(long, env = "RF_OPERATOR_KEY")]
+        key: Option<PathBuf>,
+        #[arg(long, env = "RF_CLUSTER_SECRET")]
+        secret: String,
+    },
+    /// Revoke a bearer token by its public token id.
+    TokenRevoke {
+        name: String,
+        id: String,
+        #[arg(long, env = "RF_NODE")]
+        node: String,
+        #[arg(long, env = "RF_OPERATOR_KEY")]
+        key: Option<PathBuf>,
+        #[arg(long, env = "RF_CLUSTER_SECRET")]
+        secret: String,
+    },
+    /// Submit one JSON event or JSON event array over the encrypted node API.
+    Send {
+        name: String,
+        events: String,
+        #[arg(long, env = "RF_NODE")]
+        node: String,
+        #[arg(long, env = "RF_CLUSTER_SECRET")]
+        secret: String,
+    },
+    /// Show queue and batch counters.
+    Status {
+        name: String,
+        #[arg(long, env = "RF_NODE")]
+        node: String,
+        #[arg(long, env = "RF_CLUSTER_SECRET")]
+        secret: String,
+    },
+    /// List recent output batches.
+    Batches {
+        name: String,
+        #[arg(long, default_value_t = 100)]
+        limit: usize,
+        #[arg(long, env = "RF_NODE")]
+        node: String,
+        #[arg(long, env = "RF_CLUSTER_SECRET")]
+        secret: String,
+    },
+    /// Force one pending batch to R2.
+    Flush {
+        name: String,
         #[arg(long, env = "RF_NODE")]
         node: String,
         #[arg(long, env = "RF_CLUSTER_SECRET")]
@@ -1133,6 +1249,192 @@ async fn async_main(cli: Cli) -> Result<()> {
                 Ok(())
             }
         },
+        Cmd::Pipeline { cmd } => match cmd {
+            PipelineCmd::List { node, secret } => {
+                let client = PeerClient::new(secret_bytes(&secret)?);
+                let records = client
+                    .resource_heads(&node, Some(rf::pipeline::PIPELINE_KIND))
+                    .await?;
+                let mut pipelines = Vec::new();
+                for view in records.into_iter().filter(|view| !view.resource.deleted) {
+                    let spec = rf::pipeline::pipeline_spec(&view.resource)?;
+                    let status = client
+                        .pipeline_status(&node, &view.resource.name)
+                        .await
+                        .ok();
+                    pipelines.push(serde_json::json!({
+                        "name": view.resource.name,
+                        "version": view.resource.version,
+                        "digest": view.digest,
+                        "spec": spec,
+                        "status": status,
+                    }));
+                }
+                println!("{}", serde_json::to_string_pretty(&pipelines)?);
+                Ok(())
+            }
+            PipelineCmd::Create {
+                name,
+                bucket,
+                description,
+                key_template,
+                batch_max_bytes,
+                batch_max_seconds,
+                schema,
+                hostname,
+                suspended,
+                suspend_reason,
+                node,
+                key,
+                secret,
+            } => {
+                let client = PeerClient::new(secret_bytes(&secret)?);
+                let head = client
+                    .resource_head(&node, rf::pipeline::PIPELINE_KIND, &name)
+                    .await?;
+                let tokens = head
+                    .as_ref()
+                    .filter(|view| !view.resource.deleted)
+                    .map(|view| rf::pipeline::pipeline_spec(&view.resource))
+                    .transpose()?
+                    .map(|spec| spec.tokens)
+                    .unwrap_or_default();
+                let schema = schema
+                    .map(|raw| serde_json::from_str(&raw).context("--schema 必须是 JSON Schema"))
+                    .transpose()?;
+                let spec = rf::pipeline::PipelineSpec {
+                    description,
+                    output_bucket: bucket,
+                    output_key_template: key_template,
+                    batch_max_bytes,
+                    batch_max_seconds,
+                    schema,
+                    suspended,
+                    suspend_reason,
+                    hostnames: hostname
+                        .into_iter()
+                        .map(|value| value.trim().trim_end_matches('.').to_ascii_lowercase())
+                        .collect(),
+                    tokens,
+                };
+                let record =
+                    rf::pipeline::prepare_pipeline_after(&name, spec, false, head.as_ref())?;
+                let envelope = rf_core::envelope::Envelope::seal_any(&record, &operator_key(key)?);
+                client.post_resource(&node, &envelope).await?;
+                println!("Pipeline {} 已更新至 v{}", record.name, record.version);
+                Ok(())
+            }
+            PipelineCmd::Delete {
+                name,
+                node,
+                key,
+                secret,
+            } => {
+                let client = PeerClient::new(secret_bytes(&secret)?);
+                let head = client
+                    .resource_head(&node, rf::pipeline::PIPELINE_KIND, &name)
+                    .await?
+                    .filter(|view| !view.resource.deleted)
+                    .with_context(|| format!("Pipeline {name} 不存在"))?;
+                let spec = rf::pipeline::pipeline_spec(&head.resource)?;
+                let record = rf::pipeline::prepare_pipeline_after(&name, spec, true, Some(&head))?;
+                let envelope = rf_core::envelope::Envelope::seal_any(&record, &operator_key(key)?);
+                client.post_resource(&node, &envelope).await?;
+                println!("Pipeline {} 已删除（v{}）", record.name, record.version);
+                Ok(())
+            }
+            PipelineCmd::TokenCreate {
+                name,
+                label,
+                node,
+                key,
+                secret,
+            } => {
+                let client = PeerClient::new(secret_bytes(&secret)?);
+                let head = client
+                    .resource_head(&node, rf::pipeline::PIPELINE_KIND, &name)
+                    .await?
+                    .filter(|view| !view.resource.deleted)
+                    .with_context(|| format!("Pipeline {name} 不存在"))?;
+                let mut spec = rf::pipeline::pipeline_spec(&head.resource)?;
+                let (token, plaintext) = rf::pipeline::mint_token(label)?;
+                spec.tokens.push(token);
+                let record = rf::pipeline::prepare_pipeline_after(&name, spec, false, Some(&head))?;
+                let envelope = rf_core::envelope::Envelope::seal_any(&record, &operator_key(key)?);
+                client.post_resource(&node, &envelope).await?;
+                println!("{plaintext}");
+                Ok(())
+            }
+            PipelineCmd::TokenRevoke {
+                name,
+                id,
+                node,
+                key,
+                secret,
+            } => {
+                let client = PeerClient::new(secret_bytes(&secret)?);
+                let head = client
+                    .resource_head(&node, rf::pipeline::PIPELINE_KIND, &name)
+                    .await?
+                    .filter(|view| !view.resource.deleted)
+                    .with_context(|| format!("Pipeline {name} 不存在"))?;
+                let mut spec = rf::pipeline::pipeline_spec(&head.resource)?;
+                let before = spec.tokens.len();
+                spec.tokens.retain(|token| token.id != id);
+                if before == spec.tokens.len() {
+                    anyhow::bail!("Pipeline 令牌 {id} 不存在");
+                }
+                let record = rf::pipeline::prepare_pipeline_after(&name, spec, false, Some(&head))?;
+                let envelope = rf_core::envelope::Envelope::seal_any(&record, &operator_key(key)?);
+                client.post_resource(&node, &envelope).await?;
+                println!("Pipeline 令牌 {id} 已撤销");
+                Ok(())
+            }
+            PipelineCmd::Send {
+                name,
+                events,
+                node,
+                secret,
+            } => {
+                let value: serde_json::Value =
+                    serde_json::from_str(&events).context("Pipeline 事件必须是 JSON")?;
+                let events = match value {
+                    serde_json::Value::Array(events) => events,
+                    event => vec![event],
+                };
+                let accepted = PeerClient::new(secret_bytes(&secret)?)
+                    .pipeline_ingest(&node, &name, &events)
+                    .await?;
+                println!("Pipeline 已接收 {accepted} 个事件");
+                Ok(())
+            }
+            PipelineCmd::Status { name, node, secret } => {
+                let status = PeerClient::new(secret_bytes(&secret)?)
+                    .pipeline_status(&node, &name)
+                    .await?;
+                println!("{}", serde_json::to_string_pretty(&status)?);
+                Ok(())
+            }
+            PipelineCmd::Batches {
+                name,
+                limit,
+                node,
+                secret,
+            } => {
+                let batches = PeerClient::new(secret_bytes(&secret)?)
+                    .pipeline_batches(&node, &name, limit)
+                    .await?;
+                println!("{}", serde_json::to_string_pretty(&batches)?);
+                Ok(())
+            }
+            PipelineCmd::Flush { name, node, secret } => {
+                let batch = PeerClient::new(secret_bytes(&secret)?)
+                    .pipeline_flush(&node, &name)
+                    .await?;
+                println!("{}", serde_json::to_string_pretty(&batch)?);
+                Ok(())
+            }
+        },
         Cmd::Log {
             worker,
             node,
@@ -1569,11 +1871,15 @@ async fn run(config_path: PathBuf) -> Result<()> {
     let analyticsbind_port = rf::analyticsbind::serve(node.clone()).await?;
     node.set_analyticsbind_port(analyticsbind_port);
     tracing::info!("Analytics binding on 127.0.0.1:{analyticsbind_port}");
+    let pbind_port = rf::pbind::serve(node.clone()).await?;
+    node.set_pbind_port(pbind_port);
+    tracing::info!("Pipeline binding on 127.0.0.1:{pbind_port}");
 
     let _gossip = rf::gossip::start(node.clone()).await?;
     durable.spawn_ensurer();
     durable.spawn_checkpointer();
     rf::gossip::spawn_blob_fetcher(node.clone());
+    rf::pipeline::spawn_driver(node.clone());
     tracing::info!("gossip on {}", node.cfg.gossip.listen);
 
     tokio::spawn(rf::runtime::Runtime::new(node.clone(), durable.clone()).run());
