@@ -28,6 +28,7 @@ Open only the required ports:
 | TCP | 80, 443 | public | Worker ingress + default management UI |
 | UDP | 7381 | future node IPs | encrypted gossip |
 | TCP | 7382 | administrator and future node IPs | encrypted peer/operator API |
+| TCP | 25 | public | 仅限显式启用的可选 SMTP 邮件节点 |
 
 Do not expose 7382 to the whole internet unless necessary. `/v1/ping` is public;
 all other peer API requests require the cluster secret. The install scripts do
@@ -184,6 +185,11 @@ rollback. For a private repository, add a read-only `RF_GITHUB_TOKEN` to
 `/etc/rf.env`; it remains local to this node and is stripped from the build
 sandbox. Repository configuration and every produced Manifest still require a
 one-time operator signature.
+
+邮件节点是可选角色，首台功能测试 VPS 默认不启用，也不应开放 TCP 25。需要测试
+邮件时，先按 [邮件指南](./EMAIL.md) 准备 MX/PTR、STARTTLS 证书、R2 bucket 和
+节点本地 DKIM 私钥变量，再在 `[email]` 中显式启用。邮件私钥与 rclone 凭据一样
+只能放入 VPS 的受限环境/配置文件，不能进入 Git、签名资源或浏览器。
 
 ## 6. Upgrade
 

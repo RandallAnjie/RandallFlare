@@ -140,6 +140,11 @@ enum Cmd {
         #[command(subcommand)]
         cmd: FlowCmd,
     },
+    /// 去中心化邮件域、路由、DNS 验证和投递记录。
+    Email {
+        #[command(subcommand)]
+        cmd: EmailCmd,
+    },
     /// Fetch and verify a worker's transparency log (hash chain).
     Log {
         worker: String,
@@ -852,6 +857,124 @@ struct FlowActionArgs {
     id: String,
     #[arg(long, env = "RF_NODE")]
     node: String,
+    #[arg(long, env = "RF_CLUSTER_SECRET")]
+    secret: String,
+}
+
+#[derive(Subcommand)]
+enum EmailCmd {
+    /// 列出已签名邮件域及最近一次 DNS 验证状态。
+    List {
+        #[arg(long, env = "RF_NODE")]
+        node: String,
+        #[arg(long, env = "RF_CLUSTER_SECRET")]
+        secret: String,
+    },
+    /// 创建或更新邮件域；路由文件是 EmailRoute JSON 数组。
+    Create(Box<EmailCreateArgs>),
+    /// 删除（写入墓碑）邮件域定义。
+    Delete {
+        name: String,
+        #[arg(long, env = "RF_NODE")]
+        node: String,
+        #[arg(long, env = "RF_OPERATOR_KEY")]
+        key: Option<PathBuf>,
+        #[arg(long, env = "RF_CLUSTER_SECRET")]
+        secret: String,
+    },
+    /// 立即查询 TXT、MX、DKIM 和 SPF，并持久化验证结果。
+    Verify {
+        name: String,
+        #[arg(long, env = "RF_NODE")]
+        node: String,
+        #[arg(long, env = "RF_CLUSTER_SECRET")]
+        secret: String,
+    },
+    /// 列出最近的入站与出站投递。
+    Messages {
+        name: String,
+        #[arg(long, default_value_t = 100)]
+        limit: usize,
+        #[arg(long, env = "RF_NODE")]
+        node: String,
+        #[arg(long, env = "RF_CLUSTER_SECRET")]
+        secret: String,
+    },
+    /// 查看一条投递的元数据。
+    Message {
+        name: String,
+        id: String,
+        #[arg(long, env = "RF_NODE")]
+        node: String,
+        #[arg(long, env = "RF_CLUSTER_SECRET")]
+        secret: String,
+    },
+    /// 下载原始 RFC 822 邮件。
+    Raw {
+        name: String,
+        id: String,
+        #[arg(long)]
+        output: PathBuf,
+        #[arg(long, env = "RF_NODE")]
+        node: String,
+        #[arg(long, env = "RF_CLUSTER_SECRET")]
+        secret: String,
+    },
+    /// 从 RFC 822 文件建立可靠出站投递。
+    Send {
+        name: String,
+        file: PathBuf,
+        #[arg(long)]
+        from: String,
+        #[arg(long = "to", required = true)]
+        recipients: Vec<String>,
+        #[arg(long, env = "RF_NODE")]
+        node: String,
+        #[arg(long, env = "RF_CLUSTER_SECRET")]
+        secret: String,
+    },
+}
+
+#[derive(clap::Args)]
+struct EmailCreateArgs {
+    name: String,
+    #[arg(long)]
+    domain: String,
+    #[arg(long)]
+    mx_hostname: String,
+    #[arg(long)]
+    bucket: String,
+    #[arg(long, default_value = "mail")]
+    object_prefix: String,
+    #[arg(long)]
+    routes: Option<PathBuf>,
+    #[arg(long, default_value = "")]
+    description: String,
+    #[arg(long, default_value_t = 26_214_400)]
+    max_message_bytes: u64,
+    #[arg(long, default_value_t = 1_000)]
+    inbound_per_minute: u32,
+    #[arg(long, default_value_t = 1_000)]
+    outbound_per_minute: u32,
+    #[arg(long, default_value_t = 30)]
+    retention_days: u16,
+    #[arg(long, default_value = "rf")]
+    dkim_selector: String,
+    #[arg(long, default_value = "")]
+    dkim_public_key: String,
+    /// 节点本地 DKIM 私钥环境变量名；绝不接收私钥正文。
+    #[arg(long, default_value = "")]
+    dkim_private_key_env: String,
+    #[arg(long)]
+    rotate_verification: bool,
+    #[arg(long)]
+    suspended: bool,
+    #[arg(long, default_value = "")]
+    suspend_reason: String,
+    #[arg(long, env = "RF_NODE")]
+    node: String,
+    #[arg(long, env = "RF_OPERATOR_KEY")]
+    key: Option<PathBuf>,
     #[arg(long, env = "RF_CLUSTER_SECRET")]
     secret: String,
 }
@@ -2076,6 +2199,202 @@ async fn async_main(cli: Cli) -> Result<()> {
                 Ok(())
             }
         },
+        Cmd::Email { cmd } => match cmd {
+            EmailCmd::List { node, secret } => {
+                let client = PeerClient::new(secret_bytes(&secret)?);
+                let records = client
+                    .resource_heads(&node, Some(rf::email::EMAIL_DOMAIN_KIND))
+                    .await?;
+                let mut domains = Vec::new();
+                for view in records.into_iter().filter(|view| !view.resource.deleted) {
+                    let spec = rf::email::email_domain_spec(&view.resource)?;
+                    let verification = client
+                        .email_verification(&node, &view.resource.name)
+                        .await
+                        .ok()
+                        .flatten();
+                    domains.push(serde_json::json!({
+                        "name": view.resource.name,
+                        "version": view.resource.version,
+                        "digest": view.digest,
+                        "spec": spec,
+                        "verification": verification,
+                    }));
+                }
+                println!("{}", serde_json::to_string_pretty(&domains)?);
+                Ok(())
+            }
+            EmailCmd::Create(args) => {
+                let EmailCreateArgs {
+                    name,
+                    domain,
+                    mx_hostname,
+                    bucket,
+                    object_prefix,
+                    routes,
+                    description,
+                    max_message_bytes,
+                    inbound_per_minute,
+                    outbound_per_minute,
+                    retention_days,
+                    dkim_selector,
+                    dkim_public_key,
+                    dkim_private_key_env,
+                    rotate_verification,
+                    suspended,
+                    suspend_reason,
+                    node,
+                    key,
+                    secret,
+                } = *args;
+                let client = PeerClient::new(secret_bytes(&secret)?);
+                let head = client
+                    .resource_head(&node, rf::email::EMAIL_DOMAIN_KIND, &name)
+                    .await?;
+                let previous = head
+                    .as_ref()
+                    .and_then(|head| rf::email::email_domain_spec(&head.resource).ok());
+                let routes = match routes {
+                    Some(path) => serde_json::from_str(
+                        &std::fs::read_to_string(&path)
+                            .with_context(|| format!("无法读取邮件路由文件 {}", path.display()))?,
+                    )
+                    .context("邮件路由文件必须是 EmailRoute JSON 数组")?,
+                    None => previous
+                        .as_ref()
+                        .map(|spec| spec.routes.clone())
+                        .unwrap_or_default(),
+                };
+                let verification_challenge = if rotate_verification {
+                    rf::email::generate_verification_challenge()
+                } else {
+                    previous
+                        .as_ref()
+                        .map(|spec| spec.verification_challenge.clone())
+                        .unwrap_or_else(rf::email::generate_verification_challenge)
+                };
+                let spec = rf::email::EmailDomainSpec {
+                    description,
+                    domain,
+                    verification_challenge,
+                    mx_hostname,
+                    bucket,
+                    object_prefix,
+                    routes,
+                    max_message_bytes,
+                    inbound_per_minute,
+                    outbound_per_minute,
+                    retention_days,
+                    dkim_selector,
+                    dkim_public_key,
+                    dkim_private_key_env,
+                    suspended,
+                    suspend_reason,
+                };
+                let record = rf::email::prepare_email_domain_after(
+                    &name,
+                    spec.clone(),
+                    false,
+                    head.as_ref(),
+                )?;
+                let envelope = rf_core::envelope::Envelope::seal_any(&record, &operator_key(key)?);
+                client.post_resource(&node, &envelope).await?;
+                println!("邮件域 {} 已更新至 v{}", record.name, record.version);
+                println!("请配置 TXT  {}", spec.ownership_txt_name());
+                println!("TXT 值      {}", spec.ownership_txt_value());
+                println!("请配置 MX   {} -> {}", spec.domain, spec.mx_hostname);
+                if !spec.dkim_public_key.is_empty() {
+                    println!("请配置 TXT  {}", spec.dkim_txt_name());
+                    println!("DKIM 值     {}", spec.dkim_public_key);
+                }
+                Ok(())
+            }
+            EmailCmd::Delete {
+                name,
+                node,
+                key,
+                secret,
+            } => {
+                let client = PeerClient::new(secret_bytes(&secret)?);
+                let head = client
+                    .resource_head(&node, rf::email::EMAIL_DOMAIN_KIND, &name)
+                    .await?
+                    .filter(|view| !view.resource.deleted)
+                    .with_context(|| format!("邮件域 {name} 不存在"))?;
+                let spec = rf::email::email_domain_spec(&head.resource)?;
+                let record = rf::email::prepare_email_domain_after(&name, spec, true, Some(&head))?;
+                let envelope = rf_core::envelope::Envelope::seal_any(&record, &operator_key(key)?);
+                client.post_resource(&node, &envelope).await?;
+                println!("邮件域 {} 已删除（v{}）", record.name, record.version);
+                Ok(())
+            }
+            EmailCmd::Verify { name, node, secret } => {
+                let verification = PeerClient::new(secret_bytes(&secret)?)
+                    .email_verify(&node, &name)
+                    .await?;
+                println!("{}", serde_json::to_string_pretty(&verification)?);
+                Ok(())
+            }
+            EmailCmd::Messages {
+                name,
+                limit,
+                node,
+                secret,
+            } => {
+                let messages = PeerClient::new(secret_bytes(&secret)?)
+                    .email_messages(&node, &name, limit)
+                    .await?;
+                println!("{}", serde_json::to_string_pretty(&messages)?);
+                Ok(())
+            }
+            EmailCmd::Message {
+                name,
+                id,
+                node,
+                secret,
+            } => {
+                let message = PeerClient::new(secret_bytes(&secret)?)
+                    .email_message(&node, &name, &id)
+                    .await?;
+                println!("{}", serde_json::to_string_pretty(&message)?);
+                Ok(())
+            }
+            EmailCmd::Raw {
+                name,
+                id,
+                output,
+                node,
+                secret,
+            } => {
+                let raw = PeerClient::new(secret_bytes(&secret)?)
+                    .email_message_raw(&node, &name, &id)
+                    .await?;
+                std::fs::write(&output, raw)
+                    .with_context(|| format!("无法写入 {}", output.display()))?;
+                println!("邮件原文已写入 {}", output.display());
+                Ok(())
+            }
+            EmailCmd::Send {
+                name,
+                file,
+                from,
+                recipients,
+                node,
+                secret,
+            } => {
+                let raw = std::fs::read(&file)
+                    .with_context(|| format!("无法读取 RFC 822 文件 {}", file.display()))?;
+                let metadata = rf::email::EmailSendMetadata {
+                    mail_from: from,
+                    recipients,
+                };
+                let queued = PeerClient::new(secret_bytes(&secret)?)
+                    .email_send(&node, &name, &metadata, &raw)
+                    .await?;
+                println!("{}", serde_json::to_string_pretty(&queued)?);
+                Ok(())
+            }
+        },
         Cmd::Log {
             worker,
             node,
@@ -2306,6 +2625,27 @@ fn doctor(config: PathBuf, json: bool) -> Result<()> {
             warnings.push("ACME is configured but neither acme.zone nor dns.zone is set");
         }
     }
+    let email_tls = if cfg.email.enabled {
+        let mx = cfg.email.mx_hostname.as_deref().unwrap_or_default();
+        let cert = cfg.data_dir.join("certs").join(format!("{mx}.crt"));
+        let key = cfg.data_dir.join("certs").join(format!("{mx}.key"));
+        let cert_exists = cert.is_file();
+        let key_exists = key.is_file();
+        if cert_exists != key_exists {
+            warnings
+                .push("email STARTTLS certificate is incomplete; both .crt and .key are required");
+        } else if !cert_exists {
+            warnings.push("email is enabled without a materialized STARTTLS certificate");
+        }
+        if let Some(acme) = &cfg.acme {
+            if !acme.hostnames.iter().any(|hostname| hostname == mx) && !cert_exists {
+                warnings.push("email MX hostname is not included in ACME hostnames");
+            }
+        }
+        cert_exists && key_exists
+    } else {
+        false
+    };
     if cfg.update.enabled {
         warnings.push(
             "self-update is enabled; the hardened systemd service intentionally cannot replace /usr/local/bin/rf",
@@ -2335,6 +2675,14 @@ fn doctor(config: PathBuf, json: bool) -> Result<()> {
             "local_dir": cfg.storage.local_dir,
             "rclone": rclone_version,
             "rclone_configured": cfg.storage.rclone_config.is_some(),
+        },
+        "email": {
+            "enabled": cfg.email.enabled,
+            "smtp_listen": cfg.email.smtp_listen,
+            "mx_hostname": cfg.email.mx_hostname,
+            "outbound": cfg.email.outbound,
+            "max_sessions": cfg.email.max_sessions,
+            "starttls_ready": email_tls,
         },
         "warnings": warnings,
     });
@@ -2371,6 +2719,19 @@ fn doctor(config: PathBuf, json: bool) -> Result<()> {
         match report["object_storage"]["rclone"].as_str() {
             Some(version) => println!("storage: local + {version}"),
             None => println!("storage: local"),
+        }
+        if cfg.email.enabled {
+            println!(
+                "email: {} as {} (STARTTLS {})",
+                cfg.email
+                    .smtp_listen
+                    .map(|value| value.to_string())
+                    .unwrap_or_else(|| "unavailable".into()),
+                cfg.email.mx_hostname.as_deref().unwrap_or("unavailable"),
+                if email_tls { "ready" } else { "not ready" }
+            );
+        } else {
+            println!("email: disabled");
         }
         for warning in report["warnings"].as_array().into_iter().flatten() {
             println!("warning: {}", warning.as_str().unwrap_or("unknown warning"));
@@ -2518,6 +2879,9 @@ async fn run(config_path: PathBuf) -> Result<()> {
     let workflowbind_port = rf::workflowbind::serve(node.clone()).await?;
     node.set_workflowbind_port(workflowbind_port);
     tracing::info!("Workflow binding on 127.0.0.1:{workflowbind_port}");
+    let emailbind_port = rf::emailbind::serve(node.clone()).await?;
+    node.set_emailbind_port(emailbind_port);
+    tracing::info!("Email binding on 127.0.0.1:{emailbind_port}");
 
     let _gossip = rf::gossip::start(node.clone()).await?;
     durable.spawn_ensurer();
@@ -2526,6 +2890,7 @@ async fn run(config_path: PathBuf) -> Result<()> {
     rf::pipeline::spawn_driver(node.clone());
     rf::workflow::spawn_driver(node.clone());
     rf::flow::spawn_driver(node.clone());
+    rf::email::spawn_driver(node.clone());
     tracing::info!("gossip on {}", node.cfg.gossip.listen);
 
     tokio::spawn(rf::runtime::Runtime::new(node.clone(), durable.clone()).run());
@@ -2562,6 +2927,7 @@ async fn run(config_path: PathBuf) -> Result<()> {
 
     // Certs issued anywhere in the cluster materialize on every node.
     rf::acme::spawn_materializer(node.clone());
+    let _smtp_thread = rf::email::spawn_smtp_server(node.clone())?;
     if let Some(mut acme_cfg) = node.cfg.acme.clone() {
         let zone = acme_cfg
             .zone

@@ -25,6 +25,7 @@ pub const QUEUE_METADATA_ENV: &str = "__RF_QUEUE_BINDINGS_V1";
 pub const ANALYTICS_METADATA_ENV: &str = "__RF_ANALYTICS_BINDINGS_V1";
 pub const PIPELINE_METADATA_ENV: &str = "__RF_PIPELINE_BINDINGS_V1";
 pub const WORKFLOW_METADATA_ENV: &str = "__RF_WORKFLOW_BINDINGS_V1";
+pub const EMAIL_METADATA_ENV: &str = "__RF_EMAIL_BINDINGS_V1";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DurableObjectBinding {
@@ -84,6 +85,13 @@ pub fn workflow_bindings(m: &WorkerManifest) -> BTreeMap<String, String> {
         .unwrap_or_default()
 }
 
+pub fn email_bindings(m: &WorkerManifest) -> BTreeMap<String, String> {
+    m.env
+        .get(EMAIL_METADATA_ENV)
+        .and_then(|raw| serde_json::from_str(raw).ok())
+        .unwrap_or_default()
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct DeploySpec {
@@ -118,6 +126,9 @@ pub struct DeploySpec {
     /// binding name → signed Workflow resource name.
     #[serde(default)]
     pub workflows: BTreeMap<String, String>,
+    /// binding name → signed Email Domain resource name.
+    #[serde(default)]
+    pub email: BTreeMap<String, String>,
     #[serde(default)]
     pub crons: Vec<String>,
     /// Relative dir of static assets.
@@ -149,6 +160,7 @@ fn validate_spec(spec: &DeploySpec) -> Result<()> {
         || spec.env.contains_key(ANALYTICS_METADATA_ENV)
         || spec.env.contains_key(PIPELINE_METADATA_ENV)
         || spec.env.contains_key(WORKFLOW_METADATA_ENV)
+        || spec.env.contains_key(EMAIL_METADATA_ENV)
     {
         bail!("env keys beginning with __RF_ are reserved by rf");
     }
@@ -164,6 +176,7 @@ fn validate_spec(spec: &DeploySpec) -> Result<()> {
         .chain(spec.analytics.keys())
         .chain(spec.pipelines.keys())
         .chain(spec.workflows.keys())
+        .chain(spec.email.keys())
     {
         if !binding_names.insert(name) {
             bail!("binding name {name:?} is used more than once");
@@ -570,6 +583,25 @@ fn manifest_from_bundle(
         env.insert(
             WORKFLOW_METADATA_ENV.into(),
             serde_json::to_string(&bundle.spec.workflows)?,
+        );
+    }
+    if !bundle.spec.email.is_empty() {
+        let identifier = |value: &str| {
+            let mut characters = value.chars();
+            characters.next().is_some_and(|character| {
+                character.is_ascii_alphabetic() || character == '_' || character == '$'
+            }) && characters.all(|character| {
+                character.is_ascii_alphanumeric() || character == '_' || character == '$'
+            })
+        };
+        for (binding, domain) in &bundle.spec.email {
+            if !identifier(binding) || !rf_core::manifest::valid_name(domain) {
+                bail!("invalid Email binding {binding:?}");
+            }
+        }
+        env.insert(
+            EMAIL_METADATA_ENV.into(),
+            serde_json::to_string(&bundle.spec.email)?,
         );
     }
     let manifest = WorkerManifest {

@@ -135,6 +135,17 @@ pub fn router(api: Api) -> Router {
         .route("/v1/flow/{flow}/runs/{id}", get(flow_run))
         .route("/v1/flow/{flow}/runs/{id}/{action}", post(flow_action))
         .route("/v1/flow/{flow}/stats", get(flow_stats))
+        .route(
+            "/v1/email/{domain}/verification",
+            get(email_verification).post(email_verify),
+        )
+        .route("/v1/email/{domain}/messages", get(email_messages))
+        .route("/v1/email/{domain}/messages/{id}", get(email_message))
+        .route(
+            "/v1/email/{domain}/messages/{id}/raw",
+            get(email_message_raw),
+        )
+        .route("/v1/email/{domain}/send", post(email_send))
         .route("/v1/do/{worker}/proxy", post(do_proxy))
         .route("/v1/r2/{bucket}", get(r2_list))
         .route("/v1/r2-blob/{sha}", get(r2_blob_get))
@@ -443,6 +454,7 @@ async fn status(
                 && !name.starts_with("pipeline-")
                 && !name.starts_with("workflow-")
                 && !name.starts_with("flow-")
+                && !name.starts_with("email-")
         })
         .collect();
     let buckets: Vec<serde_json::Value> = crate::r2::bucket_records(node)
@@ -514,6 +526,17 @@ async fn status(
             })
         })
         .collect();
+    let email_domains: Vec<serde_json::Value> = crate::email::email_domain_records(node)
+        .into_iter()
+        .map(|(view, spec)| {
+            serde_json::json!({
+                "name": view.resource.name,
+                "version": view.resource.version,
+                "digest": view.digest,
+                "spec": spec,
+            })
+        })
+        .collect();
     axum::Json(serde_json::json!({
         "node": node.id_hex(),
         "label": node.cfg.label,
@@ -531,6 +554,13 @@ async fn status(
         "pipelines": pipelines,
         "workflows": workflows,
         "flows": flows,
+        "email_domains": email_domains,
+        "email_node": {
+            "enabled": node.cfg.email.enabled,
+            "outbound": node.cfg.email.outbound,
+            "mx_hostname": node.cfg.email.mx_hostname,
+            "smtp_listen": node.cfg.email.smtp_listen.map(|address| address.to_string()),
+        },
         "storage": {
             "local": true,
             "rclone": node.cfg.storage.rclone_binary.is_some(),
@@ -1689,6 +1719,158 @@ async fn flow_stats(
     }
     match crate::flow::stats(&api.node, &flow).await {
         Ok(stats) => axum::Json(stats).into_response(),
+        Err(error) => (StatusCode::UNPROCESSABLE_ENTITY, error.to_string()).into_response(),
+    }
+}
+
+#[derive(Deserialize)]
+struct EmailMessagesQuery {
+    limit: Option<usize>,
+}
+
+async fn email_verification(
+    State(api): State<Api>,
+    ConnectInfo(remote): ConnectInfo<SocketAddr>,
+    Path(domain): Path<String>,
+    method: Method,
+    uri: Uri,
+    headers: HeaderMap,
+) -> Response {
+    if let Err(response) = check(&api, &remote, &headers, &method, &uri, b"") {
+        return response.into_response();
+    }
+    if crate::email::email_domain_record(&api.node, &domain).is_none() {
+        return (StatusCode::NOT_FOUND, "邮件域不存在").into_response();
+    }
+    match crate::email::latest_verification(&api.node, &domain).await {
+        Ok(verification) => axum::Json(serde_json::json!({
+            "verification": verification,
+        }))
+        .into_response(),
+        Err(error) => (StatusCode::UNPROCESSABLE_ENTITY, error.to_string()).into_response(),
+    }
+}
+
+async fn email_verify(
+    State(api): State<Api>,
+    ConnectInfo(remote): ConnectInfo<SocketAddr>,
+    Path(domain): Path<String>,
+    method: Method,
+    uri: Uri,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    if let Err(response) = check(&api, &remote, &headers, &method, &uri, &body) {
+        return response.into_response();
+    }
+    match crate::email::verify_domain(&api.node, &domain).await {
+        Ok(verification) => axum::Json(verification).into_response(),
+        Err(error) => (StatusCode::UNPROCESSABLE_ENTITY, error.to_string()).into_response(),
+    }
+}
+
+async fn email_messages(
+    State(api): State<Api>,
+    ConnectInfo(remote): ConnectInfo<SocketAddr>,
+    Path(domain): Path<String>,
+    Query(query): Query<EmailMessagesQuery>,
+    method: Method,
+    uri: Uri,
+    headers: HeaderMap,
+) -> Response {
+    if let Err(response) = check(&api, &remote, &headers, &method, &uri, b"") {
+        return response.into_response();
+    }
+    if crate::email::email_domain_record(&api.node, &domain).is_none() {
+        return (StatusCode::NOT_FOUND, "邮件域不存在").into_response();
+    }
+    match crate::email::list_messages(&api.node, &domain, query.limit.unwrap_or(100)).await {
+        Ok(messages) => axum::Json(serde_json::json!({ "messages": messages })).into_response(),
+        Err(error) => (StatusCode::UNPROCESSABLE_ENTITY, error.to_string()).into_response(),
+    }
+}
+
+async fn email_message(
+    State(api): State<Api>,
+    ConnectInfo(remote): ConnectInfo<SocketAddr>,
+    Path((domain, id)): Path<(String, String)>,
+    method: Method,
+    uri: Uri,
+    headers: HeaderMap,
+) -> Response {
+    if let Err(response) = check(&api, &remote, &headers, &method, &uri, b"") {
+        return response.into_response();
+    }
+    match crate::email::get_message(&api.node, &domain, &id).await {
+        Ok(Some(message)) => axum::Json(message).into_response(),
+        Ok(None) => (StatusCode::NOT_FOUND, "邮件记录不存在").into_response(),
+        Err(error) => (StatusCode::UNPROCESSABLE_ENTITY, error.to_string()).into_response(),
+    }
+}
+
+async fn email_message_raw(
+    State(api): State<Api>,
+    ConnectInfo(remote): ConnectInfo<SocketAddr>,
+    Path((domain, id)): Path<(String, String)>,
+    method: Method,
+    uri: Uri,
+    headers: HeaderMap,
+) -> Response {
+    if let Err(response) = check(&api, &remote, &headers, &method, &uri, b"") {
+        return response.into_response();
+    }
+    let Some(message) = (match crate::email::get_message(&api.node, &domain, &id).await {
+        Ok(message) => message,
+        Err(error) => {
+            return (StatusCode::UNPROCESSABLE_ENTITY, error.to_string()).into_response();
+        }
+    }) else {
+        return (StatusCode::NOT_FOUND, "邮件记录不存在").into_response();
+    };
+    let Some((_, spec)) = crate::email::email_domain_record(&api.node, &domain) else {
+        return (StatusCode::NOT_FOUND, "邮件域不存在").into_response();
+    };
+    match crate::r2::get_object(&api.node, &spec.bucket, &message.object_key).await {
+        Ok(Some((_metadata, raw))) => {
+            ([(axum::http::header::CONTENT_TYPE, "message/rfc822")], raw).into_response()
+        }
+        Ok(None) => (StatusCode::NOT_FOUND, "邮件原文对象不存在").into_response(),
+        Err(error) => (StatusCode::UNPROCESSABLE_ENTITY, error.to_string()).into_response(),
+    }
+}
+
+async fn email_send(
+    State(api): State<Api>,
+    ConnectInfo(remote): ConnectInfo<SocketAddr>,
+    Path(domain): Path<String>,
+    method: Method,
+    uri: Uri,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    if let Err(response) = check(&api, &remote, &headers, &method, &uri, &body) {
+        return response.into_response();
+    }
+    let (metadata, raw) = match crate::email::decode_send_request(&body) {
+        Ok(request) => request,
+        Err(error) => return (StatusCode::BAD_REQUEST, error.to_string()).into_response(),
+    };
+    match crate::email::queue_outbound(
+        &api.node,
+        &domain,
+        &metadata.mail_from,
+        &metadata.recipients,
+        raw,
+    )
+    .await
+    {
+        Ok(queued) => (
+            StatusCode::ACCEPTED,
+            axum::Json(serde_json::json!({
+                "queued": queued,
+            })),
+        )
+            .into_response(),
         Err(error) => (StatusCode::UNPROCESSABLE_ENTITY, error.to_string()).into_response(),
     }
 }

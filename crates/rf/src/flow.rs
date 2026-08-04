@@ -1847,7 +1847,7 @@ async fn execute_node(
             )
             .await
         }
-        "email" => bail!("当前节点未启用可选邮件能力；请配置邮件节点后重试"),
+        "email" => execute_email(node, &config, context).await,
         kind => bail!("尚不支持的 Flow 节点类型：{kind}"),
     }
 }
@@ -2069,6 +2069,68 @@ async fn execute_pipeline(
     let events = source.as_array().cloned().unwrap_or_else(|| vec![source]);
     let accepted = crate::pipeline::ingest(node, pipeline, events).await?;
     Ok(ExecResult::success(json!({ "accepted": accepted })))
+}
+
+async fn execute_email(
+    node: &Node,
+    config: &Map<String, Value>,
+    context: &ExecContext,
+) -> Result<ExecResult> {
+    let domain = required_string_alias(config, &["domain", "domainId"], "邮件域资源名称")?;
+    let mail_from = required_string_alias(config, &["from", "mailFrom"], "信封发件人")?;
+    if mail_from.contains(['\r', '\n']) {
+        bail!("Flow 邮件发件人不得包含换行符");
+    }
+    let recipient_value = config
+        .get("recipients")
+        .or_else(|| config.get("to"))
+        .context("Flow 邮件节点缺少收件人")?;
+    let recipients = match recipient_value {
+        Value::String(value) => value
+            .split(',')
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string)
+            .collect::<Vec<_>>(),
+        Value::Array(values) => values
+            .iter()
+            .map(|value| {
+                value
+                    .as_str()
+                    .context("Flow 邮件收件人数组只能包含字符串")
+                    .map(str::to_string)
+            })
+            .collect::<Result<Vec<_>>>()?,
+        _ => bail!("Flow 邮件收件人必须是字符串或字符串数组"),
+    };
+    if recipients.is_empty() || recipients.iter().any(|value| value.contains(['\r', '\n'])) {
+        bail!("Flow 邮件节点必须包含至少一个有效收件人");
+    }
+    let raw = if let Some(raw) = config.get("raw").and_then(Value::as_str) {
+        raw.as_bytes().to_vec()
+    } else {
+        let subject = config
+            .get("subject")
+            .and_then(Value::as_str)
+            .unwrap_or("RandallFlare Flow 通知");
+        if subject.contains(['\r', '\n']) {
+            bail!("Flow 邮件主题不得包含换行符");
+        }
+        let body = config.get("body").unwrap_or(&context.input);
+        let body = body.as_str().map(str::to_string).unwrap_or_else(|| {
+            serde_json::to_string_pretty(body).unwrap_or_else(|_| "null".into())
+        });
+        format!(
+            "From: {mail_from}\r\nTo: {}\r\nSubject: {subject}\r\nMIME-Version: 1.0\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Transfer-Encoding: 8bit\r\n\r\n{body}\r\n",
+            recipients.join(", ")
+        )
+        .into_bytes()
+    };
+    let queued = crate::email::queue_outbound(node, domain, mail_from, &recipients, &raw).await?;
+    Ok(ExecResult::success(json!({
+        "queued": queued,
+        "count": recipients.len(),
+    })))
 }
 
 async fn execute_worker(

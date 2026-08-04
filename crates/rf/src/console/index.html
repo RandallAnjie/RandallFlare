@@ -71,6 +71,9 @@
           <button class="nav-item" data-view="flows">
             <span class="nav-glyph" aria-hidden="true">⌘</span><span>Flow 编排</span><span id="flow-nav-count" class="count">0</span>
           </button>
+          <button class="nav-item" data-view="email">
+            <span class="nav-glyph" aria-hidden="true">@</span><span>邮件路由</span><span id="email-nav-count" class="count">0</span>
+          </button>
         </nav>
         <div class="sidebar-foot">
           <p class="sidebar-tagline">一次构建，一次验证，处处运行。</p>
@@ -109,6 +112,7 @@
             <article class="metric"><span>Pipeline</span><strong id="metric-pipelines">—</strong><small>持久批次与 R2 输出</small></article>
             <article class="metric"><span>Workflow</span><strong id="metric-workflows">—</strong><small>可恢复步骤与外部信号</small></article>
             <article class="metric"><span>Flow</span><strong id="metric-flows">—</strong><small>可视化 DAG 与租约接管</small></article>
+            <article class="metric"><span>邮件域</span><strong id="metric-email">—</strong><small>可选 SMTP 节点与耐久路由</small></article>
             <article class="metric"><span>内容块状态</span><strong id="metric-blobs">—</strong><small>本地缺失数</small></article>
           </div>
 
@@ -260,7 +264,7 @@
           </div>
 
           <div id="project-tab-bindings" class="project-tab">
-            <article class="panel settings-panel"><div class="settings-copy"><p class="eyebrow">运行配置</p><h2>变量与绑定</h2><p class="muted">环境变量与平台绑定会随签名清单复制。敏感凭据请使用节点侧密钥能力，不要写入普通变量。</p></div><form id="project-bindings-form" class="settings-form"><label><span>环境变量 <em>每行 KEY=value</em></span><textarea id="project-env" class="code-input" rows="8"></textarea></label><label><span>KV 绑定 <em>每行 BINDING=namespace</em></span><textarea id="project-kv-bindings" class="code-input" rows="6"></textarea></label><label><span>R2 绑定 <em>每行 BINDING=bucket</em></span><textarea id="project-r2-bindings" class="code-input" rows="5"></textarea></label><label><span>D1 绑定 <em>每行 BINDING=database</em></span><textarea id="project-d1-bindings" class="code-input" rows="5"></textarea></label><label><span>Queue 生产者绑定 <em>每行 BINDING=queue</em></span><textarea id="project-queue-bindings" class="code-input" rows="5"></textarea></label><label><span>Analytics Engine 绑定 <em>每行 BINDING=dataset</em></span><textarea id="project-analytics-bindings" class="code-input" rows="5"></textarea></label><label><span>Pipeline 绑定 <em>每行 BINDING=pipeline</em></span><textarea id="project-pipeline-bindings" class="code-input" rows="5"></textarea></label><label><span>Workflow 绑定 <em>每行 BINDING=workflow</em></span><textarea id="project-workflow-bindings" class="code-input" rows="5"></textarea></label><button class="primary" type="submit">保存变量与绑定</button></form></article>
+            <article class="panel settings-panel"><div class="settings-copy"><p class="eyebrow">运行配置</p><h2>变量与绑定</h2><p class="muted">环境变量与平台绑定会随签名清单复制。敏感凭据请使用节点侧密钥能力，不要写入普通变量。</p></div><form id="project-bindings-form" class="settings-form"><label><span>环境变量 <em>每行 KEY=value</em></span><textarea id="project-env" class="code-input" rows="8"></textarea></label><label><span>KV 绑定 <em>每行 BINDING=namespace</em></span><textarea id="project-kv-bindings" class="code-input" rows="6"></textarea></label><label><span>R2 绑定 <em>每行 BINDING=bucket</em></span><textarea id="project-r2-bindings" class="code-input" rows="5"></textarea></label><label><span>D1 绑定 <em>每行 BINDING=database</em></span><textarea id="project-d1-bindings" class="code-input" rows="5"></textarea></label><label><span>Queue 生产者绑定 <em>每行 BINDING=queue</em></span><textarea id="project-queue-bindings" class="code-input" rows="5"></textarea></label><label><span>Analytics Engine 绑定 <em>每行 BINDING=dataset</em></span><textarea id="project-analytics-bindings" class="code-input" rows="5"></textarea></label><label><span>Pipeline 绑定 <em>每行 BINDING=pipeline</em></span><textarea id="project-pipeline-bindings" class="code-input" rows="5"></textarea></label><label><span>Workflow 绑定 <em>每行 BINDING=workflow</em></span><textarea id="project-workflow-bindings" class="code-input" rows="5"></textarea></label><label><span>Email 发送绑定 <em>每行 BINDING=邮件域资源</em></span><textarea id="project-email-bindings" class="code-input" rows="5"></textarea></label><button class="primary" type="submit">保存变量与绑定</button></form></article>
           </div>
 
           <div id="project-tab-triggers" class="project-tab">
@@ -688,6 +692,110 @@
                 <div id="flow-run-actions" class="button-row"></div>
                 <h3>节点步骤</h3><div id="flow-steps" class="build-list empty-state">暂无步骤。</div>
                 <h3>审计时间线</h3><div id="flow-events" class="build-list empty-state">暂无事件。</div>
+              </article>
+            </div>
+          </div>
+        </section>
+
+        <section id="view-email" class="view" aria-labelledby="section-title">
+          <div class="projects-header">
+            <div><p class="eyebrow">去中心化邮件</p><h2>邮件路由</h2><p class="muted">域名与路由由管理员签名，邮件原文写入 R2（包括 rclone 后端），投递状态写入 D1。SMTP 接收节点为可选角色，任何节点都不会保存管理员私钥。</p></div>
+            <span id="email-count" class="badge">0 个邮件域</span>
+          </div>
+          <div id="email-node-warning" class="banner warning hidden" role="status">当前节点未启用 SMTP 邮件角色。你仍可管理签名定义和查看集群数据，但入站接收需要至少一个邮件节点。</div>
+          <div class="grid r2-grid">
+            <div class="r2-sidebar-stack">
+              <article class="panel">
+                <div class="panel-head"><div><p class="eyebrow">签名定义</p><h2>创建或编辑邮件域</h2></div><button id="email-new" class="secondary compact" type="button">新建</button></div>
+                <form id="email-domain-form" class="stack-form">
+                  <label><span>资源名称</span><input id="email-name" pattern="[a-z0-9-]{1,63}" placeholder="support-mail" required></label>
+                  <label><span>收发域名</span><input id="email-domain" type="text" placeholder="mail.example.com" required></label>
+                  <label><span>MX 主机名</span><input id="email-mx" type="text" placeholder="mx1.example.com" required></label>
+                  <label><span>邮件原文 R2 bucket</span><select id="email-bucket" required><option value="">请选择 bucket</option></select></label>
+                  <label><span>对象前缀</span><input id="email-prefix" value="mail" required></label>
+                  <label><span>说明</span><textarea id="email-description" rows="3" placeholder="客服邮件与自动化处理"></textarea></label>
+                  <div class="form-grid">
+                    <label><span>单封上限（MiB）</span><input id="email-max-size" type="number" min="1" max="63" value="25" required></label>
+                    <label><span>记录保留（天）</span><input id="email-retention" type="number" min="1" max="3650" value="30" required></label>
+                  </div>
+                  <div class="form-grid">
+                    <label><span>每分钟入站上限</span><input id="email-inbound-rate" type="number" min="1" value="1000" required></label>
+                    <label><span>每分钟出站上限</span><input id="email-outbound-rate" type="number" min="1" value="1000" required></label>
+                  </div>
+                  <details><summary><strong>DKIM 签名</strong><span class="muted">公钥进 DNS，私钥仅在邮件节点环境变量中</span></summary>
+                    <div class="stack-form details-form">
+                      <label><span>Selector</span><input id="email-dkim-selector" value="rf" required></label>
+                      <label><span>DKIM 公钥 TXT 值</span><textarea id="email-dkim-public" class="code-input" rows="4" placeholder="v=DKIM1; k=rsa; p=..."></textarea></label>
+                      <label><span>私钥环境变量名</span><input id="email-dkim-env" class="code-input" pattern="RF_EMAIL_DKIM_[A-Z0-9_]+" placeholder="RF_EMAIL_DKIM_SUPPORT"></label>
+                      <p class="form-note">这里只保存环境变量名。PEM 私钥必须直接配置到获准发信的节点，绝不能粘贴到控制台或清单中。</p>
+                    </div>
+                  </details>
+                  <label class="check-label"><input id="email-suspended" type="checkbox"><span>暂停接收与发送</span></label>
+                  <label><span>暂停原因</span><input id="email-suspend-reason" placeholder="维护窗口"></label>
+                  <label class="check-label"><input id="email-rotate-verification" type="checkbox"><span>保存时轮换所有权验证值</span></label>
+                  <button class="primary" type="submit">保存并签名</button>
+                </form>
+              </article>
+              <article class="panel">
+                <div class="panel-head"><div><p class="eyebrow">邮件域目录</p><h2>全部邮件域</h2></div></div>
+                <div id="email-domain-list" class="database-list empty-state">暂无邮件域。</div>
+              </article>
+            </div>
+
+            <div class="r2-sidebar-stack">
+              <article class="panel">
+                <div class="panel-head"><div><p class="eyebrow">域名状态</p><h2 id="email-active-name">请选择邮件域</h2><p id="email-summary" class="muted compact-copy">选择后可配置 DNS、编辑路由并查看收发记录。</p></div><button id="email-delete" class="danger ghost hidden" type="button">删除邮件域</button></div>
+                <div class="metrics compact-metrics">
+                  <article class="metric"><span>所有权 TXT</span><strong id="email-ownership-state">—</strong></article>
+                  <article class="metric"><span>MX</span><strong id="email-mx-state">—</strong></article>
+                  <article class="metric"><span>DKIM</span><strong id="email-dkim-state">—</strong></article>
+                  <article class="metric"><span>总体状态</span><strong id="email-verified-state">—</strong></article>
+                </div>
+                <button id="email-verify" class="secondary hidden" type="button">立即检查 DNS</button>
+              </article>
+
+              <article id="email-dns-panel" class="panel hidden">
+                <div class="panel-head"><div><p class="eyebrow">DNS 配置</p><h2>需要发布的记录</h2><p class="muted compact-copy">所有权 TXT 与 MX 必须完全匹配；SPF 和 DKIM 用于提升出站信誉。</p></div></div>
+                <dl id="email-dns-records" class="detail-list"></dl>
+                <div id="email-verification-detail" class="banner hidden"></div>
+              </article>
+
+              <article id="email-routes-panel" class="panel hidden">
+                <div class="panel-head"><div><p class="eyebrow">地址路由</p><h2>入站处理规则</h2><p class="muted compact-copy">精确地址优先于地址前缀，最后匹配兜底规则；同类规则中优先级数字较小者先执行。</p></div></div>
+                <form id="email-route-form" class="stack-form">
+                  <div class="form-grid"><label><span>路由 ID</span><input id="email-route-id" pattern="[a-z0-9-]{1,63}" placeholder="support" required></label><label><span>优先级</span><input id="email-route-priority" type="number" value="0" required></label></div>
+                  <div class="form-grid"><label><span>匹配方式</span><select id="email-route-match"><option value="exact">精确地址</option><option value="prefix">地址前缀</option><option value="catch_all">兜底</option></select></label><label id="email-route-value-label"><span>匹配值</span><input id="email-route-value" placeholder="support@example.com" required></label></div>
+                  <div class="form-grid"><label><span>处理方式</span><select id="email-route-destination"><option value="worker">交给 Worker</option><option value="forward">转发地址</option><option value="drop">直接丢弃</option></select></label><label id="email-route-target-label"><span>目标</span><select id="email-route-worker"><option value="">请选择 Worker</option></select><input id="email-route-addresses" class="hidden" placeholder="one@example.com, two@example.com"></label></div>
+                  <label class="check-label"><input id="email-route-enabled" type="checkbox" checked><span>启用此规则</span></label>
+                  <button class="secondary" type="submit">添加或替换路由</button>
+                </form>
+                <div id="email-route-list" class="build-list empty-state">暂无路由。</div>
+              </article>
+
+              <div class="grid one-one">
+                <article id="email-send-panel" class="panel hidden">
+                  <div class="panel-head"><div><p class="eyebrow">调试发送</p><h2>提交 RFC 822 邮件</h2><p class="muted compact-copy">邮件会先持久化，再由有出站能力的节点按 MX 直接投递。</p></div></div>
+                  <form id="email-send-form" class="stack-form">
+                    <label><span>信封发件人</span><input id="email-send-from" type="email" required></label>
+                    <label><span>信封收件人 <em>逗号分隔</em></span><input id="email-send-to" required></label>
+                    <label><span>邮件原文</span><textarea id="email-send-raw" class="code-input" rows="10">From: sender@example.com
+To: recipient@example.net
+Subject: RandallFlare 测试邮件
+Content-Type: text/plain; charset=utf-8
+
+这是一封由 RandallFlare 耐久邮件队列发送的测试邮件。</textarea></label>
+                    <button class="secondary" type="submit">加入发送队列</button>
+                  </form>
+                </article>
+                <article id="email-message-panel" class="panel hidden">
+                  <div class="panel-head"><div><p class="eyebrow">邮件详情</p><h2 id="email-message-title">请选择记录</h2></div><a id="email-message-download" class="secondary compact hidden" href="#">下载 .eml</a></div>
+                  <dl id="email-message-detail" class="detail-list"><div><dt>状态</dt><dd>—</dd></div></dl>
+                </article>
+              </div>
+
+              <article id="email-messages-panel" class="panel hidden">
+                <div class="panel-head"><div><p class="eyebrow">耐久账本</p><h2>最近收发记录</h2></div><button id="email-refresh" class="secondary compact" type="button">刷新</button></div>
+                <div id="email-message-list" class="build-list empty-state">暂无邮件记录。</div>
               </article>
             </div>
           </div>

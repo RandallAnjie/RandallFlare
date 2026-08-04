@@ -55,6 +55,46 @@ pub struct NodeConfig {
     /// the referenced rclone config and are never replicated.
     #[serde(default)]
     pub storage: StorageConfig,
+    /// Optional SMTP receive/send capability. Nodes without this section do
+    /// not open port 25 and never claim mail-delivery leases.
+    #[serde(default)]
+    pub email: EmailConfig,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EmailConfig {
+    /// Join the capability-selected SMTP pool.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Public SMTP listener. Required when enabled; normally 0.0.0.0:25.
+    #[serde(default)]
+    pub smtp_listen: Option<SocketAddr>,
+    /// EHLO name, MX verification target and STARTTLS certificate stem.
+    #[serde(default)]
+    pub mx_hostname: Option<String>,
+    /// Whether this node may claim outbound SMTP delivery leases.
+    #[serde(default = "default_true")]
+    pub outbound: bool,
+    /// Maximum simultaneous inbound SMTP sessions.
+    #[serde(default = "default_email_sessions")]
+    pub max_sessions: u32,
+}
+
+impl Default for EmailConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            smtp_listen: None,
+            mx_hostname: None,
+            outbound: true,
+            max_sessions: default_email_sessions(),
+        }
+    }
+}
+
+fn default_email_sessions() -> u32 {
+    32
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -450,6 +490,20 @@ impl NodeConfig {
         {
             anyhow::bail!("storage.rclone_timeout_seconds must be between 1 and 86400");
         }
+        if self.email.max_sessions == 0 || self.email.max_sessions > 1024 {
+            anyhow::bail!("email.max_sessions must be between 1 and 1024");
+        }
+        if self.email.enabled {
+            if self.email.smtp_listen.is_none() {
+                anyhow::bail!("email.smtp_listen is required when email.enabled=true");
+            }
+            let hostname = self.email.mx_hostname.as_deref().ok_or_else(|| {
+                anyhow::anyhow!("email.mx_hostname is required when email.enabled=true")
+            })?;
+            if !valid_hostname(hostname) {
+                anyhow::bail!("email.mx_hostname must be a lowercase DNS hostname");
+            }
+        }
         Ok(())
     }
 
@@ -577,6 +631,36 @@ mod tests {
 
         let mut invalid = cfg.clone();
         invalid.ingress.default_domain = Some("Workers.Example.com".into());
+        assert!(invalid.validate().is_err());
+    }
+
+    #[test]
+    fn email_node_is_explicit_and_bounded() {
+        let raw = r#"
+            data_dir = "/var/lib/rf"
+            operator = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+            cluster_secret = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+            [gossip]
+            listen = "127.0.0.1:7381"
+            [peer_api]
+            listen = "127.0.0.1:7382"
+            [email]
+            enabled = true
+            smtp_listen = "0.0.0.0:25"
+            mx_hostname = "mx.example.com"
+            outbound = false
+            max_sessions = 64
+        "#;
+        let cfg: NodeConfig = toml::from_str(raw).unwrap();
+        cfg.validate().unwrap();
+        assert!(cfg.email.enabled);
+        assert!(!cfg.email.outbound);
+
+        let mut invalid = cfg.clone();
+        invalid.email.mx_hostname = Some("MX.Example.com".into());
+        assert!(invalid.validate().is_err());
+        invalid.email.mx_hostname = Some("mx.example.com".into());
+        invalid.email.max_sessions = 0;
         assert!(invalid.validate().is_err());
     }
 }

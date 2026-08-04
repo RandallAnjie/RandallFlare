@@ -281,6 +281,21 @@ pub fn router(state: ConsoleState) -> Router {
         .route("/api/flows/{name}/runs", get(flow_runs).post(flow_trigger))
         .route("/api/flows/{name}/runs/{id}", get(flow_run))
         .route("/api/flows/{name}/runs/{id}/{action}", post(flow_action))
+        .route("/api/email", get(email_list).post(email_apply))
+        .route("/api/email/{name}", delete(email_delete))
+        .route(
+            "/api/email/{name}/verification",
+            get(email_verification).post(email_verify),
+        )
+        .route(
+            "/api/email/{name}/messages",
+            get(email_messages).post(email_send),
+        )
+        .route("/api/email/{name}/messages/{id}", get(email_message))
+        .route(
+            "/api/email/{name}/messages/{id}/raw",
+            get(email_message_raw),
+        )
         .route("/api/auth/logout", post(logout))
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
@@ -757,6 +772,8 @@ struct WorkerSettingsRequest {
     #[serde(default)]
     workflow_bindings: Option<BTreeMap<String, String>>,
     #[serde(default)]
+    email_bindings: Option<BTreeMap<String, String>>,
+    #[serde(default)]
     crons: Option<Vec<String>>,
     #[serde(default)]
     compatibility_date: Option<String>,
@@ -814,6 +831,7 @@ async fn worker_get(
     env.remove(deploy::ANALYTICS_METADATA_ENV);
     env.remove(deploy::PIPELINE_METADATA_ENV);
     env.remove(deploy::WORKFLOW_METADATA_ENV);
+    env.remove(deploy::EMAIL_METADATA_ENV);
     let durable_objects = deploy::durable_objects(&manifest);
     let r2_bindings = deploy::r2_bindings(&manifest);
     let d1_bindings = deploy::d1_bindings(&manifest);
@@ -821,6 +839,7 @@ async fn worker_get(
     let analytics_bindings = deploy::analytics_bindings(&manifest);
     let pipeline_bindings = deploy::pipeline_bindings(&manifest);
     let workflow_bindings = deploy::workflow_bindings(&manifest);
+    let email_bindings = deploy::email_bindings(&manifest);
     let source = match &state.mode {
         ConsoleMode::Public { node, .. } => crate::build::source_head(node, &name)
             .filter(|record| !record.source.deleted)
@@ -875,6 +894,7 @@ async fn worker_get(
             "analytics_bindings": analytics_bindings,
             "pipeline_bindings": pipeline_bindings,
             "workflow_bindings": workflow_bindings,
+            "email_bindings": email_bindings,
             "crons": manifest.crons,
             "compatibility_date": manifest.compatibility_date,
             "durable_objects": durable_objects,
@@ -1121,6 +1141,7 @@ fn apply_worker_settings(
         analytics_bindings,
         pipeline_bindings,
         workflow_bindings,
+        email_bindings,
         crons,
         compatibility_date,
     } = request;
@@ -1133,6 +1154,7 @@ fn apply_worker_settings(
         && analytics_bindings.is_none()
         && pipeline_bindings.is_none()
         && workflow_bindings.is_none()
+        && email_bindings.is_none()
         && crons.is_none()
         && compatibility_date.is_none()
     {
@@ -1159,6 +1181,7 @@ fn apply_worker_settings(
             || env.contains_key(deploy::ANALYTICS_METADATA_ENV)
             || env.contains_key(deploy::PIPELINE_METADATA_ENV)
             || env.contains_key(deploy::WORKFLOW_METADATA_ENV)
+            || env.contains_key(deploy::EMAIL_METADATA_ENV)
         {
             return Err(ApiError::bad_request(
                 "不能修改 RandallFlare 保留的环境变量",
@@ -1185,6 +1208,9 @@ fn apply_worker_settings(
         }
         if let Some(workflows) = manifest.env.get(deploy::WORKFLOW_METADATA_ENV).cloned() {
             env.insert(deploy::WORKFLOW_METADATA_ENV.into(), workflows);
+        }
+        if let Some(email) = manifest.env.get(deploy::EMAIL_METADATA_ENV).cloned() {
+            env.insert(deploy::EMAIL_METADATA_ENV.into(), email);
         }
         manifest.env = env;
     }
@@ -1352,6 +1378,32 @@ fn apply_worker_settings(
             );
         }
     }
+    if let Some(email_bindings) = email_bindings {
+        validate_settings_map(&email_bindings, "Email 绑定")?;
+        let identifier = |value: &str| {
+            let mut chars = value.chars();
+            chars.next().is_some_and(|character| {
+                character.is_ascii_alphabetic() || matches!(character, '_' | '$')
+            }) && chars.all(|character| {
+                character.is_ascii_alphanumeric() || matches!(character, '_' | '$')
+            })
+        };
+        for (binding, domain) in &email_bindings {
+            if !identifier(binding) || !valid_name(domain) {
+                return Err(ApiError::bad_request(format!(
+                    "Email 绑定 {binding} 或邮件域资源名称无效"
+                )));
+            }
+        }
+        if email_bindings.is_empty() {
+            manifest.env.remove(deploy::EMAIL_METADATA_ENV);
+        } else {
+            manifest.env.insert(
+                deploy::EMAIL_METADATA_ENV.into(),
+                serde_json::to_string(&email_bindings)?,
+            );
+        }
+    }
     if let Some(crons) = crons {
         if crons.len() > 256 {
             return Err(ApiError::bad_request(
@@ -1384,6 +1436,7 @@ fn apply_worker_settings(
         .chain(deploy::analytics_bindings(&manifest).keys())
         .chain(deploy::pipeline_bindings(&manifest).keys())
         .chain(deploy::workflow_bindings(&manifest).keys())
+        .chain(deploy::email_bindings(&manifest).keys())
     {
         if !binding_names.insert(name.clone()) {
             return Err(ApiError::bad_request(format!("绑定名称 {name} 被重复使用")));
@@ -3458,6 +3511,323 @@ async fn flow_action(
     Ok(Json(json!({ "ok": true, "result": result })))
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct EmailDomainRequest {
+    name: String,
+    #[serde(default)]
+    description: String,
+    domain: String,
+    mx_hostname: String,
+    bucket: String,
+    #[serde(default = "email_default_object_prefix")]
+    object_prefix: String,
+    #[serde(default)]
+    routes: Vec<crate::email::EmailRoute>,
+    #[serde(default = "email_default_max_message_bytes")]
+    max_message_bytes: u64,
+    #[serde(default = "email_default_per_minute")]
+    inbound_per_minute: u32,
+    #[serde(default = "email_default_per_minute")]
+    outbound_per_minute: u32,
+    #[serde(default = "email_default_retention_days")]
+    retention_days: u16,
+    #[serde(default = "email_default_dkim_selector")]
+    dkim_selector: String,
+    #[serde(default)]
+    dkim_public_key: String,
+    #[serde(default)]
+    dkim_private_key_env: String,
+    #[serde(default)]
+    rotate_verification: bool,
+    #[serde(default)]
+    suspended: bool,
+    #[serde(default)]
+    suspend_reason: String,
+}
+
+fn email_default_object_prefix() -> String {
+    "mail".into()
+}
+
+fn email_default_max_message_bytes() -> u64 {
+    25 * 1024 * 1024
+}
+
+fn email_default_per_minute() -> u32 {
+    1_000
+}
+
+fn email_default_retention_days() -> u16 {
+    30
+}
+
+fn email_default_dkim_selector() -> String {
+    "rf".into()
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct EmailSendRequest {
+    mail_from: String,
+    recipients: Vec<String>,
+    raw_base64: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct EmailMessagesQuery {
+    limit: Option<usize>,
+}
+
+async fn email_list(State(state): State<ConsoleState>) -> ApiResult<Json<Value>> {
+    let records = state
+        .client
+        .resource_heads(&state.node, Some(crate::email::EMAIL_DOMAIN_KIND))
+        .await?;
+    let mut domains = Vec::new();
+    for view in records.into_iter().filter(|view| !view.resource.deleted) {
+        let spec = crate::email::email_domain_spec(&view.resource)?;
+        let verification = state
+            .client
+            .email_verification(&state.node, &view.resource.name)
+            .await
+            .ok()
+            .flatten();
+        domains.push(json!({
+            "name": view.resource.name,
+            "version": view.resource.version,
+            "digest": view.digest,
+            "spec": spec,
+            "verification": verification,
+        }));
+    }
+    let status = state.client.status(&state.node).await.ok();
+    Ok(Json(json!({
+        "domains": domains,
+        "email_node": status.as_ref().and_then(|value| value.get("email_node")).cloned(),
+        "buckets": status.as_ref().and_then(|value| value.get("r2_buckets")).cloned().unwrap_or_else(|| json!([])),
+        "workers": status.as_ref().and_then(|value| value.get("workers")).cloned().unwrap_or_else(|| json!([])),
+    })))
+}
+
+async fn email_apply(
+    State(state): State<ConsoleState>,
+    Extension(principal): Extension<ConsolePrincipal>,
+    Json(request): Json<EmailDomainRequest>,
+) -> ApiResult<Json<Value>> {
+    state.require_mutation()?;
+    let bucket = state
+        .client
+        .resource_head(&state.node, crate::r2::BUCKET_KIND, &request.bucket)
+        .await?
+        .filter(|view| !view.resource.deleted)
+        .ok_or_else(|| ApiError::bad_request("邮件原文 R2 bucket 不存在"))?;
+    crate::r2::bucket_spec(&bucket.resource)?;
+    let records = state
+        .client
+        .resource_heads(&state.node, Some(crate::email::EMAIL_DOMAIN_KIND))
+        .await?;
+    for view in records
+        .into_iter()
+        .filter(|view| !view.resource.deleted && view.resource.name != request.name)
+    {
+        let existing = crate::email::email_domain_spec(&view.resource)?;
+        if existing.domain.eq_ignore_ascii_case(&request.domain) {
+            return Err(ApiError::bad_request(format!(
+                "邮件域 {} 已由资源 {} 管理",
+                request.domain, view.resource.name
+            )));
+        }
+    }
+    let head = state
+        .client
+        .resource_head(&state.node, crate::email::EMAIL_DOMAIN_KIND, &request.name)
+        .await?;
+    let previous = head
+        .as_ref()
+        .and_then(|view| crate::email::email_domain_spec(&view.resource).ok());
+    let verification_challenge = if request.rotate_verification {
+        crate::email::generate_verification_challenge()
+    } else {
+        previous
+            .as_ref()
+            .map(|spec| spec.verification_challenge.clone())
+            .unwrap_or_else(crate::email::generate_verification_challenge)
+    };
+    let spec = crate::email::EmailDomainSpec {
+        description: request.description,
+        domain: request.domain,
+        verification_challenge,
+        mx_hostname: request.mx_hostname,
+        bucket: request.bucket,
+        object_prefix: request.object_prefix,
+        routes: request.routes,
+        max_message_bytes: request.max_message_bytes,
+        inbound_per_minute: request.inbound_per_minute,
+        outbound_per_minute: request.outbound_per_minute,
+        retention_days: request.retention_days,
+        dkim_selector: request.dkim_selector,
+        dkim_public_key: request.dkim_public_key,
+        dkim_private_key_env: request.dkim_private_key_env,
+        suspended: request.suspended,
+        suspend_reason: request.suspend_reason,
+    };
+    let dns = json!({
+        "ownership_name": spec.ownership_txt_name(),
+        "ownership_value": spec.ownership_txt_value(),
+        "mx_name": spec.domain,
+        "mx_value": spec.mx_hostname,
+        "dkim_name": spec.dkim_txt_name(),
+        "dkim_value": spec.dkim_public_key,
+    });
+    let record =
+        crate::email::prepare_email_domain_after(&request.name, spec, false, head.as_ref())?;
+    let mut response = submit_email_resource(
+        &state,
+        &principal,
+        record,
+        format!("创建或更新邮件域 {}", request.name),
+    )
+    .await?
+    .0;
+    response["dns"] = dns;
+    Ok(Json(response))
+}
+
+async fn email_delete(
+    State(state): State<ConsoleState>,
+    Extension(principal): Extension<ConsolePrincipal>,
+    Path(name): Path<String>,
+) -> ApiResult<Json<Value>> {
+    state.require_mutation()?;
+    let head = state
+        .client
+        .resource_head(&state.node, crate::email::EMAIL_DOMAIN_KIND, &name)
+        .await?
+        .filter(|view| !view.resource.deleted)
+        .ok_or_else(|| ApiError::not_found("邮件域不存在"))?;
+    let spec = crate::email::email_domain_spec(&head.resource)?;
+    let record = crate::email::prepare_email_domain_after(&name, spec, true, Some(&head))?;
+    submit_email_resource(&state, &principal, record, format!("删除邮件域 {name}")).await
+}
+
+async fn submit_email_resource(
+    state: &ConsoleState,
+    principal: &ConsolePrincipal,
+    record: crate::resource::ResourceRecord,
+    description: String,
+) -> ApiResult<Json<Value>> {
+    match &state.mode {
+        ConsoleMode::Local { .. } => {
+            let envelope = rf_core::envelope::Envelope::seal_any(&record, state.operator()?);
+            state.client.post_resource(&state.node, &envelope).await?;
+            Ok(Json(json!({
+                "ok": true,
+                "name": record.name,
+                "version": record.version,
+            })))
+        }
+        ConsoleMode::Public { node, .. } => {
+            let approval = node.management.create_resource(
+                principal.session_id,
+                &record,
+                format!("{description} v{}", record.version),
+            )?;
+            Ok(Json(json!({
+                "ok": true,
+                "pending_approval": true,
+                "name": record.name,
+                "version": record.version,
+                "approval": approval,
+                "approve_node": node.cfg.peer_api_advertise().to_string(),
+            })))
+        }
+    }
+}
+
+async fn email_verification(
+    State(state): State<ConsoleState>,
+    Path(name): Path<String>,
+) -> ApiResult<Json<Value>> {
+    let verification = state.client.email_verification(&state.node, &name).await?;
+    Ok(Json(json!({ "verification": verification })))
+}
+
+async fn email_verify(
+    State(state): State<ConsoleState>,
+    Path(name): Path<String>,
+) -> ApiResult<Json<Value>> {
+    state.require_mutation()?;
+    let verification = state.client.email_verify(&state.node, &name).await?;
+    Ok(Json(json!({ "ok": true, "verification": verification })))
+}
+
+async fn email_messages(
+    State(state): State<ConsoleState>,
+    Path(name): Path<String>,
+    Query(query): Query<EmailMessagesQuery>,
+) -> ApiResult<Json<Value>> {
+    let messages = state
+        .client
+        .email_messages(&state.node, &name, query.limit.unwrap_or(100))
+        .await?;
+    Ok(Json(json!({ "messages": messages })))
+}
+
+async fn email_message(
+    State(state): State<ConsoleState>,
+    Path((name, id)): Path<(String, String)>,
+) -> ApiResult<Json<Value>> {
+    let message = state.client.email_message(&state.node, &name, &id).await?;
+    Ok(Json(json!({ "message": message })))
+}
+
+async fn email_message_raw(
+    State(state): State<ConsoleState>,
+    Path((name, id)): Path<(String, String)>,
+) -> ApiResult<Response> {
+    let raw = state
+        .client
+        .email_message_raw(&state.node, &name, &id)
+        .await?;
+    Ok((
+        [
+            (
+                header::CONTENT_TYPE,
+                HeaderValue::from_static("message/rfc822"),
+            ),
+            (
+                header::CONTENT_DISPOSITION,
+                HeaderValue::from_str(&format!("attachment; filename=\"{id}.eml\""))
+                    .map_err(|_| ApiError::bad_request("邮件 ID 无效"))?,
+            ),
+        ],
+        raw,
+    )
+        .into_response())
+}
+
+async fn email_send(
+    State(state): State<ConsoleState>,
+    Path(name): Path<String>,
+    Json(request): Json<EmailSendRequest>,
+) -> ApiResult<Json<Value>> {
+    state.require_mutation()?;
+    use base64::Engine as _;
+    let raw = base64::engine::general_purpose::STANDARD
+        .decode(request.raw_base64)
+        .map_err(|_| ApiError::bad_request("RFC 822 原文不是有效 Base64"))?;
+    let metadata = crate::email::EmailSendMetadata {
+        mail_from: request.mail_from,
+        recipients: request.recipients,
+    };
+    let queued = state
+        .client
+        .email_send(&state.node, &name, &metadata, &raw)
+        .await?;
+    Ok(Json(json!({ "ok": true, "queued": queued })))
+}
+
 async fn r2_object_list(
     State(state): State<ConsoleState>,
     Path(bucket): Path<String>,
@@ -3732,6 +4102,10 @@ mod tests {
                     "ORDER_FLOW".into(),
                     "order-flow".into(),
                 )])),
+                email_bindings: Some(BTreeMap::from([(
+                    "SUPPORT_MAIL".into(),
+                    "support-mail".into(),
+                )])),
                 crons: Some(vec!["*/5 * * * *".into()]),
                 compatibility_date: Some("2026-08-04".into()),
             },
@@ -3744,6 +4118,10 @@ mod tests {
         assert!(updated.env.contains_key(deploy::DO_METADATA_ENV));
         assert_eq!(deploy::r2_bindings(&updated)["ASSETS"], "assets");
         assert_eq!(deploy::d1_bindings(&updated)["DB"], "primary");
+        assert_eq!(
+            deploy::email_bindings(&updated)["SUPPORT_MAIL"],
+            "support-mail"
+        );
         assert_eq!(deploy::queue_bindings(&updated)["JOBS"], "jobs");
         assert_eq!(
             deploy::analytics_bindings(&updated)["METRICS"],

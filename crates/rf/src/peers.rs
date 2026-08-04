@@ -941,6 +941,109 @@ impl PeerClient {
         Ok(serde_json::from_slice(&raw)?)
     }
 
+    pub async fn email_verification(
+        &self,
+        base: &str,
+        domain: &str,
+    ) -> Result<Option<crate::email::EmailVerification>> {
+        let raw = self
+            .get(
+                base,
+                &format!("/v1/email/{}/verification", component(domain)),
+            )
+            .await?;
+        let response: serde_json::Value = serde_json::from_slice(&raw)?;
+        serde_json::from_value(response.get("verification").cloned().unwrap_or_default())
+            .context("邮件域验证状态响应无效")
+    }
+
+    pub async fn email_verify(
+        &self,
+        base: &str,
+        domain: &str,
+    ) -> Result<crate::email::EmailVerification> {
+        let raw = self
+            .post(
+                base,
+                &format!("/v1/email/{}/verification", component(domain)),
+                vec![],
+            )
+            .await?;
+        Ok(serde_json::from_slice(&raw)?)
+    }
+
+    pub async fn email_messages(
+        &self,
+        base: &str,
+        domain: &str,
+        limit: usize,
+    ) -> Result<Vec<crate::email::EmailMessage>> {
+        let raw = self
+            .get(
+                base,
+                &format!(
+                    "/v1/email/{}/messages?limit={}",
+                    component(domain),
+                    limit.clamp(1, 500)
+                ),
+            )
+            .await?;
+        let response: serde_json::Value = serde_json::from_slice(&raw)?;
+        Ok(serde_json::from_value(
+            response
+                .get("messages")
+                .cloned()
+                .unwrap_or_else(|| serde_json::json!([])),
+        )?)
+    }
+
+    pub async fn email_message(
+        &self,
+        base: &str,
+        domain: &str,
+        id: &str,
+    ) -> Result<crate::email::EmailMessage> {
+        let raw = self
+            .get(
+                base,
+                &format!("/v1/email/{}/messages/{}", component(domain), component(id)),
+            )
+            .await?;
+        Ok(serde_json::from_slice(&raw)?)
+    }
+
+    pub async fn email_message_raw(&self, base: &str, domain: &str, id: &str) -> Result<Vec<u8>> {
+        self.get(
+            base,
+            &format!(
+                "/v1/email/{}/messages/{}/raw",
+                component(domain),
+                component(id)
+            ),
+        )
+        .await
+    }
+
+    pub async fn email_send(
+        &self,
+        base: &str,
+        domain: &str,
+        metadata: &crate::email::EmailSendMetadata,
+        raw: &[u8],
+    ) -> Result<Vec<crate::email::QueuedMessage>> {
+        let body = crate::email::encode_send_request(metadata, raw)?;
+        let response = self
+            .post(base, &format!("/v1/email/{}/send", component(domain)), body)
+            .await?;
+        let response: serde_json::Value = serde_json::from_slice(&response)?;
+        Ok(serde_json::from_value(
+            response
+                .get("queued")
+                .cloned()
+                .unwrap_or_else(|| serde_json::json!([])),
+        )?)
+    }
+
     /// Execute SQL against a D1 database, following leader hints
     /// (bounded) — callers can point at ANY cluster node.
     pub async fn d1_exec(

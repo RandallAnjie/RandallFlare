@@ -61,7 +61,7 @@ surface yet.
 | runtime/build logs and cluster distribution | done | request logs, analytics and retention |
 | previews and pull-request deployments | planned | deterministic preview hostnames and cleanup |
 | service bindings and placement tags | planned | loopback/mesh service router |
-| R2, D1, Queue, Analytics, Pipeline, Workflow, Email, Binary bindings | partial | native R2, CF-shaped D1, Queue producer/consumer, Analytics Engine, Pipeline and Workflow bindings + console editors done; remaining event-product bindings remain |
+| R2, D1, Queue, Analytics, Pipeline, Workflow, Email, Binary bindings | partial | native R2, CF-shaped D1, Queue producer/consumer, Analytics Engine, Pipeline, Workflow and Email bindings + console editors done; Binary Deliver remains |
 
 ### Data and storage
 
@@ -86,19 +86,19 @@ surface yet.
 | Analytics Engine | partial | signed datasets, independent D1 ledger, 20-slot blobs/doubles/indexes data points, 100-point/1-MiB batching, retention, `writeDataPoint` waitUntil binding, encrypted API, CLI, hour/day counters, recent events, grouping/value aggregates and Chinese console are real-workerd tested; SQL-compatible query language, sampling and multi-node fault soak remain |
 | Pipelines | partial | signed definitions, one-time bearer tokens stored only as SHA-256, default/custom domains, ACME discovery, 32-MiB JSON/array/events/NDJSON/text ingest, Draft JSON Schema validation, D1 durable staging, quorum leases, deterministic retry-safe keys, gzip JSONL, direct/multipart R2 output over local or rclone buckets, Worker binding, encrypted API, CLI, status/batch audit and Chinese console are real-workerd/public-ingress tested; streaming request bodies, transform stages and multi-node crash-point soak remain |
 | Workflow | partial | signed definitions, per-Workflow D1 quorum, idempotent instances, exactly-once replay boundaries, step retry/timeout, durable sleep/sleepUntil, signals, fenced leases and heartbeats, crash replay, pause/resume/terminate/restart, retention, Worker binding and built-in module, encrypted API, CLI, audit timeline and Chinese console are real-workerd tested; cron/webhook triggers, version-pinned definitions, concurrency groups and multi-node crash-point soak remain |
-| visual Flow | partial | signed/version-frozen DAGs, Vercel-style Chinese canvas and inspector, manual/webhook/cron triggers, one-way token hashes, synchronous Flow-as-API, idempotency, per-Flow D1 run/step/audit ledger, fenced recovery, cancellation/retry/retention/concurrency, durable loop subgraphs, typed templates, guarded inline subflows, SSRF-safe HTTP/local credentials, failure alerts, and Worker/KV/D1/R2/Queue/Analytics/Pipeline/Workflow nodes are real-daemon tested; full JSONata grammar, nested loops in subflows and multi-node crash-point soak remain |
+| visual Flow | partial | signed/version-frozen DAGs, Vercel-style Chinese canvas and inspector, manual/webhook/cron triggers, one-way token hashes, synchronous Flow-as-API, idempotency, per-Flow D1 run/step/audit ledger, fenced recovery, cancellation/retry/retention/concurrency, durable loop subgraphs, typed templates, guarded inline subflows, SSRF-safe HTTP/local credentials, failure alerts, and Worker/KV/D1/R2/Queue/Analytics/Pipeline/Workflow nodes are real-daemon tested; Email now durably queues through signed mail domains; full JSONata grammar, nested loops in subflows and multi-node crash-point soak remain |
 | Binary Deliver | planned | signed binaries, content cache, sandboxed execution and bindings |
 
 ### Optional email nodes
 
 | Capability | State | Remaining acceptance work |
 | --- | --- | --- |
-| capability-selected MX nodes | planned | `email` capability, DNS/ACME reconcile and health routing |
-| inbound SMTP and routing | planned | RFC822 limits, exact/prefix/catch-all routes and durable dispatch |
-| authentication results | planned | SPF, DKIM and Authentication-Results exposure |
-| raw-message R2 archival | planned | local and rclone-backed buckets, attachments included |
-| Worker email handler | planned | reject, forward and binding shims |
-| outbound SMTP | planned | durable queue, retries, MX/TLS, DKIM signing, SPF gating and delivery log |
+| capability-selected MX nodes | partial | explicit node role, signed MX match, capability reporting, bounded SMTP pool and STARTTLS cert loading done; automatic certificate hot-reload, health-weighted placement and multi-MX soak remain |
+| inbound SMTP and routing | partial | RFC 822 limits, verified domains, exact/prefix/catch-all routes, D1 leases, crash recovery, rate limits and terminal retention done; multi-node SMTP fault soak and DSN generation remain |
+| authentication results | partial | SPF, DKIM, DMARC and full Authentication-Results are persisted/exposed; ARC and MTA-STS policy remain |
+| raw-message R2 archival | partial | immutable source, metadata hashes, shared-recipient reference-safe retention and local/rclone buckets done; multi-GiB streaming remains |
+| Worker email handler | partial | `email()` event, headers/raw stream, `setReject`, reliable idempotent `forward`, loop protection and `env.MAIL.send()` done; real-SMTP/workerd fault soak remains |
+| outbound SMTP | partial | per-recipient durable queue, fenced leases, bounded exponential retry, direct sorted MX, Null MX, opportunistic TLS, node-local RSA DKIM signing, CLI/API/Flow and delivery console done; bounce/DSN processing, SMTPUTF8 and reputation automation remain |
 
 ## Delivery order
 
@@ -108,7 +108,7 @@ surface yet.
    previews, exports, and backups.
 3. Worker binding expansion; KV/D1/DO parity and unified static-site workflows.
 4. Queues, Analytics, Pipeline, Workflow and visual Flow.
-5. Optional email nodes and end-to-end mail routing.
+5. Optional email nodes and end-to-end mail routing (foundation complete; fault soak remains).
 6. Cross-feature security, quota, audit, fault-injection and multi-node soak.
 
 Every milestone is merged only after secret scans and CI. VPS upgrades always

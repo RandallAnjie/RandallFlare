@@ -296,6 +296,7 @@ impl Runtime {
                 analytics: self.node.analyticsbind_port(),
                 pipeline: self.node.pbind_port(),
                 workflow: self.node.workflowbind_port(),
+                email: self.node.emailbind_port(),
             },
             &durable_dir,
         );
@@ -472,6 +473,12 @@ fn rf_entry_source(
             .collect::<Vec<_>>(),
     )
     .expect("Workflow binding names are serializable");
+    let email_names = serde_json::to_string(
+        &crate::deploy::email_bindings(manifest)
+            .keys()
+            .collect::<Vec<_>>(),
+    )
+    .expect("Email binding names are serializable");
     let event_token = serde_json::to_string(event_token).expect("event token is serializable");
     let mut durable_wrappers = String::new();
     let mut seen = std::collections::BTreeSet::new();
@@ -490,6 +497,7 @@ fn rf_entry_source(
         .replace("__RF_ANALYTICS_BINDING_NAMES__", &analytics_names)
         .replace("__RF_PIPELINE_BINDING_NAMES__", &pipeline_names)
         .replace("__RF_WORKFLOW_BINDING_NAMES__", &workflow_names)
+        .replace("__RF_EMAIL_BINDING_NAMES__", &email_names)
         .replace("__RF_EVENT_TOKEN__", &event_token)
         .replace("__RF_DURABLE_WRAPPERS__", &durable_wrappers)
 }
@@ -658,11 +666,37 @@ class RandallFlareWorkflowBinding {
   }
 }
 
+class RandallFlareEmailBinding {
+  constructor(service) { this._service = service; }
+  async send(message) {
+    if (!message || typeof message !== "object") throw new TypeError("Email send() expects a message object");
+    const from = String(message.from || "");
+    const to = String(message.to || "");
+    if (!from || !to || /[\r\n]/.test(from + to)) throw new TypeError("Email send() requires valid from and to addresses");
+    let source = message.raw;
+    if (source == null) throw new TypeError("Email send() requires raw RFC 822 source");
+    if (typeof source === "string") source = new TextEncoder().encode(source);
+    const raw = await new Response(source).arrayBuffer();
+    const response = await this._service.fetch("http://email-binding/send", {
+      method: "POST",
+      headers: {
+        "content-type": "message/rfc822",
+        "x-rf-email-from": from,
+        "x-rf-email-to": to,
+      },
+      body: raw,
+    });
+    if (!response.ok) throw new Error("EMAIL_ERROR: " + response.status + " " + await response.text());
+    return await response.json();
+  }
+}
+
 const __rfD1Names = __RF_D1_BINDING_NAMES__;
 const __rfQueueNames = __RF_QUEUE_BINDING_NAMES__;
 const __rfAnalyticsNames = __RF_ANALYTICS_BINDING_NAMES__;
 const __rfPipelineNames = __RF_PIPELINE_BINDING_NAMES__;
 const __rfWorkflowNames = __RF_WORKFLOW_BINDING_NAMES__;
+const __rfEmailNames = __RF_EMAIL_BINDING_NAMES__;
 const __rfEventToken = __RF_EVENT_TOKEN__;
 function __rfWrapEnv(env, context) {
   const wrapped = Object.create(env);
@@ -689,6 +723,11 @@ function __rfWrapEnv(env, context) {
   for (const name of __rfWorkflowNames) {
     Object.defineProperty(wrapped, name, {
       value: new RandallFlareWorkflowBinding(env[name]), enumerable: true, configurable: false,
+    });
+  }
+  for (const name of __rfEmailNames) {
+    Object.defineProperty(wrapped, name, {
+      value: new RandallFlareEmailBinding(env[name]), enumerable: true, configurable: false,
     });
   }
   return wrapped;
@@ -886,6 +925,78 @@ async function __rfQueueEvent(request, env, context) {
   return Response.json({ actions });
 }
 
+function __rfParseMailHeaders(raw) {
+  let end = -1;
+  for (let i = 0; i + 3 < raw.length; i++) {
+    if (raw[i] === 13 && raw[i + 1] === 10 && raw[i + 2] === 13 && raw[i + 3] === 10) { end = i; break; }
+  }
+  if (end < 0) {
+    for (let i = 0; i + 1 < raw.length; i++) {
+      if (raw[i] === 10 && raw[i + 1] === 10) { end = i; break; }
+    }
+  }
+  const headers = new Headers();
+  const text = new TextDecoder("utf-8", { fatal: false }).decode(raw.slice(0, end < 0 ? raw.length : end));
+  const unfolded = text.replace(/\r?\n[\t ]+/g, " ").split(/\r?\n/);
+  for (const line of unfolded) {
+    const colon = line.indexOf(":");
+    if (colon <= 0) continue;
+    try { headers.append(line.slice(0, colon).trim(), line.slice(colon + 1).trim()); } catch {}
+  }
+  return headers;
+}
+
+async function __rfEmailEvent(request, env, context) {
+  if (!__rfUserDefault || typeof __rfUserDefault.email !== "function") {
+    return new Response("此 Worker 没有导出 email() 处理程序", { status: 501 });
+  }
+  const raw = new Uint8Array(await request.arrayBuffer());
+  const state = { reject: null, forwards: [] };
+  const message = {
+    from: request.headers.get("x-rf-email-from") || "",
+    to: request.headers.get("x-rf-email-to") || "",
+    authResults: request.headers.get("x-rf-email-authentication-results") || "",
+    spf: request.headers.get("x-rf-email-spf") || "none",
+    dkim: request.headers.get("x-rf-email-dkim") || "none",
+    dmarc: request.headers.get("x-rf-email-dmarc") || "none",
+    raw: new Blob([raw], { type: "message/rfc822" }).stream(),
+    rawSize: raw.byteLength,
+    headers: __rfParseMailHeaders(raw),
+    setReject(reason) {
+      const value = String(reason || "").trim();
+      if (!value || value.length > 1000 || /[\r\n]/.test(value)) throw new TypeError("setReject() requires a safe reason");
+      state.reject = value;
+    },
+    async forward(recipient, extraHeaders) {
+      const value = String(recipient || "");
+      if (!value || value.length > 320 || /[\r\n]/.test(value)) throw new TypeError("forward() requires a valid recipient");
+      const headers = [];
+      if (extraHeaders != null) {
+        const input = extraHeaders instanceof Headers ? extraHeaders : new Headers(extraHeaders);
+        for (const [name, headerValue] of input) {
+          if (headers.length >= 128) throw new TypeError("forward() accepts at most 128 extra headers");
+          headers.push([name, headerValue]);
+        }
+      }
+      state.forwards.push({ recipient: value, headers });
+    },
+  };
+  const pending = [];
+  const eventContext = {
+    waitUntil(promise) { pending.push(Promise.resolve(promise)); },
+    passThroughOnException() {
+      if (context && typeof context.passThroughOnException === "function") context.passThroughOnException();
+    },
+  };
+  try {
+    await __rfUserDefault.email(message, __rfWrapEnv(env, eventContext), eventContext);
+    await Promise.all(pending);
+  } catch (error) {
+    return new Response(String(error && error.stack || error).slice(0, 4000), { status: 500 });
+  }
+  return Response.json(state);
+}
+
 const __rfOut = { ...__rfUserDefault };
 __rfOut.fetch = (request, env, context) => {
   const url = new URL(request.url);
@@ -894,6 +1005,9 @@ __rfOut.fetch = (request, env, context) => {
   }
   if (url.pathname === "/.rf/internal/workflow" && request.headers.get("x-rf-internal-event") === __rfEventToken) {
     return __rfWorkflowEvent(request, env, context);
+  }
+  if (url.pathname === "/.rf/internal/email" && request.headers.get("x-rf-internal-event") === __rfEventToken) {
+    return __rfEmailEvent(request, env, context);
   }
   if (__rfUserDefault && typeof __rfUserDefault.fetch === "function") {
     return __rfUserDefault.fetch(request, __rfWrapEnv(env, context), context);
@@ -937,6 +1051,7 @@ pub struct BindingPorts {
     pub analytics: u16,
     pub pipeline: u16,
     pub workflow: u16,
+    pub email: u16,
 }
 
 pub fn generate_config(
@@ -953,6 +1068,7 @@ pub fn generate_config(
         analytics: analyticsbind_port,
         pipeline: pbind_port,
         workflow: workflowbind_port,
+        email: emailbind_port,
     } = binding_ports;
     let mut modules = String::new();
     modules
@@ -984,6 +1100,7 @@ pub fn generate_config(
             || k == crate::deploy::ANALYTICS_METADATA_ENV
             || k == crate::deploy::PIPELINE_METADATA_ENV
             || k == crate::deploy::WORKFLOW_METADATA_ENV
+            || k == crate::deploy::EMAIL_METADATA_ENV
         {
             continue;
         }
@@ -1117,6 +1234,27 @@ pub fn generate_config(
         worker_header = crate::workflowbind::WORKER_HEADER,
         worker = capnp_string(&m.name),
     ));
+    let mut email_services = String::new();
+    for (binding, domain) in crate::deploy::email_bindings(m) {
+        let service = format!("email-{binding}");
+        bindings.push_str(&format!(
+            "        (name = {binding}, service = {service}),\n",
+            binding = capnp_string(&binding),
+            service = capnp_string(&service),
+        ));
+        email_services.push_str(&format!(
+            "    (name = {service}, external = (address = \"127.0.0.1:{emailbind_port}\", \
+             http = (injectRequestHeaders = [\
+               (name = \"{domain_header}\", value = {domain}),\
+               (name = \"{worker_header}\", value = {worker})\
+             ]))),\n",
+            service = capnp_string(&service),
+            domain_header = crate::emailbind::EMAIL_DOMAIN_HEADER,
+            domain = capnp_string(&domain),
+            worker_header = crate::emailbind::WORKER_HEADER,
+            worker = capnp_string(&m.name),
+        ));
+    }
     let durable_objects = crate::deploy::durable_objects(m);
     let mut durable_namespaces = String::new();
     let mut seen_durable = std::collections::BTreeSet::new();
@@ -1163,7 +1301,7 @@ const config :Workerd.Config = (
       bindings = [
 {bindings}      ],
 {durable_worker}    )),
-{kv_services}{r2_services}{d1_services}{queue_services}{analytics_services}{pipeline_services}{workflow_services}{durable_service}  ],
+{kv_services}{r2_services}{d1_services}{queue_services}{analytics_services}{pipeline_services}{workflow_services}{email_services}{durable_service}  ],
   sockets = [
     (name = "http", address = "127.0.0.1:{port}", http = (), service = "main"),
   ],
@@ -1265,6 +1403,14 @@ mod tests {
             )]))
             .unwrap(),
         );
+        m.env.insert(
+            crate::deploy::EMAIL_METADATA_ENV.into(),
+            serde_json::to_string(&BTreeMap::from([(
+                "MAILER".to_string(),
+                "primary-mail".to_string(),
+            )]))
+            .unwrap(),
+        );
         let cfg = generate_config(
             &m,
             30111,
@@ -1276,6 +1422,7 @@ mod tests {
                 analytics: 7386,
                 pipeline: 7387,
                 workflow: 7388,
+                email: 7389,
             },
             std::path::Path::new("/tmp/rf-do"),
         );
@@ -1305,6 +1452,9 @@ mod tests {
         assert!(cfg.contains("(name = \"ORDER_FLOW\", service = \"workflow-ORDER_FLOW\")"));
         assert!(cfg.contains("address = \"127.0.0.1:7388\""));
         assert!(cfg.contains("x-rf-workflow\", value = \"order-flow\""));
+        assert!(cfg.contains("(name = \"MAILER\", service = \"email-MAILER\")"));
+        assert!(cfg.contains("address = \"127.0.0.1:7389\""));
+        assert!(cfg.contains("x-rf-email-domain\", value = \"primary-mail\""));
         assert!(cfg.contains("x-rf-worker\", value = \"w\""));
         assert!(cfg.contains("name = \"randallflare:workers\""));
         assert!(cfg.contains("compatibilityDate = \"2026-07-31\""));
@@ -1368,6 +1518,14 @@ mod tests {
             )]))
             .unwrap(),
         );
+        manifest.env.insert(
+            crate::deploy::EMAIL_METADATA_ENV.into(),
+            serde_json::to_string(&BTreeMap::from([(
+                "MAILER".to_string(),
+                "primary-mail".to_string(),
+            )]))
+            .unwrap(),
+        );
         let source = rf_entry_source(
             &manifest,
             &crate::deploy::d1_bindings(&manifest),
@@ -1378,10 +1536,15 @@ mod tests {
         assert!(source.contains("new RandallFlareAnalyticsDataset(env[name], context)"));
         assert!(source.contains("new RandallFlarePipeline(env[name], context)"));
         assert!(source.contains("new RandallFlareWorkflowBinding(env[name])"));
+        assert!(source.contains("new RandallFlareEmailBinding(env[name])"));
         assert!(source.contains("/.rf/internal/workflow"));
         assert!(source.contains("waitForSignal"));
         assert!(source.contains("test-token"));
         assert!(source.contains("/.rf/internal/queue"));
+        assert!(source.contains("/.rf/internal/email"));
+        assert!(source.contains("setReject(reason)"));
+        assert!(source.contains("authResults: request.headers.get"));
+        assert!(source.contains("x-rf-email-dmarc"));
         assert!(source.contains("export class Counter extends __rfUserModule.Counter"));
         assert!(
             source.contains("__rfUserDefault.fetch(request, __rfWrapEnv(env, context), context)")

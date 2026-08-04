@@ -94,6 +94,16 @@ Working today, verified by multi-process fault-injection e2e tests:
   outputs. Public Flow domains support asynchronous 202 responses or
   request/response mode with `?wait=1`; credentials remain node-local and
   outbound HTTP is protected against SSRF. See [the Flow guide](./docs/FLOWS.md).
+- **Optional decentralized Email**: operator-signed domains define exact,
+  prefix and catch-all routes to Workers, reliable forwards or drops. Selected
+  MX nodes receive SMTP with optional STARTTLS, authenticate inbound RFC 822
+  with SPF/DKIM/DMARC, archive immutable source in ordinary local or
+  rclone-backed R2, and dispatch through fenced D1 leases. Outbound mail is
+  durably queued per recipient, DKIM-signed using node-local keys, delivered
+  directly to sorted MX targets with opportunistic TLS, and retried five times.
+  Worker `email()` handlers, `env.MAIL.send()`, Flow email nodes, CLI/API,
+  retention cleanup and a dedicated Chinese DNS/routing/delivery console are
+  included. See [the Email guide](./docs/EMAIL.md).
 
 Also in: HTTPS ingress (SNI cert store, hot-reload, wildcard files,
 self-signed fallback) and **native workerd kvNamespace bindings** —
@@ -200,6 +210,13 @@ timeout_seconds = 1200
 # rclone_config = "/etc/rclone/rclone.conf" # keep mode 0600, never commit
 # rclone_timeout_seconds = 1800
 
+[email]                              # optional SMTP-capable node role
+enabled = false                      # ordinary nodes leave this false
+# smtp_listen = "0.0.0.0:25"
+# mx_hostname = "mx1.example.com"   # also the cert stem and signed MX target
+# outbound = true
+# max_sessions = 32
+
 rf run --config rf.toml
 ```
 
@@ -304,7 +321,8 @@ my-worker/
                    #  "queues":{"EVENTS":"events"},
                    #  "analytics":{"METRICS":"web-metrics"},
                    #  "pipelines":{"ARCHIVE":"event-archive"},
-                   #  "workflows":{"ORDER_FLOW":"order-flow"}}
+                   #  "workflows":{"ORDER_FLOW":"order-flow"},
+                   #  "email":{"MAIL":"support-mail"}}
   index.js         # omit "main" entirely for a pure static site
   public/…
 

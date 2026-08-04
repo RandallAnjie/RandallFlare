@@ -105,10 +105,12 @@ curl -X POST 'https://flow-order-sync.example.com/v1/run?wait=1' \
 | Pipeline | 向耐久 Pipeline 写入事件 |
 | Workflow | 创建或取得耐久 Workflow 实例 |
 | Subflow | 内联调用另一份已签名 Flow 并返回输出 |
-| Email | 仅在节点启用可选邮件能力时发送或路由邮件 |
+| Email | 把 RFC 822 邮件耐久排入签名邮件域；实际 SMTP 由可选邮件节点领取 |
 
 Worker、KV、D1、R2、Queue、Analytics、Pipeline、Workflow 和子 Flow 的名称来自
 签名配置，不允许用请求输入伪造资源绑定。
+Email 节点的 `domain` 使用邮件域资源名；可填写 `raw`，也可使用 `from`、`to`、
+`subject` 和 `body` 由平台生成纯文本邮件。详见 [邮件指南](./EMAIL.md)。
 
 ## 凭据与网络安全
 

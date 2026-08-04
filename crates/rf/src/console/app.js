@@ -46,6 +46,12 @@ const state = {
   flowNodeActive: null,
   flowRuns: [],
   flowRunActive: null,
+  emailDomains: [],
+  emailActive: null,
+  emailRoutes: [],
+  emailMessages: [],
+  emailMessageActive: null,
+  emailContext: { buckets: [], workers: [], email_node: null },
 };
 
 const titles = {
@@ -61,6 +67,7 @@ const titles = {
   pipelines: ["数据传输", "Pipeline"],
   workflows: ["耐久执行", "Workflow"],
   flows: ["可视化编排", "Flow"],
+  email: ["去中心化邮件", "邮件路由"],
 };
 
 function escapeHtml(value) {
@@ -232,6 +239,7 @@ function renderOverview(data) {
   const pipelines = Array.isArray(data.pipelines) ? data.pipelines : [];
   const workflows = Array.isArray(data.workflows) ? data.workflows : [];
   const flows = Array.isArray(data.flows) ? data.flows : [];
+  const emailDomains = Array.isArray(data.email_domains) ? data.email_domains : [];
   const allNodes = [
     {
       id: data.node,
@@ -260,6 +268,8 @@ function renderOverview(data) {
   $("#workflow-nav-count").textContent = String(workflows.length);
   $("#metric-flows").textContent = String(flows.length);
   $("#flow-nav-count").textContent = String(flows.length);
+  $("#metric-email").textContent = String(emailDomains.length);
+  $("#email-nav-count").textContent = String(emailDomains.length);
   $("#metric-r2-backend").textContent = data.storage?.rclone ? "本地副本与 rclone 已就绪" : "集群本地多数派副本";
   $("#r2-nav-count").textContent = String(buckets.length);
   $("#metric-blobs").textContent = String(data.missing_blobs ?? 0);
@@ -546,6 +556,7 @@ function renderWorkerDetail(data) {
     <div><dt>Analytics 绑定</dt><dd>${escapeHtml(Object.keys(worker.analytics_bindings || {}).length)} 项</dd></div>
     <div><dt>Pipeline 绑定</dt><dd>${escapeHtml(Object.keys(worker.pipeline_bindings || {}).length)} 项</dd></div>
     <div><dt>Workflow 绑定</dt><dd>${escapeHtml(Object.keys(worker.workflow_bindings || {}).length)} 项</dd></div>
+    <div><dt>Email 绑定</dt><dd>${escapeHtml(Object.keys(worker.email_bindings || {}).length)} 项</dd></div>
     <div><dt>定时任务</dt><dd>${escapeHtml(worker.crons?.length || 0)} 条</dd></div>`;
   $("#detail-distribution-count").textContent = `${distribution.ready}/${distribution.total} 个节点`;
   $("#detail-distribution").innerHTML = (distribution.nodes || []).map((node) => {
@@ -564,6 +575,7 @@ function renderWorkerDetail(data) {
   $("#project-analytics-bindings").value = mapToLines(worker.analytics_bindings);
   $("#project-pipeline-bindings").value = mapToLines(worker.pipeline_bindings);
   $("#project-workflow-bindings").value = mapToLines(worker.workflow_bindings);
+  $("#project-email-bindings").value = mapToLines(worker.email_bindings);
   $("#project-crons").value = (worker.crons || []).join("\n");
   $("#project-compatibility-date").value = worker.compatibility_date;
   $("#project-source-repository").value = source?.repository?.replace(/\.git$/, "") || "";
@@ -690,6 +702,7 @@ async function saveProjectBindings(event) {
       analytics_bindings: linesToMap($("#project-analytics-bindings").value, "Analytics 绑定"),
       pipeline_bindings: linesToMap($("#project-pipeline-bindings").value, "Pipeline 绑定"),
       workflow_bindings: linesToMap($("#project-workflow-bindings").value, "Workflow 绑定"),
+      email_bindings: linesToMap($("#project-email-bindings").value, "Email 绑定"),
     };
     await updateWorkerSettings(payload, `更新 ${state.activeWorker} 的变量与绑定。`);
   } catch (error) {
@@ -2314,6 +2327,290 @@ async function deleteFlow() {
   catch (error) { toast(error.message, true); }
 }
 
+function emailBooleanLabel(value, optional = false) {
+  if (optional && value == null) return "未检查";
+  return value ? "通过" : "未通过";
+}
+
+function emailStatusLabel(status) {
+  return {
+    received: "已接收", processing: "处理中", delivered: "已交付", forwarded: "已转发",
+    queued: "排队中", sending: "发送中", sent: "已发送", rejected: "已拒绝",
+    failed: "失败", dropped: "已丢弃", deferred: "稍后重试",
+  }[status] || status || "未知";
+}
+
+function emailRouteSummary(route) {
+  const matcher = route.match === "exact" ? `精确 ${route.value}`
+    : route.match === "prefix" ? `前缀 ${route.value}` : "兜底";
+  const destination = route.destination?.type === "worker" ? `Worker ${route.destination.worker}`
+    : route.destination?.type === "forward" ? `转发至 ${(route.destination.addresses || []).join(", ")}`
+      : "直接丢弃";
+  return `${matcher} → ${destination}`;
+}
+
+function updateEmailContextOptions(selectedBucket = "", selectedWorker = "") {
+  const buckets = state.emailContext.buckets || [];
+  const workers = state.emailContext.workers || [];
+  $("#email-bucket").innerHTML = '<option value="">请选择 bucket</option>' + buckets.map((item) => {
+    const name = item.name || item;
+    return `<option value="${escapeHtml(name)}"${name === selectedBucket ? " selected" : ""}>${escapeHtml(name)}</option>`;
+  }).join("");
+  $("#email-route-worker").innerHTML = '<option value="">请选择 Worker</option>' + workers.map((item) => {
+    const name = item.name || item;
+    return `<option value="${escapeHtml(name)}"${name === selectedWorker ? " selected" : ""}>${escapeHtml(name)}</option>`;
+  }).join("");
+}
+
+function fillEmailDomainForm(domain) {
+  const spec = domain?.spec || {};
+  $("#email-name").value = domain?.name || "";
+  $("#email-name").readOnly = Boolean(domain);
+  $("#email-domain").value = spec.domain || "";
+  $("#email-mx").value = spec.mx_hostname || state.emailContext.email_node?.mx_hostname || "";
+  updateEmailContextOptions(spec.bucket || "", $("#email-route-worker").value);
+  $("#email-prefix").value = spec.object_prefix || "mail";
+  $("#email-description").value = spec.description || "";
+  $("#email-max-size").value = Math.max(1, Math.round(Number(spec.max_message_bytes || 25 * 1024 * 1024) / 1024 / 1024));
+  $("#email-retention").value = spec.retention_days || 30;
+  $("#email-inbound-rate").value = spec.inbound_per_minute || 1000;
+  $("#email-outbound-rate").value = spec.outbound_per_minute || 1000;
+  $("#email-dkim-selector").value = spec.dkim_selector || "rf";
+  $("#email-dkim-public").value = spec.dkim_public_key || "";
+  $("#email-dkim-env").value = spec.dkim_private_key_env || "";
+  $("#email-suspended").checked = Boolean(spec.suspended);
+  $("#email-suspend-reason").value = spec.suspend_reason || "";
+  $("#email-rotate-verification").checked = false;
+}
+
+function resetEmailDomainForm() {
+  state.emailActive = null;
+  state.emailRoutes = [];
+  state.emailMessages = [];
+  state.emailMessageActive = null;
+  $("#email-domain-form").reset();
+  fillEmailDomainForm(null);
+  renderEmailRoutes();
+  ["#email-dns-panel", "#email-routes-panel", "#email-send-panel", "#email-message-panel", "#email-messages-panel"].forEach((id) => $(id).classList.add("hidden"));
+  $("#email-delete").classList.add("hidden");
+  $("#email-verify").classList.add("hidden");
+  $("#email-active-name").textContent = "请选择邮件域";
+  $("#email-summary").textContent = "选择后可配置 DNS、编辑路由并查看收发记录。";
+}
+
+function renderEmailDomains() {
+  $("#email-count").textContent = `${state.emailDomains.length} 个邮件域`;
+  $("#email-nav-count").textContent = String(state.emailDomains.length);
+  const list = $("#email-domain-list");
+  list.classList.toggle("empty-state", state.emailDomains.length === 0);
+  list.innerHTML = state.emailDomains.length ? state.emailDomains.map((domain) => {
+    const active = state.emailActive === domain.name ? " active" : "";
+    const verified = domain.verification?.verified;
+    const status = domain.spec?.suspended ? "已暂停" : verified ? "DNS 已验证" : "等待 DNS";
+    return `<button class="database-item${active}" type="button" data-email-domain="${escapeHtml(domain.name)}"><span><strong>${escapeHtml(domain.name)}</strong><small>${escapeHtml(domain.spec?.domain || "未配置域名")} · ${escapeHtml(status)}</small></span><span>v${escapeHtml(domain.version)}</span></button>`;
+  }).join("") : "暂无邮件域。";
+}
+
+function renderEmailRoutes() {
+  const list = $("#email-route-list");
+  const routes = [...state.emailRoutes].sort((a, b) => Number(a.priority || 0) - Number(b.priority || 0));
+  list.classList.toggle("empty-state", routes.length === 0);
+  list.innerHTML = routes.length ? routes.map((route) => `<article class="build-row"><span class="pipeline-state ${route.enabled === false ? "failed" : "active"}"></span><div><strong>${escapeHtml(route.id)} · 优先级 ${escapeHtml(route.priority || 0)}</strong><small>${escapeHtml(emailRouteSummary(route))}${route.enabled === false ? " · 已停用" : ""}</small></div><button class="mini-button" type="button" data-email-route-edit="${escapeHtml(route.id)}">编辑</button><button class="mini-button danger" type="button" data-email-route-remove="${escapeHtml(route.id)}">移除</button></article>`).join("") : "暂无路由。";
+}
+
+function updateEmailRouteFields() {
+  const match = $("#email-route-match").value;
+  const destination = $("#email-route-destination").value;
+  $("#email-route-value-label").classList.toggle("hidden", match === "catch_all");
+  $("#email-route-value").required = match !== "catch_all";
+  $("#email-route-target-label").classList.toggle("hidden", destination === "drop");
+  $("#email-route-worker").classList.toggle("hidden", destination !== "worker");
+  $("#email-route-addresses").classList.toggle("hidden", destination !== "forward");
+  $("#email-route-worker").required = destination === "worker";
+  $("#email-route-addresses").required = destination === "forward";
+}
+
+function fillEmailRouteForm(route) {
+  if (!route) return;
+  $("#email-route-id").value = route.id;
+  $("#email-route-priority").value = route.priority || 0;
+  $("#email-route-match").value = route.match;
+  $("#email-route-value").value = route.value || "";
+  $("#email-route-destination").value = route.destination?.type || "worker";
+  $("#email-route-worker").value = route.destination?.worker || "";
+  $("#email-route-addresses").value = (route.destination?.addresses || []).join(", ");
+  $("#email-route-enabled").checked = route.enabled !== false;
+  updateEmailRouteFields();
+}
+
+function saveEmailRoute(event) {
+  event.preventDefault();
+  const match = $("#email-route-match").value;
+  const destinationType = $("#email-route-destination").value;
+  const route = {
+    id: $("#email-route-id").value.trim(), priority: Number($("#email-route-priority").value),
+    enabled: $("#email-route-enabled").checked, match,
+    destination: destinationType === "worker" ? { type: "worker", worker: $("#email-route-worker").value }
+      : destinationType === "forward" ? { type: "forward", addresses: $("#email-route-addresses").value.split(",").map((value) => value.trim().toLowerCase()).filter(Boolean) }
+        : { type: "drop" },
+  };
+  if (match !== "catch_all") route.value = $("#email-route-value").value.trim().toLowerCase();
+  state.emailRoutes = state.emailRoutes.filter((item) => item.id !== route.id).concat(route);
+  renderEmailRoutes();
+  event.target.reset();
+  $("#email-route-enabled").checked = true;
+  updateEmailRouteFields();
+}
+
+function renderEmailDns(domain) {
+  const spec = domain.spec || {};
+  const verification = domain.verification;
+  const records = [
+    ["TXT（所有权）", spec.ownership_name || `_randallflare-verify.${spec.domain}`, spec.ownership_value || `rf-email-verification=${spec.verification_challenge}`],
+    ["MX", spec.domain, spec.mx_hostname],
+    ["TXT（SPF）", spec.domain, "v=spf1 mx -all"],
+  ];
+  if (spec.dkim_public_key) records.push(["TXT（DKIM）", `${spec.dkim_selector}._domainkey.${spec.domain}`, spec.dkim_public_key]);
+  $("#email-dns-records").innerHTML = records.map(([kind, name, value]) => `<div><dt>${escapeHtml(kind)} · ${escapeHtml(name)}</dt><dd class="mono">${escapeHtml(value)}</dd></div>`).join("");
+  $("#email-ownership-state").textContent = emailBooleanLabel(verification?.ownership_ok, true);
+  $("#email-mx-state").textContent = emailBooleanLabel(verification?.mx_ok, true);
+  $("#email-dkim-state").textContent = spec.dkim_public_key ? emailBooleanLabel(verification?.dkim_ok, true) : "未配置";
+  $("#email-verified-state").textContent = verification?.verified ? "已就绪" : "待验证";
+  const detail = $("#email-verification-detail");
+  detail.classList.toggle("hidden", !verification);
+  detail.classList.toggle("error", Boolean(verification?.error));
+  if (verification) detail.textContent = verification.error || `最近检查：${new Date(verification.checked_at_ms).toLocaleString("zh-CN")}；SPF ${verification.spf_present ? "已发现" : "未发现（建议配置）"}。`;
+}
+
+async function loadEmail({ quiet = false } = {}) {
+  try {
+    const data = await api("/api/email");
+    state.emailDomains = data.domains || [];
+    state.emailContext = { buckets: data.buckets || [], workers: data.workers || [], email_node: data.email_node || null };
+    const warning = $("#email-node-warning");
+    warning.textContent = "当前节点未启用 SMTP 邮件角色。你仍可管理签名定义和查看集群数据，但入站接收需要至少一个邮件节点。";
+    warning.classList.toggle("hidden", Boolean(data.email_node?.enabled));
+    updateEmailContextOptions($("#email-bucket").value, $("#email-route-worker").value);
+    if (!state.emailActive && !$("#email-name").value) fillEmailDomainForm(null);
+    renderEmailDomains();
+    if (state.emailActive) {
+      const active = state.emailDomains.find((item) => item.name === state.emailActive);
+      if (active) await selectEmailDomain(active.name, { loadMessages: false }); else resetEmailDomainForm();
+    }
+    if (!quiet) toast("邮件域已刷新");
+  } catch (error) {
+    const warning = $("#email-node-warning");
+    warning.textContent = `连接节点尚未提供邮件资源接口：${error.message}。请先把该节点升级到包含邮件能力的版本。`;
+    warning.classList.remove("hidden");
+    if (!quiet) toast(error.message, true);
+  }
+}
+
+async function selectEmailDomain(name, { loadMessages = true } = {}) {
+  const domain = state.emailDomains.find((item) => item.name === name);
+  if (!domain) return;
+  state.emailActive = name;
+  state.emailRoutes = structuredClone(domain.spec?.routes || []);
+  state.emailMessageActive = null;
+  fillEmailDomainForm(domain);
+  renderEmailDomains();
+  renderEmailRoutes();
+  renderEmailDns(domain);
+  $("#email-active-name").textContent = domain.spec.domain;
+  $("#email-summary").textContent = `${domain.name} · v${domain.version} · R2 ${domain.spec.bucket}/${domain.spec.object_prefix}`;
+  ["#email-dns-panel", "#email-routes-panel", "#email-send-panel", "#email-messages-panel"].forEach((id) => $(id).classList.remove("hidden"));
+  $("#email-message-panel").classList.add("hidden");
+  $("#email-delete").classList.remove("hidden");
+  $("#email-verify").classList.remove("hidden");
+  $("#email-send-from").value = `noreply@${domain.spec.domain}`;
+  if (loadMessages) await loadEmailMessages();
+}
+
+async function saveEmailDomain(event) {
+  event.preventDefault();
+  const payload = {
+    name: $("#email-name").value.trim(), description: $("#email-description").value.trim(),
+    domain: $("#email-domain").value.trim().toLowerCase().replace(/\.$/, ""),
+    mx_hostname: $("#email-mx").value.trim().toLowerCase().replace(/\.$/, ""), bucket: $("#email-bucket").value,
+    object_prefix: $("#email-prefix").value.trim(), routes: state.emailRoutes,
+    max_message_bytes: Number($("#email-max-size").value) * 1024 * 1024,
+    inbound_per_minute: Number($("#email-inbound-rate").value), outbound_per_minute: Number($("#email-outbound-rate").value),
+    retention_days: Number($("#email-retention").value), dkim_selector: $("#email-dkim-selector").value.trim(),
+    dkim_public_key: $("#email-dkim-public").value.trim(), dkim_private_key_env: $("#email-dkim-env").value.trim(),
+    rotate_verification: $("#email-rotate-verification").checked, suspended: $("#email-suspended").checked,
+    suspend_reason: $("#email-suspend-reason").value.trim(),
+  };
+  try {
+    const result = await api("/api/email", { method: "POST", body: JSON.stringify(payload) });
+    const complete = async () => { await loadEmail({ quiet: true }); await selectEmailDomain(payload.name); };
+    if (result.pending_approval) showApproval(result, `批准邮件域 ${payload.domain} 的签名定义。`, complete);
+    else { toast("邮件域定义已保存"); await complete(); }
+  } catch (error) { toast(error.message, true); }
+}
+
+async function verifyEmailDomain() {
+  if (!state.emailActive) return;
+  try {
+    const data = await api(`/api/email/${encodeURIComponent(state.emailActive)}/verification`, { method: "POST", body: "{}" });
+    const domain = state.emailDomains.find((item) => item.name === state.emailActive);
+    if (domain) { domain.verification = data.verification; renderEmailDns(domain); renderEmailDomains(); }
+    toast(data.verification?.verified ? "DNS 验证已全部通过" : "DNS 尚未完全生效");
+  } catch (error) { toast(error.message, true); }
+}
+
+async function deleteEmailDomain() {
+  const name = state.emailActive;
+  if (!name || !window.confirm(`要删除邮件域“${name}”吗？新邮件将停止接收，既有审计记录按保留策略处理。`)) return;
+  try {
+    const result = await api(`/api/email/${encodeURIComponent(name)}`, { method: "DELETE" });
+    const complete = async () => { resetEmailDomainForm(); await loadEmail({ quiet: true }); };
+    if (result.pending_approval) showApproval(result, `批准删除邮件域 ${name}。`, complete); else await complete();
+  } catch (error) { toast(error.message, true); }
+}
+
+function renderEmailMessages() {
+  const list = $("#email-message-list");
+  list.classList.toggle("empty-state", state.emailMessages.length === 0);
+  list.innerHTML = state.emailMessages.length ? state.emailMessages.map((message) => `<button class="build-row" type="button" data-email-message="${escapeHtml(message.id)}"><span class="pipeline-state ${["failed", "rejected"].includes(message.status) ? "failed" : message.status === "sent" || message.status === "delivered" ? "complete" : "active"}"></span><div><strong>${escapeHtml(message.subject || "（无主题）")}</strong><small>${message.direction === "inbound" ? "入站" : "出站"} · ${escapeHtml(message.mail_from || "空信封发件人")} → ${escapeHtml(message.rcpt_to)} · ${escapeHtml(new Date(message.created_at_ms).toLocaleString("zh-CN"))}</small><code>${escapeHtml(message.last_error || message.id)}</code></div><span class="badge">${escapeHtml(emailStatusLabel(message.status))}</span></button>`).join("") : "暂无邮件记录。";
+}
+
+async function loadEmailMessages() {
+  if (!state.emailActive) return;
+  try {
+    const data = await api(`/api/email/${encodeURIComponent(state.emailActive)}/messages?limit=200`);
+    state.emailMessages = data.messages || [];
+    renderEmailMessages();
+  } catch (error) { toast(error.message, true); }
+}
+
+async function openEmailMessage(id) {
+  if (!state.emailActive) return;
+  try {
+    const data = await api(`/api/email/${encodeURIComponent(state.emailActive)}/messages/${encodeURIComponent(id)}`);
+    const message = data.message;
+    state.emailMessageActive = id;
+    $("#email-message-panel").classList.remove("hidden");
+    $("#email-message-title").textContent = message.subject || "（无主题）";
+    const fields = [["方向", message.direction === "inbound" ? "入站" : "出站"], ["状态", emailStatusLabel(message.status)], ["信封发件人", message.mail_from || "空"], ["信封收件人", message.rcpt_to], ["大小", formatBytes(message.size)], ["尝试次数", message.attempts], ["SPF / DKIM / DMARC", [message.spf, message.dkim, message.dmarc].filter(Boolean).join(" / ") || "无"], ["R2 对象", message.object_key], ["SHA-256", message.sha256], ["最后错误", message.last_error || "无"]];
+    $("#email-message-detail").innerHTML = fields.map(([key, value]) => `<div><dt>${escapeHtml(key)}</dt><dd class="${key === "R2 对象" || key === "SHA-256" ? "mono" : ""}">${escapeHtml(value)}</dd></div>`).join("");
+    const download = $("#email-message-download");
+    download.href = `/api/email/${encodeURIComponent(state.emailActive)}/messages/${encodeURIComponent(id)}/raw`;
+    download.classList.remove("hidden");
+  } catch (error) { toast(error.message, true); }
+}
+
+async function sendEmailMessage(event) {
+  event.preventDefault();
+  if (!state.emailActive) return;
+  const rawBytes = new TextEncoder().encode($("#email-send-raw").value);
+  const payload = { mail_from: $("#email-send-from").value.trim().toLowerCase(), recipients: $("#email-send-to").value.split(",").map((value) => value.trim().toLowerCase()).filter(Boolean), raw_base64: bytesToBase64(rawBytes) };
+  try {
+    const data = await api(`/api/email/${encodeURIComponent(state.emailActive)}/messages`, { method: "POST", body: JSON.stringify(payload) });
+    toast(`已持久化并排队 ${data.queued?.length || 0} 封邮件`);
+    await loadEmailMessages();
+  } catch (error) { toast(error.message, true); }
+}
+
 async function loadOverview({ quiet = false } = {}) {
   try {
     const data = await api("/api/overview");
@@ -2628,7 +2925,7 @@ async function boot() {
     $("#security-copy").innerHTML = consoleMode === "public"
       ? "此节点不保存<br>任何私钥。"
       : "密钥仅保留在本地<br>控制台进程中。";
-    $$("#deploy-form button, #source-form button, #kv-editor-form button, #d1-create-form button, #d1-exec-form button, #r2-bucket-form button, #r2-upload-form button, #r2-delete-bucket, #queue-form button, #queue-send-form button, #queue-delete, #analytics-form button, #analytics-write-form button, #analytics-delete, #pipeline-form button, #pipeline-token-form button, #pipeline-ingest-form button, #pipeline-flush, #pipeline-delete, #workflow-form button, #workflow-trigger-form button, #workflow-signal-form button, #workflow-delete, #flow-form button, #flow-token-form button, #flow-trigger-form button, #flow-delete, #project-domain-add-form button, #project-bindings-form button, #project-triggers-form button, #project-settings-form button, #project-source-form button, #project-redeploy, #project-delete")
+    $$("#deploy-form button, #source-form button, #kv-editor-form button, #d1-create-form button, #d1-exec-form button, #r2-bucket-form button, #r2-upload-form button, #r2-delete-bucket, #queue-form button, #queue-send-form button, #queue-delete, #analytics-form button, #analytics-write-form button, #analytics-delete, #pipeline-form button, #pipeline-token-form button, #pipeline-ingest-form button, #pipeline-flush, #pipeline-delete, #workflow-form button, #workflow-trigger-form button, #workflow-signal-form button, #workflow-delete, #flow-form button, #flow-token-form button, #flow-trigger-form button, #flow-delete, #email-domain-form button, #email-route-form button, #email-send-form button, #email-delete, #email-verify, #project-domain-add-form button, #project-bindings-form button, #project-triggers-form button, #project-settings-form button, #project-source-form button, #project-redeploy, #project-delete")
       .forEach((button) => { button.disabled = state.session.read_only; });
     await loadOverview({ quiet: true });
     await loadWorkerOps();
@@ -2639,6 +2936,7 @@ async function boot() {
     await loadPipelines({ quiet: true });
     await loadWorkflows({ quiet: true });
     await loadFlows({ quiet: true });
+    await loadEmail({ quiet: true });
   } catch (error) {
     if (consoleMode === "public" && error.status === 401) {
       state.session = null;
@@ -2695,6 +2993,7 @@ $("#refresh").addEventListener("click", async () => {
   await loadPipelines({ quiet: true });
   await loadWorkflows({ quiet: true });
   await loadFlows({ quiet: true });
+  await loadEmail({ quiet: true });
 });
 $("#deploy-form").addEventListener("submit", deployWorker);
 $("#deploy-file-picker").addEventListener("click", () => $("#deploy-files").click());
@@ -2861,6 +3160,24 @@ $("#flow-edge-list").addEventListener("click", (event) => { const button = event
 $("#flow-token-list").addEventListener("click", (event) => { const button = event.target.closest("[data-flow-token-revoke]"); if (button) revokeFlowToken(button.dataset.flowTokenRevoke); });
 $("#flow-runs").addEventListener("click", (event) => { const button = event.target.closest("[data-flow-run]"); if (button) openFlowRun(button.dataset.flowRun); });
 $("#flow-run-actions").addEventListener("click", (event) => { const button = event.target.closest("[data-flow-action]"); if (button) runFlowAction(button.dataset.flowAction); });
+$("#email-domain-form").addEventListener("submit", saveEmailDomain);
+$("#email-route-form").addEventListener("submit", saveEmailRoute);
+$("#email-route-match").addEventListener("change", updateEmailRouteFields);
+$("#email-route-destination").addEventListener("change", updateEmailRouteFields);
+$("#email-verify").addEventListener("click", verifyEmailDomain);
+$("#email-delete").addEventListener("click", deleteEmailDomain);
+$("#email-new").addEventListener("click", resetEmailDomainForm);
+$("#email-refresh").addEventListener("click", loadEmailMessages);
+$("#email-send-form").addEventListener("submit", sendEmailMessage);
+$("#email-domain-list").addEventListener("click", (event) => { const button = event.target.closest("[data-email-domain]"); if (button) selectEmailDomain(button.dataset.emailDomain); });
+$("#email-route-list").addEventListener("click", (event) => {
+  const edit = event.target.closest("[data-email-route-edit]");
+  const remove = event.target.closest("[data-email-route-remove]");
+  if (edit) fillEmailRouteForm(state.emailRoutes.find((route) => route.id === edit.dataset.emailRouteEdit));
+  if (remove) { state.emailRoutes = state.emailRoutes.filter((route) => route.id !== remove.dataset.emailRouteRemove); renderEmailRoutes(); }
+});
+$("#email-message-list").addEventListener("click", (event) => { const button = event.target.closest("[data-email-message]"); if (button) openEmailMessage(button.dataset.emailMessage); });
+updateEmailRouteFields();
 
 setInterval(() => {
   if (state.session) {
@@ -2879,6 +3196,9 @@ setInterval(() => {
     });
     if (state.view === "flows") loadFlows({ quiet: true }).then(() => {
       if (state.flowActive) selectFlow(state.flowActive);
+    });
+    if (state.view === "email") loadEmail({ quiet: true }).then(() => {
+      if (state.emailActive) loadEmailMessages();
     });
   }
 }, 10_000);
