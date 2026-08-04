@@ -28,9 +28,14 @@ ProtectSystem=strict
 ProtectHome=true
 PrivateTmp=true
 PrivateDevices=true
-ProtectKernelTunables=true
+# bubblewrap creates a fresh procfs inside its user/mount namespace. systemd's
+# procfs masking for these two options makes that nested mount "too revealing"
+# and the kernel rejects it. The daemon remains unprivileged with NNP, a
+# one-capability bounding set, private devices, and a read-only host filesystem;
+# build commands receive bubblewrap's fresh /proc and /dev instead.
+ProtectKernelTunables=false
 ProtectKernelModules=true
-ProtectKernelLogs=true
+ProtectKernelLogs=false
 ProtectControlGroups=true
 RestrictRealtime=true
 RestrictSUIDSGID=true

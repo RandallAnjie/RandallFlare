@@ -10,7 +10,7 @@ machine, verifies its SHA-256 sidecar, and delegates to the hardened installer.
 No locally-built binary is uploaded.
 
 Options:
-  --version TAG       Exact release tag, for example v0.6.2 (required).
+  --version TAG       Exact release tag, for example v0.6.3 (required).
   --repo OWNER/REPO   GitHub repository (default RandallAnjie/RandallFlare).
   --config PATH       Install this node config. Required on first install.
   --env PATH          Install an EnvironmentFile.
@@ -53,7 +53,7 @@ while (($#)); do
 done
 
 [[ "$version" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]+)?$ ]] || {
-  echo "--version must be an exact release tag such as v0.6.2" >&2
+  echo "--version must be an exact release tag such as v0.6.3" >&2
   exit 2
 }
 [[ "$repo" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]] || {

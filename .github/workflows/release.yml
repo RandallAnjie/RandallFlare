@@ -31,6 +31,8 @@ jobs:
           if command -v apparmor_parser >/dev/null; then
             apparmor_parser -KQ infra/rf-bwrap.apparmor
           fi
+          grep -Fxq 'ProtectKernelTunables=false' infra/rf.service
+          grep -Fxq 'ProtectKernelLogs=false' infra/rf.service
       - name: Install pinned workerd for real-runtime tests
         run: |
           infra/fetch-workerd.sh --output "$RUNNER_TEMP/workerd-bin/workerd"
