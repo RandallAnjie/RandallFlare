@@ -110,6 +110,11 @@ enum Cmd {
         #[command(subcommand)]
         cmd: D1Cmd,
     },
+    /// R2-compatible bucket and object operations.
+    R2 {
+        #[command(subcommand)]
+        cmd: R2Cmd,
+    },
     /// Fetch and verify a worker's transparency log (hash chain).
     Log {
         worker: String,
@@ -182,6 +187,112 @@ enum KvCmd {
     Delete {
         ns: String,
         key: String,
+        #[arg(long, env = "RF_NODE")]
+        node: String,
+        #[arg(long, env = "RF_CLUSTER_SECRET")]
+        secret: String,
+    },
+}
+
+#[derive(Subcommand)]
+enum R2Cmd {
+    /// List signed bucket definitions.
+    BucketList {
+        #[arg(long, env = "RF_NODE")]
+        node: String,
+        #[arg(long, env = "RF_CLUSTER_SECRET")]
+        secret: String,
+    },
+    /// Create or update a bucket. Omitting --rclone-remote uses local storage.
+    BucketCreate {
+        name: String,
+        #[arg(long, default_value = "")]
+        description: String,
+        #[arg(long)]
+        public: bool,
+        #[arg(long)]
+        rclone_remote: Option<String>,
+        #[arg(long, default_value = "")]
+        rclone_prefix: String,
+        #[arg(long)]
+        max_bytes: Option<u64>,
+        #[arg(long)]
+        max_objects: Option<u64>,
+        #[arg(long)]
+        expire_after_days: Option<u32>,
+        #[arg(long = "cors-origin")]
+        cors_origins: Vec<String>,
+        /// Additional public hostname (repeatable). The default r2-<bucket>
+        /// hostname is derived from ingress.default_domain automatically.
+        #[arg(long = "hostname")]
+        hostnames: Vec<String>,
+        #[arg(long, env = "RF_NODE")]
+        node: String,
+        #[arg(long, env = "RF_OPERATOR_KEY")]
+        key: Option<PathBuf>,
+        #[arg(long, env = "RF_CLUSTER_SECRET")]
+        secret: String,
+    },
+    /// Tombstone a bucket definition (stored object bytes are retained for GC).
+    BucketDelete {
+        name: String,
+        #[arg(long, env = "RF_NODE")]
+        node: String,
+        #[arg(long, env = "RF_OPERATOR_KEY")]
+        key: Option<PathBuf>,
+        #[arg(long, env = "RF_CLUSTER_SECRET")]
+        secret: String,
+    },
+    /// List objects by key prefix.
+    List {
+        bucket: String,
+        #[arg(long, default_value = "")]
+        prefix: String,
+        #[arg(long)]
+        cursor: Option<String>,
+        #[arg(long, default_value_t = 100)]
+        limit: usize,
+        #[arg(long, env = "RF_NODE")]
+        node: String,
+        #[arg(long, env = "RF_CLUSTER_SECRET")]
+        secret: String,
+    },
+    /// Read object metadata.
+    Head {
+        bucket: String,
+        object: String,
+        #[arg(long, env = "RF_NODE")]
+        node: String,
+        #[arg(long, env = "RF_CLUSTER_SECRET")]
+        secret: String,
+    },
+    /// Upload one object (up to 63 MiB; multipart support is separate).
+    Put {
+        bucket: String,
+        object: String,
+        file: PathBuf,
+        #[arg(long)]
+        content_type: Option<String>,
+        #[arg(long, env = "RF_NODE")]
+        node: String,
+        #[arg(long, env = "RF_CLUSTER_SECRET")]
+        secret: String,
+    },
+    /// Download one object. Without --output, writes bytes to stdout.
+    Get {
+        bucket: String,
+        object: String,
+        #[arg(long)]
+        output: Option<PathBuf>,
+        #[arg(long, env = "RF_NODE")]
+        node: String,
+        #[arg(long, env = "RF_CLUSTER_SECRET")]
+        secret: String,
+    },
+    /// Delete one object's metadata index.
+    Delete {
+        bucket: String,
+        object: String,
         #[arg(long, env = "RF_NODE")]
         node: String,
         #[arg(long, env = "RF_CLUSTER_SECRET")]
@@ -394,6 +505,186 @@ async fn async_main(cli: Cli) -> Result<()> {
                 Ok(())
             }
         },
+        Cmd::R2 { cmd } => match cmd {
+            R2Cmd::BucketList { node, secret } => {
+                let client = PeerClient::new(secret_bytes(&secret)?);
+                let buckets = client
+                    .resource_heads(&node, Some(rf::r2::BUCKET_KIND))
+                    .await?
+                    .into_iter()
+                    .filter(|view| !view.resource.deleted)
+                    .map(|view| {
+                        let spec = rf::r2::bucket_spec(&view.resource)?;
+                        Ok(serde_json::json!({
+                            "name": view.resource.name,
+                            "version": view.resource.version,
+                            "digest": view.digest,
+                            "spec": spec,
+                        }))
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                println!("{}", serde_json::to_string_pretty(&buckets)?);
+                Ok(())
+            }
+            R2Cmd::BucketCreate {
+                name,
+                description,
+                public,
+                rclone_remote,
+                rclone_prefix,
+                max_bytes,
+                max_objects,
+                expire_after_days,
+                cors_origins,
+                hostnames,
+                node,
+                key,
+                secret,
+            } => {
+                let storage = match rclone_remote {
+                    Some(remote) => rf::objectstore::StorageLocation::Rclone {
+                        remote,
+                        prefix: rclone_prefix,
+                    },
+                    None if rclone_prefix.is_empty() => rf::objectstore::StorageLocation::Local,
+                    None => anyhow::bail!("--rclone-prefix 必须与 --rclone-remote 一起使用"),
+                };
+                let spec = rf::r2::BucketSpec {
+                    description,
+                    public_access: public,
+                    storage,
+                    max_bytes,
+                    max_objects,
+                    expire_objects_after_days: expire_after_days,
+                    cors_origins,
+                    hostnames,
+                };
+                let client = PeerClient::new(secret_bytes(&secret)?);
+                let head = client
+                    .resource_head(&node, rf::r2::BUCKET_KIND, &name)
+                    .await?;
+                let record = rf::r2::prepare_bucket_after(&name, spec, false, head.as_ref())?;
+                let operator = operator_key(key)?;
+                let envelope = rf_core::envelope::Envelope::seal_any(&record, &operator);
+                client.post_resource(&node, &envelope).await?;
+                println!("R2 bucket {} 已更新至 v{}", record.name, record.version);
+                Ok(())
+            }
+            R2Cmd::BucketDelete {
+                name,
+                node,
+                key,
+                secret,
+            } => {
+                let client = PeerClient::new(secret_bytes(&secret)?);
+                let head = client
+                    .resource_head(&node, rf::r2::BUCKET_KIND, &name)
+                    .await?
+                    .with_context(|| format!("R2 bucket {name} 不存在"))?;
+                if head.resource.deleted {
+                    anyhow::bail!("R2 bucket {name} 已删除");
+                }
+                let spec = rf::r2::bucket_spec(&head.resource)?;
+                let record = rf::r2::prepare_bucket_after(&name, spec, true, Some(&head))?;
+                let operator = operator_key(key)?;
+                let envelope = rf_core::envelope::Envelope::seal_any(&record, &operator);
+                client.post_resource(&node, &envelope).await?;
+                println!("R2 bucket {} 已删除（v{}）", record.name, record.version);
+                Ok(())
+            }
+            R2Cmd::List {
+                bucket,
+                prefix,
+                cursor,
+                limit,
+                node,
+                secret,
+            } => {
+                let client = PeerClient::new(secret_bytes(&secret)?);
+                let objects = client
+                    .r2_list(&node, &bucket, &prefix, cursor.as_deref(), limit)
+                    .await?;
+                println!("{}", serde_json::to_string_pretty(&objects)?);
+                Ok(())
+            }
+            R2Cmd::Head {
+                bucket,
+                object,
+                node,
+                secret,
+            } => {
+                let client = PeerClient::new(secret_bytes(&secret)?);
+                let metadata = client
+                    .r2_head(&node, &bucket, &object)
+                    .await?
+                    .with_context(|| format!("R2 对象 {bucket}/{object} 不存在"))?;
+                println!("{}", serde_json::to_string_pretty(&metadata)?);
+                Ok(())
+            }
+            R2Cmd::Put {
+                bucket,
+                object,
+                file,
+                content_type,
+                node,
+                secret,
+            } => {
+                let bytes = std::fs::read(&file)
+                    .with_context(|| format!("读取上传文件 {}", file.display()))?;
+                let client = PeerClient::new(secret_bytes(&secret)?);
+                let metadata = client
+                    .r2_put(
+                        &node,
+                        &bucket,
+                        &object,
+                        &bytes,
+                        &rf::r2::PutOptions {
+                            content_type,
+                            ..Default::default()
+                        },
+                    )
+                    .await?;
+                println!("{}", serde_json::to_string_pretty(&metadata)?);
+                Ok(())
+            }
+            R2Cmd::Get {
+                bucket,
+                object,
+                output,
+                node,
+                secret,
+            } => {
+                let client = PeerClient::new(secret_bytes(&secret)?);
+                let (_, bytes) = client
+                    .r2_get(&node, &bucket, &object)
+                    .await?
+                    .with_context(|| format!("R2 对象 {bucket}/{object} 不存在"))?;
+                if let Some(path) = output {
+                    if path.exists() {
+                        anyhow::bail!("拒绝覆盖已有文件：{}", path.display());
+                    }
+                    std::fs::write(&path, bytes)
+                        .with_context(|| format!("写入下载文件 {}", path.display()))?;
+                } else {
+                    use std::io::Write;
+                    std::io::stdout().write_all(&bytes)?;
+                }
+                Ok(())
+            }
+            R2Cmd::Delete {
+                bucket,
+                object,
+                node,
+                secret,
+            } => {
+                let client = PeerClient::new(secret_bytes(&secret)?);
+                if !client.r2_delete(&node, &bucket, &object).await? {
+                    anyhow::bail!("R2 对象 {bucket}/{object} 不存在");
+                }
+                println!("R2 对象 {bucket}/{object} 已删除");
+                Ok(())
+            }
+        },
         Cmd::Log {
             worker,
             node,
@@ -503,6 +794,25 @@ fn describe_approval(
                 ))
             }
         }
+        rf::management::ApprovalKind::Resource => {
+            let resource: rf::resource::ResourceRecord =
+                postcard::from_bytes(payload).context("节点返回的平台资源配置无效")?;
+            resource.validate().context("已拒绝无效的平台资源配置")?;
+            if resource.deleted {
+                Ok(format!(
+                    "删除平台资源 {}/{}（生成版本 v{}）",
+                    resource.kind, resource.name, resource.version
+                ))
+            } else {
+                Ok(format!(
+                    "更新平台资源 {}/{} v{}\n  配置摘要：{}",
+                    resource.kind,
+                    resource.name,
+                    resource.version,
+                    &rf::blob::sha256_hex(resource.spec_json.as_bytes())[..16],
+                ))
+            }
+        }
     }
 }
 
@@ -527,6 +837,19 @@ fn doctor(config: PathBuf, json: bool) -> Result<()> {
     });
     let git = rf::build::configured_binary(cfg.build.git.as_deref(), "git");
     let sandbox = rf::build::configured_binary(cfg.build.sandbox.as_deref(), "bwrap");
+    let rclone_version = cfg.storage.rclone_binary.as_ref().and_then(|path| {
+        std::process::Command::new(path)
+            .arg("version")
+            .output()
+            .ok()
+            .filter(|output| output.status.success())
+            .and_then(|output| {
+                String::from_utf8_lossy(&output.stdout)
+                    .lines()
+                    .next()
+                    .map(str::to_string)
+            })
+    });
     if let (Some(path), None) = (&configured_workerd, &workerd_version) {
         anyhow::bail!(
             "configured workerd could not be executed successfully: {}",
@@ -544,6 +867,29 @@ fn doctor(config: PathBuf, json: bool) -> Result<()> {
         warnings.push(
             "bubblewrap was not found; zero-config builds work, custom build commands do not",
         );
+    }
+    if let Some(path) = &cfg.storage.rclone_binary {
+        if rclone_version.is_none() {
+            anyhow::bail!(
+                "configured rclone could not be executed: {}",
+                path.display()
+            );
+        }
+    }
+    if let Some(path) = &cfg.storage.rclone_config {
+        if !path.is_file() {
+            anyhow::bail!(
+                "configured rclone config does not exist: {}",
+                path.display()
+            );
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            if std::fs::metadata(path)?.permissions().mode() & 0o077 != 0 {
+                warnings.push("rclone config is readable by group or others; use mode 0600");
+            }
+        }
     }
     if cfg.public && cfg.ingress.http.is_none() && cfg.ingress.https.is_none() {
         warnings.push("public node has no HTTP or HTTPS ingress listener");
@@ -594,6 +940,11 @@ fn doctor(config: PathBuf, json: bool) -> Result<()> {
         "git": git,
         "build_sandbox": sandbox,
         "github_token_configured": std::env::var_os(&cfg.build.github_token_env).is_some(),
+        "object_storage": {
+            "local_dir": cfg.storage.local_dir,
+            "rclone": rclone_version,
+            "rclone_configured": cfg.storage.rclone_config.is_some(),
+        },
         "warnings": warnings,
     });
     if json {
@@ -625,6 +976,10 @@ fn doctor(config: PathBuf, json: bool) -> Result<()> {
             );
         } else {
             println!("builds: disabled");
+        }
+        match report["object_storage"]["rclone"].as_str() {
+            Some(version) => println!("storage: local + {version}"),
+            None => println!("storage: local"),
         }
         for warning in report["warnings"].as_array().into_iter().flatten() {
             println!("warning: {}", warning.as_str().unwrap_or("unknown warning"));
@@ -747,13 +1102,19 @@ async fn run(config_path: PathBuf) -> Result<()> {
         rf::durable::Coordinator::new(node.clone(), d1_registry.clone(), d1_leadership.clone());
     let api_addr = rf::peerapi::serve(node.clone(), d1_registry.clone(), durable.clone()).await?;
     tracing::info!("peer api on {api_addr}");
-    rf::d1::spawn_manager(node.clone(), d1_registry, d1_leadership);
+    let _d1_manager = rf::d1::spawn_manager(node.clone(), d1_registry, d1_leadership);
 
     // KV binding backend for workerd — must be up before the runtime
     // writes any workerd config.
     let kvbind_port = rf::kvbind::serve(node.clone()).await?;
     node.set_kvbind_port(kvbind_port);
     tracing::info!("kvbind on 127.0.0.1:{kvbind_port}");
+    let r2bind_port = rf::r2bind::serve(node.clone()).await?;
+    node.set_r2bind_port(r2bind_port);
+    tracing::info!("r2bind on 127.0.0.1:{r2bind_port}");
+    let d1bind_port = rf::d1bind::serve(node.clone()).await?;
+    node.set_d1bind_port(d1bind_port);
+    tracing::info!("d1bind on 127.0.0.1:{d1bind_port}");
 
     let _gossip = rf::gossip::start(node.clone()).await?;
     durable.spawn_ensurer();
@@ -826,6 +1187,35 @@ async fn run(config_path: PathBuf) -> Result<()> {
     rf::anchor::spawn(node.clone(), node.cfg.anchor.clone());
 
     rf::selfupdate::spawn(node.cfg.update.clone());
+
+    // R2 lifecycle rules, expired multipart sessions and delayed orphan
+    // collection are idempotent. Every node may attempt the sweep; D1 quorum
+    // serialization and conditional deletes make concurrent reconcilers safe.
+    {
+        let node = node.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(std::time::Duration::from_secs(60 * 60)).await;
+                match rf::r2::sweep_lifecycle(&node).await {
+                    Ok(result)
+                        if result.expired_objects > 0
+                            || result.expired_uploads > 0
+                            || result.collected_blobs > 0 =>
+                    {
+                        tracing::info!(
+                            expired_objects = result.expired_objects,
+                            expired_uploads = result.expired_uploads,
+                            collected_blobs = result.collected_blobs,
+                            retained_blobs = result.retained_blobs,
+                            "R2 lifecycle sweep complete"
+                        );
+                    }
+                    Ok(_) => {}
+                    Err(error) => tracing::warn!("R2 lifecycle sweep failed closed: {error:#}"),
+                }
+            }
+        });
+    }
 
     // Periodic GC.
     {

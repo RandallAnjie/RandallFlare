@@ -50,6 +50,9 @@
           <button class="nav-item" data-view="kv">
             <span class="nav-glyph">≋</span><span>KV 存储</span>
           </button>
+          <button class="nav-item" data-view="r2">
+            <span class="nav-glyph">⬡</span><span>R2 对象存储</span><span id="r2-nav-count" class="count">0</span>
+          </button>
           <button class="nav-item" data-view="d1">
             <span class="nav-glyph">◫</span><span>D1 数据库</span>
           </button>
@@ -85,6 +88,7 @@
             <article class="metric"><span>在线节点</span><strong id="metric-nodes">—</strong><small id="metric-public">正在等待集群数据</small></article>
             <article class="metric"><span>Worker</span><strong id="metric-workers">—</strong><small id="metric-routes">暂无路由数据</small></article>
             <article class="metric"><span>D1 数据库</span><strong id="metric-databases">—</strong><small>多数派复制保障一致性</small></article>
+            <article class="metric"><span>R2 bucket</span><strong id="metric-r2">—</strong><small id="metric-r2-backend">内容寻址对象存储</small></article>
             <article class="metric"><span>内容块状态</span><strong id="metric-blobs">—</strong><small>本地缺失数</small></article>
           </div>
 
@@ -236,7 +240,7 @@
           </div>
 
           <div id="project-tab-bindings" class="project-tab">
-            <article class="panel settings-panel"><div class="settings-copy"><p class="eyebrow">运行配置</p><h2>变量与绑定</h2><p class="muted">环境变量和 KV 命名空间会随清单复制。敏感凭据请使用节点侧密钥能力，不要写入普通变量。</p></div><form id="project-bindings-form" class="settings-form"><label><span>环境变量 <em>每行 KEY=value</em></span><textarea id="project-env" class="code-input" rows="8"></textarea></label><label><span>KV 绑定 <em>每行 BINDING=namespace</em></span><textarea id="project-kv-bindings" class="code-input" rows="6"></textarea></label><button class="primary" type="submit">保存变量与绑定</button></form></article>
+            <article class="panel settings-panel"><div class="settings-copy"><p class="eyebrow">运行配置</p><h2>变量与绑定</h2><p class="muted">环境变量、KV、R2 与 D1 绑定会随签名清单复制。敏感凭据请使用节点侧密钥能力，不要写入普通变量。</p></div><form id="project-bindings-form" class="settings-form"><label><span>环境变量 <em>每行 KEY=value</em></span><textarea id="project-env" class="code-input" rows="8"></textarea></label><label><span>KV 绑定 <em>每行 BINDING=namespace</em></span><textarea id="project-kv-bindings" class="code-input" rows="6"></textarea></label><label><span>R2 绑定 <em>每行 BINDING=bucket</em></span><textarea id="project-r2-bindings" class="code-input" rows="5"></textarea></label><label><span>D1 绑定 <em>每行 BINDING=database</em></span><textarea id="project-d1-bindings" class="code-input" rows="5"></textarea></label><button class="primary" type="submit">保存变量与绑定</button></form></article>
           </div>
 
           <div id="project-tab-triggers" class="project-tab">
@@ -280,6 +284,67 @@
                 </div>
               </form>
               <p class="form-note">以 <code>__rf</code> 开头的系统命名空间受保护，不能在控制台中写入。</p>
+            </article>
+          </div>
+        </section>
+
+        <section id="view-r2" class="view" aria-labelledby="section-title">
+          <div class="projects-header">
+            <div><p class="eyebrow">对象存储</p><h2>R2 bucket</h2><p class="muted">对象元数据由 D1 多数派提交；内容以 SHA-256 寻址，存入本地副本组或节点本地配置的 rclone remote。</p></div>
+            <span id="r2-capability" class="badge">正在检查存储能力</span>
+          </div>
+          <div class="grid r2-grid">
+            <div class="r2-sidebar-stack">
+              <article class="panel">
+                <div class="panel-head"><div><p class="eyebrow">签名资源</p><h2>创建 bucket</h2></div><span class="badge">可验证版本</span></div>
+                <form id="r2-bucket-form" class="stack-form">
+                  <label><span>bucket 名称</span><input id="r2-bucket-name" pattern="[a-z0-9-]{1,63}" placeholder="assets" required></label>
+                  <label><span>说明</span><input id="r2-bucket-description" placeholder="生产静态资源"></label>
+                  <label><span>存储后端</span><select id="r2-storage-backend"><option value="local">集群本地副本</option><option value="rclone">rclone remote</option></select></label>
+                  <div id="r2-rclone-fields" class="form-grid hidden">
+                    <label><span>remote 名称</span><input id="r2-rclone-remote" placeholder="s3-primary"></label>
+                    <label><span>对象前缀</span><input id="r2-rclone-prefix" placeholder="randallflare/assets"></label>
+                  </div>
+                  <div class="form-grid">
+                    <label><span>容量上限（字节）</span><input id="r2-max-bytes" type="number" min="1" placeholder="不限制"></label>
+                    <label><span>对象数上限</span><input id="r2-max-objects" type="number" min="1" placeholder="不限制"></label>
+                  </div>
+                  <label><span>自动过期（天）</span><input id="r2-expire-days" type="number" min="1" max="36500" placeholder="不自动过期"></label>
+                  <label><span>CORS 来源 <em>每行一个</em></span><textarea id="r2-cors-origins" rows="3" placeholder="https://example.com"></textarea></label>
+                  <label><span>自定义公开域名 <em>每行一个</em></span><textarea id="r2-hostnames" rows="2" placeholder="objects.example.com"></textarea><small id="r2-default-domain" class="input-note">默认公开域名将在保存后自动生成</small></label>
+                  <label class="check-label"><input id="r2-public-access" type="checkbox"><span>允许通过公开 R2 网关读取</span></label>
+                  <button class="primary" type="submit">创建 bucket</button>
+                </form>
+                <p class="form-note">这里只复制 remote 名称和前缀；rclone 凭据始终保留在各节点自己的配置文件中。</p>
+              </article>
+              <article class="panel">
+                <div class="panel-head"><div><p class="eyebrow">bucket 目录</p><h2>所有 bucket</h2></div><span id="r2-bucket-count" class="badge">0 个</span></div>
+                <div id="r2-bucket-list" class="database-list empty-state">暂无 R2 bucket。</div>
+              </article>
+            </div>
+            <article class="panel r2-object-panel">
+              <div class="panel-head">
+                <div><p class="eyebrow">对象浏览器</p><h2 id="r2-active-bucket">请选择 bucket</h2><p id="r2-bucket-summary" class="muted compact-copy">选择左侧 bucket 后即可管理对象。</p></div>
+                <button id="r2-delete-bucket" class="danger ghost hidden" type="button">删除 bucket</button>
+              </div>
+              <div id="r2-object-tools" class="hidden">
+                <form id="r2-object-search" class="inline-form">
+                  <label><span>键前缀</span><input id="r2-object-prefix" placeholder="images/"></label>
+                  <span></span><button class="secondary" type="submit">筛选</button>
+                </form>
+                <form id="r2-upload-form" class="r2-upload-form">
+                  <label><span>对象键</span><input id="r2-object-key" placeholder="images/logo.svg" required></label>
+                  <label><span>本地文件</span><input id="r2-object-file" type="file" required></label>
+                  <button class="primary" type="submit">上传对象</button>
+                </form>
+                <div class="table-wrap r2-object-table-wrap">
+                  <table class="project-table">
+                    <thead><tr><th>对象键</th><th>大小</th><th>类型</th><th>上传时间</th><th><span class="sr-only">操作</span></th></tr></thead>
+                    <tbody id="r2-object-table"><tr><td colspan="5" class="empty-state">bucket 中暂无对象。</td></tr></tbody>
+                  </table>
+                </div>
+                <button id="r2-load-more" class="secondary hidden" type="button">加载更多</button>
+              </div>
             </article>
           </div>
         </section>

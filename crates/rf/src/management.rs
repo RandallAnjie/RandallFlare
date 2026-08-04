@@ -25,6 +25,7 @@ pub const CONSOLE_GRANT_VERSION: u8 = 1;
 pub const LOGIN_APPROVAL_TTL_MS: u64 = 5 * 60 * 1000;
 pub const MANIFEST_APPROVAL_TTL_MS: u64 = 10 * 60 * 1000;
 pub const SOURCE_APPROVAL_TTL_MS: u64 = 10 * 60 * 1000;
+pub const RESOURCE_APPROVAL_TTL_MS: u64 = 10 * 60 * 1000;
 pub const CONSOLE_SESSION_TTL_MS: u64 = 60 * 60 * 1000;
 pub const MAX_CONSOLE_SESSION_TTL_MS: u64 = 12 * 60 * 60 * 1000;
 const MAX_PENDING: usize = 1024;
@@ -77,6 +78,7 @@ pub enum ApprovalKind {
     Login,
     Manifest,
     Source,
+    Resource,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -236,6 +238,22 @@ impl Management {
         )
     }
 
+    pub fn create_resource(
+        &self,
+        session_id: [u8; 32],
+        resource: &crate::resource::ResourceRecord,
+        summary: String,
+    ) -> Result<CreatedApproval> {
+        resource.validate()?;
+        self.create(
+            ApprovalKind::Resource,
+            summary,
+            postcard::to_stdvec(resource)?,
+            Some(session_id),
+            RESOURCE_APPROVAL_TTL_MS,
+        )
+    }
+
     fn create(
         &self,
         kind: ApprovalKind,
@@ -352,6 +370,13 @@ impl Management {
                 source.validate()?;
                 approval.status = Status::Approved(envelope.clone());
             }
+            ApprovalKind::Resource => {
+                let resource: crate::resource::ResourceRecord = envelope
+                    .open(Some(operator))
+                    .map_err(|error| anyhow::anyhow!("平台资源审批无效：{error}"))?;
+                resource.validate()?;
+                approval.status = Status::Approved(envelope.clone());
+            }
         }
         Ok(ApprovedPayload {
             id,
@@ -385,6 +410,10 @@ impl Management {
 
     pub fn poll_source(&self, id: &str, session_id: [u8; 32]) -> Result<ApprovalPoll> {
         self.poll(id, Some(session_id), ApprovalKind::Source)
+    }
+
+    pub fn poll_resource(&self, id: &str, session_id: [u8; 32]) -> Result<ApprovalPoll> {
+        self.poll(id, Some(session_id), ApprovalKind::Resource)
     }
 
     /// Internal build-manager observation, never exposed without console auth.

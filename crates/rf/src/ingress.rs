@@ -14,7 +14,7 @@ use crate::node::Node;
 use anyhow::Result;
 use axum::body::Body;
 use axum::extract::{Request, State};
-use axum::http::{uri::Authority, uri::Uri, HeaderValue, StatusCode};
+use axum::http::{uri::Authority, uri::Uri, HeaderValue, Method, StatusCode};
 use axum::response::{IntoResponse, Response};
 use rf_core::manifest::WorkerManifest;
 use std::net::SocketAddr;
@@ -102,6 +102,20 @@ async fn handle(State(ingress): State<Ingress>, req: Request) -> Response {
             .unwrap_or_else(|never| match never {});
     }
 
+    if let Some((bucket, spec)) = crate::r2::bucket_records(&ingress.node)
+        .into_iter()
+        .find_map(|(view, spec)| {
+            ingress
+                .node
+                .effective_r2_hostnames(&view.resource.name, &spec)
+                .iter()
+                .any(|candidate| candidate == &host)
+                .then_some((view.resource.name, spec))
+        })
+    {
+        return serve_public_r2(&ingress.node, req, &bucket, &spec).await;
+    }
+
     let routes = ingress.node.routes();
     let Some(worker_name) = routes.get(&host) else {
         return ingress
@@ -156,6 +170,208 @@ async fn handle(State(ingress): State<Ingress>, req: Request) -> Response {
             .into_response();
     };
     proxy(&ingress.http, req, port).await
+}
+
+async fn serve_public_r2(
+    node: &Node,
+    req: Request,
+    bucket: &str,
+    spec: &crate::r2::BucketSpec,
+) -> Response {
+    if !spec.public_access {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+    if req.method() == Method::OPTIONS {
+        let mut response = StatusCode::NO_CONTENT.into_response();
+        apply_r2_cors(req.headers(), spec, &mut response);
+        response.headers_mut().insert(
+            axum::http::header::ACCESS_CONTROL_ALLOW_METHODS,
+            HeaderValue::from_static("GET, HEAD, OPTIONS"),
+        );
+        response.headers_mut().insert(
+            axum::http::header::ACCESS_CONTROL_ALLOW_HEADERS,
+            HeaderValue::from_static("Range, If-None-Match"),
+        );
+        response.headers_mut().insert(
+            axum::http::header::ACCESS_CONTROL_MAX_AGE,
+            HeaderValue::from_static("86400"),
+        );
+        return response;
+    }
+    if req.method() != Method::GET && req.method() != Method::HEAD {
+        return StatusCode::METHOD_NOT_ALLOWED.into_response();
+    }
+    let key = match percent_encoding::percent_decode_str(req.uri().path().trim_start_matches('/'))
+        .decode_utf8()
+    {
+        Ok(key) if !key.is_empty() => key.into_owned(),
+        _ => return (StatusCode::BAD_REQUEST, "invalid object key\n").into_response(),
+    };
+    let origin_headers = req.headers().clone();
+    let object = match crate::r2::get_object(node, bucket, &key).await {
+        Ok(Some(object)) => object,
+        Ok(None) => return StatusCode::NOT_FOUND.into_response(),
+        Err(error) => {
+            tracing::warn!("public R2 read {bucket}/{key}: {error:#}");
+            return StatusCode::SERVICE_UNAVAILABLE.into_response();
+        }
+    };
+    let (metadata, bytes) = object;
+    if req
+        .headers()
+        .get(axum::http::header::IF_NONE_MATCH)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| {
+            value.split(',').any(|etag| {
+                let etag = etag.trim().trim_start_matches("W/").trim_matches('"');
+                etag == "*" || etag == metadata.etag
+            })
+        })
+    {
+        let mut response = StatusCode::NOT_MODIFIED.into_response();
+        add_r2_object_headers(&metadata, &mut response);
+        apply_r2_cors(&origin_headers, spec, &mut response);
+        return response;
+    }
+    let range = req
+        .headers()
+        .get(axum::http::header::RANGE)
+        .and_then(|value| value.to_str().ok())
+        .map(|header| public_byte_range(header, bytes.len()));
+    let (status, body, content_range) = match range {
+        Some(Ok((start, end))) => (
+            StatusCode::PARTIAL_CONTENT,
+            &bytes[start..=end],
+            Some(format!("bytes {start}-{end}/{}", bytes.len())),
+        ),
+        Some(Err(())) => {
+            let mut response = StatusCode::RANGE_NOT_SATISFIABLE.into_response();
+            if let Ok(value) = HeaderValue::from_str(&format!("bytes */{}", bytes.len())) {
+                response
+                    .headers_mut()
+                    .insert(axum::http::header::CONTENT_RANGE, value);
+            }
+            apply_r2_cors(&origin_headers, spec, &mut response);
+            return response;
+        }
+        None => (StatusCode::OK, bytes.as_slice(), None),
+    };
+    let mut response = if req.method() == Method::HEAD {
+        status.into_response()
+    } else {
+        (status, body.to_vec()).into_response()
+    };
+    add_r2_object_headers(&metadata, &mut response);
+    response.headers_mut().insert(
+        axum::http::header::ACCEPT_RANGES,
+        HeaderValue::from_static("bytes"),
+    );
+    response.headers_mut().insert(
+        axum::http::header::CONTENT_LENGTH,
+        HeaderValue::from_str(&body.len().to_string()).unwrap(),
+    );
+    if let Some(content_range) = content_range {
+        if let Ok(value) = HeaderValue::from_str(&content_range) {
+            response
+                .headers_mut()
+                .insert(axum::http::header::CONTENT_RANGE, value);
+        }
+    }
+    apply_r2_cors(&origin_headers, spec, &mut response);
+    response
+}
+
+fn add_r2_object_headers(metadata: &crate::r2::ObjectMeta, response: &mut Response) {
+    if let Ok(value) = HeaderValue::from_str(&format!("\"{}\"", metadata.etag)) {
+        response
+            .headers_mut()
+            .insert(axum::http::header::ETAG, value);
+    }
+    if let Some(content_type) = &metadata.content_type {
+        if let Ok(value) = HeaderValue::from_str(content_type) {
+            response
+                .headers_mut()
+                .insert(axum::http::header::CONTENT_TYPE, value);
+        }
+    }
+    for (field, header) in [
+        ("cacheControl", axum::http::header::CACHE_CONTROL),
+        (
+            "contentDisposition",
+            axum::http::header::CONTENT_DISPOSITION,
+        ),
+        ("contentEncoding", axum::http::header::CONTENT_ENCODING),
+        ("contentLanguage", axum::http::header::CONTENT_LANGUAGE),
+    ] {
+        if let Some(value) = metadata
+            .http_metadata
+            .get(field)
+            .and_then(|value| value.as_str())
+        {
+            if let Ok(value) = HeaderValue::from_str(value) {
+                response.headers_mut().insert(header, value);
+            }
+        }
+    }
+}
+
+fn apply_r2_cors(
+    headers: &axum::http::HeaderMap,
+    spec: &crate::r2::BucketSpec,
+    response: &mut Response,
+) {
+    let Some(origin) = headers
+        .get(axum::http::header::ORIGIN)
+        .and_then(|value| value.to_str().ok())
+    else {
+        return;
+    };
+    let allowed = if spec.cors_origins.iter().any(|value| value == "*") {
+        "*"
+    } else if spec.cors_origins.iter().any(|value| value == origin) {
+        origin
+    } else {
+        return;
+    };
+    if let Ok(value) = HeaderValue::from_str(allowed) {
+        response
+            .headers_mut()
+            .insert(axum::http::header::ACCESS_CONTROL_ALLOW_ORIGIN, value);
+    }
+    response.headers_mut().insert(
+        axum::http::header::ACCESS_CONTROL_EXPOSE_HEADERS,
+        HeaderValue::from_static("ETag, Content-Length, Content-Range"),
+    );
+    if allowed != "*" {
+        response
+            .headers_mut()
+            .append(axum::http::header::VARY, HeaderValue::from_static("Origin"));
+    }
+}
+
+fn public_byte_range(header: &str, size: usize) -> std::result::Result<(usize, usize), ()> {
+    let value = header.strip_prefix("bytes=").ok_or(())?;
+    if size == 0 || value.contains(',') {
+        return Err(());
+    }
+    let (start, end) = value.split_once('-').ok_or(())?;
+    if start.is_empty() {
+        let suffix = end.parse::<usize>().map_err(|_| ())?;
+        if suffix == 0 {
+            return Err(());
+        }
+        return Ok((size.saturating_sub(suffix), size - 1));
+    }
+    let start = start.parse::<usize>().map_err(|_| ())?;
+    let end = if end.is_empty() {
+        size - 1
+    } else {
+        end.parse::<usize>().map_err(|_| ())?.min(size - 1)
+    };
+    if start >= size || start > end {
+        return Err(());
+    }
+    Ok((start, end))
 }
 
 fn request_authority(req: &Request) -> Option<&str> {
@@ -351,5 +567,15 @@ mod tests {
             .body(Body::empty())
             .unwrap();
         assert_eq!(request_hostname(&http1), "[2001:db8::1]");
+    }
+
+    #[test]
+    fn public_r2_ranges_cover_open_suffix_and_invalid_requests() {
+        assert_eq!(public_byte_range("bytes=2-4", 10), Ok((2, 4)));
+        assert_eq!(public_byte_range("bytes=8-", 10), Ok((8, 9)));
+        assert_eq!(public_byte_range("bytes=-3", 10), Ok((7, 9)));
+        assert_eq!(public_byte_range("bytes=-99", 10), Ok((0, 9)));
+        assert_eq!(public_byte_range("bytes=11-", 10), Err(()));
+        assert_eq!(public_byte_range("bytes=1-2,4-5", 10), Err(()));
     }
 }

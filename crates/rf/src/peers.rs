@@ -10,6 +10,7 @@ use futures_util::StreamExt;
 use percent_encoding::{utf8_percent_encode, NON_ALPHANUMERIC};
 use rf_core::envelope::Envelope;
 use rf_core::kv::KvEntry;
+use sha2::Digest;
 use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -263,6 +264,37 @@ impl PeerClient {
         Ok(())
     }
 
+    pub async fn resource_heads(
+        &self,
+        base: &str,
+        kind: Option<&str>,
+    ) -> Result<Vec<crate::resource::ResourceView>> {
+        let path = kind
+            .map(|kind| format!("/v1/resources?kind={}", component(kind)))
+            .unwrap_or_else(|| "/v1/resources".to_string());
+        let raw = self.get(base, &path).await?;
+        Ok(serde_json::from_slice(&raw)?)
+    }
+
+    pub async fn resource_head(
+        &self,
+        base: &str,
+        kind: &str,
+        name: &str,
+    ) -> Result<Option<crate::resource::ResourceView>> {
+        let path = format!("/v1/resource/{}/{}", component(kind), component(name));
+        match self.get(base, &path).await {
+            Ok(raw) => Ok(Some(serde_json::from_slice(&raw)?)),
+            Err(error) if peer_http_status(&error) == Some(404) => Ok(None),
+            Err(error) => Err(error),
+        }
+    }
+
+    pub async fn post_resource(&self, base: &str, envelope: &Envelope) -> Result<()> {
+        self.post(base, "/v1/resource", envelope.to_bytes()).await?;
+        Ok(())
+    }
+
     pub async fn status(&self, base: &str) -> Result<serde_json::Value> {
         let raw = self.get(base, "/v1/status").await?;
         Ok(serde_json::from_slice(&raw)?)
@@ -378,6 +410,100 @@ impl PeerClient {
             .collect())
     }
 
+    pub async fn r2_list(
+        &self,
+        base: &str,
+        bucket: &str,
+        prefix: &str,
+        cursor: Option<&str>,
+        limit: usize,
+    ) -> Result<crate::r2::ObjectList> {
+        let mut path = format!(
+            "/v1/r2/{}?prefix={}&limit={}",
+            component(bucket),
+            component(prefix),
+            limit.clamp(1, crate::r2::MAX_LIST_LIMIT)
+        );
+        if let Some(cursor) = cursor {
+            path.push_str("&cursor=");
+            path.push_str(&component(cursor));
+        }
+        let raw = self.get(base, &path).await?;
+        Ok(serde_json::from_slice(&raw)?)
+    }
+
+    pub async fn r2_head(
+        &self,
+        base: &str,
+        bucket: &str,
+        key: &str,
+    ) -> Result<Option<crate::r2::ObjectMeta>> {
+        let path = format!("/v1/r2/{}/meta/{}", component(bucket), component(key));
+        match self.get(base, &path).await {
+            Ok(raw) => Ok(Some(serde_json::from_slice(&raw)?)),
+            Err(error) if peer_http_status(&error) == Some(404) => Ok(None),
+            Err(error) => Err(error),
+        }
+    }
+
+    pub async fn r2_get(
+        &self,
+        base: &str,
+        bucket: &str,
+        key: &str,
+    ) -> Result<Option<(crate::r2::ObjectMeta, Vec<u8>)>> {
+        let path = format!("/v1/r2/{}/object/{}", component(bucket), component(key));
+        match self.get(base, &path).await {
+            Ok(raw) => Ok(Some(crate::r2::decode_get_response(&raw)?)),
+            Err(error) if peer_http_status(&error) == Some(404) => Ok(None),
+            Err(error) => Err(error),
+        }
+    }
+
+    pub async fn r2_put(
+        &self,
+        base: &str,
+        bucket: &str,
+        key: &str,
+        bytes: &[u8],
+        options: &crate::r2::PutOptions,
+    ) -> Result<crate::r2::ObjectMeta> {
+        let path = format!("/v1/r2/{}/object/{}", component(bucket), component(key));
+        let payload = crate::r2::encode_put_request(options, bytes)?;
+        let raw = self.post(base, &path, payload).await?;
+        Ok(serde_json::from_slice(&raw)?)
+    }
+
+    pub async fn r2_delete(&self, base: &str, bucket: &str, key: &str) -> Result<bool> {
+        let path = format!("/v1/r2/{}/object/{}", component(bucket), component(key));
+        match self.delete(base, &path).await {
+            Ok(_) => Ok(true),
+            Err(error) if peer_http_status(&error) == Some(404) => Ok(false),
+            Err(error) => Err(error),
+        }
+    }
+
+    pub async fn r2_put_blob(&self, base: &str, bytes: &[u8]) -> Result<[u8; 32]> {
+        let raw = self.post(base, "/v1/r2-blob", bytes.to_vec()).await?;
+        hex::decode(String::from_utf8(raw)?.trim())?
+            .try_into()
+            .map_err(|_| anyhow::anyhow!("peer returned an invalid R2 blob digest"))
+    }
+
+    pub async fn r2_fetch_blob(&self, base: &str, sha: &[u8; 32]) -> Result<Option<Vec<u8>>> {
+        let path = format!("/v1/r2-blob/{}", hex::encode(sha));
+        match self.get(base, &path).await {
+            Ok(bytes) => {
+                if sha2::Sha256::digest(&bytes).as_slice() != sha {
+                    bail!("peer returned corrupt R2 object bytes");
+                }
+                Ok(Some(bytes))
+            }
+            Err(error) if peer_http_status(&error) == Some(404) => Ok(None),
+            Err(error) => Err(error),
+        }
+    }
+
     /// Execute SQL against a D1 database, following leader hints
     /// (bounded) — callers can point at ANY cluster node.
     pub async fn d1_exec(
@@ -461,6 +587,12 @@ impl PeerClient {
         }
         anyhow::bail!("no leader found for {db} after retries")
     }
+}
+
+fn peer_http_status(error: &anyhow::Error) -> Option<u16> {
+    error
+        .downcast_ref::<PeerHttpError>()
+        .map(|error| error.status)
 }
 
 pub fn encode_envelopes(envs: &[Envelope]) -> Vec<u8> {

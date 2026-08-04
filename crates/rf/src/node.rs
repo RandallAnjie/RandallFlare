@@ -5,6 +5,7 @@
 use crate::blob::BlobStore;
 use crate::config::NodeConfig;
 use crate::management::Management;
+use crate::objectstore::ObjectStore;
 use crate::store::Store;
 use anyhow::Result;
 use rf_core::claim::{ClaimSet, Ingest};
@@ -14,12 +15,17 @@ use rf_core::identity::{Keypair, PublicId};
 use rf_core::kv::{KvEntry, Merge, Namespace};
 use rf_core::manifest::{ManifestIngest, ManifestSet, WorkerManifest};
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::net::SocketAddr;
 use std::sync::Mutex;
 use tokio::sync::broadcast;
 
 pub type KvListPage = (Vec<(String, Option<u64>)>, bool, Option<String>);
+pub type KvMetadataListPage = (
+    Vec<(String, Option<u64>, Option<Vec<u8>>)>,
+    bool,
+    Option<String>,
+);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum NodeEvent {
@@ -77,6 +83,9 @@ pub struct Inner {
     pub runtime_logs: HashMap<String, VecDeque<RuntimeLogLine>>,
     /// Loopback port of the kvbind server (set at daemon start).
     pub kvbind_port: u16,
+    /// Loopback port of the native workerd R2 binding adapter.
+    pub r2bind_port: u16,
+    pub d1bind_port: u16,
 }
 
 pub struct Node {
@@ -84,8 +93,10 @@ pub struct Node {
     pub keypair: Keypair,
     pub store: Store,
     pub blobs: BlobStore,
+    pub objects: ObjectStore,
     pub management: Management,
     pub inner: Mutex<Inner>,
+    r2_schemas: Mutex<HashSet<String>>,
     events: broadcast::Sender<NodeEvent>,
 }
 
@@ -94,6 +105,13 @@ pub fn now_ms() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0)
+}
+
+fn kv_metadata_namespace(namespace: &str) -> String {
+    format!(
+        "__rf_kvmeta/{}",
+        crate::blob::sha256_hex(namespace.as_bytes())
+    )
 }
 
 impl Node {
@@ -106,6 +124,7 @@ impl Node {
         }
         let store = Store::open(&cfg.data_dir.join("state.redb"))?;
         let blobs = BlobStore::open(cfg.data_dir.join("blobs"))?;
+        let objects = ObjectStore::open(&cfg.data_dir, &cfg.storage)?;
         let mut inner = Inner {
             clock: Clock::new(),
             claims: ClaimSet::new(),
@@ -116,6 +135,8 @@ impl Node {
             runtime_status: HashMap::new(),
             runtime_logs: HashMap::new(),
             kvbind_port: 0,
+            r2bind_port: 0,
+            d1bind_port: 0,
         };
         // Hydrate: static stability means booting entirely from disk.
         for env in store.load_manifests()? {
@@ -138,8 +159,10 @@ impl Node {
             keypair,
             store,
             blobs,
+            objects,
             management: Management::default(),
             inner: Mutex::new(inner),
+            r2_schemas: Mutex::new(HashSet::new()),
             events,
         })
     }
@@ -326,6 +349,32 @@ impl Node {
         value: Option<Vec<u8>>,
         expires_at_ms: Option<u64>,
     ) -> Result<()> {
+        self.kv_put_entry(ns, key, value, expires_at_ms)?;
+        if !ns.starts_with("__rf") {
+            self.kv_put_entry(&kv_metadata_namespace(ns), key, None, None)?;
+        }
+        Ok(())
+    }
+
+    pub fn kv_put_with_metadata(
+        &self,
+        ns: &str,
+        key: &str,
+        value: Option<Vec<u8>>,
+        expires_at_ms: Option<u64>,
+        metadata: Option<Vec<u8>>,
+    ) -> Result<()> {
+        self.kv_put_entry(ns, key, value, expires_at_ms)?;
+        self.kv_put_entry(&kv_metadata_namespace(ns), key, metadata, expires_at_ms)
+    }
+
+    fn kv_put_entry(
+        &self,
+        ns: &str,
+        key: &str,
+        value: Option<Vec<u8>>,
+        expires_at_ms: Option<u64>,
+    ) -> Result<()> {
         {
             let mut inner = self.inner.lock().unwrap();
             let hlc = inner.clock.now(now_ms());
@@ -346,6 +395,12 @@ impl Node {
     pub fn kv_get(&self, ns: &str, key: &str) -> Option<Vec<u8>> {
         let inner = self.inner.lock().unwrap();
         inner.kv.get(ns)?.get(key, now_ms()).map(|v| v.to_vec())
+    }
+
+    pub fn kv_get_with_metadata(&self, ns: &str, key: &str) -> Option<(Vec<u8>, Option<Vec<u8>>)> {
+        let value = self.kv_get(ns, key)?;
+        let metadata = self.kv_get(&kv_metadata_namespace(ns), key);
+        Some((value, metadata))
     }
 
     pub fn kv_list(&self, ns: &str, prefix: &str, limit: usize) -> Vec<String> {
@@ -370,32 +425,57 @@ impl Node {
         limit: usize,
         cursor: Option<&str>,
     ) -> KvListPage {
+        self.kv_list_page_plain(ns, prefix, limit, cursor)
+    }
+
+    pub fn kv_list_page_with_metadata(
+        &self,
+        ns: &str,
+        prefix: &str,
+        limit: usize,
+        cursor: Option<&str>,
+    ) -> KvMetadataListPage {
+        let (items, complete, cursor) = self.kv_list_page_plain(ns, prefix, limit, cursor);
+        let metadata_ns = kv_metadata_namespace(ns);
+        let items = items
+            .into_iter()
+            .map(|(key, expiration)| {
+                let metadata = self.kv_get(&metadata_ns, &key);
+                (key, expiration, metadata)
+            })
+            .collect();
+        (items, complete, cursor)
+    }
+
+    fn kv_list_page_plain(
+        &self,
+        ns: &str,
+        prefix: &str,
+        limit: usize,
+        cursor: Option<&str>,
+    ) -> KvListPage {
         let inner = self.inner.lock().unwrap();
-        let Some(n) = inner.kv.get(ns) else {
+        let Some(namespace) = inner.kv.get(ns) else {
             return (Vec::new(), true, None);
         };
         let now = now_ms();
-        let mut out: Vec<(String, Option<u64>)> = Vec::new();
+        let mut output = Vec::new();
         let mut more = false;
-        for key in n.list(prefix, now, usize::MAX) {
-            if let Some(c) = cursor {
-                if key <= c {
-                    continue;
-                }
+        for key in namespace.list(prefix, now, usize::MAX) {
+            if cursor.is_some_and(|cursor| key <= cursor) {
+                continue;
             }
-            if out.len() == limit {
+            if output.len() == limit {
                 more = true;
                 break;
             }
-            let exp = n.entry(key).and_then(|e| e.expires_at_ms);
-            out.push((key.to_string(), exp));
+            let expiration = namespace.entry(key).and_then(|entry| entry.expires_at_ms);
+            output.push((key.to_string(), expiration));
         }
-        let next = if more {
-            out.last().map(|(k, _)| k.clone())
-        } else {
-            None
-        };
-        (out, !more, next)
+        let cursor = more
+            .then(|| output.last().map(|(key, _)| key.clone()))
+            .flatten();
+        (output, !more, cursor)
     }
 
     pub fn kv_merge_remote(&self, ns: &str, items: Vec<(String, KvEntry)>) -> Result<usize> {
@@ -465,6 +545,29 @@ impl Node {
 
     pub fn default_worker_hostname(&self, worker: &str) -> Option<String> {
         self.cfg.default_worker_hostname(worker)
+    }
+
+    pub fn default_r2_hostname(&self, bucket: &str) -> Option<String> {
+        self.cfg
+            .default_worker_domain()
+            .map(|domain| format!("r2-{bucket}.{domain}"))
+    }
+
+    pub fn effective_r2_hostnames(
+        &self,
+        bucket: &str,
+        spec: &crate::r2::BucketSpec,
+    ) -> Vec<String> {
+        let mut hostnames = Vec::with_capacity(spec.hostnames.len() + 1);
+        if let Some(default) = self.default_r2_hostname(bucket) {
+            hostnames.push(default);
+        }
+        for hostname in &spec.hostnames {
+            if !hostnames.contains(hostname) {
+                hostnames.push(hostname.clone());
+            }
+        }
+        hostnames
     }
 
     pub fn effective_worker_hostnames(&self, manifest: &WorkerManifest) -> Vec<String> {
@@ -690,6 +793,30 @@ impl Node {
 
     pub fn kvbind_port(&self) -> u16 {
         self.inner.lock().unwrap().kvbind_port
+    }
+
+    pub fn set_r2bind_port(&self, port: u16) {
+        self.inner.lock().unwrap().r2bind_port = port;
+    }
+
+    pub fn r2bind_port(&self) -> u16 {
+        self.inner.lock().unwrap().r2bind_port
+    }
+
+    pub fn set_d1bind_port(&self, port: u16) {
+        self.inner.lock().unwrap().d1bind_port = port;
+    }
+
+    pub fn d1bind_port(&self) -> u16 {
+        self.inner.lock().unwrap().d1bind_port
+    }
+
+    pub(crate) fn r2_schema_ready(&self, database: &str) -> bool {
+        self.r2_schemas.lock().unwrap().contains(database)
+    }
+
+    pub(crate) fn mark_r2_schema_ready(&self, database: String) {
+        self.r2_schemas.lock().unwrap().insert(database);
     }
 
     /// Periodic GC of dead claims + KV tombstones.

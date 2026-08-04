@@ -436,7 +436,8 @@ async fn module_worker_on_real_workerd() {
     std::fs::write(
         dir.join("rf.json"),
         r#"{"name":"api","main":"index.js","hostnames":["api.test"],
-            "env":{"GREETING":"hi from env"},"kv":{"CACHE":"ns1"}}"#,
+            "env":{"GREETING":"hi from env"},"kv":{"CACHE":"ns1"},
+            "d1":{"DB":"worker-db"}}"#,
     )
     .unwrap();
     std::fs::write(
@@ -452,6 +453,34 @@ async fn module_worker_on_real_workerd() {
       const val = await env.CACHE.get("written-by-worker");
       const missing = await env.CACHE.get("no-such-key");
       return new Response(JSON.stringify({val, missing, names: listed.keys.map(k => k.name)}));
+    }
+    if (url.pathname === "/kv-meta") {
+      await env.CACHE.put("with-meta", "metadata-value", {
+        expirationTtl: 3600,
+        metadata: { source: "native-workerd", generation: 2 }
+      });
+      const fetched = await env.CACHE.getWithMetadata("with-meta");
+      const listed = await env.CACHE.list({prefix: "with-meta"});
+      return Response.json({fetched, listed: listed.keys[0]});
+    }
+    if (url.pathname === "/kv-bulk") {
+      await env.CACHE.put("bulk-a", "one");
+      await env.CACHE.put("bulk-b", JSON.stringify({number: 2}));
+      const texts = await env.CACHE.get(["bulk-a", "missing"]);
+      const json = await env.CACHE.get(["bulk-b"], "json");
+      return Response.json({texts: Object.fromEntries(texts), json: Object.fromEntries(json)});
+    }
+    if (url.pathname === "/d1") {
+      await env.DB.exec("CREATE TABLE IF NOT EXISTS users (id INTEGER PRIMARY KEY, name TEXT); DELETE FROM users;");
+      const inserted = await env.DB.prepare("INSERT INTO users (id, name) VALUES (?, ?)").bind(1, "安杰").run();
+      const batch = await env.DB.batch([
+        env.DB.prepare("INSERT INTO users (id, name) VALUES (?, ?)").bind(2, "Randall"),
+        env.DB.prepare("SELECT id, name FROM users ORDER BY id")
+      ]);
+      const first = await env.DB.prepare("SELECT name FROM users WHERE id = ?").bind(1).first("name");
+      const all = await env.DB.prepare("SELECT id, name FROM users ORDER BY id").all();
+      const raw = await env.DB.prepare("SELECT id, name FROM users ORDER BY id").raw({columnNames: true});
+      return Response.json({inserted, batch, first, all, raw});
     }
     return new Response("module worker up");
   }
@@ -513,6 +542,51 @@ async fn module_worker_on_real_workerd() {
     assert_eq!(rw["val"], "worker-wrote-this");
     assert_eq!(rw["missing"], serde_json::Value::Null);
     assert_eq!(rw["names"][0], "written-by-worker");
+    let metadata: serde_json::Value = http
+        .get(format!("http://127.0.0.1:{}/kv-meta", n.ingress))
+        .header("host", "api.test")
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(metadata["fetched"]["value"], "metadata-value");
+    assert_eq!(metadata["fetched"]["metadata"]["source"], "native-workerd");
+    assert_eq!(metadata["listed"]["metadata"]["generation"], 2);
+    let bulk: serde_json::Value = http
+        .get(format!("http://127.0.0.1:{}/kv-bulk", n.ingress))
+        .header("host", "api.test")
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(bulk["texts"]["bulk-a"], "one");
+    assert_eq!(bulk["texts"]["missing"], serde_json::Value::Null);
+    assert_eq!(bulk["json"]["bulk-b"]["number"], 2);
+    let d1: serde_json::Value = http
+        .get(format!("http://127.0.0.1:{}/d1", n.ingress))
+        .header("host", "api.test")
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(d1["inserted"]["success"], true);
+    assert_eq!(d1["inserted"]["meta"]["changes"], 1);
+    assert_eq!(d1["first"], "安杰");
+    assert_eq!(d1["all"]["results"][1]["name"], "Randall");
+    assert_eq!(d1["batch"][1]["results"][0]["id"], 1);
+    assert_eq!(d1["raw"][0], serde_json::json!(["id", "name"]));
     // The worker's write is a real cluster KV write, visible via the
     // peer API too.
     assert_eq!(

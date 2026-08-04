@@ -51,6 +51,41 @@ pub struct NodeConfig {
     /// cluster, but credentials and build processes deliberately do not.
     #[serde(default)]
     pub build: BuildConfig,
+    /// Node-local object storage settings. Remote credentials live only in
+    /// the referenced rclone config and are never replicated.
+    #[serde(default)]
+    pub storage: StorageConfig,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct StorageConfig {
+    /// Local content-addressed object root. Defaults to `<data_dir>/objects`.
+    #[serde(default)]
+    pub local_dir: Option<PathBuf>,
+    /// rclone executable and config. Both must be set to enable rclone-backed
+    /// R2 buckets on this node.
+    #[serde(default)]
+    pub rclone_binary: Option<PathBuf>,
+    #[serde(default)]
+    pub rclone_config: Option<PathBuf>,
+    #[serde(default = "default_rclone_timeout_seconds")]
+    pub rclone_timeout_seconds: u64,
+}
+
+impl Default for StorageConfig {
+    fn default() -> Self {
+        Self {
+            local_dir: None,
+            rclone_binary: None,
+            rclone_config: None,
+            rclone_timeout_seconds: default_rclone_timeout_seconds(),
+        }
+    }
+}
+
+fn default_rclone_timeout_seconds() -> u64 {
+    30 * 60
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -404,6 +439,16 @@ impl NodeConfig {
                 .all(|c| c.is_ascii_alphanumeric() || c == '_')
         {
             anyhow::bail!("build.github_token_env must be a valid environment variable name");
+        }
+        if self.storage.rclone_binary.is_some() != self.storage.rclone_config.is_some() {
+            anyhow::bail!(
+                "storage.rclone_binary and storage.rclone_config must be configured together"
+            );
+        }
+        if self.storage.rclone_timeout_seconds == 0
+            || self.storage.rclone_timeout_seconds > 24 * 60 * 60
+        {
+            anyhow::bail!("storage.rclone_timeout_seconds must be between 1 and 86400");
         }
         Ok(())
     }

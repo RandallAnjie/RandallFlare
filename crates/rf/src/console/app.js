@@ -22,6 +22,10 @@ const state = {
   activeWorker: null,
   workerDetail: null,
   projectTab: "overview",
+  r2Buckets: [],
+  r2Active: null,
+  r2Cursor: null,
+  r2Objects: [],
 };
 
 const titles = {
@@ -30,6 +34,7 @@ const titles = {
   "worker-new": ["Worker 项目", "新建项目"],
   "worker-detail": ["Worker 项目", "项目详情"],
   kv: ["分布式数据", "KV 存储"],
+  r2: ["对象存储", "R2 bucket"],
   d1: ["分布式 SQLite", "D1 数据库"],
 };
 
@@ -192,9 +197,11 @@ function updateDefaultDomainPreview() {
 
 function renderOverview(data) {
   state.overview = data;
+  updateR2DefaultDomainPreview();
   const peers = Array.isArray(data.peers) ? data.peers : [];
   const workers = Array.isArray(data.workers) ? data.workers : [];
   const databases = Array.isArray(data.databases) ? data.databases : [];
+  const buckets = Array.isArray(data.r2_buckets) ? data.r2_buckets : [];
   const allNodes = [
     {
       id: data.node,
@@ -212,6 +219,9 @@ function renderOverview(data) {
   const routeCount = workers.reduce((total, worker) => total + (worker.hostnames?.length || 0), 0);
   $("#metric-routes").textContent = `${routeCount} 条主机名路由`;
   $("#metric-databases").textContent = String(databases.length);
+  $("#metric-r2").textContent = String(buckets.length);
+  $("#metric-r2-backend").textContent = data.storage?.rclone ? "本地副本与 rclone 已就绪" : "集群本地多数派副本";
+  $("#r2-nav-count").textContent = String(buckets.length);
   $("#metric-blobs").textContent = String(data.missing_blobs ?? 0);
   $("#cluster-version").textContent = `rf ${data.version || "—"}`;
   $("#node-label").textContent = data.label || "未命名节点";
@@ -490,6 +500,8 @@ function renderWorkerDetail(data) {
     <div><dt>域名</dt><dd>${escapeHtml(worker.hostnames?.length || 0)} 个</dd></div>
     <div><dt>环境变量</dt><dd>${escapeHtml(Object.keys(worker.env || {}).length)} 项</dd></div>
     <div><dt>KV 绑定</dt><dd>${escapeHtml(Object.keys(worker.kv_bindings || {}).length)} 项</dd></div>
+    <div><dt>R2 绑定</dt><dd>${escapeHtml(Object.keys(worker.r2_bindings || {}).length)} 项</dd></div>
+    <div><dt>D1 绑定</dt><dd>${escapeHtml(Object.keys(worker.d1_bindings || {}).length)} 项</dd></div>
     <div><dt>定时任务</dt><dd>${escapeHtml(worker.crons?.length || 0)} 条</dd></div>`;
   $("#detail-distribution-count").textContent = `${distribution.ready}/${distribution.total} 个节点`;
   $("#detail-distribution").innerHTML = (distribution.nodes || []).map((node) => {
@@ -502,6 +514,8 @@ function renderWorkerDetail(data) {
   renderProjectDomains(worker, data.tls || {});
   $("#project-env").value = mapToLines(worker.env);
   $("#project-kv-bindings").value = mapToLines(worker.kv_bindings);
+  $("#project-r2-bindings").value = mapToLines(worker.r2_bindings);
+  $("#project-d1-bindings").value = mapToLines(worker.d1_bindings);
   $("#project-crons").value = (worker.crons || []).join("\n");
   $("#project-compatibility-date").value = worker.compatibility_date;
   $("#project-source-repository").value = source?.repository?.replace(/\.git$/, "") || "";
@@ -622,6 +636,8 @@ async function saveProjectBindings(event) {
     const payload = {
       env: linesToMap($("#project-env").value, "环境变量"),
       kv_bindings: linesToMap($("#project-kv-bindings").value, "KV 绑定"),
+      r2_bindings: linesToMap($("#project-r2-bindings").value, "R2 绑定"),
+      d1_bindings: linesToMap($("#project-d1-bindings").value, "D1 绑定"),
     };
     await updateWorkerSettings(payload, `更新 ${state.activeWorker} 的变量与绑定。`);
   } catch (error) {
@@ -802,6 +818,252 @@ function renderNamespaces(namespaces) {
   $("#kv-namespaces").innerHTML = namespaces
     .map((namespace) => `<option value="${escapeHtml(namespace)}"></option>`)
     .join("");
+}
+
+function renderR2Buckets() {
+  const list = $("#r2-bucket-list");
+  $("#r2-bucket-count").textContent = `${state.r2Buckets.length} 个`;
+  $("#r2-nav-count").textContent = String(state.r2Buckets.length);
+  list.classList.toggle("empty-state", state.r2Buckets.length === 0);
+  list.innerHTML = state.r2Buckets.length
+    ? state.r2Buckets.map((bucket) => {
+      const storage = bucket.spec?.storage || {};
+      const backend = storage.type === "rclone"
+        ? `rclone · ${storage.remote}`
+        : "集群本地副本";
+      const access = bucket.spec?.public_access ? "公开" : "私有";
+      return `<button class="database-button r2-bucket-button${state.r2Active === bucket.name ? " active" : ""}" type="button" data-r2-bucket="${escapeHtml(bucket.name)}"><span><strong>${escapeHtml(bucket.name)}</strong><small>${escapeHtml(backend)} · ${access} · v${escapeHtml(bucket.version)}</small></span><span>打开 →</span></button>`;
+    }).join("")
+    : "暂无 R2 bucket。";
+}
+
+async function loadR2({ quiet = false } = {}) {
+  try {
+    const data = await api("/api/r2/buckets");
+    state.r2Buckets = data.buckets || [];
+    const rcloneReady = Boolean(data.capabilities?.rclone);
+    $("#r2-capability").textContent = rcloneReady ? "本地副本 + rclone" : "集群本地副本";
+    $("#r2-storage-backend").querySelector('option[value="rclone"]').disabled = !rcloneReady;
+    if (!state.r2Buckets.some((bucket) => bucket.name === state.r2Active)) {
+      state.r2Active = null;
+      state.r2Objects = [];
+      state.r2Cursor = null;
+      $("#r2-active-bucket").textContent = "请选择 bucket";
+      $("#r2-bucket-summary").textContent = "选择左侧 bucket 后即可管理对象。";
+      $("#r2-object-tools").classList.add("hidden");
+      $("#r2-delete-bucket").classList.add("hidden");
+    }
+    renderR2Buckets();
+    if (!quiet) toast("R2 bucket 已刷新");
+  } catch (error) {
+    if (!quiet) toast(error.message, true);
+  }
+}
+
+function numberOrNull(selector) {
+  const value = $(selector).value.trim();
+  return value ? Number(value) : null;
+}
+
+function fillR2BucketForm(bucket) {
+  const spec = bucket?.spec || {};
+  const storage = spec.storage || { type: "local" };
+  $("#r2-bucket-name").value = bucket?.name || "";
+  $("#r2-bucket-description").value = spec.description || "";
+  $("#r2-storage-backend").value = storage.type || "local";
+  $("#r2-rclone-remote").value = storage.remote || "";
+  $("#r2-rclone-prefix").value = storage.prefix || "";
+  $("#r2-max-bytes").value = spec.max_bytes ?? "";
+  $("#r2-max-objects").value = spec.max_objects ?? "";
+  $("#r2-expire-days").value = spec.expire_objects_after_days ?? "";
+  $("#r2-cors-origins").value = (spec.cors_origins || []).join("\n");
+  $("#r2-hostnames").value = (spec.hostnames || []).join("\n");
+  $("#r2-public-access").checked = Boolean(spec.public_access);
+  updateR2DefaultDomainPreview();
+  toggleR2StorageFields();
+}
+
+async function saveR2Bucket(event) {
+  event.preventDefault();
+  const backend = $("#r2-storage-backend").value;
+  const payload = {
+    name: $("#r2-bucket-name").value.trim(),
+    description: $("#r2-bucket-description").value.trim(),
+    public_access: $("#r2-public-access").checked,
+    storage_backend: backend,
+    rclone_remote: backend === "rclone" ? $("#r2-rclone-remote").value.trim() : "",
+    rclone_prefix: backend === "rclone" ? $("#r2-rclone-prefix").value.trim() : "",
+    max_bytes: numberOrNull("#r2-max-bytes"),
+    max_objects: numberOrNull("#r2-max-objects"),
+    expire_objects_after_days: numberOrNull("#r2-expire-days"),
+    cors_origins: $("#r2-cors-origins").value.split("\n").map((value) => value.trim()).filter(Boolean),
+    hostnames: $("#r2-hostnames").value.split("\n").map((value) => value.trim().toLowerCase()).filter(Boolean),
+  };
+  try {
+    const result = await api("/api/r2/buckets", { method: "POST", body: JSON.stringify(payload) });
+    const complete = async () => {
+      await loadOverview({ quiet: true });
+      await loadR2({ quiet: true });
+      await selectR2Bucket(payload.name);
+    };
+    if (result.pending_approval) {
+      showApproval(result, `批准后，R2 bucket ${payload.name} 的签名配置将传播到集群。`, complete);
+    } else {
+      toast(`R2 bucket ${payload.name} 已保存`);
+      await complete();
+    }
+  } catch (error) {
+    toast(error.message, true);
+  }
+}
+
+function updateR2DefaultDomainPreview() {
+  const bucket = $("#r2-bucket-name").value.trim().toLowerCase();
+  const domain = state.overview?.default_worker_domain;
+  const preview = $("#r2-default-domain");
+  if (!domain) {
+    preview.textContent = "当前节点尚未启用默认公开域名";
+  } else if (/^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/.test(bucket)) {
+    preview.textContent = `默认公开域名：https://r2-${bucket}.${domain}/<对象键>`;
+  } else {
+    preview.textContent = `填写名称后自动获得 r2-<bucket>.${domain}`;
+  }
+}
+
+function toggleR2StorageFields() {
+  const rclone = $("#r2-storage-backend").value === "rclone";
+  $("#r2-rclone-fields").classList.toggle("hidden", !rclone);
+  $("#r2-rclone-remote").required = rclone;
+}
+
+async function selectR2Bucket(name) {
+  const bucket = state.r2Buckets.find((item) => item.name === name);
+  if (!bucket) return;
+  state.r2Active = name;
+  state.r2Objects = [];
+  state.r2Cursor = null;
+  fillR2BucketForm(bucket);
+  const storage = bucket.spec?.storage || { type: "local" };
+  $("#r2-active-bucket").textContent = name;
+  const storageSummary = storage.type === "rclone"
+    ? `rclone remote ${storage.remote}:${storage.prefix || "（根目录）"} · 配置 v${bucket.version}`
+    : `集群本地多数派副本 · 配置 v${bucket.version}`;
+  const publicHosts = [
+    ...(state.overview?.default_worker_domain ? [`r2-${name}.${state.overview.default_worker_domain}`] : []),
+    ...(bucket.spec?.hostnames || []),
+  ];
+  $("#r2-bucket-summary").textContent = bucket.spec?.public_access && publicHosts.length
+    ? `${storageSummary} · 公开地址 https://${publicHosts[0]}/<对象键>`
+    : storageSummary;
+  $("#r2-object-tools").classList.remove("hidden");
+  $("#r2-delete-bucket").classList.remove("hidden");
+  renderR2Buckets();
+  await loadR2Objects();
+}
+
+function renderR2Objects() {
+  const table = $("#r2-object-table");
+  table.innerHTML = state.r2Objects.length
+    ? state.r2Objects.map((object) => `<tr><td><strong class="mono">${escapeHtml(object.key)}</strong><small>${escapeHtml(shortId(object.sha256, 18))}</small></td><td>${escapeHtml(formatBytes(object.size))}</td><td><small>${escapeHtml(object.content_type || "application/octet-stream")}</small></td><td><small>${escapeHtml(new Date(object.uploaded_at_ms).toLocaleString("zh-CN"))}</small></td><td><div class="table-actions"><button class="mini-button" data-r2-action="download" data-r2-key="${escapeHtml(object.key)}">下载</button><button class="mini-button danger" data-r2-action="delete" data-r2-key="${escapeHtml(object.key)}">删除</button></div></td></tr>`).join("")
+    : '<tr><td colspan="5" class="empty-state">bucket 中暂无对象。</td></tr>';
+  $("#r2-load-more").classList.toggle("hidden", !state.r2Cursor);
+}
+
+async function loadR2Objects({ append = false } = {}) {
+  if (!state.r2Active) return;
+  try {
+    const query = new URLSearchParams({
+      prefix: $("#r2-object-prefix").value,
+      limit: "100",
+    });
+    if (append && state.r2Cursor) query.set("cursor", state.r2Cursor);
+    const data = await api(`/api/r2/objects/${encodeURIComponent(state.r2Active)}?${query}`);
+    state.r2Objects = append ? [...state.r2Objects, ...(data.objects || [])] : (data.objects || []);
+    state.r2Cursor = data.cursor || null;
+    renderR2Objects();
+  } catch (error) {
+    toast(error.message, true);
+  }
+}
+
+async function uploadR2Object(event) {
+  event.preventDefault();
+  const file = $("#r2-object-file").files?.[0];
+  const key = $("#r2-object-key").value;
+  if (!file || !state.r2Active) return;
+  if (file.size > 63 * 1024 * 1024) {
+    toast("单次上传最大为 63 MiB", true);
+    return;
+  }
+  try {
+    await api(`/api/r2/object/${encodeURIComponent(state.r2Active)}/${encodeURIComponent(key)}`, {
+      method: "PUT",
+      headers: { "content-type": file.type || "application/octet-stream" },
+      body: file,
+    });
+    toast(`已上传 ${key}`);
+    $("#r2-object-file").value = "";
+    await loadR2Objects();
+  } catch (error) {
+    toast(error.message, true);
+  }
+}
+
+async function downloadR2Object(key) {
+  if (!state.r2Active) return;
+  setBusy(true);
+  try {
+    const headers = new Headers();
+    if (consoleMode === "local") headers.set("x-rf-console-token", token);
+    const response = await fetch(`/api/r2/object/${encodeURIComponent(state.r2Active)}/${encodeURIComponent(key)}`, { headers });
+    if (!response.ok) {
+      const payload = await response.json().catch(() => ({}));
+      throw new Error(payload.error || `下载失败（HTTP ${response.status}）`);
+    }
+    const url = URL.createObjectURL(await response.blob());
+    const anchor = document.createElement("a");
+    anchor.href = url;
+    anchor.download = key.split("/").pop() || "object";
+    anchor.click();
+    setTimeout(() => URL.revokeObjectURL(url), 1000);
+  } catch (error) {
+    toast(error.message, true);
+  } finally {
+    setBusy(false);
+  }
+}
+
+async function deleteR2Object(key) {
+  if (!state.r2Active || !window.confirm(`要删除对象“${key}”吗？`)) return;
+  try {
+    await api(`/api/r2/object/${encodeURIComponent(state.r2Active)}/${encodeURIComponent(key)}`, { method: "DELETE" });
+    toast(`已删除 ${key}`);
+    await loadR2Objects();
+  } catch (error) {
+    toast(error.message, true);
+  }
+}
+
+async function deleteR2Bucket() {
+  const name = state.r2Active;
+  if (!name || !window.confirm(`要删除 R2 bucket“${name}”吗？对象字节将等待安全回收。`)) return;
+  try {
+    const result = await api(`/api/r2/buckets/${encodeURIComponent(name)}`, { method: "DELETE" });
+    const complete = async () => {
+      state.r2Active = null;
+      fillR2BucketForm(null);
+      await loadOverview({ quiet: true });
+      await loadR2({ quiet: true });
+    };
+    if (result.pending_approval) {
+      showApproval(result, `批准后，R2 bucket ${name} 将写入可验证的墓碑版本。`, complete);
+    } else {
+      toast(`R2 bucket ${name} 已删除`);
+      await complete();
+    }
+  } catch (error) {
+    toast(error.message, true);
+  }
 }
 
 async function loadOverview({ quiet = false } = {}) {
@@ -1118,11 +1380,12 @@ async function boot() {
     $("#security-copy").innerHTML = consoleMode === "public"
       ? "此节点不保存<br>任何私钥。"
       : "密钥仅保留在本地<br>控制台进程中。";
-    $$("#deploy-form button, #source-form button, #kv-editor-form button, #d1-create-form button, #d1-exec-form button, #project-domain-add-form button, #project-bindings-form button, #project-triggers-form button, #project-settings-form button, #project-source-form button, #project-redeploy, #project-delete")
+    $$("#deploy-form button, #source-form button, #kv-editor-form button, #d1-create-form button, #d1-exec-form button, #r2-bucket-form button, #r2-upload-form button, #r2-delete-bucket, #project-domain-add-form button, #project-bindings-form button, #project-triggers-form button, #project-settings-form button, #project-source-form button, #project-redeploy, #project-delete")
       .forEach((button) => { button.disabled = state.session.read_only; });
     await loadOverview({ quiet: true });
     await loadWorkerOps();
     await loadKeys();
+    await loadR2({ quiet: true });
   } catch (error) {
     if (consoleMode === "public" && error.status === 401) {
       state.session = null;
@@ -1171,7 +1434,10 @@ $("#project-source-form").addEventListener("submit", saveProjectSource);
 $("#project-source-disconnect").addEventListener("click", () => state.activeWorker && disconnectSource(state.activeWorker));
 $("#project-delete").addEventListener("click", () => state.activeWorker && deleteWorker(state.activeWorker));
 $("#detail-refresh-logs").addEventListener("click", loadDetailLogs);
-$("#refresh").addEventListener("click", () => loadOverview());
+$("#refresh").addEventListener("click", async () => {
+  await loadOverview();
+  await loadR2({ quiet: true });
+});
 $("#deploy-form").addEventListener("submit", deployWorker);
 $("#deploy-file-picker").addEventListener("click", () => $("#deploy-files").click());
 $("#deploy-files").addEventListener("change", updateDeployFileStatus);
@@ -1183,6 +1449,17 @@ $("#kv-new").addEventListener("click", clearKey);
 $("#kv-delete").addEventListener("click", removeKey);
 $("#d1-create-form").addEventListener("submit", createDatabase);
 $("#d1-exec-form").addEventListener("submit", executeSql);
+$("#r2-bucket-form").addEventListener("submit", saveR2Bucket);
+$("#r2-bucket-name").addEventListener("input", updateR2DefaultDomainPreview);
+$("#r2-storage-backend").addEventListener("change", toggleR2StorageFields);
+$("#r2-object-search").addEventListener("submit", (event) => { event.preventDefault(); loadR2Objects(); });
+$("#r2-upload-form").addEventListener("submit", uploadR2Object);
+$("#r2-load-more").addEventListener("click", () => loadR2Objects({ append: true }));
+$("#r2-delete-bucket").addEventListener("click", deleteR2Bucket);
+$("#r2-object-file").addEventListener("change", () => {
+  const file = $("#r2-object-file").files?.[0];
+  if (file && !$("#r2-object-key").value) $("#r2-object-key").value = file.name;
+});
 $("#history-close").addEventListener("click", () => $("#history-dialog").close());
 $("#log-close").addEventListener("click", () => {
   clearTimeout(state.buildTimer);
@@ -1238,11 +1515,22 @@ $("#database-list").addEventListener("click", (event) => {
   $("#d1-name").value = button.dataset.database;
   $("#d1-sql").focus();
 });
+$("#r2-bucket-list").addEventListener("click", (event) => {
+  const button = event.target.closest("button[data-r2-bucket]");
+  if (button) selectR2Bucket(button.dataset.r2Bucket);
+});
+$("#r2-object-table").addEventListener("click", (event) => {
+  const button = event.target.closest("button[data-r2-action]");
+  if (!button) return;
+  if (button.dataset.r2Action === "download") downloadR2Object(button.dataset.r2Key);
+  if (button.dataset.r2Action === "delete") deleteR2Object(button.dataset.r2Key);
+});
 
 setInterval(() => {
   if (state.session) {
     loadOverview({ quiet: true });
     loadWorkerOps();
+    if (state.view === "r2") loadR2({ quiet: true });
   }
 }, 10_000);
 boot();

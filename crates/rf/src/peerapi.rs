@@ -5,6 +5,7 @@
 use crate::auth;
 use crate::node::{now_ms, Node};
 use crate::peers::encode_envelopes;
+use crate::r2;
 use crate::transport;
 use anyhow::Result;
 use axum::body::{to_bytes, Body, Bytes};
@@ -36,6 +37,17 @@ pub async fn serve(
     d1: crate::d1::Registry,
     durable: crate::durable::Coordinator,
 ) -> Result<SocketAddr> {
+    let (address, _server) = serve_managed(node, d1, durable).await?;
+    Ok(address)
+}
+
+/// Start the peer API and retain a handle for tests or supervised embedders.
+/// Dropping the handle detaches the server, matching [`serve`].
+pub async fn serve_managed(
+    node: Arc<Node>,
+    d1: crate::d1::Registry,
+    durable: crate::durable::Coordinator,
+) -> Result<(SocketAddr, tokio::task::JoinHandle<()>)> {
     let secret = node.cfg.cluster_secret_bytes()?;
     let api = Api {
         node: node.clone(),
@@ -47,7 +59,7 @@ pub async fn serve(
     let app = router(api);
     let listener = tokio::net::TcpListener::bind(node.cfg.peer_api.listen).await?;
     let addr = listener.local_addr()?;
-    tokio::spawn(async move {
+    let server = tokio::spawn(async move {
         if let Err(e) = axum::serve(
             listener,
             app.into_make_service_with_connect_info::<SocketAddr>(),
@@ -57,7 +69,7 @@ pub async fn serve(
             tracing::error!("peer api server died: {e}");
         }
     });
-    Ok(addr)
+    Ok((addr, server))
 }
 
 pub fn router(api: Api) -> Router {
@@ -71,6 +83,9 @@ pub fn router(api: Api) -> Router {
         .route("/v1/blob/{sha}", get(blob_get))
         .route("/v1/blob", post(blob_put))
         .route("/v1/manifest", post(manifest_post))
+        .route("/v1/resources", get(resource_list))
+        .route("/v1/resource", post(resource_post))
+        .route("/v1/resource/{kind}/{name}", get(resource_get))
         .route(
             "/v1/authorize/{code}",
             get(authorization_get).post(authorization_post),
@@ -85,7 +100,15 @@ pub fn router(api: Api) -> Router {
         .route("/v1/quorum/{db}", post(quorum_msg))
         .route("/v1/d1/create", post(d1_create))
         .route("/v1/d1/{db}/exec", post(d1_exec))
-        .route("/v1/do/{worker}/proxy", post(do_proxy));
+        .route("/v1/do/{worker}/proxy", post(do_proxy))
+        .route("/v1/r2/{bucket}", get(r2_list))
+        .route("/v1/r2-blob/{sha}", get(r2_blob_get))
+        .route("/v1/r2-blob", post(r2_blob_put))
+        .route("/v1/r2/{bucket}/meta/{*key}", get(r2_head))
+        .route(
+            "/v1/r2/{bucket}/object/{*key}",
+            get(r2_get).post(r2_put).delete(r2_delete),
+        );
     routes
         .layer(middleware::from_fn_with_state(
             api.clone(),
@@ -377,6 +400,18 @@ async fn status(
         .kv_list(crate::acme::NS, "d1/", 10_000)
         .into_iter()
         .filter_map(|key| key.strip_prefix("d1/").map(str::to_string))
+        .filter(|name| !name.starts_with("r2-") && !name.starts_with("rfdo-"))
+        .collect();
+    let buckets: Vec<serde_json::Value> = crate::r2::bucket_records(node)
+        .into_iter()
+        .map(|(view, spec)| {
+            serde_json::json!({
+                "name": view.resource.name,
+                "version": view.resource.version,
+                "digest": view.digest,
+                "spec": spec,
+            })
+        })
         .collect();
     axum::Json(serde_json::json!({
         "node": node.id_hex(),
@@ -389,6 +424,11 @@ async fn status(
         "peers": peers,
         "workers": workers,
         "databases": databases,
+        "r2_buckets": buckets,
+        "storage": {
+            "local": true,
+            "rclone": node.cfg.storage.rclone_binary.is_some(),
+        },
         "kv_namespaces": kv_namespaces,
         "manifest_digest": node.manifest_digest_hex(),
         "routes": node.routes(),
@@ -591,6 +631,9 @@ async fn authorization_post(
             }
             crate::management::ApprovalKind::Source => {
                 crate::build::ingest_source(&api.node, &approved.envelope).map(|_| ())
+            }
+            crate::management::ApprovalKind::Resource => {
+                crate::resource::ingest(&api.node, &approved.envelope).map(|_| ())
             }
             crate::management::ApprovalKind::Login => unreachable!(),
         };
@@ -932,6 +975,250 @@ async fn kv_delete(
     match api.node.kv_put(&ns, &key, None, None) {
         Ok(()) => StatusCode::OK.into_response(),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    }
+}
+
+#[derive(Deserialize)]
+struct R2ListQuery {
+    #[serde(default)]
+    prefix: String,
+    cursor: Option<String>,
+    limit: Option<usize>,
+}
+
+async fn r2_list(
+    State(api): State<Api>,
+    ConnectInfo(remote): ConnectInfo<SocketAddr>,
+    Path(bucket): Path<String>,
+    Query(query): Query<R2ListQuery>,
+    method: Method,
+    uri: Uri,
+    headers: HeaderMap,
+) -> Response {
+    if let Err(response) = check(&api, &remote, &headers, &method, &uri, b"") {
+        return response.into_response();
+    }
+    match r2::list_objects(
+        &api.node,
+        &bucket,
+        &query.prefix,
+        query.cursor.as_deref(),
+        query.limit.unwrap_or(100),
+    )
+    .await
+    {
+        Ok(objects) => axum::Json(objects).into_response(),
+        Err(error) => r2_error(error),
+    }
+}
+
+async fn r2_head(
+    State(api): State<Api>,
+    ConnectInfo(remote): ConnectInfo<SocketAddr>,
+    Path((bucket, key)): Path<(String, String)>,
+    method: Method,
+    uri: Uri,
+    headers: HeaderMap,
+) -> Response {
+    if let Err(response) = check(&api, &remote, &headers, &method, &uri, b"") {
+        return response.into_response();
+    }
+    match r2::head_object(&api.node, &bucket, &key).await {
+        Ok(Some(metadata)) => axum::Json(metadata).into_response(),
+        Ok(None) => (StatusCode::NOT_FOUND, "R2 对象不存在").into_response(),
+        Err(error) => r2_error(error),
+    }
+}
+
+async fn r2_get(
+    State(api): State<Api>,
+    ConnectInfo(remote): ConnectInfo<SocketAddr>,
+    Path((bucket, key)): Path<(String, String)>,
+    method: Method,
+    uri: Uri,
+    headers: HeaderMap,
+) -> Response {
+    if let Err(response) = check(&api, &remote, &headers, &method, &uri, b"") {
+        return response.into_response();
+    }
+    match r2::get_object(&api.node, &bucket, &key).await {
+        Ok(Some((metadata, bytes))) => match r2::encode_get_response(&metadata, &bytes) {
+            Ok(response) => response.into_response(),
+            Err(error) => r2_error(error),
+        },
+        Ok(None) => (StatusCode::NOT_FOUND, "R2 对象不存在").into_response(),
+        Err(error) => r2_error(error),
+    }
+}
+
+async fn r2_put(
+    State(api): State<Api>,
+    ConnectInfo(remote): ConnectInfo<SocketAddr>,
+    Path((bucket, key)): Path<(String, String)>,
+    request: Request<Body>,
+) -> Response {
+    let (parts, body) = request.into_parts();
+    let body = match to_bytes(body, MAX_PEER_PAYLOAD).await {
+        Ok(body) => body,
+        Err(_) => return (StatusCode::PAYLOAD_TOO_LARGE, "R2 对象过大").into_response(),
+    };
+    if let Err(response) = check(
+        &api,
+        &remote,
+        &parts.headers,
+        &parts.method,
+        &parts.uri,
+        &body,
+    ) {
+        return response.into_response();
+    }
+    let (options, bytes) = match r2::decode_put_request(&body) {
+        Ok(request) => request,
+        Err(error) => return (StatusCode::BAD_REQUEST, error.to_string()).into_response(),
+    };
+    match r2::put_object(&api.node, &bucket, &key, bytes, options).await {
+        Ok(metadata) => axum::Json(metadata).into_response(),
+        Err(error) => r2_error(error),
+    }
+}
+
+async fn r2_delete(
+    State(api): State<Api>,
+    ConnectInfo(remote): ConnectInfo<SocketAddr>,
+    Path((bucket, key)): Path<(String, String)>,
+    method: Method,
+    uri: Uri,
+    headers: HeaderMap,
+) -> Response {
+    if let Err(response) = check(&api, &remote, &headers, &method, &uri, b"") {
+        return response.into_response();
+    }
+    match r2::delete_object(&api.node, &bucket, &key).await {
+        Ok(true) => StatusCode::OK.into_response(),
+        Ok(false) => (StatusCode::NOT_FOUND, "R2 对象不存在").into_response(),
+        Err(error) => r2_error(error),
+    }
+}
+
+fn r2_error(error: anyhow::Error) -> Response {
+    let message = format!("{error:#}");
+    let status = if message.contains("不存在") {
+        StatusCode::NOT_FOUND
+    } else if message.contains("配额不足") {
+        StatusCode::INSUFFICIENT_STORAGE
+    } else if message.contains("不具备") || message.contains("rclone") {
+        StatusCode::SERVICE_UNAVAILABLE
+    } else {
+        StatusCode::BAD_REQUEST
+    };
+    (status, message).into_response()
+}
+
+async fn r2_blob_get(
+    State(api): State<Api>,
+    ConnectInfo(remote): ConnectInfo<SocketAddr>,
+    Path(sha): Path<String>,
+    method: Method,
+    uri: Uri,
+    headers: HeaderMap,
+) -> Response {
+    if let Err(response) = check(&api, &remote, &headers, &method, &uri, b"") {
+        return response.into_response();
+    }
+    let digest: [u8; 32] = match hex::decode(&sha).ok().and_then(|raw| raw.try_into().ok()) {
+        Some(digest) => digest,
+        None => return (StatusCode::BAD_REQUEST, "R2 对象摘要无效").into_response(),
+    };
+    match api
+        .node
+        .objects
+        .get(&crate::objectstore::StorageLocation::Local, &digest)
+        .await
+    {
+        Ok(bytes) => bytes.into_response(),
+        Err(_) => (StatusCode::NOT_FOUND, "R2 对象副本不存在").into_response(),
+    }
+}
+
+async fn r2_blob_put(
+    State(api): State<Api>,
+    ConnectInfo(remote): ConnectInfo<SocketAddr>,
+    method: Method,
+    uri: Uri,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    if let Err(response) = check(&api, &remote, &headers, &method, &uri, &body) {
+        return response.into_response();
+    }
+    if body.len() > r2::MAX_DIRECT_OBJECT_BYTES {
+        return (StatusCode::PAYLOAD_TOO_LARGE, "R2 对象副本过大").into_response();
+    }
+    match api
+        .node
+        .objects
+        .put(&crate::objectstore::StorageLocation::Local, &body)
+        .await
+    {
+        Ok(digest) => hex::encode(digest).into_response(),
+        Err(error) => r2_error(error),
+    }
+}
+
+#[derive(Deserialize)]
+struct ResourceListQuery {
+    kind: Option<String>,
+}
+
+async fn resource_list(
+    State(api): State<Api>,
+    ConnectInfo(remote): ConnectInfo<SocketAddr>,
+    Query(query): Query<ResourceListQuery>,
+    method: Method,
+    uri: Uri,
+    headers: HeaderMap,
+) -> Response {
+    if let Err(response) = check(&api, &remote, &headers, &method, &uri, b"") {
+        return response.into_response();
+    }
+    axum::Json(crate::resource::heads(&api.node, query.kind.as_deref())).into_response()
+}
+
+async fn resource_get(
+    State(api): State<Api>,
+    ConnectInfo(remote): ConnectInfo<SocketAddr>,
+    Path((kind, name)): Path<(String, String)>,
+    method: Method,
+    uri: Uri,
+    headers: HeaderMap,
+) -> Response {
+    if let Err(response) = check(&api, &remote, &headers, &method, &uri, b"") {
+        return response.into_response();
+    }
+    match crate::resource::head(&api.node, &kind, &name) {
+        Some(resource) => axum::Json(resource).into_response(),
+        None => (StatusCode::NOT_FOUND, "平台资源不存在").into_response(),
+    }
+}
+
+async fn resource_post(
+    State(api): State<Api>,
+    ConnectInfo(remote): ConnectInfo<SocketAddr>,
+    method: Method,
+    uri: Uri,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    if let Err(response) = check(&api, &remote, &headers, &method, &uri, &body) {
+        return response.into_response();
+    }
+    let envelope = match Envelope::from_bytes(&body) {
+        Ok(envelope) => envelope,
+        Err(error) => return (StatusCode::BAD_REQUEST, error.to_string()).into_response(),
+    };
+    match crate::resource::ingest(&api.node, &envelope) {
+        Ok(resource) => axum::Json(resource).into_response(),
+        Err(error) => (StatusCode::BAD_REQUEST, error.to_string()).into_response(),
     }
 }
 

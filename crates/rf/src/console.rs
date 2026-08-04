@@ -223,6 +223,15 @@ pub fn router(state: ConsoleState) -> Router {
         .route("/api/kv/value", get(kv_get).put(kv_put).delete(kv_delete))
         .route("/api/d1/create", post(d1_create))
         .route("/api/d1/exec", post(d1_exec))
+        .route("/api/r2/buckets", get(r2_bucket_list).post(r2_bucket_apply))
+        .route("/api/r2/buckets/{name}", delete(r2_bucket_delete))
+        .route("/api/r2/objects/{bucket}", get(r2_object_list))
+        .route(
+            "/api/r2/object/{bucket}/{*key}",
+            get(r2_object_get)
+                .put(r2_object_put)
+                .delete(r2_object_delete),
+        )
         .route("/api/auth/logout", post(logout))
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
@@ -687,6 +696,10 @@ struct WorkerSettingsRequest {
     #[serde(default)]
     kv_bindings: Option<BTreeMap<String, String>>,
     #[serde(default)]
+    r2_bindings: Option<BTreeMap<String, String>>,
+    #[serde(default)]
+    d1_bindings: Option<BTreeMap<String, String>>,
+    #[serde(default)]
     crons: Option<Vec<String>>,
     #[serde(default)]
     compatibility_date: Option<String>,
@@ -738,7 +751,11 @@ async fn worker_get(
     let (manifest, digest) = current_manifest(&state, &name).await?;
     let mut env = manifest.env.clone();
     env.remove(deploy::DO_METADATA_ENV);
+    env.remove(deploy::R2_METADATA_ENV);
+    env.remove(deploy::D1_METADATA_ENV);
     let durable_objects = deploy::durable_objects(&manifest);
+    let r2_bindings = deploy::r2_bindings(&manifest);
+    let d1_bindings = deploy::d1_bindings(&manifest);
     let source = match &state.mode {
         ConsoleMode::Public { node, .. } => crate::build::source_head(node, &name)
             .filter(|record| !record.source.deleted)
@@ -787,6 +804,8 @@ async fn worker_get(
             "default_hostname": default_hostname,
             "env": env,
             "kv_bindings": manifest.kv_bindings,
+            "r2_bindings": r2_bindings,
+            "d1_bindings": d1_bindings,
             "crons": manifest.crons,
             "compatibility_date": manifest.compatibility_date,
             "durable_objects": durable_objects,
@@ -1027,12 +1046,16 @@ fn apply_worker_settings(
         hostnames,
         env,
         kv_bindings,
+        r2_bindings,
+        d1_bindings,
         crons,
         compatibility_date,
     } = request;
     if hostnames.is_none()
         && env.is_none()
         && kv_bindings.is_none()
+        && r2_bindings.is_none()
+        && d1_bindings.is_none()
         && crons.is_none()
         && compatibility_date.is_none()
     {
@@ -1052,7 +1075,10 @@ fn apply_worker_settings(
         manifest.hostnames = normalized;
     }
     if let Some(mut env) = env {
-        if env.contains_key(deploy::DO_METADATA_ENV) {
+        if env.contains_key(deploy::DO_METADATA_ENV)
+            || env.contains_key(deploy::R2_METADATA_ENV)
+            || env.contains_key(deploy::D1_METADATA_ENV)
+        {
             return Err(ApiError::bad_request(
                 "不能修改 RandallFlare 保留的环境变量",
             ));
@@ -1061,11 +1087,73 @@ fn apply_worker_settings(
         if let Some(durable_objects) = manifest.env.get(deploy::DO_METADATA_ENV).cloned() {
             env.insert(deploy::DO_METADATA_ENV.into(), durable_objects);
         }
+        if let Some(r2) = manifest.env.get(deploy::R2_METADATA_ENV).cloned() {
+            env.insert(deploy::R2_METADATA_ENV.into(), r2);
+        }
+        if let Some(d1) = manifest.env.get(deploy::D1_METADATA_ENV).cloned() {
+            env.insert(deploy::D1_METADATA_ENV.into(), d1);
+        }
         manifest.env = env;
     }
     if let Some(kv_bindings) = kv_bindings {
         validate_settings_map(&kv_bindings, "KV 绑定")?;
         manifest.kv_bindings = kv_bindings;
+    }
+    if let Some(r2_bindings) = r2_bindings {
+        validate_settings_map(&r2_bindings, "R2 绑定")?;
+        let identifier = |value: &str| {
+            let mut chars = value.chars();
+            chars.next().is_some_and(|character| {
+                character.is_ascii_alphabetic() || matches!(character, '_' | '$')
+            }) && chars.all(|character| {
+                character.is_ascii_alphanumeric() || matches!(character, '_' | '$')
+            })
+        };
+        for (binding, bucket) in &r2_bindings {
+            if !identifier(binding) || !valid_name(bucket) {
+                return Err(ApiError::bad_request(format!(
+                    "R2 绑定 {binding} 或 bucket 名称无效"
+                )));
+            }
+        }
+        if r2_bindings.is_empty() {
+            manifest.env.remove(deploy::R2_METADATA_ENV);
+        } else {
+            manifest.env.insert(
+                deploy::R2_METADATA_ENV.into(),
+                serde_json::to_string(&r2_bindings)?,
+            );
+        }
+    }
+    if let Some(d1_bindings) = d1_bindings {
+        validate_settings_map(&d1_bindings, "D1 绑定")?;
+        let identifier = |value: &str| {
+            let mut chars = value.chars();
+            chars.next().is_some_and(|character| {
+                character.is_ascii_alphabetic() || matches!(character, '_' | '$')
+            }) && chars.all(|character| {
+                character.is_ascii_alphanumeric() || matches!(character, '_' | '$')
+            })
+        };
+        for (binding, database) in &d1_bindings {
+            if !identifier(binding)
+                || !valid_name(database)
+                || database.starts_with("r2-")
+                || database.starts_with("rfdo-")
+            {
+                return Err(ApiError::bad_request(format!(
+                    "D1 绑定 {binding} 或数据库名称无效"
+                )));
+            }
+        }
+        if d1_bindings.is_empty() {
+            manifest.env.remove(deploy::D1_METADATA_ENV);
+        } else {
+            manifest.env.insert(
+                deploy::D1_METADATA_ENV.into(),
+                serde_json::to_string(&d1_bindings)?,
+            );
+        }
     }
     if let Some(crons) = crons {
         if crons.len() > 256 {
@@ -1660,6 +1748,280 @@ async fn d1_exec(
     Ok(Json(result))
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct R2BucketRequest {
+    name: String,
+    #[serde(default)]
+    description: String,
+    #[serde(default)]
+    public_access: bool,
+    #[serde(default = "default_storage_backend")]
+    storage_backend: String,
+    #[serde(default)]
+    rclone_remote: String,
+    #[serde(default)]
+    rclone_prefix: String,
+    #[serde(default)]
+    max_bytes: Option<u64>,
+    #[serde(default)]
+    max_objects: Option<u64>,
+    #[serde(default)]
+    expire_objects_after_days: Option<u32>,
+    #[serde(default)]
+    cors_origins: Vec<String>,
+    #[serde(default)]
+    hostnames: Vec<String>,
+}
+
+fn default_storage_backend() -> String {
+    "local".into()
+}
+
+#[derive(Deserialize)]
+struct R2ObjectListQuery {
+    #[serde(default)]
+    prefix: String,
+    cursor: Option<String>,
+    limit: Option<usize>,
+}
+
+async fn r2_bucket_list(State(state): State<ConsoleState>) -> ApiResult<Json<Value>> {
+    let buckets = state
+        .client
+        .resource_heads(&state.node, Some(crate::r2::BUCKET_KIND))
+        .await?
+        .into_iter()
+        .filter(|view| !view.resource.deleted)
+        .map(|view| {
+            let spec = crate::r2::bucket_spec(&view.resource)?;
+            Ok(json!({
+                "name": view.resource.name,
+                "version": view.resource.version,
+                "digest": view.digest,
+                "spec": spec,
+            }))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let status = state.client.status(&state.node).await?;
+    Ok(Json(json!({
+        "buckets": buckets,
+        "capabilities": status.get("storage").cloned().unwrap_or_else(|| json!({
+            "local": true,
+            "rclone": false,
+        })),
+    })))
+}
+
+async fn r2_bucket_apply(
+    State(state): State<ConsoleState>,
+    Extension(principal): Extension<ConsolePrincipal>,
+    Json(request): Json<R2BucketRequest>,
+) -> ApiResult<Json<Value>> {
+    state.require_mutation()?;
+    let storage = match request.storage_backend.as_str() {
+        "local" if request.rclone_remote.is_empty() && request.rclone_prefix.is_empty() => {
+            crate::objectstore::StorageLocation::Local
+        }
+        "rclone" if !request.rclone_remote.is_empty() => {
+            crate::objectstore::StorageLocation::Rclone {
+                remote: request.rclone_remote,
+                prefix: request.rclone_prefix,
+            }
+        }
+        "local" => {
+            return Err(ApiError::bad_request(
+                "本地存储不能同时填写 rclone remote 或前缀",
+            ))
+        }
+        "rclone" => return Err(ApiError::bad_request("请选择 rclone remote")),
+        _ => return Err(ApiError::bad_request("存储后端必须是 local 或 rclone")),
+    };
+    let spec = crate::r2::BucketSpec {
+        description: request.description,
+        public_access: request.public_access,
+        storage,
+        max_bytes: request.max_bytes,
+        max_objects: request.max_objects,
+        expire_objects_after_days: request.expire_objects_after_days,
+        cors_origins: request.cors_origins,
+        hostnames: request.hostnames,
+    };
+    let head = state
+        .client
+        .resource_head(&state.node, crate::r2::BUCKET_KIND, &request.name)
+        .await?;
+    let record = crate::r2::prepare_bucket_after(&request.name, spec, false, head.as_ref())?;
+    match &state.mode {
+        ConsoleMode::Local { .. } => {
+            let envelope = rf_core::envelope::Envelope::seal_any(&record, state.operator()?);
+            state.client.post_resource(&state.node, &envelope).await?;
+            Ok(Json(json!({
+                "ok": true,
+                "name": record.name,
+                "version": record.version,
+            })))
+        }
+        ConsoleMode::Public { node, .. } => {
+            let approval = node.management.create_resource(
+                principal.session_id,
+                &record,
+                format!("创建或更新 R2 bucket {} v{}", record.name, record.version),
+            )?;
+            Ok(Json(json!({
+                "ok": true,
+                "pending_approval": true,
+                "name": record.name,
+                "version": record.version,
+                "approval": approval,
+                "approve_node": node.cfg.peer_api_advertise().to_string(),
+            })))
+        }
+    }
+}
+
+async fn r2_bucket_delete(
+    State(state): State<ConsoleState>,
+    Extension(principal): Extension<ConsolePrincipal>,
+    Path(name): Path<String>,
+) -> ApiResult<Json<Value>> {
+    state.require_mutation()?;
+    let head = state
+        .client
+        .resource_head(&state.node, crate::r2::BUCKET_KIND, &name)
+        .await?
+        .ok_or_else(|| ApiError::not_found("R2 bucket 不存在"))?;
+    if head.resource.deleted {
+        return Err(ApiError::not_found("R2 bucket 已删除"));
+    }
+    let spec = crate::r2::bucket_spec(&head.resource)?;
+    let record = crate::r2::prepare_bucket_after(&name, spec, true, Some(&head))?;
+    match &state.mode {
+        ConsoleMode::Local { .. } => {
+            let envelope = rf_core::envelope::Envelope::seal_any(&record, state.operator()?);
+            state.client.post_resource(&state.node, &envelope).await?;
+            Ok(Json(json!({
+                "ok": true,
+                "name": record.name,
+                "version": record.version,
+            })))
+        }
+        ConsoleMode::Public { node, .. } => {
+            let approval = node.management.create_resource(
+                principal.session_id,
+                &record,
+                format!(
+                    "删除 R2 bucket {}（生成 v{} 墓碑）",
+                    record.name, record.version
+                ),
+            )?;
+            Ok(Json(json!({
+                "ok": true,
+                "pending_approval": true,
+                "name": record.name,
+                "version": record.version,
+                "approval": approval,
+                "approve_node": node.cfg.peer_api_advertise().to_string(),
+            })))
+        }
+    }
+}
+
+async fn r2_object_list(
+    State(state): State<ConsoleState>,
+    Path(bucket): Path<String>,
+    Query(query): Query<R2ObjectListQuery>,
+) -> ApiResult<Json<Value>> {
+    let objects = state
+        .client
+        .r2_list(
+            &state.node,
+            &bucket,
+            &query.prefix,
+            query.cursor.as_deref(),
+            query.limit.unwrap_or(100),
+        )
+        .await?;
+    Ok(Json(json!({
+        "bucket": bucket,
+        "objects": objects.objects,
+        "truncated": objects.truncated,
+        "cursor": objects.cursor,
+    })))
+}
+
+async fn r2_object_get(
+    State(state): State<ConsoleState>,
+    Path((bucket, key)): Path<(String, String)>,
+) -> ApiResult<Response> {
+    let (metadata, bytes) = state
+        .client
+        .r2_get(&state.node, &bucket, &key)
+        .await?
+        .ok_or_else(|| ApiError::not_found("R2 对象不存在"))?;
+    let mut response = bytes.into_response();
+    response.headers_mut().insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_str(
+            metadata
+                .content_type
+                .as_deref()
+                .unwrap_or("application/octet-stream"),
+        )
+        .map_err(|_| ApiError::upstream("R2 对象 Content-Type 无效"))?,
+    );
+    response.headers_mut().insert(
+        header::ETAG,
+        HeaderValue::from_str(&format!("\"{}\"", metadata.etag))
+            .map_err(|_| ApiError::upstream("R2 对象 ETag 无效"))?,
+    );
+    Ok(response)
+}
+
+async fn r2_object_put(
+    State(state): State<ConsoleState>,
+    Path((bucket, key)): Path<(String, String)>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> ApiResult<Json<Value>> {
+    state.require_mutation()?;
+    if body.len() > crate::r2::MAX_DIRECT_OBJECT_BYTES {
+        return Err(ApiError::bad_request(
+            "控制台单次上传最大为 63 MiB；更大的对象请使用分片上传",
+        ));
+    }
+    let content_type = headers
+        .get(header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .filter(|value| *value != "application/octet-stream")
+        .map(str::to_string);
+    let metadata = state
+        .client
+        .r2_put(
+            &state.node,
+            &bucket,
+            &key,
+            &body,
+            &crate::r2::PutOptions {
+                content_type,
+                ..Default::default()
+            },
+        )
+        .await?;
+    Ok(Json(json!({ "ok": true, "object": metadata })))
+}
+
+async fn r2_object_delete(
+    State(state): State<ConsoleState>,
+    Path((bucket, key)): Path<(String, String)>,
+) -> ApiResult<Json<Value>> {
+    state.require_mutation()?;
+    if !state.client.r2_delete(&state.node, &bucket, &key).await? {
+        return Err(ApiError::not_found("R2 对象不存在"));
+    }
+    Ok(Json(json!({ "ok": true })))
+}
+
 type ApiResult<T> = std::result::Result<T, ApiError>;
 
 #[derive(Debug)]
@@ -1786,6 +2148,14 @@ mod tests {
             r#"{"COUNTER":{"class_name":"Counter","unique_key":"counter","enable_sql":true}}"#
                 .into(),
         );
+        env.insert(
+            deploy::R2_METADATA_ENV.into(),
+            r#"{"OLD":"archive"}"#.into(),
+        );
+        env.insert(
+            deploy::D1_METADATA_ENV.into(),
+            r#"{"OLD_DB":"archive"}"#.into(),
+        );
         let manifest = WorkerManifest {
             name: "demo".into(),
             version: 4,
@@ -1807,6 +2177,8 @@ mod tests {
                 hostnames: Some(vec!["API.Example.com.".into(), "api.example.com".into()]),
                 env: Some(BTreeMap::from([("MODE".into(), "production".into())])),
                 kv_bindings: Some(BTreeMap::from([("CACHE".into(), "shared".into())])),
+                r2_bindings: Some(BTreeMap::from([("ASSETS".into(), "assets".into())])),
+                d1_bindings: Some(BTreeMap::from([("DB".into(), "primary".into())])),
                 crons: Some(vec!["*/5 * * * *".into()]),
                 compatibility_date: Some("2026-08-04".into()),
             },
@@ -1817,6 +2189,8 @@ mod tests {
         assert_eq!(updated.hostnames, vec!["api.example.com"]);
         assert_eq!(updated.env["MODE"], "production");
         assert!(updated.env.contains_key(deploy::DO_METADATA_ENV));
+        assert_eq!(deploy::r2_bindings(&updated)["ASSETS"], "assets");
+        assert_eq!(deploy::d1_bindings(&updated)["DB"], "primary");
         assert_eq!(updated.kv_bindings["CACHE"], "shared");
         assert_eq!(updated.crons, vec!["*/5 * * * *"]);
     }

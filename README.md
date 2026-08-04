@@ -48,6 +48,13 @@ Working today, verified by multi-process fault-injection e2e tests:
   rollout on every node. Push webhooks, immutable build history, runtime logs,
   and signed rollback are built in. Repository settings are operator-signed and
   replicated; tokens and build processes stay node-local.
+- **R2-compatible object storage**: operator-signed buckets, per-bucket D1
+  metadata quorums, content-addressed local replicas or node-local rclone
+  remotes, quotas, metadata, ranges, conditions, delimiter listing,
+  multipart upload, lifecycle expiry and delayed reference-safe collection.
+  Stock workerd receives native `R2Bucket` bindings; public buckets get
+  `r2-<bucket>.<default_domain>` plus optional custom hostnames, CORS and
+  ETag/Range-aware object delivery.
 
 Also in: HTTPS ingress (SNI cert store, hot-reload, wildcard files,
 self-signed fallback) and **native workerd kvNamespace bindings** —
@@ -65,6 +72,11 @@ commit through a majority; killing the leader loses nothing
 (e2e-verified). `rf d1 create mydb`, `rf d1 exec mydb "INSERT …"
 --params '[…]'` against any node — requests chase the leader
 automatically.
+
+Worker manifests can bind a database with `"d1": {"DB":"mydb"}`.
+The runtime exposes the familiar `env.DB.prepare(...).bind(...).all()/first()/run()/raw()`,
+plus `exec()`, `batch()` and `withSession()`, while every operation is routed
+to the database's current quorum leader.
 
 **Durable Objects (v0.3 phase 2)**: native workerd namespaces and SQLite
 storage run under a per-Worker 3-node micro-quorum. Only the epoch-fenced
@@ -143,6 +155,12 @@ sandbox = "/usr/bin/bwrap"          # mandatory for custom build commands
 github_token_env = "RF_GITHUB_TOKEN" # optional, private repositories only
 timeout_seconds = 1200
 
+[storage]                            # optional rclone-backed R2 buckets
+# local_dir = "/var/lib/rf/objects" # default shown; content-addressed
+# rclone_binary = "/usr/bin/rclone" # set both lines to enable rclone
+# rclone_config = "/etc/rclone/rclone.conf" # keep mode 0600, never commit
+# rclone_timeout_seconds = 1800
+
 rf run --config rf.toml
 ```
 
@@ -151,6 +169,12 @@ Worker's signed manifest. Every node derives the same hostname from the Worker
 name, and the deterministic default route is reserved for that Worker. Point a
 wildcard DNS record and certificate at the public nodes once; custom domains can
 still be attached through signed Worker settings.
+
+The same wildcard also covers public object buckets: bucket `assets` receives
+`r2-assets.workers.example.com`. Bucket definitions replicate only a remote
+name and path prefix. Provider credentials stay exclusively in each node's
+`rclone_config`; `rf doctor` verifies the binary and config without printing
+their contents.
 
 For a systemd deployment, prefer `infra/install-release.sh`; it downloads the
 GitHub Actions artifact directly on the VPS and verifies its checksum. The

@@ -140,7 +140,11 @@ fn is_read(conn: &rusqlite::Connection, sql: &str) -> Result<bool> {
 
 /// Manager: watches the KV for databases whose group includes us and
 /// spawns a driver per db.
-pub fn spawn_manager(node: Arc<Node>, registry: Registry, leadership: Leadership) {
+pub fn spawn_manager(
+    node: Arc<Node>,
+    registry: Registry,
+    leadership: Leadership,
+) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         loop {
             for key in node.kv_list(acme_ns(), "d1/", 10_000) {
@@ -179,7 +183,7 @@ pub fn spawn_manager(node: Arc<Node>, registry: Registry, leadership: Leadership
             }
             tokio::time::sleep(Duration::from_secs(1)).await;
         }
-    });
+    })
 }
 
 struct Driver {

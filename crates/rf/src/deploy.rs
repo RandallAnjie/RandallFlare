@@ -19,6 +19,8 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 pub const DO_METADATA_ENV: &str = "__RF_DURABLE_OBJECTS_V1";
+pub const R2_METADATA_ENV: &str = "__RF_R2_BINDINGS_V1";
+pub const D1_METADATA_ENV: &str = "__RF_D1_BINDINGS_V1";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DurableObjectBinding {
@@ -32,6 +34,20 @@ pub struct DurableObjectBinding {
 pub fn durable_objects(m: &WorkerManifest) -> BTreeMap<String, DurableObjectBinding> {
     m.env
         .get(DO_METADATA_ENV)
+        .and_then(|raw| serde_json::from_str(raw).ok())
+        .unwrap_or_default()
+}
+
+pub fn r2_bindings(m: &WorkerManifest) -> BTreeMap<String, String> {
+    m.env
+        .get(R2_METADATA_ENV)
+        .and_then(|raw| serde_json::from_str(raw).ok())
+        .unwrap_or_default()
+}
+
+pub fn d1_bindings(m: &WorkerManifest) -> BTreeMap<String, String> {
+    m.env
+        .get(D1_METADATA_ENV)
         .and_then(|raw| serde_json::from_str(raw).ok())
         .unwrap_or_default()
 }
@@ -52,6 +68,12 @@ pub struct DeploySpec {
     /// binding name → Durable Object class configuration.
     #[serde(default)]
     pub durable_objects: BTreeMap<String, DurableObjectBinding>,
+    /// binding name → signed R2 bucket name.
+    #[serde(default)]
+    pub r2: BTreeMap<String, String>,
+    /// binding name → D1 database name.
+    #[serde(default)]
+    pub d1: BTreeMap<String, String>,
     #[serde(default)]
     pub crons: Vec<String>,
     /// Relative dir of static assets.
@@ -76,8 +98,11 @@ fn module_kind(path: &Path) -> ModuleKind {
 }
 
 fn validate_spec(spec: &DeploySpec) -> Result<()> {
-    if spec.env.contains_key(DO_METADATA_ENV) {
-        bail!("env key {DO_METADATA_ENV} is reserved by rf");
+    if spec.env.contains_key(DO_METADATA_ENV)
+        || spec.env.contains_key(R2_METADATA_ENV)
+        || spec.env.contains_key(D1_METADATA_ENV)
+    {
+        bail!("env keys beginning with __RF_ are reserved by rf");
     }
     if let Some(assets) = &spec.assets {
         let path = Path::new(assets);
@@ -94,6 +119,13 @@ fn validate_spec(spec: &DeploySpec) -> Result<()> {
 }
 
 fn validate_bundle(bundle: &Bundle) -> Result<()> {
+    if bundle
+        .modules
+        .iter()
+        .any(|(path, _, _)| path == "__rf_d1_entry.js")
+    {
+        bail!("module path __rf_d1_entry.js is reserved by rf");
+    }
     if let Some(main) = &bundle.spec.main {
         if !bundle.modules.iter().any(|(path, _, _)| path == main) {
             bail!("main module {main:?} not found in bundle");
@@ -351,6 +383,52 @@ fn manifest_from_bundle(
         env.insert(
             DO_METADATA_ENV.into(),
             serde_json::to_string(&durable_objects)?,
+        );
+    }
+    if !bundle.spec.r2.is_empty() {
+        let identifier = |s: &str| {
+            let mut chars = s.chars();
+            chars
+                .next()
+                .map(|c| c.is_ascii_alphabetic() || c == '_' || c == '$')
+                .unwrap_or(false)
+                && chars.all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '$')
+        };
+        for (binding, bucket) in &bundle.spec.r2 {
+            if !identifier(binding) || !rf_core::manifest::valid_name(bucket) {
+                bail!("invalid R2 binding {binding:?}");
+            }
+        }
+        env.insert(
+            R2_METADATA_ENV.into(),
+            serde_json::to_string(&bundle.spec.r2)?,
+        );
+    }
+    if !bundle.spec.d1.is_empty() {
+        let identifier = |value: &str| {
+            let mut characters = value.chars();
+            characters
+                .next()
+                .map(|character| {
+                    character.is_ascii_alphabetic() || character == '_' || character == '$'
+                })
+                .unwrap_or(false)
+                && characters.all(|character| {
+                    character.is_ascii_alphanumeric() || character == '_' || character == '$'
+                })
+        };
+        for (binding, database) in &bundle.spec.d1 {
+            if !identifier(binding)
+                || !rf_core::manifest::valid_name(database)
+                || database.starts_with("r2-")
+                || database.starts_with("rfdo-")
+            {
+                bail!("invalid D1 binding {binding:?}");
+            }
+        }
+        env.insert(
+            D1_METADATA_ENV.into(),
+            serde_json::to_string(&bundle.spec.d1)?,
         );
     }
     let manifest = WorkerManifest {
