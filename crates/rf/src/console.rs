@@ -20,9 +20,10 @@ use axum::routing::{delete, get, post};
 use axum::{Json, Router};
 use rand::RngCore;
 use rf_core::identity::AnyKeypair;
-use rf_core::manifest::{valid_name, WorkerManifest};
+use rf_core::manifest::{valid_name, ManifestError, WorkerManifest};
 use serde::Deserialize;
 use serde_json::{json, Value};
+use std::collections::BTreeMap;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -192,7 +193,10 @@ pub fn router(state: ConsoleState) -> Router {
         .route("/api/session", get(session))
         .route("/api/overview", get(overview))
         .route("/api/workers/deploy", post(worker_deploy))
-        .route("/api/workers/{name}", delete(worker_delete))
+        .route(
+            "/api/workers/{name}",
+            get(worker_get).patch(worker_update).delete(worker_delete),
+        )
         .route("/api/workers/{name}/log", get(worker_log))
         .route("/api/workers/{name}/runtime-log", get(worker_runtime_log))
         .route("/api/workers/{name}/build", post(worker_build))
@@ -612,6 +616,262 @@ async fn worker_deploy(
                     manifest.version,
                     manifest.modules.len(),
                     manifest.assets.len()
+                ),
+            )?;
+            Ok(Json(json!({
+                "ok": true,
+                "pending_approval": true,
+                "name": manifest.name,
+                "version": manifest.version,
+                "approval": approval,
+                "approve_node": node.cfg.peer_api_advertise().to_string(),
+            })))
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WorkerSettingsRequest {
+    #[serde(default)]
+    hostnames: Option<Vec<String>>,
+    #[serde(default)]
+    env: Option<BTreeMap<String, String>>,
+    #[serde(default)]
+    kv_bindings: Option<BTreeMap<String, String>>,
+    #[serde(default)]
+    crons: Option<Vec<String>>,
+    #[serde(default)]
+    compatibility_date: Option<String>,
+}
+
+fn manifest_error_zh(error: ManifestError) -> String {
+    match error {
+        ManifestError::Envelope(_) => "部署清单封装无效".into(),
+        ManifestError::NotOperator => "部署清单并非由集群管理员签署".into(),
+        ManifestError::BadName => "Worker 名称须由小写字母、数字或连字符组成".into(),
+        ManifestError::MainNotInModules => "入口模块不在构建产物的模块列表中".into(),
+        ManifestError::BadCron(value) => format!("Cron 表达式无效：{value}"),
+        ManifestError::BadHostname(value) => format!("域名格式无效：{value}"),
+        ManifestError::BadPath(value) => format!("Worker 包含不安全的文件路径：{value}"),
+        ManifestError::DuplicatePath(value) => format!("Worker 包含重复的文件路径：{value}"),
+        ManifestError::ChainBroken => "部署清单的版本哈希链已断裂".into(),
+    }
+}
+
+async fn current_manifest(
+    state: &ConsoleState,
+    name: &str,
+) -> ApiResult<(WorkerManifest, [u8; 32])> {
+    if !valid_name(name) {
+        return Err(ApiError::bad_request("Worker 名称无效"));
+    }
+    let envelopes = state.client.worker_log(&state.node, name).await?;
+    let operator = state
+        .operator_id()
+        .ok_or_else(|| ApiError::upstream("无法确定部署清单的签名者"))?;
+    let chain = rf_core::manifest::verify_chain(&envelopes, &operator)
+        .map_err(|error| ApiError::upstream(manifest_error_zh(error)))?;
+    let manifest = chain
+        .last()
+        .filter(|manifest| !manifest.deleted)
+        .cloned()
+        .ok_or_else(|| ApiError::not_found("Worker 不存在或已删除"))?;
+    let digest = envelopes
+        .last()
+        .map(rf_core::envelope::Envelope::digest)
+        .ok_or_else(|| ApiError::not_found("未找到 Worker 部署清单"))?;
+    Ok((manifest, digest))
+}
+
+async fn worker_get(
+    State(state): State<ConsoleState>,
+    Path(name): Path<String>,
+) -> ApiResult<Json<Value>> {
+    let (manifest, digest) = current_manifest(&state, &name).await?;
+    let mut env = manifest.env.clone();
+    env.remove(deploy::DO_METADATA_ENV);
+    let durable_objects = deploy::durable_objects(&manifest);
+    let source = match &state.mode {
+        ConsoleMode::Public { node, .. } => crate::build::source_head(node, &name)
+            .filter(|record| !record.source.deleted)
+            .map(|record| serde_json::to_value(record).unwrap_or(Value::Null)),
+        ConsoleMode::Local { .. } => None,
+    };
+    Ok(Json(json!({
+        "worker": {
+            "name": manifest.name,
+            "version": manifest.version,
+            "digest": hex::encode(digest),
+            "main": manifest.main,
+            "modules": manifest.modules,
+            "assets": manifest.assets,
+            "hostnames": manifest.hostnames,
+            "env": env,
+            "kv_bindings": manifest.kv_bindings,
+            "crons": manifest.crons,
+            "compatibility_date": manifest.compatibility_date,
+            "durable_objects": durable_objects,
+        },
+        "source": source,
+    })))
+}
+
+fn valid_compatibility_date(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    if bytes.len() != 10
+        || bytes[4] != b'-'
+        || bytes[7] != b'-'
+        || bytes
+            .iter()
+            .enumerate()
+            .any(|(index, byte)| index != 4 && index != 7 && !byte.is_ascii_digit())
+    {
+        return false;
+    }
+    let year = value[0..4].parse::<u16>().ok();
+    let month = value[5..7].parse::<u8>().ok();
+    let day = value[8..10].parse::<u8>().ok();
+    let (Some(year @ 2021..=9999), Some(month @ 1..=12), Some(day)) = (year, month, day) else {
+        return false;
+    };
+    let leap = year % 4 == 0 && (year % 100 != 0 || year % 400 == 0);
+    let days = match month {
+        2 if leap => 29,
+        2 => 28,
+        4 | 6 | 9 | 11 => 30,
+        _ => 31,
+    };
+    (1..=days).contains(&day)
+}
+
+fn validate_settings_map(values: &BTreeMap<String, String>, label: &str) -> ApiResult<()> {
+    if values.len() > 256 {
+        return Err(ApiError::bad_request(format!("{label}最多允许 256 项")));
+    }
+    let mut total = 0usize;
+    for (key, value) in values {
+        if key.is_empty()
+            || key.len() > 256
+            || key.as_bytes().iter().any(|byte| byte.is_ascii_control())
+        {
+            return Err(ApiError::bad_request(format!("{label}中包含无效名称")));
+        }
+        if value.len() > MAX_CONSOLE_VALUE {
+            return Err(ApiError::bad_request(format!(
+                "{label}中的单项值超过 1 MiB"
+            )));
+        }
+        total = total.saturating_add(key.len()).saturating_add(value.len());
+    }
+    if total > MAX_CONSOLE_VALUE {
+        return Err(ApiError::bad_request(format!("{label}总大小超过 1 MiB")));
+    }
+    Ok(())
+}
+
+fn apply_worker_settings(
+    mut manifest: WorkerManifest,
+    digest: [u8; 32],
+    request: WorkerSettingsRequest,
+) -> ApiResult<WorkerManifest> {
+    let WorkerSettingsRequest {
+        hostnames,
+        env,
+        kv_bindings,
+        crons,
+        compatibility_date,
+    } = request;
+    if hostnames.is_none()
+        && env.is_none()
+        && kv_bindings.is_none()
+        && crons.is_none()
+        && compatibility_date.is_none()
+    {
+        return Err(ApiError::bad_request("没有需要更新的 Worker 配置"));
+    }
+    if let Some(hostnames) = hostnames {
+        if hostnames.len() > 256 {
+            return Err(ApiError::bad_request("一个 Worker 最多绑定 256 个域名"));
+        }
+        let mut normalized: Vec<String> = hostnames
+            .into_iter()
+            .map(|hostname| hostname.trim().trim_end_matches('.').to_ascii_lowercase())
+            .filter(|hostname| !hostname.is_empty())
+            .collect();
+        normalized.sort();
+        normalized.dedup();
+        manifest.hostnames = normalized;
+    }
+    if let Some(mut env) = env {
+        if env.contains_key(deploy::DO_METADATA_ENV) {
+            return Err(ApiError::bad_request(
+                "不能修改 RandallFlare 保留的环境变量",
+            ));
+        }
+        validate_settings_map(&env, "环境变量")?;
+        if let Some(durable_objects) = manifest.env.get(deploy::DO_METADATA_ENV).cloned() {
+            env.insert(deploy::DO_METADATA_ENV.into(), durable_objects);
+        }
+        manifest.env = env;
+    }
+    if let Some(kv_bindings) = kv_bindings {
+        validate_settings_map(&kv_bindings, "KV 绑定")?;
+        manifest.kv_bindings = kv_bindings;
+    }
+    if let Some(crons) = crons {
+        if crons.len() > 256 {
+            return Err(ApiError::bad_request(
+                "一个 Worker 最多配置 256 个定时触发器",
+            ));
+        }
+        manifest.crons = crons
+            .into_iter()
+            .map(|cron| cron.trim().to_string())
+            .filter(|cron| !cron.is_empty())
+            .collect();
+    }
+    if let Some(compatibility_date) = compatibility_date {
+        let compatibility_date = compatibility_date.trim().to_string();
+        if !valid_compatibility_date(&compatibility_date) {
+            return Err(ApiError::bad_request("兼容日期必须采用 YYYY-MM-DD 格式"));
+        }
+        manifest.compatibility_date = compatibility_date;
+    }
+    manifest.version = manifest.version.saturating_add(1);
+    manifest.prev = Some(digest);
+    manifest.validate().map_err(|error| {
+        ApiError::bad_request(format!("Worker 配置无效：{}", manifest_error_zh(error)))
+    })?;
+    Ok(manifest)
+}
+
+async fn worker_update(
+    State(state): State<ConsoleState>,
+    Extension(principal): Extension<ConsolePrincipal>,
+    Path(name): Path<String>,
+    Json(request): Json<WorkerSettingsRequest>,
+) -> ApiResult<Json<Value>> {
+    state.require_mutation()?;
+    let (manifest, digest) = current_manifest(&state, &name).await?;
+    let manifest = apply_worker_settings(manifest, digest, request)?;
+    match &state.mode {
+        ConsoleMode::Local { .. } => {
+            let envelope = rf_core::envelope::Envelope::seal_any(&manifest, state.operator()?);
+            state.client.post_manifest(&state.node, &envelope).await?;
+            Ok(Json(json!({
+                "ok": true,
+                "name": manifest.name,
+                "version": manifest.version,
+            })))
+        }
+        ConsoleMode::Public { node, .. } => {
+            let approval = node.management.create_manifest(
+                principal.session_id,
+                &manifest,
+                format!(
+                    "更新 Worker {} 的配置并发布 v{}",
+                    manifest.name, manifest.version
                 ),
             )?;
             Ok(Json(json!({
@@ -1226,6 +1486,52 @@ mod tests {
             [7u8; 32],
             Some(AnyKeypair::Ed(Keypair::from_seed([9u8; 32]))),
         )
+    }
+
+    #[test]
+    fn worker_settings_create_a_linked_manifest_and_preserve_internal_metadata() {
+        assert!(valid_compatibility_date("2028-02-29"));
+        assert!(!valid_compatibility_date("2027-02-29"));
+        assert!(!valid_compatibility_date("2026-十三-01"));
+        let mut env = BTreeMap::from([("GREETING".into(), "hello".into())]);
+        env.insert(
+            deploy::DO_METADATA_ENV.into(),
+            r#"{"COUNTER":{"class_name":"Counter","unique_key":"counter","enable_sql":true}}"#
+                .into(),
+        );
+        let manifest = WorkerManifest {
+            name: "demo".into(),
+            version: 4,
+            prev: Some([3; 32]),
+            deleted: false,
+            main: String::new(),
+            modules: vec![],
+            assets: vec![],
+            hostnames: vec!["old.example".into()],
+            env,
+            kv_bindings: BTreeMap::new(),
+            crons: vec![],
+            compatibility_date: "2026-08-01".into(),
+        };
+        let updated = apply_worker_settings(
+            manifest,
+            [9; 32],
+            WorkerSettingsRequest {
+                hostnames: Some(vec!["API.Example.com.".into(), "api.example.com".into()]),
+                env: Some(BTreeMap::from([("MODE".into(), "production".into())])),
+                kv_bindings: Some(BTreeMap::from([("CACHE".into(), "shared".into())])),
+                crons: Some(vec!["*/5 * * * *".into()]),
+                compatibility_date: Some("2026-08-04".into()),
+            },
+        )
+        .unwrap();
+        assert_eq!(updated.version, 5);
+        assert_eq!(updated.prev, Some([9; 32]));
+        assert_eq!(updated.hostnames, vec!["api.example.com"]);
+        assert_eq!(updated.env["MODE"], "production");
+        assert!(updated.env.contains_key(deploy::DO_METADATA_ENV));
+        assert_eq!(updated.kv_bindings["CACHE"], "shared");
+        assert_eq!(updated.crons, vec!["*/5 * * * *"]);
     }
 
     fn public_state() -> (ConsoleState, Arc<Node>, AnyKeypair) {

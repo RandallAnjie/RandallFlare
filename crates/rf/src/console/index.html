@@ -55,6 +55,7 @@
           </button>
         </nav>
         <div class="sidebar-foot">
+          <p class="sidebar-tagline">一次构建，一次验证，处处运行。</p>
           <div class="security-note"><span>●</span> 管理员身份已验证</div>
           <small id="security-copy">此节点不保存<br>任何私钥。</small>
         </div>
@@ -112,63 +113,111 @@
         </section>
 
         <section id="view-workers" class="view" aria-labelledby="section-title">
-          <div class="worker-hero">
-            <div><p class="eyebrow">Git 原生边缘交付</p><h2>一次构建，一次验证，处处运行。</h2><p class="muted">每项仓库配置与发布产物都须经管理员签名。构建在当前节点完成，不可变内容块与清单随后由集群点对点分发。</p></div>
-            <div id="build-capabilities" class="capability-strip"><span class="dot pending"></span> 正在检查构建节点…</div>
+          <div class="projects-header">
+            <div><p class="eyebrow">边缘计算项目</p><h2>Worker 项目</h2><p class="muted">从一个项目进入它的部署、日志、域名和运行配置。每次变更都会生成新的可验证版本。</p><div id="build-capabilities" class="capability-strip"><span class="dot pending"></span><strong>正在检查构建环境</strong></div></div>
+            <button id="new-project" class="primary" type="button">新建项目</button>
           </div>
 
-          <div id="git-workspace" class="grid one-one">
-            <article class="panel">
-              <div class="panel-head"><div><p class="eyebrow">代码源</p><h2>连接 GitHub 仓库</h2></div><span class="badge">须管理员签名</span></div>
-              <form id="source-form" class="source-form">
-                <label><span>Worker 名称</span><input id="source-worker" pattern="[a-z0-9-]{1,63}" placeholder="api" required></label>
-                <label class="wide"><span>仓库地址</span><input id="source-repository" type="url" placeholder="https://github.com/owner/repository" required></label>
-                <label><span>分支</span><input id="source-branch" value="main" required></label>
-                <label><span>仓库内项目目录</span><input id="source-root" value="." required></label>
-                <label class="wide"><span>构建命令 <em>可选 · 沙箱运行</em></span><input id="source-command" class="code-input" placeholder="npm ci && npm run build"></label>
-                <label><span>产物目录</span><input id="source-output" value="." required></label>
-                <label class="check-label"><input id="source-private" type="checkbox"><span>使用私有仓库令牌</span></label>
-                <label class="check-label"><input id="source-webhook" type="checkbox" checked><span>GitHub 推送时自动构建</span></label>
-                <button class="primary wide" type="submit">提交仓库连接</button>
-              </form>
-              <p class="form-note">私有仓库只会从当前节点读取 <code>RF_GITHUB_TOKEN</code>。令牌不会被保存、复制，也不会暴露给构建命令。</p>
-            </article>
-
-            <article class="panel deploy-panel">
-              <div class="panel-head"><div><p class="eyebrow">直接发布</p><h2>上传已构建的 Worker 包</h2></div><span class="badge">rf.json</span></div>
-              <p class="muted">此入口适用于预构建产物或紧急发布。Git 构建同样使用已签名的部署清单（Manifest）与相同的分发协议。</p>
-              <form id="deploy-form">
-                <div id="deploy-local-fields"><label for="deploy-path">本地 Worker 包路径</label><input id="deploy-path" name="path" type="text" placeholder="/absolute/path/to/worker" autocomplete="off"></div>
-                <div id="deploy-public-fields" class="hidden">
-                  <label>Worker 包目录</label>
-                  <input id="deploy-files" name="files" type="file" webkitdirectory multiple hidden>
-                  <div class="file-picker"><button id="deploy-file-picker" class="secondary" type="button">选择目录</button><span id="deploy-file-status">尚未选择目录</span></div>
-                </div>
-                <button class="secondary" type="submit">准备直接发布</button>
-              </form>
-              <div id="deploy-mode" class="form-note"></div>
-            </article>
-          </div>
-
-          <article class="panel">
-            <div class="panel-head"><div><p class="eyebrow">代码仓库</p><h2>已连接的代码源</h2></div><span id="source-count" class="badge">已连接 0 个</span></div>
-            <div id="source-list" class="source-list empty-state">尚未连接 GitHub 仓库。</div>
-          </article>
-
-          <article class="panel">
-            <div class="panel-head"><div><p class="eyebrow">构建流水线</p><h2>构建记录</h2></div><button id="build-refresh" class="text-button" type="button">刷新构建记录 ↻</button></div>
-            <div id="build-list" class="build-list empty-state">暂无构建记录。</div>
-          </article>
-
-          <article class="panel">
-            <div class="panel-head"><div><p class="eyebrow">集群部署</p><h2>Worker 清单</h2></div><span id="worker-count" class="badge">运行中 0 个</span></div>
+          <article class="panel project-list-panel">
+            <div class="panel-head"><div><h2>所有项目</h2><p class="muted compact-copy">一次构建后，由集群自动完成全量分发。</p></div><span id="worker-count" class="badge">运行中 0 个</span></div>
             <div class="table-wrap">
-              <table>
-                <thead><tr><th>Worker</th><th>版本</th><th>内容</th><th>路由</th><th>分发状态</th><th><span class="sr-only">操作</span></th></tr></thead>
+              <table class="project-table">
+                <thead><tr><th>项目</th><th>当前版本</th><th>内容</th><th>域名</th><th>部署状态</th><th><span class="sr-only">操作</span></th></tr></thead>
                 <tbody id="workers-table"><tr><td colspan="6" class="empty-state">暂无 Worker。</td></tr></tbody>
               </table>
             </div>
           </article>
+
+          <details id="create-project-panel" class="panel disclosure-panel">
+            <summary><span><strong>新建或导入项目</strong><small>连接 GitHub 仓库，或上传已构建的 Worker 包</small></span><span aria-hidden="true">＋</span></summary>
+            <div id="git-workspace" class="grid one-one disclosure-content">
+              <article class="subpanel">
+                <div class="panel-head"><div><p class="eyebrow">推荐工作流</p><h2>从 GitHub 导入</h2></div><span class="badge">须管理员签名</span></div>
+                <form id="source-form" class="source-form">
+                  <label><span>Worker 名称</span><input id="source-worker" pattern="[a-z0-9-]{1,63}" placeholder="api" required></label>
+                  <label class="wide"><span>仓库地址</span><input id="source-repository" type="url" placeholder="https://github.com/owner/repository" required></label>
+                  <label><span>分支</span><input id="source-branch" value="main" required></label>
+                  <label><span>仓库内项目目录</span><input id="source-root" value="." required></label>
+                  <label class="wide"><span>构建命令 <em>可选 · 沙箱运行</em></span><input id="source-command" class="code-input" placeholder="npm ci && npm run build"></label>
+                  <label><span>产物目录</span><input id="source-output" value="." required></label>
+                  <label class="check-label"><input id="source-private" type="checkbox"><span>使用私有仓库令牌</span></label>
+                  <label class="check-label"><input id="source-webhook" type="checkbox" checked><span>GitHub 推送时自动构建</span></label>
+                  <button class="primary wide" type="submit">连接并继续</button>
+                </form>
+                <p class="form-note">私有仓库只会从当前节点读取 <code>RF_GITHUB_TOKEN</code>。令牌不会保存到集群。</p>
+              </article>
+
+              <article class="subpanel deploy-panel">
+                <div class="panel-head"><div><p class="eyebrow">手动部署</p><h2>上传 Worker 包</h2></div><span class="badge">rf.json</span></div>
+                <p class="muted">适用于预构建产物或紧急发布。上传后仍需管理员签署部署清单。</p>
+                <form id="deploy-form">
+                  <div id="deploy-local-fields"><label for="deploy-path">本地 Worker 包路径</label><input id="deploy-path" name="path" type="text" placeholder="/absolute/path/to/worker" autocomplete="off"></div>
+                  <div id="deploy-public-fields" class="hidden">
+                    <label>Worker 包目录</label>
+                    <input id="deploy-files" name="files" type="file" webkitdirectory multiple hidden>
+                    <div class="file-picker"><button id="deploy-file-picker" class="secondary" type="button">选择目录</button><span id="deploy-file-status">尚未选择目录</span></div>
+                  </div>
+                  <button class="secondary" type="submit">准备部署</button>
+                </form>
+                <div id="deploy-mode" class="form-note"></div>
+              </article>
+            </div>
+          </details>
+
+          <div class="grid one-one workspace-summary">
+            <article class="panel">
+              <div class="panel-head"><div><p class="eyebrow">代码仓库</p><h2>已连接的代码源</h2></div><span id="source-count" class="badge">已连接 0 个</span></div>
+              <div id="source-list" class="source-list empty-state">尚未连接 GitHub 仓库。</div>
+            </article>
+            <article class="panel">
+              <div class="panel-head"><div><p class="eyebrow">最近活动</p><h2>构建记录</h2></div><button id="build-refresh" class="text-button" type="button">刷新 ↻</button></div>
+              <div id="build-list" class="build-list empty-state">暂无构建记录。</div>
+            </article>
+          </div>
+        </section>
+
+        <section id="view-worker-detail" class="view" aria-labelledby="project-title">
+          <button id="project-back" class="back-button" type="button">← 返回所有项目</button>
+          <div class="project-detail-head">
+            <div class="project-identity"><span class="project-avatar">W</span><div><p class="eyebrow">Worker 项目</p><h2 id="project-title">—</h2><p id="project-subtitle" class="muted">正在加载项目…</p></div></div>
+            <div class="project-actions"><a id="project-open" class="secondary-link hidden" target="_blank" rel="noreferrer">访问项目 ↗</a><button id="project-redeploy" class="primary" type="button">重新部署</button></div>
+          </div>
+          <nav class="project-tabs" aria-label="项目详情">
+            <button class="active" data-project-tab="overview" type="button">概览</button>
+            <button data-project-tab="deployments" type="button">部署</button>
+            <button data-project-tab="logs" type="button">日志</button>
+            <button data-project-tab="domains" type="button">域名</button>
+            <button data-project-tab="settings" type="button">设置</button>
+          </nav>
+
+          <div id="project-tab-overview" class="project-tab active">
+            <div class="grid two-one">
+              <article class="panel deployment-card"><div class="panel-head"><div><p class="eyebrow">生产环境</p><h2>当前部署</h2></div><span id="detail-status" class="badge active">—</span></div><div id="detail-deployment" class="detail-stack"></div></article>
+              <article class="panel"><p class="eyebrow">项目摘要</p><dl id="detail-summary" class="detail-list"></dl></article>
+            </div>
+            <div class="grid one-one">
+              <article class="panel"><div class="panel-head"><div><p class="eyebrow">集群状态</p><h2>节点分发</h2></div><span id="detail-distribution-count" class="badge">—</span></div><div id="detail-distribution" class="node-list"></div></article>
+              <article class="panel"><div class="panel-head"><div><p class="eyebrow">构建产物</p><h2>文件与绑定</h2></div></div><div id="detail-content" class="detail-stack"></div></article>
+            </div>
+          </div>
+
+          <div id="project-tab-deployments" class="project-tab">
+            <div class="grid one-one"><article class="panel"><div class="panel-head"><div><p class="eyebrow">流水线</p><h2>构建与部署</h2></div></div><div id="detail-builds" class="build-list"></div></article><article class="panel"><div class="panel-head"><div><p class="eyebrow">可验证记录</p><h2>版本历史</h2></div></div><div id="detail-history"></div></article></div>
+          </div>
+
+          <div id="project-tab-logs" class="project-tab">
+            <article class="panel"><div class="panel-head"><div><p class="eyebrow">本节点实时输出</p><h2>运行日志</h2></div><button id="detail-refresh-logs" class="secondary compact" type="button">刷新日志</button></div><div id="detail-log-meta" class="muted"></div><pre id="detail-logs" class="result log-output">正在等待日志数据…</pre></article>
+          </div>
+
+          <div id="project-tab-domains" class="project-tab">
+            <article class="panel settings-panel"><div class="settings-copy"><p class="eyebrow">路由</p><h2>域名</h2><p class="muted">每行填写一个完整域名。新清单获批后，所有节点会同时接管这些路由。</p></div><form id="project-domains-form"><label for="project-hostnames">绑定域名</label><textarea id="project-hostnames" class="code-input" rows="7" placeholder="api.example.com"></textarea><p class="form-note">正式环境建议先配置 HTTPS 与通配符 Worker 域名。</p><button class="primary" type="submit">保存域名并发布</button></form></article>
+          </div>
+
+          <div id="project-tab-settings" class="project-tab">
+            <article class="panel settings-panel"><div class="settings-copy"><p class="eyebrow">运行配置</p><h2>变量与绑定</h2><p class="muted">修改后会生成一个新版本；既有代码与静态资源保持不变。</p></div><form id="project-settings-form" class="settings-form"><label><span>环境变量 <em>每行 KEY=value</em></span><textarea id="project-env" class="code-input" rows="7"></textarea></label><label><span>KV 绑定 <em>每行 BINDING=namespace</em></span><textarea id="project-kv-bindings" class="code-input" rows="5"></textarea></label><label><span>定时触发器 <em>每行一条 Cron 表达式</em></span><textarea id="project-crons" class="code-input" rows="4"></textarea></label><label><span>兼容日期</span><input id="project-compatibility-date" class="code-input" type="date" required></label><button class="primary" type="submit">保存配置并发布</button></form></article>
+            <article id="project-source-panel" class="panel settings-panel"><div class="settings-copy"><p class="eyebrow">Git 集成</p><h2>代码源</h2><p class="muted">编辑仓库、分支与构建命令。源码配置也由管理员签名并在集群内复制。</p></div><form id="project-source-form" class="settings-form"><label><span>仓库地址</span><input id="project-source-repository" type="url" required></label><div class="form-grid"><label><span>分支</span><input id="project-source-branch" required></label><label><span>项目目录</span><input id="project-source-root" required></label></div><label><span>构建命令</span><input id="project-source-command" class="code-input"></label><label><span>产物目录</span><input id="project-source-output" required></label><label class="check-label"><input id="project-source-private" type="checkbox"><span>使用私有仓库令牌</span></label><label class="check-label"><input id="project-source-webhook" type="checkbox"><span>GitHub 推送时自动构建</span></label><button class="primary" type="submit">保存 Git 配置</button></form></article>
+            <article class="panel danger-zone"><div><p class="eyebrow">危险操作</p><h2>删除项目</h2><p class="muted">写入可验证的墓碑版本；历史记录仍会保留。</p></div><button id="project-delete" class="danger" type="button">删除 Worker</button></article>
+          </div>
         </section>
 
         <section id="view-kv" class="view" aria-labelledby="section-title">

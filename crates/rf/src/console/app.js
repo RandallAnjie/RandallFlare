@@ -18,11 +18,15 @@ const state = {
   builds: [],
   buildTimer: null,
   activeLog: null,
+  activeWorker: null,
+  workerDetail: null,
+  projectTab: "overview",
 };
 
 const titles = {
   overview: ["集群控制", "概览"],
   workers: ["签名清单", "Worker"],
+  "worker-detail": ["Worker 项目", "项目详情"],
   kv: ["分布式数据", "KV 存储"],
   d1: ["分布式 SQLite", "D1 数据库"],
 };
@@ -163,8 +167,9 @@ function switchView(view) {
   state.view = view;
   $$(".nav-item").forEach((item) => item.classList.toggle("active", item.dataset.view === view));
   $$(".view").forEach((item) => item.classList.toggle("active", item.id === `view-${view}`));
-  $("#section-eyebrow").textContent = titles[view][0];
-  $("#section-title").textContent = titles[view][1];
+  const title = titles[view] || titles.overview;
+  $("#section-eyebrow").textContent = title[0];
+  $("#section-title").textContent = title[1];
 }
 
 function renderOverview(data) {
@@ -215,10 +220,10 @@ function renderOverview(data) {
   strip.classList.toggle("empty-state", workers.length === 0);
   strip.innerHTML = workers.length
     ? workers.slice(0, 6).map((worker) => `
-      <div class="worker-card">
+      <button class="worker-card" type="button" data-open-worker="${escapeHtml(worker.name)}">
         <strong>${escapeHtml(worker.name)} <span class="badge">v${escapeHtml(worker.version)}</span></strong>
         <p>${escapeHtml(worker.hostnames?.join(", ") || "未配置主机名")}</p>
-      </div>`).join("")
+      </button>`).join("")
     : "暂无运行中的 Worker。";
 
   renderWorkers(workers);
@@ -245,13 +250,17 @@ function renderWorkers(workers) {
         const status = node.status || {};
         return `${node.label || shortId(node.node)}：${deploymentStateLabel(status.state)} v${status.version || "—"}`;
       }).join("\n");
+      const source = state.sources.find((item) => item.worker === worker.name);
+      const subtitle = source
+        ? source.repository.replace(/\.git$/, "").replace(/^https:\/\/github\.com\//, "")
+        : worker.hostnames?.[0] || "手动部署";
       return `<tr>
-        <td><strong>${escapeHtml(worker.name)}</strong><small>${worker.crons?.length || 0} 个定时触发器</small></td>
+        <td><button class="project-name" data-action="open-worker" data-worker="${escapeHtml(worker.name)}"><span class="project-icon">W</span><span><strong>${escapeHtml(worker.name)}</strong><small>${escapeHtml(subtitle)}</small></span></button></td>
         <td class="mono">v${escapeHtml(worker.version)}</td>
         <td>${escapeHtml(content)}</td>
         <td><small>${escapeHtml(worker.hostnames?.join(", ") || "—")}</small></td>
         <td><span class="${complete ? "state-ok" : "state-wait"}" title="${escapeHtml(nodeStates)}">${escapeHtml(distribution.ready)}/${escapeHtml(distribution.total)} 个节点</span><small>${complete ? "已完成全量分发" : "正在收敛"}</small></td>
-        <td><div class="table-actions"><button class="mini-button" data-action="runtime" data-worker="${escapeHtml(worker.name)}">运行日志</button><button class="mini-button" data-action="history" data-worker="${escapeHtml(worker.name)}">版本历史</button><button class="mini-button danger" data-action="delete-worker" data-worker="${escapeHtml(worker.name)}"${mutationDisabled}>删除</button></div></td>
+        <td><div class="table-actions"><button class="mini-button" data-action="open-worker" data-worker="${escapeHtml(worker.name)}">打开</button></div></td>
       </tr>`;
     }).join("")
     : '<tr><td colspan="6" class="empty-state">暂无 Worker。</td></tr>';
@@ -307,13 +316,11 @@ function renderSources(data) {
       </div>
       <div class="source-actions"><button class="primary" data-source-action="build" data-worker="${escapeHtml(source.worker)}">立即构建</button><button class="mini-button" data-source-action="edit" data-worker="${escapeHtml(source.worker)}">编辑</button><button class="mini-button danger" data-source-action="disconnect" data-worker="${escapeHtml(source.worker)}">断开连接</button></div>
     </article>`).join("") : "尚未连接 GitHub 仓库。请先在上方连接仓库，以启用构建和推送部署。";
+  if (state.overview?.workers) renderWorkers(state.overview.workers);
 }
 
-function renderBuilds(jobs, approveNode) {
-  state.builds = jobs || [];
-  const list = $("#build-list");
-  list.classList.toggle("empty-state", state.builds.length === 0);
-  list.innerHTML = state.builds.length ? state.builds.map((job) => {
+function buildRowsHtml(jobs, approveNode) {
+  return jobs.length ? jobs.map((job) => {
     const terminal = job.state === "deployed" || job.state === "failed";
     const short = job.commit ? job.commit.slice(0, 12) : "等待中";
     const approval = job.approval && job.state === "awaiting_approval"
@@ -324,7 +331,217 @@ function renderBuilds(jobs, approveNode) {
       <div class="build-stage"><span class="badge ${job.state === "deployed" ? "active" : ""}">${escapeHtml(buildStateLabel(job.state))}</span><small>${job.version ? `发布 v${escapeHtml(job.version)}` : "产物尚未就绪"}</small></div>
       <div class="table-actions">${approval}<button class="mini-button" data-build-action="log" data-build="${escapeHtml(job.id)}">查看日志</button></div>
     </article>`;
-  }).join("") : "暂无构建记录。连接仓库后即可开始首次构建。";
+  }).join("") : '<div class="empty-state">暂无构建记录。连接仓库后即可开始首次构建。</div>';
+}
+
+function renderBuilds(jobs, approveNode) {
+  state.builds = jobs || [];
+  const list = $("#build-list");
+  list.classList.toggle("empty-state", state.builds.length === 0);
+  list.innerHTML = buildRowsHtml(state.builds, approveNode);
+  if (state.activeWorker) {
+    $("#detail-builds").innerHTML = buildRowsHtml(
+      state.builds.filter((job) => job.worker === state.activeWorker),
+      approveNode,
+    );
+  }
+}
+
+function formatBytes(bytes) {
+  const value = Number(bytes || 0);
+  if (value < 1024) return `${value} B`;
+  if (value < 1024 * 1024) return `${(value / 1024).toFixed(1)} KiB`;
+  return `${(value / (1024 * 1024)).toFixed(1)} MiB`;
+}
+
+function workerUrl(hostname) {
+  if (!hostname) return "";
+  return `${location.protocol}//${hostname}`;
+}
+
+function mapToLines(values) {
+  return Object.entries(values || {}).map(([key, value]) => `${key}=${value}`).join("\n");
+}
+
+function linesToMap(value, label) {
+  const result = {};
+  for (const [index, raw] of String(value || "").split(/\r?\n/).entries()) {
+    const line = raw.trim();
+    if (!line) continue;
+    const split = line.indexOf("=");
+    if (split <= 0) throw new Error(`${label}第 ${index + 1} 行必须采用 KEY=value 格式`);
+    const key = line.slice(0, split).trim();
+    if (Object.hasOwn(result, key)) throw new Error(`${label}包含重复名称：${key}`);
+    result[key] = line.slice(split + 1);
+  }
+  return result;
+}
+
+function switchProjectTab(tab) {
+  state.projectTab = tab;
+  $$('[data-project-tab]').forEach((button) => button.classList.toggle("active", button.dataset.projectTab === tab));
+  $$(".project-tab").forEach((panel) => panel.classList.toggle("active", panel.id === `project-tab-${tab}`));
+  if (tab === "logs") loadDetailLogs();
+  if (tab === "deployments") loadDetailHistory();
+}
+
+function renderWorkerDetail(data) {
+  const worker = data.worker;
+  const summary = (state.overview?.workers || []).find((item) => item.name === worker.name) || {};
+  const source = data.source || state.sources.find((item) => item.worker === worker.name) || null;
+  const distribution = summary.distribution || { ready: 0, total: 1, nodes: [] };
+  const modules = worker.modules || [];
+  const assets = worker.assets || [];
+  const totalBytes = [...modules, ...assets].reduce((total, item) => total + Number(item.size || 0), 0);
+  const openUrl = workerUrl(worker.hostnames?.[0]);
+
+  $("#project-title").textContent = worker.name;
+  $("#project-subtitle").textContent = source
+    ? `${source.repository.replace(/\.git$/, "")} · ${source.branch}`
+    : "由签名部署包管理 · 尚未连接 GitHub";
+  $("#section-title").textContent = worker.name;
+  $("#detail-status").textContent = distribution.ready === distribution.total ? "生产环境就绪" : "正在分发";
+  $("#detail-status").classList.toggle("active", distribution.ready === distribution.total);
+  $("#project-open").classList.toggle("hidden", !openUrl);
+  if (openUrl) $("#project-open").href = openUrl;
+  $("#detail-deployment").innerHTML = `
+    <div class="deployment-version"><span class="deployment-check">✓</span><div><strong>v${escapeHtml(worker.version)}</strong><p>${source ? "由 GitHub 构建流水线发布" : "由 Worker 包直接发布"}</p></div></div>
+    <dl class="detail-list compact"><div><dt>清单摘要</dt><dd class="mono">${escapeHtml(worker.digest)}</dd></div><div><dt>入口模块</dt><dd class="mono">${escapeHtml(worker.main || "静态资源项目")}</dd></div><div><dt>兼容日期</dt><dd>${escapeHtml(worker.compatibility_date)}</dd></div></dl>`;
+  $("#detail-summary").innerHTML = `
+    <div><dt>当前版本</dt><dd>v${escapeHtml(worker.version)}</dd></div>
+    <div><dt>域名</dt><dd>${escapeHtml(worker.hostnames?.length || 0)} 个</dd></div>
+    <div><dt>环境变量</dt><dd>${escapeHtml(Object.keys(worker.env || {}).length)} 项</dd></div>
+    <div><dt>KV 绑定</dt><dd>${escapeHtml(Object.keys(worker.kv_bindings || {}).length)} 项</dd></div>
+    <div><dt>定时任务</dt><dd>${escapeHtml(worker.crons?.length || 0)} 条</dd></div>`;
+  $("#detail-distribution-count").textContent = `${distribution.ready}/${distribution.total} 个节点`;
+  $("#detail-distribution").innerHTML = (distribution.nodes || []).map((node) => {
+    const status = node.status || {};
+    return `<div class="node-row"><span class="dot ${status.state === "running" ? "online" : "pending"}"></span><div><div class="node-name">${escapeHtml(node.label || shortId(node.node))}</div><div class="node-short">${escapeHtml(shortId(node.node, 18))}</div></div><div class="node-address">${escapeHtml(deploymentStateLabel(status.state))}</div><span class="badge">v${escapeHtml(status.version || "—")}</span></div>`;
+  }).join("") || '<div class="empty-state">尚无节点分发状态。</div>';
+  $("#detail-content").innerHTML = `
+    <div class="content-metrics"><div><strong>${modules.length}</strong><span>模块</span></div><div><strong>${assets.length}</strong><span>静态资源</span></div><div><strong>${formatBytes(totalBytes)}</strong><span>总大小</span></div></div>
+    <div class="content-files"><strong>主要内容</strong>${[...modules, ...assets].slice(0, 6).map((file) => `<span><code>${escapeHtml(file.path)}</code><small>${formatBytes(file.size)}</small></span>`).join("") || '<span class="muted">清单中没有文件</span>'}</div>`;
+  $("#project-hostnames").value = (worker.hostnames || []).join("\n");
+  $("#project-env").value = mapToLines(worker.env);
+  $("#project-kv-bindings").value = mapToLines(worker.kv_bindings);
+  $("#project-crons").value = (worker.crons || []).join("\n");
+  $("#project-compatibility-date").value = worker.compatibility_date;
+  $("#project-source-repository").value = source?.repository?.replace(/\.git$/, "") || "";
+  $("#project-source-branch").value = source?.branch || "main";
+  $("#project-source-root").value = source?.root || ".";
+  $("#project-source-command").value = source?.build_command || "";
+  $("#project-source-output").value = source?.output_dir || ".";
+  $("#project-source-private").checked = Boolean(source?.use_github_token);
+  $("#project-source-webhook").checked = source ? Boolean(source.webhook) : true;
+  $("#project-source-panel .settings-copy .muted").textContent = source
+    ? "编辑仓库、分支与构建命令。源码配置也由管理员签名并在集群内复制。"
+    : "该项目尚未连接 GitHub；填写配置即可接入构建与推送部署。";
+  $("#project-source-form button[type=submit]").textContent = source ? "保存 Git 配置" : "连接 GitHub 仓库";
+  $("#detail-builds").innerHTML = buildRowsHtml(state.builds.filter((job) => job.worker === worker.name));
+}
+
+async function openWorkerDetail(name, tab = "overview") {
+  state.activeWorker = name;
+  state.workerDetail = null;
+  switchView("worker-detail");
+  switchProjectTab(tab);
+  $("#project-title").textContent = name;
+  $("#project-subtitle").textContent = "正在加载项目详情…";
+  try {
+    const data = await api(`/api/workers/${encodeURIComponent(name)}`);
+    if (state.activeWorker !== name) return;
+    state.workerDetail = data;
+    renderWorkerDetail(data);
+    await Promise.all([loadDetailHistory(), tab === "logs" ? loadDetailLogs() : Promise.resolve()]);
+  } catch (error) {
+    toast(error.message, true);
+    switchView("workers");
+  }
+}
+
+async function loadDetailHistory() {
+  const name = state.activeWorker;
+  if (!name) return;
+  try {
+    const data = await api(`/api/workers/${encodeURIComponent(name)}/log`);
+    if (state.activeWorker !== name) return;
+    $("#detail-history").innerHTML = `<p class="muted"><span class="state-ok">✓ 哈希链验证通过</span> · ${data.entries.length} 个版本</p>${data.entries.slice().reverse().map((entry, index) => `<div class="history-entry"><div class="version">v${escapeHtml(entry.version)}</div><div>${escapeHtml(entry.hostnames?.join(", ") || "未配置域名")}<code>${escapeHtml(entry.digest)}</code></div>${!entry.deleted && index > 0 ? `<button class="mini-button" data-rollback-worker="${escapeHtml(name)}" data-rollback-version="${escapeHtml(entry.version)}">回滚</button>` : ""}</div>`).join("")}`;
+  } catch (error) {
+    $("#detail-history").innerHTML = `<div class="empty-state">${escapeHtml(error.message)}</div>`;
+  }
+}
+
+async function loadDetailLogs() {
+  const name = state.activeWorker;
+  if (!name) return;
+  $("#detail-logs").textContent = "正在读取运行日志…";
+  try {
+    const data = await api(`/api/workers/${encodeURIComponent(name)}/runtime-log?limit=500`);
+    if (state.activeWorker !== name) return;
+    const streams = { system: "系统", stdout: "标准输出", stderr: "标准错误" };
+    $("#detail-log-meta").textContent = `节点 ${shortId(data.node, 20)} · 最近 ${data.lines?.length || 0} 条`;
+    $("#detail-logs").textContent = (data.lines || []).map((line) => `${new Date(line.at_ms).toLocaleString("zh-CN")} [v${line.version}] [${streams[line.stream] || line.stream}] ${line.message}`).join("\n") || "当前节点尚未记录运行输出。";
+  } catch (error) {
+    $("#detail-logs").textContent = error.message;
+  }
+}
+
+async function updateWorkerSettings(payload, summary) {
+  const name = state.activeWorker;
+  if (!name) return;
+  try {
+    const result = await api(`/api/workers/${encodeURIComponent(name)}`, { method: "PATCH", body: JSON.stringify(payload) });
+    if (result.pending_approval) {
+      showApproval(result, summary);
+    } else {
+      toast(`${name} v${result.version} 已发布`);
+      await loadOverview({ quiet: true });
+      await openWorkerDetail(name, state.projectTab);
+    }
+  } catch (error) {
+    toast(error.message, true);
+  }
+}
+
+async function saveProjectDomains(event) {
+  event.preventDefault();
+  const hostnames = $("#project-hostnames").value.split(/\r?\n/).map((value) => value.trim()).filter(Boolean);
+  await updateWorkerSettings({ hostnames }, `更新 ${state.activeWorker} 的域名路由。`);
+}
+
+async function saveProjectSettings(event) {
+  event.preventDefault();
+  try {
+    const payload = {
+      env: linesToMap($("#project-env").value, "环境变量"),
+      kv_bindings: linesToMap($("#project-kv-bindings").value, "KV 绑定"),
+      crons: $("#project-crons").value.split(/\r?\n/).map((value) => value.trim()).filter(Boolean),
+      compatibility_date: $("#project-compatibility-date").value,
+    };
+    await updateWorkerSettings(payload, `更新 ${state.activeWorker} 的运行配置。`);
+  } catch (error) {
+    toast(error.message, true);
+  }
+}
+
+async function saveProjectSource(event) {
+  event.preventDefault();
+  const payload = {
+    worker: state.activeWorker,
+    repository: $("#project-source-repository").value.trim(),
+    branch: $("#project-source-branch").value.trim(),
+    root: $("#project-source-root").value.trim(),
+    build_command: $("#project-source-command").value,
+    output_dir: $("#project-source-output").value.trim(),
+    use_github_token: $("#project-source-private").checked,
+    webhook: $("#project-source-webhook").checked,
+  };
+  try {
+    const result = await api("/api/sources", { method: "POST", body: JSON.stringify(payload) });
+    showApproval(result, `保存 ${payload.worker} 的 GitHub 代码源配置。`);
+  } catch (error) {
+    toast(error.message, true);
+  }
 }
 
 async function loadWorkerOps({ quiet = true } = {}) {
@@ -387,6 +604,7 @@ async function triggerBuild(worker) {
     const result = await api(`/api/workers/${encodeURIComponent(worker)}/build`, { method: "POST", body: "{}" });
     toast(`${worker} 的构建任务已进入队列`);
     await loadWorkerOps();
+    if (state.activeWorker === worker) switchProjectTab("deployments");
     openBuildLog(result.job.id);
   } catch (error) {
     toast(error.message, true);
@@ -515,6 +733,11 @@ async function deleteWorker(name) {
       showApproval(result, `管理员批准后，${name} 将被标记为已删除。`);
     } else {
       toast(`${name} 已在 v${result.version} 写入删除标记`);
+      if (state.activeWorker === name) {
+        state.activeWorker = null;
+        state.workerDetail = null;
+        switchView("workers");
+      }
       await loadOverview({ quiet: true });
     }
   } catch (error) {
@@ -587,6 +810,7 @@ async function pollApproval(id) {
       toast(result.summary || "集群变更已提交");
       await loadOverview({ quiet: true });
       await loadWorkerOps();
+      if (state.activeWorker) await openWorkerDetail(state.activeWorker, state.projectTab);
       return;
     }
     if (result.state === "failed") {
@@ -761,7 +985,7 @@ async function boot() {
     $("#security-copy").innerHTML = consoleMode === "public"
       ? "此节点不保存<br>任何私钥。"
       : "密钥仅保留在本地<br>控制台进程中。";
-    $$("#deploy-form button, #source-form button, #kv-editor-form button, #d1-create-form button, #d1-exec-form button")
+    $$("#deploy-form button, #source-form button, #kv-editor-form button, #d1-create-form button, #d1-exec-form button, #project-domains-form button, #project-settings-form button, #project-source-form button, #project-redeploy, #project-delete")
       .forEach((button) => { button.disabled = state.session.read_only; });
     await loadOverview({ quiet: true });
     await loadWorkerOps();
@@ -779,6 +1003,35 @@ async function boot() {
 
 $$(".nav-item").forEach((button) => button.addEventListener("click", () => switchView(button.dataset.view)));
 $$('[data-go]').forEach((button) => button.addEventListener("click", () => switchView(button.dataset.go)));
+$("#overview-workers").addEventListener("click", (event) => {
+  const button = event.target.closest("[data-open-worker]");
+  if (button) openWorkerDetail(button.dataset.openWorker);
+});
+$("#new-project").addEventListener("click", () => {
+  $("#create-project-panel").open = true;
+  $("#create-project-panel").scrollIntoView({ behavior: "smooth", block: "start" });
+  setTimeout(() => $("#source-worker").focus(), 300);
+});
+$("#project-back").addEventListener("click", () => {
+  state.activeWorker = null;
+  state.workerDetail = null;
+  switchView("workers");
+});
+$$("[data-project-tab]").forEach((button) => button.addEventListener("click", () => switchProjectTab(button.dataset.projectTab)));
+$("#project-redeploy").addEventListener("click", () => {
+  if (state.sources.some((source) => source.worker === state.activeWorker)) {
+    triggerBuild(state.activeWorker);
+  } else {
+    switchProjectTab("settings");
+    $("#project-source-repository").focus();
+    toast("请先连接 GitHub 仓库，再触发自动构建", true);
+  }
+});
+$("#project-domains-form").addEventListener("submit", saveProjectDomains);
+$("#project-settings-form").addEventListener("submit", saveProjectSettings);
+$("#project-source-form").addEventListener("submit", saveProjectSource);
+$("#project-delete").addEventListener("click", () => state.activeWorker && deleteWorker(state.activeWorker));
+$("#detail-refresh-logs").addEventListener("click", loadDetailLogs);
 $("#refresh").addEventListener("click", () => loadOverview());
 $("#deploy-form").addEventListener("submit", deployWorker);
 $("#deploy-file-picker").addEventListener("click", () => $("#deploy-files").click());
@@ -813,6 +1066,7 @@ $("#logout").addEventListener("click", async () => {
 $("#workers-table").addEventListener("click", (event) => {
   const button = event.target.closest("button[data-action]");
   if (!button) return;
+  if (button.dataset.action === "open-worker") openWorkerDetail(button.dataset.worker);
   if (button.dataset.action === "history") loadHistory(button.dataset.worker);
   if (button.dataset.action === "runtime") openRuntimeLog(button.dataset.worker);
   if (button.dataset.action === "delete-worker") deleteWorker(button.dataset.worker);
@@ -829,6 +1083,16 @@ $("#build-list").addEventListener("click", (event) => {
   if (!button) return;
   if (button.dataset.buildAction === "log") openBuildLog(button.dataset.build);
   if (button.dataset.buildAction === "approve") approveBuild(button.dataset.build, button.dataset.node);
+});
+$("#detail-builds").addEventListener("click", (event) => {
+  const button = event.target.closest("button[data-build-action]");
+  if (!button) return;
+  if (button.dataset.buildAction === "log") openBuildLog(button.dataset.build);
+  if (button.dataset.buildAction === "approve") approveBuild(button.dataset.build, button.dataset.node);
+});
+$("#detail-history").addEventListener("click", (event) => {
+  const button = event.target.closest("button[data-rollback-worker]");
+  if (button) rollbackWorker(button.dataset.rollbackWorker, button.dataset.rollbackVersion);
 });
 $("#history-content").addEventListener("click", (event) => {
   const button = event.target.closest("button[data-rollback-worker]");
