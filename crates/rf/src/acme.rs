@@ -21,7 +21,8 @@ use crate::dns::DnsApi;
 use crate::node::{now_ms, Node, NodeEvent};
 use anyhow::{bail, Context, Result};
 use instant_acme::{
-    Account, AuthorizationStatus, ChallengeType, Identifier, NewAccount, NewOrder, RetryPolicy,
+    Account, AuthorizationStatus, AuthorizedIdentifier, ChallengeType, Identifier, NewAccount,
+    NewOrder, OrderStatus, RetryPolicy,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
@@ -54,6 +55,21 @@ pub fn file_stem(hostname: &str) -> String {
 
 pub fn cert_kv_key(hostname: &str) -> String {
     format!("cert/{}", file_stem(hostname))
+}
+
+/// RFC 8555 represents a wildcard authorization as the base DNS name plus a
+/// separate `wildcard` flag. `AuthorizedIdentifier`'s Display implementation
+/// intentionally adds `*.` back for humans, but DNS-01 must always publish at
+/// `_acme-challenge.<base-name>`.
+fn dns_challenge_record(identifier: &AuthorizedIdentifier<'_>) -> Result<String> {
+    let Identifier::Dns(name) = identifier.identifier else {
+        bail!("dns-01 authorization did not contain a DNS identifier");
+    };
+    let name = name.trim().trim_end_matches('.').to_ascii_lowercase();
+    if name.is_empty() || name.contains('*') {
+        bail!("invalid DNS authorization identifier");
+    }
+    Ok(format!("_acme-challenge.{name}"))
 }
 
 fn needs_renewal(node: &Node, hostname: &str) -> bool {
@@ -216,7 +232,7 @@ async fn issue(node: &Node, cfg: &AcmeConfig, dns: &DnsApi, hostname: &str) -> R
             let mut challenge = authz
                 .challenge(ChallengeType::Dns01)
                 .ok_or_else(|| anyhow::anyhow!("no dns-01 challenge offered"))?;
-            let record = format!("_acme-challenge.{}", challenge.identifier());
+            let record = dns_challenge_record(challenge.identifier())?;
             let value = challenge.key_authorization().dns_value();
             dns.create_txt_record(&record, &value)
                 .await
@@ -235,7 +251,44 @@ async fn issue(node: &Node, cfg: &AcmeConfig, dns: &DnsApi, hostname: &str) -> R
     }
 
     let result = async {
-        order.poll_ready(&RetryPolicy::default()).await?;
+        let status = order.poll_ready(&RetryPolicy::default()).await?;
+        if status != OrderStatus::Ready {
+            let mut reasons = Vec::new();
+            let mut authorizations = order.authorizations();
+            while let Some(result) = authorizations.next().await {
+                match result {
+                    Ok(mut authz) => {
+                        if let Err(error) = authz.refresh().await {
+                            reasons.push(format!("authorization refresh failed: {error}"));
+                            continue;
+                        }
+                        let identifier = authz.identifier().to_string();
+                        let reason_count = reasons.len();
+                        for challenge in &authz.challenges {
+                            if let Some(error) = &challenge.error {
+                                reasons.push(format!(
+                                    "{identifier} {:?} challenge: {error}",
+                                    challenge.r#type
+                                ));
+                            }
+                        }
+                        if reasons.len() == reason_count {
+                            reasons.push(format!(
+                                "{identifier} authorization status {:?}",
+                                authz.status
+                            ));
+                        }
+                    }
+                    Err(error) => reasons.push(format!("authorization lookup failed: {error}")),
+                }
+            }
+            let detail = if reasons.is_empty() {
+                "ACME server returned no authorization details".to_string()
+            } else {
+                reasons.join("; ")
+            };
+            bail!("ACME order became {status:?}: {detail}");
+        }
         let key_pem = order.finalize().await?;
         let cert_pem = order.poll_certificate(&RetryPolicy::default()).await?;
         Ok::<(String, String), anyhow::Error>((cert_pem, key_pem))
@@ -279,5 +332,18 @@ mod tests {
             "_wildcard.edge.example.com"
         );
         assert_eq!(cert_kv_key("*.x.y"), "cert/_wildcard.x.y");
+    }
+
+    #[test]
+    fn wildcard_dns_challenge_uses_base_identifier() {
+        let identifier = Identifier::Dns("FreeChip.EU.org.".to_string());
+        assert_eq!(
+            dns_challenge_record(&identifier.authorized(true)).unwrap(),
+            "_acme-challenge.freechip.eu.org"
+        );
+        assert_eq!(
+            dns_challenge_record(&identifier.authorized(false)).unwrap(),
+            "_acme-challenge.freechip.eu.org"
+        );
     }
 }
