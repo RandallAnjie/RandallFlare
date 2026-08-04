@@ -222,6 +222,14 @@ async fn issue(node: &Node, cfg: &AcmeConfig, dns: &DnsApi, hostname: &str) -> R
                 .await
                 .context("creating TXT")?;
             txt_created.push((record, value));
+            if cfg.dns_propagation_seconds > 0 {
+                tracing::info!(
+                    seconds = cfg.dns_propagation_seconds,
+                    hostname,
+                    "acme: waiting for DNS-01 propagation"
+                );
+                tokio::time::sleep(Duration::from_secs(cfg.dns_propagation_seconds)).await;
+            }
             challenge.set_ready().await?;
         }
     }
