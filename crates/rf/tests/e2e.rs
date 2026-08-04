@@ -437,7 +437,8 @@ async fn module_worker_on_real_workerd() {
         dir.join("rf.json"),
         r#"{"name":"api","main":"index.js","hostnames":["api.test"],
             "env":{"GREETING":"hi from env"},"kv":{"CACHE":"ns1"},
-            "d1":{"DB":"worker-db"},"queues":{"EVENTS":"events"}}"#,
+            "d1":{"DB":"worker-db"},"queues":{"EVENTS":"events"},
+            "analytics":{"METRICS":"web-metrics"}}"#,
     )
     .unwrap();
     std::fs::write(
@@ -488,6 +489,14 @@ async fn module_worker_on_real_workerd() {
       await env.EVENTS.send({ id: "dead", mode: "always-retry" });
       return new Response("queued");
     }
+    if (url.pathname === "/analytics") {
+      env.METRICS.writeDataPoint({
+        blobs: ["pageview", "/analytics"],
+        doubles: [42.5, 9],
+        indexes: ["visitor-e2e"],
+      });
+      return new Response("recorded");
+    }
     return new Response("module worker up");
   },
   async queue(batch, env, context) {
@@ -530,6 +539,23 @@ async fn module_worker_on_real_workerd() {
         .post_resource(
             &n.api,
             &rf_core::envelope::Envelope::seal_any(&queue_record, &op_any),
+        )
+        .await
+        .unwrap();
+    let analytics_record = rf::analytics::prepare_dataset_after(
+        "web-metrics",
+        rf::analytics::DatasetSpec {
+            description: "真实 workerd 指标".into(),
+            retention_days: Some(30),
+        },
+        false,
+        None,
+    )
+    .unwrap();
+    client
+        .post_resource(
+            &n.api,
+            &rf_core::envelope::Envelope::seal_any(&analytics_record, &op_any),
         )
         .await
         .unwrap();
@@ -632,6 +658,42 @@ async fn module_worker_on_real_workerd() {
     assert_eq!(d1["all"]["results"][1]["name"], "Randall");
     assert_eq!(d1["batch"][1]["results"][0]["id"], 1);
     assert_eq!(d1["raw"][0], serde_json::json!(["id", "name"]));
+    let analytics_response = http
+        .get(format!("http://127.0.0.1:{}/analytics", n.ingress))
+        .header("host", "api.test")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(analytics_response.text().await.unwrap(), "recorded");
+    let deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        let events = client
+            .analytics_recent(&n.api, "web-metrics", None, 10)
+            .await
+            .unwrap_or_default();
+        if let Some(event) = events.first() {
+            assert_eq!(event.blobs, ["pageview", "/analytics"]);
+            assert_eq!(event.doubles, [42.5, 9.0]);
+            assert_eq!(event.indexes, ["visitor-e2e"]);
+            let stats = client.analytics_stats(&n.api, "web-metrics").await.unwrap();
+            assert_eq!(stats.last_hour, 1);
+            assert_eq!(stats.last_24_hours, 1);
+            assert_eq!(stats.total, 1);
+            let groups = client
+                .analytics_group(&n.api, "web-metrics", "blob", 0, Some(0), 0, 10)
+                .await
+                .unwrap();
+            assert_eq!(groups[0].key, "pageview");
+            assert_eq!(groups[0].count, 1);
+            assert_eq!(groups[0].sum, Some(42.5));
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "Analytics Worker binding did not persist its waitUntil write"
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
     let queued = http
         .get(format!("http://127.0.0.1:{}/queue-send", n.ingress))
         .header("host", "api.test")

@@ -104,6 +104,12 @@ pub fn router(api: Api) -> Router {
         .route("/v1/queue/{queue}/stats", get(queue_stats))
         .route("/v1/queue/{queue}/dead", get(queue_dead_letters))
         .route("/v1/queue/{queue}/dead/{id}/redrive", post(queue_redrive))
+        .route(
+            "/v1/analytics/{dataset}/events",
+            post(analytics_write).get(analytics_recent),
+        )
+        .route("/v1/analytics/{dataset}/stats", get(analytics_stats))
+        .route("/v1/analytics/{dataset}/group", get(analytics_group))
         .route("/v1/do/{worker}/proxy", post(do_proxy))
         .route("/v1/r2/{bucket}", get(r2_list))
         .route("/v1/r2-blob/{sha}", get(r2_blob_get))
@@ -405,7 +411,10 @@ async fn status(
         .into_iter()
         .filter_map(|key| key.strip_prefix("d1/").map(str::to_string))
         .filter(|name| {
-            !name.starts_with("r2-") && !name.starts_with("rfdo-") && !name.starts_with("queue-")
+            !name.starts_with("r2-")
+                && !name.starts_with("rfdo-")
+                && !name.starts_with("queue-")
+                && !name.starts_with("analytics-")
         })
         .collect();
     let buckets: Vec<serde_json::Value> = crate::r2::bucket_records(node)
@@ -430,6 +439,17 @@ async fn status(
             })
         })
         .collect();
+    let analytics_datasets: Vec<serde_json::Value> = crate::analytics::dataset_records(node)
+        .into_iter()
+        .map(|(view, spec)| {
+            serde_json::json!({
+                "name": view.resource.name,
+                "version": view.resource.version,
+                "digest": view.digest,
+                "spec": spec,
+            })
+        })
+        .collect();
     axum::Json(serde_json::json!({
         "node": node.id_hex(),
         "label": node.cfg.label,
@@ -443,6 +463,7 @@ async fn status(
         "databases": databases,
         "r2_buckets": buckets,
         "queues": queues,
+        "analytics_datasets": analytics_datasets,
         "storage": {
             "local": true,
             "rclone": node.cfg.storage.rclone_binary.is_some(),
@@ -1063,6 +1084,125 @@ async fn queue_redrive(
     match crate::queue::redrive_dead_letter(&api.node, &queue, &id).await {
         Ok(true) => axum::Json(serde_json::json!({ "ok": true })).into_response(),
         Ok(false) => (StatusCode::NOT_FOUND, "dead letter not found").into_response(),
+        Err(error) => (StatusCode::UNPROCESSABLE_ENTITY, error.to_string()).into_response(),
+    }
+}
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AnalyticsWriteReq {
+    points: Vec<crate::analytics::DataPoint>,
+}
+
+#[derive(serde::Deserialize)]
+struct AnalyticsRecentQuery {
+    before: Option<u64>,
+    limit: Option<usize>,
+}
+
+#[derive(serde::Deserialize)]
+struct AnalyticsGroupQuery {
+    #[serde(default = "default_analytics_dimension")]
+    dimension: String,
+    #[serde(default)]
+    dimension_index: usize,
+    double_index: Option<usize>,
+    #[serde(default)]
+    since: u64,
+    limit: Option<usize>,
+}
+
+fn default_analytics_dimension() -> String {
+    "blob".into()
+}
+
+async fn analytics_write(
+    State(api): State<Api>,
+    ConnectInfo(remote): ConnectInfo<SocketAddr>,
+    Path(dataset): Path<String>,
+    method: Method,
+    uri: Uri,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    if let Err(response) = check(&api, &remote, &headers, &method, &uri, &body) {
+        return response.into_response();
+    }
+    let Ok(request) = serde_json::from_slice::<AnalyticsWriteReq>(&body) else {
+        return (StatusCode::BAD_REQUEST, "bad Analytics write request").into_response();
+    };
+    match crate::analytics::write(&api.node, &dataset, request.points).await {
+        Ok(written) => axum::Json(serde_json::json!({ "written": written })).into_response(),
+        Err(error) => (StatusCode::UNPROCESSABLE_ENTITY, error.to_string()).into_response(),
+    }
+}
+
+async fn analytics_recent(
+    State(api): State<Api>,
+    ConnectInfo(remote): ConnectInfo<SocketAddr>,
+    Path(dataset): Path<String>,
+    Query(query): Query<AnalyticsRecentQuery>,
+    method: Method,
+    uri: Uri,
+    headers: HeaderMap,
+) -> Response {
+    if let Err(response) = check(&api, &remote, &headers, &method, &uri, b"") {
+        return response.into_response();
+    }
+    match crate::analytics::recent(
+        &api.node,
+        &dataset,
+        query.before,
+        query.limit.unwrap_or(100),
+    )
+    .await
+    {
+        Ok(events) => axum::Json(serde_json::json!({ "events": events })).into_response(),
+        Err(error) => (StatusCode::UNPROCESSABLE_ENTITY, error.to_string()).into_response(),
+    }
+}
+
+async fn analytics_stats(
+    State(api): State<Api>,
+    ConnectInfo(remote): ConnectInfo<SocketAddr>,
+    Path(dataset): Path<String>,
+    method: Method,
+    uri: Uri,
+    headers: HeaderMap,
+) -> Response {
+    if let Err(response) = check(&api, &remote, &headers, &method, &uri, b"") {
+        return response.into_response();
+    }
+    match crate::analytics::stats(&api.node, &dataset).await {
+        Ok(stats) => axum::Json(stats).into_response(),
+        Err(error) => (StatusCode::UNPROCESSABLE_ENTITY, error.to_string()).into_response(),
+    }
+}
+
+async fn analytics_group(
+    State(api): State<Api>,
+    ConnectInfo(remote): ConnectInfo<SocketAddr>,
+    Path(dataset): Path<String>,
+    Query(query): Query<AnalyticsGroupQuery>,
+    method: Method,
+    uri: Uri,
+    headers: HeaderMap,
+) -> Response {
+    if let Err(response) = check(&api, &remote, &headers, &method, &uri, b"") {
+        return response.into_response();
+    }
+    match crate::analytics::group_by(
+        &api.node,
+        &dataset,
+        &query.dimension,
+        query.dimension_index,
+        query.double_index,
+        query.since,
+        query.limit.unwrap_or(20),
+    )
+    .await
+    {
+        Ok(groups) => axum::Json(serde_json::json!({ "groups": groups })).into_response(),
         Err(error) => (StatusCode::UNPROCESSABLE_ENTITY, error.to_string()).into_response(),
     }
 }

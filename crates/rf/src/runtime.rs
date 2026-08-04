@@ -287,10 +287,13 @@ impl Runtime {
         let config = generate_config(
             m,
             port,
-            self.node.kvbind_port(),
-            self.node.r2bind_port(),
-            self.node.d1bind_port(),
-            self.node.qbind_port(),
+            BindingPorts {
+                kv: self.node.kvbind_port(),
+                r2: self.node.r2bind_port(),
+                d1: self.node.d1bind_port(),
+                queue: self.node.qbind_port(),
+                analytics: self.node.analyticsbind_port(),
+            },
             &durable_dir,
         );
         std::fs::write(dir.join("config.capnp"), config)?;
@@ -432,6 +435,12 @@ fn rf_entry_source(
             .collect::<Vec<_>>(),
     )
     .expect("queue binding names are serializable");
+    let analytics_names = serde_json::to_string(
+        &crate::deploy::analytics_bindings(manifest)
+            .keys()
+            .collect::<Vec<_>>(),
+    )
+    .expect("Analytics binding names are serializable");
     let event_token = serde_json::to_string(event_token).expect("event token is serializable");
     let mut durable_wrappers = String::new();
     let mut seen = std::collections::BTreeSet::new();
@@ -447,6 +456,7 @@ fn rf_entry_source(
         .replace("__RF_USER_IMPORT__", &import_literal)
         .replace("__RF_D1_BINDING_NAMES__", &binding_names)
         .replace("__RF_QUEUE_BINDING_NAMES__", &queue_names)
+        .replace("__RF_ANALYTICS_BINDING_NAMES__", &analytics_names)
         .replace("__RF_EVENT_TOKEN__", &event_token)
         .replace("__RF_DURABLE_WRAPPERS__", &durable_wrappers)
 }
@@ -526,10 +536,43 @@ class RandallFlareQueue {
   }
 }
 
+class RandallFlareAnalyticsDataset {
+  constructor(service, context) { this._service = service; this._context = context; }
+  async _write(points) {
+    const response = await this._service.fetch("http://analytics-binding/", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ points }),
+    });
+    if (!response.ok) throw new Error("ANALYTICS_ERROR: " + response.status + " " + await response.text());
+  }
+  writeDataPoint(point = {}) {
+    if (point === null || typeof point !== "object" || Array.isArray(point)) {
+      throw new TypeError("Analytics writeDataPoint() expects an object");
+    }
+    const timestamp = point.ts_ms ?? point.ts ?? point.timestamp;
+    const normalized = {
+      blobs: Array.isArray(point.blobs) ? point.blobs.map(String) : [],
+      doubles: Array.isArray(point.doubles) ? point.doubles.map(Number) : [],
+      indexes: Array.isArray(point.indexes) ? point.indexes.map(String) : [],
+    };
+    if (timestamp !== undefined && timestamp !== null) {
+      normalized.ts_ms = timestamp instanceof Date ? timestamp.getTime() : Number(timestamp);
+    }
+    const pending = this._write([normalized]);
+    if (this._context && typeof this._context.waitUntil === "function") {
+      this._context.waitUntil(pending);
+      return;
+    }
+    return pending;
+  }
+}
+
 const __rfD1Names = __RF_D1_BINDING_NAMES__;
 const __rfQueueNames = __RF_QUEUE_BINDING_NAMES__;
+const __rfAnalyticsNames = __RF_ANALYTICS_BINDING_NAMES__;
 const __rfEventToken = __RF_EVENT_TOKEN__;
-function __rfWrapEnv(env) {
+function __rfWrapEnv(env, context) {
   const wrapped = Object.create(env);
   for (const name of __rfD1Names) {
     Object.defineProperty(wrapped, name, {
@@ -539,6 +582,11 @@ function __rfWrapEnv(env) {
   for (const name of __rfQueueNames) {
     Object.defineProperty(wrapped, name, {
       value: new RandallFlareQueue(env[name]), enumerable: true, configurable: false,
+    });
+  }
+  for (const name of __rfAnalyticsNames) {
+    Object.defineProperty(wrapped, name, {
+      value: new RandallFlareAnalyticsDataset(env[name], context), enumerable: true, configurable: false,
     });
   }
   return wrapped;
@@ -590,7 +638,7 @@ async function __rfQueueEvent(request, env, context) {
     },
   };
   try {
-    await __rfUserDefault.queue(batch, __rfWrapEnv(env), eventContext);
+    await __rfUserDefault.queue(batch, __rfWrapEnv(env, eventContext), eventContext);
     await Promise.all(pending);
   } catch (error) {
     return new Response(String(error && error.stack || error), { status: 500 });
@@ -609,33 +657,46 @@ __rfOut.fetch = (request, env, context) => {
     return __rfQueueEvent(request, env, context);
   }
   if (__rfUserDefault && typeof __rfUserDefault.fetch === "function") {
-    return __rfUserDefault.fetch(request, __rfWrapEnv(env), context);
+    return __rfUserDefault.fetch(request, __rfWrapEnv(env, context), context);
   }
   return new Response("Not Found", { status: 404 });
 };
 if (__rfUserDefault && typeof __rfUserDefault.scheduled === "function") {
-  __rfOut.scheduled = (event, env, context) => __rfUserDefault.scheduled(event, __rfWrapEnv(env), context);
+  __rfOut.scheduled = (event, env, context) => __rfUserDefault.scheduled(event, __rfWrapEnv(env, context), context);
 }
 if (__rfUserDefault && typeof __rfUserDefault.queue === "function") {
-  __rfOut.queue = (batch, env, context) => __rfUserDefault.queue(batch, __rfWrapEnv(env), context);
+  __rfOut.queue = (batch, env, context) => __rfUserDefault.queue(batch, __rfWrapEnv(env, context), context);
 }
 if (__rfUserDefault && typeof __rfUserDefault.email === "function") {
-  __rfOut.email = (message, env, context) => __rfUserDefault.email(message, __rfWrapEnv(env), context);
+  __rfOut.email = (message, env, context) => __rfUserDefault.email(message, __rfWrapEnv(env, context), context);
 }
 export default __rfOut;
 __RF_DURABLE_WRAPPERS__
 "#;
 
 /// Emit the workerd capnp config for one worker.
+#[derive(Debug, Clone, Copy)]
+pub struct BindingPorts {
+    pub kv: u16,
+    pub r2: u16,
+    pub d1: u16,
+    pub queue: u16,
+    pub analytics: u16,
+}
+
 pub fn generate_config(
     m: &WorkerManifest,
     port: u16,
-    kvbind_port: u16,
-    r2bind_port: u16,
-    d1bind_port: u16,
-    qbind_port: u16,
+    binding_ports: BindingPorts,
     durable_dir: &std::path::Path,
 ) -> String {
+    let BindingPorts {
+        kv: kvbind_port,
+        r2: r2bind_port,
+        d1: d1bind_port,
+        queue: qbind_port,
+        analytics: analyticsbind_port,
+    } = binding_ports;
     let mut modules = String::new();
     modules
         .push_str("        (name = \"__rf_entry.js\", esModule = embed \"src/__rf_entry.js\"),\n");
@@ -660,6 +721,7 @@ pub fn generate_config(
             || k == crate::deploy::R2_METADATA_ENV
             || k == crate::deploy::D1_METADATA_ENV
             || k == crate::deploy::QUEUE_METADATA_ENV
+            || k == crate::deploy::ANALYTICS_METADATA_ENV
         {
             continue;
         }
@@ -735,6 +797,22 @@ pub fn generate_config(
             queue = capnp_string(&queue),
         ));
     }
+    let mut analytics_services = String::new();
+    for (binding, dataset) in crate::deploy::analytics_bindings(m) {
+        let service = format!("analytics-{binding}");
+        bindings.push_str(&format!(
+            "        (name = {binding}, service = {service}),\n",
+            binding = capnp_string(&binding),
+            service = capnp_string(&service),
+        ));
+        analytics_services.push_str(&format!(
+            "    (name = {service}, external = (address = \"127.0.0.1:{analyticsbind_port}\", \
+             http = (injectRequestHeaders = [(name = \"{dataset_header}\", value = {dataset})]))),\n",
+            service = capnp_string(&service),
+            dataset_header = crate::analyticsbind::DATASET_HEADER,
+            dataset = capnp_string(&dataset),
+        ));
+    }
     let durable_objects = crate::deploy::durable_objects(m);
     let mut durable_namespaces = String::new();
     let mut seen_durable = std::collections::BTreeSet::new();
@@ -781,7 +859,7 @@ const config :Workerd.Config = (
       bindings = [
 {bindings}      ],
 {durable_worker}    )),
-{kv_services}{r2_services}{d1_services}{queue_services}{durable_service}  ],
+{kv_services}{r2_services}{d1_services}{queue_services}{analytics_services}{durable_service}  ],
   sockets = [
     (name = "http", address = "127.0.0.1:{port}", http = (), service = "main"),
   ],
@@ -859,13 +937,24 @@ mod tests {
             )]))
             .unwrap(),
         );
+        m.env.insert(
+            crate::deploy::ANALYTICS_METADATA_ENV.into(),
+            serde_json::to_string(&BTreeMap::from([(
+                "METRICS".to_string(),
+                "web-metrics".to_string(),
+            )]))
+            .unwrap(),
+        );
         let cfg = generate_config(
             &m,
             30111,
-            7382,
-            7383,
-            7384,
-            7385,
+            BindingPorts {
+                kv: 7382,
+                r2: 7383,
+                d1: 7384,
+                queue: 7385,
+                analytics: 7386,
+            },
             std::path::Path::new("/tmp/rf-do"),
         );
         assert!(cfg.contains("esModule = embed \"src/index.js\""));
@@ -885,6 +974,9 @@ mod tests {
         assert!(cfg.contains("(name = \"EVENTS\", service = \"queue-EVENTS\")"));
         assert!(cfg.contains("address = \"127.0.0.1:7385\""));
         assert!(cfg.contains("x-rf-queue\", value = \"events\""));
+        assert!(cfg.contains("(name = \"METRICS\", service = \"analytics-METRICS\")"));
+        assert!(cfg.contains("address = \"127.0.0.1:7386\""));
+        assert!(cfg.contains("x-rf-analytics-dataset\", value = \"web-metrics\""));
         assert!(cfg.contains("compatibilityDate = \"2026-07-31\""));
         assert!(cfg.contains("durableObjectNamespace = (className = \"Counter\")"));
         assert!(cfg.contains("uniqueKey = \"rf--w--Counter\", enableSql = true"));
@@ -922,6 +1014,14 @@ mod tests {
             serde_json::to_string(&BTreeMap::from([("JOBS".to_string(), "jobs".to_string())]))
                 .unwrap(),
         );
+        manifest.env.insert(
+            crate::deploy::ANALYTICS_METADATA_ENV.into(),
+            serde_json::to_string(&BTreeMap::from([(
+                "METRICS".to_string(),
+                "web-metrics".to_string(),
+            )]))
+            .unwrap(),
+        );
         let source = rf_entry_source(
             &manifest,
             &crate::deploy::d1_bindings(&manifest),
@@ -929,10 +1029,13 @@ mod tests {
         );
         assert!(source.contains("new RandallFlareD1Database(env[name])"));
         assert!(source.contains("new RandallFlareQueue(env[name])"));
+        assert!(source.contains("new RandallFlareAnalyticsDataset(env[name], context)"));
         assert!(source.contains("test-token"));
         assert!(source.contains("/.rf/internal/queue"));
         assert!(source.contains("export class Counter extends __rfUserModule.Counter"));
-        assert!(source.contains("__rfUserDefault.fetch(request, __rfWrapEnv(env), context)"));
+        assert!(
+            source.contains("__rfUserDefault.fetch(request, __rfWrapEnv(env, context), context)")
+        );
     }
 
     fn tests_manifest() -> WorkerManifest {

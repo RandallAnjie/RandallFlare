@@ -87,6 +87,7 @@ pub struct Inner {
     pub r2bind_port: u16,
     pub d1bind_port: u16,
     pub qbind_port: u16,
+    pub analyticsbind_port: u16,
     /// Per-process unguessable tokens used only for rf → workerd event
     /// delivery. They are regenerated on every Worker start and never gossip.
     pub worker_event_tokens: HashMap<String, String>,
@@ -102,6 +103,7 @@ pub struct Node {
     pub inner: Mutex<Inner>,
     r2_schemas: Mutex<HashSet<String>>,
     queue_schemas: Mutex<HashSet<String>>,
+    analytics_schemas: Mutex<HashSet<String>>,
     events: broadcast::Sender<NodeEvent>,
 }
 
@@ -143,6 +145,7 @@ impl Node {
             r2bind_port: 0,
             d1bind_port: 0,
             qbind_port: 0,
+            analyticsbind_port: 0,
             worker_event_tokens: HashMap::new(),
         };
         // Hydrate: static stability means booting entirely from disk.
@@ -171,6 +174,7 @@ impl Node {
             inner: Mutex::new(inner),
             r2_schemas: Mutex::new(HashSet::new()),
             queue_schemas: Mutex::new(HashSet::new()),
+            analytics_schemas: Mutex::new(HashSet::new()),
             events,
         })
     }
@@ -827,6 +831,14 @@ impl Node {
         self.inner.lock().unwrap().qbind_port
     }
 
+    pub fn set_analyticsbind_port(&self, port: u16) {
+        self.inner.lock().unwrap().analyticsbind_port = port;
+    }
+
+    pub fn analyticsbind_port(&self) -> u16 {
+        self.inner.lock().unwrap().analyticsbind_port
+    }
+
     pub fn set_worker_event_token(&self, worker: &str, token: String) {
         self.inner
             .lock()
@@ -866,6 +878,14 @@ impl Node {
 
     pub(crate) fn mark_queue_schema_ready(&self, database: String) {
         self.queue_schemas.lock().unwrap().insert(database);
+    }
+
+    pub(crate) fn analytics_schema_ready(&self, database: &str) -> bool {
+        self.analytics_schemas.lock().unwrap().contains(database)
+    }
+
+    pub(crate) fn mark_analytics_schema_ready(&self, database: String) {
+        self.analytics_schemas.lock().unwrap().insert(database);
     }
 
     /// Periodic GC of dead claims + KV tombstones.

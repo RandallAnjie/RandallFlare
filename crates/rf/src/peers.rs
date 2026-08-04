@@ -572,6 +572,91 @@ impl PeerClient {
         }
     }
 
+    pub async fn analytics_write(
+        &self,
+        base: &str,
+        dataset: &str,
+        points: &[crate::analytics::DataPoint],
+    ) -> Result<usize> {
+        let raw = self
+            .post(
+                base,
+                &format!("/v1/analytics/{}/events", component(dataset)),
+                serde_json::to_vec(&serde_json::json!({ "points": points }))?,
+            )
+            .await?;
+        let response: serde_json::Value = serde_json::from_slice(&raw)?;
+        Ok(response["written"].as_u64().unwrap_or(0) as usize)
+    }
+
+    pub async fn analytics_recent(
+        &self,
+        base: &str,
+        dataset: &str,
+        before: Option<u64>,
+        limit: usize,
+    ) -> Result<Vec<crate::analytics::AnalyticsEvent>> {
+        let mut path = format!(
+            "/v1/analytics/{}/events?limit={}",
+            component(dataset),
+            limit.clamp(1, 1_000)
+        );
+        if let Some(before) = before {
+            path.push_str(&format!("&before={before}"));
+        }
+        let raw = self.get(base, &path).await?;
+        let response: serde_json::Value = serde_json::from_slice(&raw)?;
+        Ok(serde_json::from_value(
+            response
+                .get("events")
+                .cloned()
+                .unwrap_or_else(|| serde_json::json!([])),
+        )?)
+    }
+
+    pub async fn analytics_stats(
+        &self,
+        base: &str,
+        dataset: &str,
+    ) -> Result<crate::analytics::DatasetStats> {
+        let raw = self
+            .get(base, &format!("/v1/analytics/{}/stats", component(dataset)))
+            .await?;
+        Ok(serde_json::from_slice(&raw)?)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn analytics_group(
+        &self,
+        base: &str,
+        dataset: &str,
+        dimension: &str,
+        dimension_index: usize,
+        double_index: Option<usize>,
+        since: u64,
+        limit: usize,
+    ) -> Result<Vec<crate::analytics::DimensionGroup>> {
+        let mut path = format!(
+            "/v1/analytics/{}/group?dimension={}&dimension_index={}&since={}&limit={}",
+            component(dataset),
+            component(dimension),
+            dimension_index,
+            since,
+            limit.clamp(1, 100)
+        );
+        if let Some(index) = double_index {
+            path.push_str(&format!("&double_index={index}"));
+        }
+        let raw = self.get(base, &path).await?;
+        let response: serde_json::Value = serde_json::from_slice(&raw)?;
+        Ok(serde_json::from_value(
+            response
+                .get("groups")
+                .cloned()
+                .unwrap_or_else(|| serde_json::json!([])),
+        )?)
+    }
+
     /// Execute SQL against a D1 database, following leader hints
     /// (bounded) — callers can point at ANY cluster node.
     pub async fn d1_exec(

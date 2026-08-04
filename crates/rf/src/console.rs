@@ -237,6 +237,14 @@ pub fn router(state: ConsoleState) -> Router {
         .route("/api/queues/{name}/messages", post(queue_send))
         .route("/api/queues/{name}/dead", get(queue_dead_letters))
         .route("/api/queues/{name}/dead/{id}/redrive", post(queue_redrive))
+        .route("/api/analytics", get(analytics_list).post(analytics_apply))
+        .route("/api/analytics/{name}", delete(analytics_delete))
+        .route(
+            "/api/analytics/{name}/events",
+            get(analytics_recent).post(analytics_write),
+        )
+        .route("/api/analytics/{name}/stats", get(analytics_stats))
+        .route("/api/analytics/{name}/group", get(analytics_group))
         .route("/api/auth/logout", post(logout))
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
@@ -707,6 +715,8 @@ struct WorkerSettingsRequest {
     #[serde(default)]
     queue_bindings: Option<BTreeMap<String, String>>,
     #[serde(default)]
+    analytics_bindings: Option<BTreeMap<String, String>>,
+    #[serde(default)]
     crons: Option<Vec<String>>,
     #[serde(default)]
     compatibility_date: Option<String>,
@@ -761,10 +771,12 @@ async fn worker_get(
     env.remove(deploy::R2_METADATA_ENV);
     env.remove(deploy::D1_METADATA_ENV);
     env.remove(deploy::QUEUE_METADATA_ENV);
+    env.remove(deploy::ANALYTICS_METADATA_ENV);
     let durable_objects = deploy::durable_objects(&manifest);
     let r2_bindings = deploy::r2_bindings(&manifest);
     let d1_bindings = deploy::d1_bindings(&manifest);
     let queue_bindings = deploy::queue_bindings(&manifest);
+    let analytics_bindings = deploy::analytics_bindings(&manifest);
     let source = match &state.mode {
         ConsoleMode::Public { node, .. } => crate::build::source_head(node, &name)
             .filter(|record| !record.source.deleted)
@@ -816,6 +828,7 @@ async fn worker_get(
             "r2_bindings": r2_bindings,
             "d1_bindings": d1_bindings,
             "queue_bindings": queue_bindings,
+            "analytics_bindings": analytics_bindings,
             "crons": manifest.crons,
             "compatibility_date": manifest.compatibility_date,
             "durable_objects": durable_objects,
@@ -1059,6 +1072,7 @@ fn apply_worker_settings(
         r2_bindings,
         d1_bindings,
         queue_bindings,
+        analytics_bindings,
         crons,
         compatibility_date,
     } = request;
@@ -1068,6 +1082,7 @@ fn apply_worker_settings(
         && r2_bindings.is_none()
         && d1_bindings.is_none()
         && queue_bindings.is_none()
+        && analytics_bindings.is_none()
         && crons.is_none()
         && compatibility_date.is_none()
     {
@@ -1091,6 +1106,7 @@ fn apply_worker_settings(
             || env.contains_key(deploy::R2_METADATA_ENV)
             || env.contains_key(deploy::D1_METADATA_ENV)
             || env.contains_key(deploy::QUEUE_METADATA_ENV)
+            || env.contains_key(deploy::ANALYTICS_METADATA_ENV)
         {
             return Err(ApiError::bad_request(
                 "不能修改 RandallFlare 保留的环境变量",
@@ -1108,6 +1124,9 @@ fn apply_worker_settings(
         }
         if let Some(queues) = manifest.env.get(deploy::QUEUE_METADATA_ENV).cloned() {
             env.insert(deploy::QUEUE_METADATA_ENV.into(), queues);
+        }
+        if let Some(analytics) = manifest.env.get(deploy::ANALYTICS_METADATA_ENV).cloned() {
+            env.insert(deploy::ANALYTICS_METADATA_ENV.into(), analytics);
         }
         manifest.env = env;
     }
@@ -1197,6 +1216,32 @@ fn apply_worker_settings(
             );
         }
     }
+    if let Some(analytics_bindings) = analytics_bindings {
+        validate_settings_map(&analytics_bindings, "Analytics 绑定")?;
+        let identifier = |value: &str| {
+            let mut chars = value.chars();
+            chars.next().is_some_and(|character| {
+                character.is_ascii_alphabetic() || matches!(character, '_' | '$')
+            }) && chars.all(|character| {
+                character.is_ascii_alphanumeric() || matches!(character, '_' | '$')
+            })
+        };
+        for (binding, dataset) in &analytics_bindings {
+            if !identifier(binding) || !valid_name(dataset) {
+                return Err(ApiError::bad_request(format!(
+                    "Analytics 绑定 {binding} 或数据集名称无效"
+                )));
+            }
+        }
+        if analytics_bindings.is_empty() {
+            manifest.env.remove(deploy::ANALYTICS_METADATA_ENV);
+        } else {
+            manifest.env.insert(
+                deploy::ANALYTICS_METADATA_ENV.into(),
+                serde_json::to_string(&analytics_bindings)?,
+            );
+        }
+    }
     if let Some(crons) = crons {
         if crons.len() > 256 {
             return Err(ApiError::bad_request(
@@ -1226,6 +1271,7 @@ fn apply_worker_settings(
         .chain(deploy::r2_bindings(&manifest).keys())
         .chain(deploy::d1_bindings(&manifest).keys())
         .chain(deploy::queue_bindings(&manifest).keys())
+        .chain(deploy::analytics_bindings(&manifest).keys())
     {
         if !binding_names.insert(name.clone()) {
             return Err(ApiError::bad_request(format!("绑定名称 {name} 被重复使用")));
@@ -2188,6 +2234,209 @@ async fn queue_redrive(
     Ok(Json(json!({ "ok": true })))
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AnalyticsDatasetRequest {
+    name: String,
+    #[serde(default)]
+    description: String,
+    #[serde(default)]
+    retention_days: Option<u32>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AnalyticsWriteRequest {
+    points: Vec<crate::analytics::DataPoint>,
+}
+
+#[derive(Debug, Deserialize)]
+struct AnalyticsRecentQuery {
+    before: Option<u64>,
+    limit: Option<usize>,
+}
+
+#[derive(Debug, Deserialize)]
+struct AnalyticsGroupQuery {
+    #[serde(default = "analytics_default_dimension")]
+    dimension: String,
+    #[serde(default)]
+    dimension_index: usize,
+    double_index: Option<usize>,
+    since: Option<u64>,
+    limit: Option<usize>,
+}
+
+fn analytics_default_dimension() -> String {
+    "blob".into()
+}
+
+async fn analytics_list(State(state): State<ConsoleState>) -> ApiResult<Json<Value>> {
+    let records = state
+        .client
+        .resource_heads(&state.node, Some(crate::analytics::DATASET_KIND))
+        .await?;
+    let mut datasets = Vec::new();
+    for view in records.into_iter().filter(|view| !view.resource.deleted) {
+        let spec = crate::analytics::dataset_spec(&view.resource)?;
+        let stats = state
+            .client
+            .analytics_stats(&state.node, &view.resource.name)
+            .await
+            .ok();
+        datasets.push(json!({
+            "name": view.resource.name,
+            "version": view.resource.version,
+            "digest": view.digest,
+            "spec": spec,
+            "stats": stats,
+        }));
+    }
+    Ok(Json(json!({ "datasets": datasets })))
+}
+
+async fn analytics_apply(
+    State(state): State<ConsoleState>,
+    Extension(principal): Extension<ConsolePrincipal>,
+    Json(request): Json<AnalyticsDatasetRequest>,
+) -> ApiResult<Json<Value>> {
+    state.require_mutation()?;
+    let spec = crate::analytics::DatasetSpec {
+        description: request.description,
+        retention_days: request.retention_days,
+    };
+    let head = state
+        .client
+        .resource_head(&state.node, crate::analytics::DATASET_KIND, &request.name)
+        .await?;
+    let record =
+        crate::analytics::prepare_dataset_after(&request.name, spec, false, head.as_ref())?;
+    match &state.mode {
+        ConsoleMode::Local { .. } => {
+            let envelope = rf_core::envelope::Envelope::seal_any(&record, state.operator()?);
+            state.client.post_resource(&state.node, &envelope).await?;
+            Ok(Json(
+                json!({ "ok": true, "name": record.name, "version": record.version }),
+            ))
+        }
+        ConsoleMode::Public { node, .. } => {
+            let approval = node.management.create_resource(
+                principal.session_id,
+                &record,
+                format!(
+                    "创建或更新 Analytics 数据集 {} v{}",
+                    record.name, record.version
+                ),
+            )?;
+            Ok(Json(json!({
+                "ok": true,
+                "pending_approval": true,
+                "name": record.name,
+                "version": record.version,
+                "approval": approval,
+                "approve_node": node.cfg.peer_api_advertise().to_string(),
+            })))
+        }
+    }
+}
+
+async fn analytics_delete(
+    State(state): State<ConsoleState>,
+    Extension(principal): Extension<ConsolePrincipal>,
+    Path(name): Path<String>,
+) -> ApiResult<Json<Value>> {
+    state.require_mutation()?;
+    let head = state
+        .client
+        .resource_head(&state.node, crate::analytics::DATASET_KIND, &name)
+        .await?
+        .ok_or_else(|| ApiError::not_found("Analytics 数据集不存在"))?;
+    if head.resource.deleted {
+        return Err(ApiError::not_found("Analytics 数据集已删除"));
+    }
+    let spec = crate::analytics::dataset_spec(&head.resource)?;
+    let record = crate::analytics::prepare_dataset_after(&name, spec, true, Some(&head))?;
+    match &state.mode {
+        ConsoleMode::Local { .. } => {
+            let envelope = rf_core::envelope::Envelope::seal_any(&record, state.operator()?);
+            state.client.post_resource(&state.node, &envelope).await?;
+            Ok(Json(json!({ "ok": true, "name": name })))
+        }
+        ConsoleMode::Public { node, .. } => {
+            let approval = node.management.create_resource(
+                principal.session_id,
+                &record,
+                format!(
+                    "删除 Analytics 数据集 {}（生成 v{} 墓碑）",
+                    name, record.version
+                ),
+            )?;
+            Ok(Json(json!({
+                "ok": true,
+                "pending_approval": true,
+                "name": name,
+                "version": record.version,
+                "approval": approval,
+                "approve_node": node.cfg.peer_api_advertise().to_string(),
+            })))
+        }
+    }
+}
+
+async fn analytics_write(
+    State(state): State<ConsoleState>,
+    Path(name): Path<String>,
+    Json(request): Json<AnalyticsWriteRequest>,
+) -> ApiResult<Json<Value>> {
+    state.require_mutation()?;
+    let written = state
+        .client
+        .analytics_write(&state.node, &name, &request.points)
+        .await?;
+    Ok(Json(json!({ "ok": true, "written": written })))
+}
+
+async fn analytics_recent(
+    State(state): State<ConsoleState>,
+    Path(name): Path<String>,
+    Query(query): Query<AnalyticsRecentQuery>,
+) -> ApiResult<Json<Value>> {
+    let events = state
+        .client
+        .analytics_recent(&state.node, &name, query.before, query.limit.unwrap_or(100))
+        .await?;
+    Ok(Json(json!({ "events": events })))
+}
+
+async fn analytics_stats(
+    State(state): State<ConsoleState>,
+    Path(name): Path<String>,
+) -> ApiResult<Json<Value>> {
+    Ok(Json(serde_json::to_value(
+        state.client.analytics_stats(&state.node, &name).await?,
+    )?))
+}
+
+async fn analytics_group(
+    State(state): State<ConsoleState>,
+    Path(name): Path<String>,
+    Query(query): Query<AnalyticsGroupQuery>,
+) -> ApiResult<Json<Value>> {
+    let groups = state
+        .client
+        .analytics_group(
+            &state.node,
+            &name,
+            &query.dimension,
+            query.dimension_index,
+            query.double_index,
+            query.since.unwrap_or(0),
+            query.limit.unwrap_or(20),
+        )
+        .await?;
+    Ok(Json(json!({ "groups": groups })))
+}
+
 async fn r2_object_list(
     State(state): State<ConsoleState>,
     Path(bucket): Path<String>,
@@ -2421,6 +2670,10 @@ mod tests {
             deploy::QUEUE_METADATA_ENV.into(),
             r#"{"OLD_QUEUE":"archive"}"#.into(),
         );
+        env.insert(
+            deploy::ANALYTICS_METADATA_ENV.into(),
+            r#"{"OLD_METRICS":"archive"}"#.into(),
+        );
         let manifest = WorkerManifest {
             name: "demo".into(),
             version: 4,
@@ -2445,6 +2698,10 @@ mod tests {
                 r2_bindings: Some(BTreeMap::from([("ASSETS".into(), "assets".into())])),
                 d1_bindings: Some(BTreeMap::from([("DB".into(), "primary".into())])),
                 queue_bindings: Some(BTreeMap::from([("JOBS".into(), "jobs".into())])),
+                analytics_bindings: Some(BTreeMap::from([(
+                    "METRICS".into(),
+                    "web-metrics".into(),
+                )])),
                 crons: Some(vec!["*/5 * * * *".into()]),
                 compatibility_date: Some("2026-08-04".into()),
             },
@@ -2458,6 +2715,10 @@ mod tests {
         assert_eq!(deploy::r2_bindings(&updated)["ASSETS"], "assets");
         assert_eq!(deploy::d1_bindings(&updated)["DB"], "primary");
         assert_eq!(deploy::queue_bindings(&updated)["JOBS"], "jobs");
+        assert_eq!(
+            deploy::analytics_bindings(&updated)["METRICS"],
+            "web-metrics"
+        );
         assert_eq!(updated.kv_bindings["CACHE"], "shared");
         assert_eq!(updated.crons, vec!["*/5 * * * *"]);
     }

@@ -61,6 +61,13 @@ Working today, verified by multi-process fault-injection e2e tests:
   with `env.EVENTS.send()/sendBatch()` and consume with `queue(batch, env,
   context)`; real-workerd tests cover automatic acknowledgement, retry and
   dead-letter transitions.
+- **Decentralized Analytics Engine**: operator-signed datasets retain the
+  Cloudflare-shaped `blobs` / `doubles` / `indexes` data-point model in an
+  independent D1 micro-quorum. Workers call `env.METRICS.writeDataPoint()`;
+  signed dataset CRUD, encrypted node APIs, recent-event browsing, hour/day
+  counters and dimension/value aggregations are available in the CLI and
+  Chinese console. The binding's `waitUntil` path is verified against real
+  workerd.
 
 Also in: HTTPS ingress (SNI cert store, hot-reload, wildcard files,
 self-signed fallback) and **native workerd kvNamespace bindings** —

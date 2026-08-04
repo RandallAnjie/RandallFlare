@@ -22,6 +22,7 @@ pub const DO_METADATA_ENV: &str = "__RF_DURABLE_OBJECTS_V1";
 pub const R2_METADATA_ENV: &str = "__RF_R2_BINDINGS_V1";
 pub const D1_METADATA_ENV: &str = "__RF_D1_BINDINGS_V1";
 pub const QUEUE_METADATA_ENV: &str = "__RF_QUEUE_BINDINGS_V1";
+pub const ANALYTICS_METADATA_ENV: &str = "__RF_ANALYTICS_BINDINGS_V1";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DurableObjectBinding {
@@ -60,6 +61,13 @@ pub fn queue_bindings(m: &WorkerManifest) -> BTreeMap<String, String> {
         .unwrap_or_default()
 }
 
+pub fn analytics_bindings(m: &WorkerManifest) -> BTreeMap<String, String> {
+    m.env
+        .get(ANALYTICS_METADATA_ENV)
+        .and_then(|raw| serde_json::from_str(raw).ok())
+        .unwrap_or_default()
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct DeploySpec {
@@ -85,6 +93,9 @@ pub struct DeploySpec {
     /// binding name → signed Queue resource name.
     #[serde(default)]
     pub queues: BTreeMap<String, String>,
+    /// binding name → signed Analytics Engine dataset name.
+    #[serde(default)]
+    pub analytics: BTreeMap<String, String>,
     #[serde(default)]
     pub crons: Vec<String>,
     /// Relative dir of static assets.
@@ -113,6 +124,7 @@ fn validate_spec(spec: &DeploySpec) -> Result<()> {
         || spec.env.contains_key(R2_METADATA_ENV)
         || spec.env.contains_key(D1_METADATA_ENV)
         || spec.env.contains_key(QUEUE_METADATA_ENV)
+        || spec.env.contains_key(ANALYTICS_METADATA_ENV)
     {
         bail!("env keys beginning with __RF_ are reserved by rf");
     }
@@ -125,6 +137,7 @@ fn validate_spec(spec: &DeploySpec) -> Result<()> {
         .chain(spec.r2.keys())
         .chain(spec.d1.keys())
         .chain(spec.queues.keys())
+        .chain(spec.analytics.keys())
     {
         if !binding_names.insert(name) {
             bail!("binding name {name:?} is used more than once");
@@ -474,6 +487,25 @@ fn manifest_from_bundle(
         env.insert(
             QUEUE_METADATA_ENV.into(),
             serde_json::to_string(&bundle.spec.queues)?,
+        );
+    }
+    if !bundle.spec.analytics.is_empty() {
+        let identifier = |value: &str| {
+            let mut characters = value.chars();
+            characters.next().is_some_and(|character| {
+                character.is_ascii_alphabetic() || character == '_' || character == '$'
+            }) && characters.all(|character| {
+                character.is_ascii_alphanumeric() || character == '_' || character == '$'
+            })
+        };
+        for (binding, dataset) in &bundle.spec.analytics {
+            if !identifier(binding) || !rf_core::manifest::valid_name(dataset) {
+                bail!("invalid Analytics binding {binding:?}");
+            }
+        }
+        env.insert(
+            ANALYTICS_METADATA_ENV.into(),
+            serde_json::to_string(&bundle.spec.analytics)?,
         );
     }
     let manifest = WorkerManifest {

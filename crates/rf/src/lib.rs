@@ -1,6 +1,8 @@
 //! rf — the RandallFlare node. One binary, no control plane.
 
 pub mod acme;
+pub mod analytics;
+pub mod analyticsbind;
 pub mod anchor;
 pub mod auth;
 pub mod blob;

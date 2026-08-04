@@ -29,6 +29,10 @@ const state = {
   queues: [],
   queueActive: null,
   queueDeadLetters: [],
+  analyticsDatasets: [],
+  analyticsActive: null,
+  analyticsEvents: [],
+  analyticsGroups: [],
 };
 
 const titles = {
@@ -40,6 +44,7 @@ const titles = {
   r2: ["对象存储", "R2 bucket"],
   d1: ["分布式 SQLite", "D1 数据库"],
   queues: ["事件驱动", "队列"],
+  analytics: ["可观测数据", "Analytics Engine"],
 };
 
 function escapeHtml(value) {
@@ -207,6 +212,7 @@ function renderOverview(data) {
   const databases = Array.isArray(data.databases) ? data.databases : [];
   const buckets = Array.isArray(data.r2_buckets) ? data.r2_buckets : [];
   const queues = Array.isArray(data.queues) ? data.queues : [];
+  const analyticsDatasets = Array.isArray(data.analytics_datasets) ? data.analytics_datasets : [];
   const allNodes = [
     {
       id: data.node,
@@ -227,6 +233,8 @@ function renderOverview(data) {
   $("#metric-r2").textContent = String(buckets.length);
   $("#metric-queues").textContent = String(queues.length);
   $("#queue-nav-count").textContent = String(queues.length);
+  $("#metric-analytics").textContent = String(analyticsDatasets.length);
+  $("#analytics-nav-count").textContent = String(analyticsDatasets.length);
   $("#metric-r2-backend").textContent = data.storage?.rclone ? "本地副本与 rclone 已就绪" : "集群本地多数派副本";
   $("#r2-nav-count").textContent = String(buckets.length);
   $("#metric-blobs").textContent = String(data.missing_blobs ?? 0);
@@ -510,6 +518,7 @@ function renderWorkerDetail(data) {
     <div><dt>R2 绑定</dt><dd>${escapeHtml(Object.keys(worker.r2_bindings || {}).length)} 项</dd></div>
     <div><dt>D1 绑定</dt><dd>${escapeHtml(Object.keys(worker.d1_bindings || {}).length)} 项</dd></div>
     <div><dt>Queue 绑定</dt><dd>${escapeHtml(Object.keys(worker.queue_bindings || {}).length)} 项</dd></div>
+    <div><dt>Analytics 绑定</dt><dd>${escapeHtml(Object.keys(worker.analytics_bindings || {}).length)} 项</dd></div>
     <div><dt>定时任务</dt><dd>${escapeHtml(worker.crons?.length || 0)} 条</dd></div>`;
   $("#detail-distribution-count").textContent = `${distribution.ready}/${distribution.total} 个节点`;
   $("#detail-distribution").innerHTML = (distribution.nodes || []).map((node) => {
@@ -525,6 +534,7 @@ function renderWorkerDetail(data) {
   $("#project-r2-bindings").value = mapToLines(worker.r2_bindings);
   $("#project-d1-bindings").value = mapToLines(worker.d1_bindings);
   $("#project-queue-bindings").value = mapToLines(worker.queue_bindings);
+  $("#project-analytics-bindings").value = mapToLines(worker.analytics_bindings);
   $("#project-crons").value = (worker.crons || []).join("\n");
   $("#project-compatibility-date").value = worker.compatibility_date;
   $("#project-source-repository").value = source?.repository?.replace(/\.git$/, "") || "";
@@ -648,6 +658,7 @@ async function saveProjectBindings(event) {
       r2_bindings: linesToMap($("#project-r2-bindings").value, "R2 绑定"),
       d1_bindings: linesToMap($("#project-d1-bindings").value, "D1 绑定"),
       queue_bindings: linesToMap($("#project-queue-bindings").value, "Queue 绑定"),
+      analytics_bindings: linesToMap($("#project-analytics-bindings").value, "Analytics 绑定"),
     };
     await updateWorkerSettings(payload, `更新 ${state.activeWorker} 的变量与绑定。`);
   } catch (error) {
@@ -1250,6 +1261,189 @@ async function deleteQueue() {
   }
 }
 
+function analyticsStatsCopy(stats) {
+  if (!stats) return "统计正在收敛";
+  return `${stats.last_hour || 0} / 小时 · ${stats.last_24_hours || 0} / 24 小时 · 共 ${stats.total || 0}`;
+}
+
+function renderAnalyticsDatasets() {
+  $("#analytics-count").textContent = `${state.analyticsDatasets.length} 个数据集`;
+  $("#analytics-nav-count").textContent = String(state.analyticsDatasets.length);
+  const list = $("#analytics-list");
+  list.classList.toggle("empty-state", state.analyticsDatasets.length === 0);
+  list.innerHTML = state.analyticsDatasets.length
+    ? state.analyticsDatasets.map((dataset) => {
+      const active = dataset.name === state.analyticsActive ? " active" : "";
+      const retention = dataset.spec?.retention_days ? `保留 ${dataset.spec.retention_days} 天` : "永久保留";
+      return `<button class="database-item${active}" type="button" data-analytics="${escapeHtml(dataset.name)}"><span><strong>${escapeHtml(dataset.name)}</strong><small>${escapeHtml(retention)} · ${escapeHtml(analyticsStatsCopy(dataset.stats))}</small></span><span>打开 →</span></button>`;
+    }).join("")
+    : "暂无 Analytics 数据集。";
+}
+
+function fillAnalyticsForm(dataset) {
+  $("#analytics-name").value = dataset?.name || "";
+  $("#analytics-description").value = dataset?.spec?.description || "";
+  $("#analytics-retention").value = dataset?.spec?.retention_days || "";
+}
+
+function renderAnalyticsEvents() {
+  const list = $("#analytics-events");
+  list.classList.toggle("empty-state", state.analyticsEvents.length === 0);
+  list.innerHTML = state.analyticsEvents.length
+    ? state.analyticsEvents.map((event) => `<article class="build-row"><span class="pipeline-state success"></span><div><strong>${escapeHtml(new Date(event.ts_ms).toLocaleString("zh-CN"))}</strong><small>${escapeHtml(shortId(event.id, 24))}</small><code>blobs ${escapeHtml(JSON.stringify(event.blobs))}</code></div><div><code>doubles ${escapeHtml(JSON.stringify(event.doubles))}</code><code>indexes ${escapeHtml(JSON.stringify(event.indexes))}</code></div></article>`).join("")
+    : "暂无事件。";
+}
+
+function renderAnalyticsGroups() {
+  const list = $("#analytics-groups");
+  list.classList.toggle("empty-state", state.analyticsGroups.length === 0);
+  list.innerHTML = state.analyticsGroups.length
+    ? state.analyticsGroups.map((group) => `<article class="build-row"><span class="pipeline-state success"></span><div><strong>${escapeHtml(JSON.stringify(group.key))}</strong><small>${escapeHtml(group.count)} 个事件</small></div><div><small>总和 ${escapeHtml(group.sum ?? "—")} · 平均 ${escapeHtml(group.average ?? "—")}</small><small>范围 ${escapeHtml(group.minimum ?? "—")} ～ ${escapeHtml(group.maximum ?? "—")}</small></div></article>`).join("")
+    : "暂无聚合结果。";
+}
+
+async function loadAnalytics({ quiet = false } = {}) {
+  try {
+    const data = await api("/api/analytics");
+    state.analyticsDatasets = data.datasets || [];
+    if (state.analyticsActive && !state.analyticsDatasets.some((item) => item.name === state.analyticsActive)) {
+      state.analyticsActive = null;
+      state.analyticsEvents = [];
+      state.analyticsGroups = [];
+      $("#analytics-active-name").textContent = "请选择数据集";
+      $("#analytics-summary").textContent = "选择左侧数据集后，可查看聚合结果与最近事件。";
+      $("#analytics-write-form").classList.add("hidden");
+      $("#analytics-delete").classList.add("hidden");
+      $("#analytics-hour").textContent = "—";
+      $("#analytics-day").textContent = "—";
+      $("#analytics-total").textContent = "—";
+      renderAnalyticsEvents();
+      renderAnalyticsGroups();
+    }
+    renderAnalyticsDatasets();
+    if (!quiet) toast("Analytics 数据集已刷新");
+  } catch (error) {
+    if (!quiet) toast(error.message, true);
+  }
+}
+
+async function loadAnalyticsGroups() {
+  if (!state.analyticsActive) {
+    state.analyticsGroups = [];
+    renderAnalyticsGroups();
+    return;
+  }
+  const kind = $("#analytics-group-kind").value;
+  const dimensionIndex = Number($("#analytics-group-index").value || 0);
+  const doubleRaw = $("#analytics-double-index").value.trim();
+  const params = new URLSearchParams({
+    dimension: kind,
+    dimension_index: String(dimensionIndex),
+    since: String(Date.now() - 24 * 60 * 60 * 1000),
+    limit: "20",
+  });
+  if (doubleRaw !== "") params.set("double_index", doubleRaw);
+  const data = await api(`/api/analytics/${encodeURIComponent(state.analyticsActive)}/group?${params}`);
+  state.analyticsGroups = data.groups || [];
+  renderAnalyticsGroups();
+}
+
+async function selectAnalytics(name) {
+  const dataset = state.analyticsDatasets.find((item) => item.name === name);
+  if (!dataset) return;
+  state.analyticsActive = name;
+  fillAnalyticsForm(dataset);
+  $("#analytics-active-name").textContent = name;
+  $("#analytics-summary").textContent = dataset.spec?.description || analyticsStatsCopy(dataset.stats);
+  $("#analytics-write-form").classList.remove("hidden");
+  $("#analytics-delete").classList.remove("hidden");
+  renderAnalyticsDatasets();
+  try {
+    const [stats, events] = await Promise.all([
+      api(`/api/analytics/${encodeURIComponent(name)}/stats`),
+      api(`/api/analytics/${encodeURIComponent(name)}/events?limit=100`),
+    ]);
+    if (state.analyticsActive !== name) return;
+    $("#analytics-hour").textContent = String(stats.last_hour || 0);
+    $("#analytics-day").textContent = String(stats.last_24_hours || 0);
+    $("#analytics-total").textContent = String(stats.total || 0);
+    state.analyticsEvents = events.events || [];
+    renderAnalyticsEvents();
+    await loadAnalyticsGroups();
+  } catch (error) {
+    toast(error.message, true);
+  }
+}
+
+async function saveAnalytics(event) {
+  event.preventDefault();
+  const retention = $("#analytics-retention").value.trim();
+  const payload = {
+    name: $("#analytics-name").value.trim(),
+    description: $("#analytics-description").value.trim(),
+    retention_days: retention === "" ? null : Number(retention),
+  };
+  try {
+    const result = await api("/api/analytics", { method: "POST", body: JSON.stringify(payload) });
+    const complete = async () => {
+      await loadAnalytics({ quiet: true });
+      await selectAnalytics(payload.name);
+    };
+    if (result.pending_approval) {
+      showApproval(result, `批准后，Analytics 数据集 ${payload.name} 的签名配置将传播到集群。`, complete);
+    } else {
+      toast(`Analytics 数据集 ${payload.name} 已保存`);
+      await complete();
+    }
+  } catch (error) {
+    toast(error.message, true);
+  }
+}
+
+async function writeAnalyticsPoint(event) {
+  event.preventDefault();
+  if (!state.analyticsActive) return;
+  let point;
+  try {
+    point = JSON.parse($("#analytics-point").value);
+  } catch (error) {
+    toast(`数据点不是有效 JSON：${error.message}`, true);
+    return;
+  }
+  try {
+    await api(`/api/analytics/${encodeURIComponent(state.analyticsActive)}/events`, {
+      method: "POST",
+      body: JSON.stringify({ points: [point] }),
+    });
+    toast("Analytics 数据点已写入");
+    await loadAnalytics({ quiet: true });
+    await selectAnalytics(state.analyticsActive);
+  } catch (error) {
+    toast(error.message, true);
+  }
+}
+
+async function deleteAnalytics() {
+  const name = state.analyticsActive;
+  if (!name || !window.confirm(`要删除 Analytics 数据集“${name}”吗？已签名的历史与底层数据将保留供审计。`)) return;
+  try {
+    const result = await api(`/api/analytics/${encodeURIComponent(name)}`, { method: "DELETE" });
+    const complete = async () => {
+      state.analyticsActive = null;
+      fillAnalyticsForm(null);
+      await loadAnalytics({ quiet: true });
+    };
+    if (result.pending_approval) {
+      showApproval(result, `批准后，Analytics 数据集 ${name} 将写入可验证的墓碑版本。`, complete);
+    } else {
+      toast(`Analytics 数据集 ${name} 已删除`);
+      await complete();
+    }
+  } catch (error) {
+    toast(error.message, true);
+  }
+}
+
 async function loadOverview({ quiet = false } = {}) {
   try {
     const data = await api("/api/overview");
@@ -1564,13 +1758,14 @@ async function boot() {
     $("#security-copy").innerHTML = consoleMode === "public"
       ? "此节点不保存<br>任何私钥。"
       : "密钥仅保留在本地<br>控制台进程中。";
-    $$("#deploy-form button, #source-form button, #kv-editor-form button, #d1-create-form button, #d1-exec-form button, #r2-bucket-form button, #r2-upload-form button, #r2-delete-bucket, #queue-form button, #queue-send-form button, #queue-delete, #project-domain-add-form button, #project-bindings-form button, #project-triggers-form button, #project-settings-form button, #project-source-form button, #project-redeploy, #project-delete")
+    $$("#deploy-form button, #source-form button, #kv-editor-form button, #d1-create-form button, #d1-exec-form button, #r2-bucket-form button, #r2-upload-form button, #r2-delete-bucket, #queue-form button, #queue-send-form button, #queue-delete, #analytics-form button, #analytics-write-form button, #analytics-delete, #project-domain-add-form button, #project-bindings-form button, #project-triggers-form button, #project-settings-form button, #project-source-form button, #project-redeploy, #project-delete")
       .forEach((button) => { button.disabled = state.session.read_only; });
     await loadOverview({ quiet: true });
     await loadWorkerOps();
     await loadKeys();
     await loadR2({ quiet: true });
     await loadQueues({ quiet: true });
+    await loadAnalytics({ quiet: true });
   } catch (error) {
     if (consoleMode === "public" && error.status === 401) {
       state.session = null;
@@ -1623,6 +1818,7 @@ $("#refresh").addEventListener("click", async () => {
   await loadOverview();
   await loadR2({ quiet: true });
   await loadQueues({ quiet: true });
+  await loadAnalytics({ quiet: true });
 });
 $("#deploy-form").addEventListener("submit", deployWorker);
 $("#deploy-file-picker").addEventListener("click", () => $("#deploy-files").click());
@@ -1646,6 +1842,14 @@ $("#queue-form").addEventListener("submit", saveQueue);
 $("#queue-send-form").addEventListener("submit", sendQueueMessage);
 $("#queue-delete").addEventListener("click", deleteQueue);
 $("#queue-refresh-dead").addEventListener("click", loadQueueDeadLetters);
+$("#analytics-form").addEventListener("submit", saveAnalytics);
+$("#analytics-write-form").addEventListener("submit", writeAnalyticsPoint);
+$("#analytics-group-form").addEventListener("submit", (event) => {
+  event.preventDefault();
+  loadAnalyticsGroups().catch((error) => toast(error.message, true));
+});
+$("#analytics-refresh").addEventListener("click", () => state.analyticsActive && selectAnalytics(state.analyticsActive));
+$("#analytics-delete").addEventListener("click", deleteAnalytics);
 $("#r2-object-file").addEventListener("change", () => {
   const file = $("#r2-object-file").files?.[0];
   if (file && !$("#r2-object-key").value) $("#r2-object-key").value = file.name;
@@ -1723,6 +1927,10 @@ $("#queue-dead-list").addEventListener("click", (event) => {
   const button = event.target.closest("button[data-queue-redrive]");
   if (button) redriveQueueMessage(button.dataset.queueRedrive);
 });
+$("#analytics-list").addEventListener("click", (event) => {
+  const button = event.target.closest("button[data-analytics]");
+  if (button) selectAnalytics(button.dataset.analytics);
+});
 
 setInterval(() => {
   if (state.session) {
@@ -1730,6 +1938,9 @@ setInterval(() => {
     loadWorkerOps();
     if (state.view === "r2") loadR2({ quiet: true });
     if (state.view === "queues") loadQueues({ quiet: true });
+    if (state.view === "analytics") loadAnalytics({ quiet: true }).then(() => {
+      if (state.analyticsActive) selectAnalytics(state.analyticsActive);
+    });
   }
 }, 10_000);
 boot();

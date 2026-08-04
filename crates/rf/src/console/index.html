@@ -59,6 +59,9 @@
           <button class="nav-item" data-view="queues">
             <span class="nav-glyph">⇄</span><span>队列</span><span id="queue-nav-count" class="count">0</span>
           </button>
+          <button class="nav-item" data-view="analytics">
+            <span class="nav-glyph">⌁</span><span>Analytics</span><span id="analytics-nav-count" class="count">0</span>
+          </button>
         </nav>
         <div class="sidebar-foot">
           <p class="sidebar-tagline">一次构建，一次验证，处处运行。</p>
@@ -93,6 +96,7 @@
             <article class="metric"><span>D1 数据库</span><strong id="metric-databases">—</strong><small>多数派复制保障一致性</small></article>
             <article class="metric"><span>R2 bucket</span><strong id="metric-r2">—</strong><small id="metric-r2-backend">内容寻址对象存储</small></article>
             <article class="metric"><span>队列</span><strong id="metric-queues">—</strong><small>多数派租约与死信</small></article>
+            <article class="metric"><span>Analytics 数据集</span><strong id="metric-analytics">—</strong><small>时序事件与维度聚合</small></article>
             <article class="metric"><span>内容块状态</span><strong id="metric-blobs">—</strong><small>本地缺失数</small></article>
           </div>
 
@@ -244,7 +248,7 @@
           </div>
 
           <div id="project-tab-bindings" class="project-tab">
-            <article class="panel settings-panel"><div class="settings-copy"><p class="eyebrow">运行配置</p><h2>变量与绑定</h2><p class="muted">环境变量、KV、R2、D1 与 Queue 绑定会随签名清单复制。敏感凭据请使用节点侧密钥能力，不要写入普通变量。</p></div><form id="project-bindings-form" class="settings-form"><label><span>环境变量 <em>每行 KEY=value</em></span><textarea id="project-env" class="code-input" rows="8"></textarea></label><label><span>KV 绑定 <em>每行 BINDING=namespace</em></span><textarea id="project-kv-bindings" class="code-input" rows="6"></textarea></label><label><span>R2 绑定 <em>每行 BINDING=bucket</em></span><textarea id="project-r2-bindings" class="code-input" rows="5"></textarea></label><label><span>D1 绑定 <em>每行 BINDING=database</em></span><textarea id="project-d1-bindings" class="code-input" rows="5"></textarea></label><label><span>Queue 生产者绑定 <em>每行 BINDING=queue</em></span><textarea id="project-queue-bindings" class="code-input" rows="5"></textarea></label><button class="primary" type="submit">保存变量与绑定</button></form></article>
+            <article class="panel settings-panel"><div class="settings-copy"><p class="eyebrow">运行配置</p><h2>变量与绑定</h2><p class="muted">环境变量与平台绑定会随签名清单复制。敏感凭据请使用节点侧密钥能力，不要写入普通变量。</p></div><form id="project-bindings-form" class="settings-form"><label><span>环境变量 <em>每行 KEY=value</em></span><textarea id="project-env" class="code-input" rows="8"></textarea></label><label><span>KV 绑定 <em>每行 BINDING=namespace</em></span><textarea id="project-kv-bindings" class="code-input" rows="6"></textarea></label><label><span>R2 绑定 <em>每行 BINDING=bucket</em></span><textarea id="project-r2-bindings" class="code-input" rows="5"></textarea></label><label><span>D1 绑定 <em>每行 BINDING=database</em></span><textarea id="project-d1-bindings" class="code-input" rows="5"></textarea></label><label><span>Queue 生产者绑定 <em>每行 BINDING=queue</em></span><textarea id="project-queue-bindings" class="code-input" rows="5"></textarea></label><label><span>Analytics Engine 绑定 <em>每行 BINDING=dataset</em></span><textarea id="project-analytics-bindings" class="code-input" rows="5"></textarea></label><button class="primary" type="submit">保存变量与绑定</button></form></article>
           </div>
 
           <div id="project-tab-triggers" class="project-tab">
@@ -395,6 +399,58 @@
               <article class="panel">
                 <div class="panel-head"><div><p class="eyebrow">失败处理</p><h2>死信</h2></div><button id="queue-refresh-dead" class="secondary compact" type="button">刷新</button></div>
                 <div id="queue-dead-list" class="build-list empty-state">暂无死信。</div>
+              </article>
+            </div>
+          </div>
+        </section>
+
+        <section id="view-analytics" class="view" aria-labelledby="section-title">
+          <div class="projects-header">
+            <div><p class="eyebrow">可观测数据</p><h2>Analytics Engine</h2><p class="muted">以 Cloudflare Analytics Engine 熟悉的 blobs、doubles 与 indexes 结构写入；每个数据集由独立 D1 多数派保存，可从任意节点查询。</p></div>
+            <span id="analytics-count" class="badge">0 个数据集</span>
+          </div>
+          <div class="grid r2-grid">
+            <div class="r2-sidebar-stack">
+              <article class="panel">
+                <div class="panel-head"><div><p class="eyebrow">签名资源</p><h2>创建或编辑数据集</h2></div><span class="badge">20 维</span></div>
+                <form id="analytics-form" class="stack-form">
+                  <label><span>数据集名称</span><input id="analytics-name" pattern="[a-z0-9-]{1,63}" placeholder="web-metrics" required></label>
+                  <label><span>说明</span><input id="analytics-description" placeholder="站点性能与访问指标"></label>
+                  <label><span>自动保留天数 <em>留空则永久保留</em></span><input id="analytics-retention" type="number" min="1" max="36500" placeholder="90"></label>
+                  <button class="primary" type="submit">保存数据集</button>
+                </form>
+              </article>
+              <article class="panel">
+                <div class="panel-head"><div><p class="eyebrow">数据集目录</p><h2>所有数据集</h2></div></div>
+                <div id="analytics-list" class="database-list empty-state">暂无 Analytics 数据集。</div>
+              </article>
+            </div>
+            <div class="r2-sidebar-stack">
+              <article class="panel">
+                <div class="panel-head"><div><p class="eyebrow">数据概况</p><h2 id="analytics-active-name">请选择数据集</h2><p id="analytics-summary" class="muted compact-copy">选择左侧数据集后，可查看聚合结果与最近事件。</p></div><button id="analytics-delete" class="danger ghost hidden" type="button">删除数据集</button></div>
+                <div id="analytics-stats" class="metrics compact-metrics">
+                  <article class="metric"><span>最近 1 小时</span><strong id="analytics-hour">—</strong></article>
+                  <article class="metric"><span>最近 24 小时</span><strong id="analytics-day">—</strong></article>
+                  <article class="metric"><span>全部事件</span><strong id="analytics-total">—</strong></article>
+                </div>
+                <form id="analytics-write-form" class="stack-form hidden">
+                  <label><span>调试数据点（JSON）</span><textarea id="analytics-point" class="code-input" rows="5">{"blobs":["pageview","/"],"doubles":[42.5],"indexes":["visitor-1"]}</textarea></label>
+                  <button class="secondary" type="submit">写入测试数据点</button>
+                </form>
+              </article>
+              <article class="panel">
+                <div class="panel-head"><div><p class="eyebrow">维度分析</p><h2>分组聚合</h2></div><button id="analytics-refresh" class="secondary compact" type="button">刷新</button></div>
+                <form id="analytics-group-form" class="inline-form">
+                  <label><span>维度类型</span><select id="analytics-group-kind"><option value="blob">blob</option><option value="index">index</option></select></label>
+                  <label><span>维度编号</span><input id="analytics-group-index" type="number" min="0" max="19" value="0"></label>
+                  <label><span>数值编号 <em>可空</em></span><input id="analytics-double-index" type="number" min="0" max="19" placeholder="0"></label>
+                  <button class="secondary" type="submit">聚合</button>
+                </form>
+                <div id="analytics-groups" class="build-list empty-state">暂无聚合结果。</div>
+              </article>
+              <article class="panel">
+                <div class="panel-head"><div><p class="eyebrow">原始事件</p><h2>最近写入</h2></div></div>
+                <div id="analytics-events" class="build-list empty-state">暂无事件。</div>
               </article>
             </div>
           </div>

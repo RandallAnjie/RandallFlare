@@ -120,6 +120,11 @@ enum Cmd {
         #[command(subcommand)]
         cmd: QueueCmd,
     },
+    /// Decentralized Analytics Engine operations.
+    Analytics {
+        #[command(subcommand)]
+        cmd: AnalyticsCmd,
+    },
     /// Fetch and verify a worker's transparency log (hash chain).
     Log {
         worker: String,
@@ -385,6 +390,88 @@ enum QueueCmd {
     Redrive {
         name: String,
         id: String,
+        #[arg(long, env = "RF_NODE")]
+        node: String,
+        #[arg(long, env = "RF_CLUSTER_SECRET")]
+        secret: String,
+    },
+}
+
+#[derive(Subcommand)]
+enum AnalyticsCmd {
+    /// List signed datasets and their current counters.
+    List {
+        #[arg(long, env = "RF_NODE")]
+        node: String,
+        #[arg(long, env = "RF_CLUSTER_SECRET")]
+        secret: String,
+    },
+    /// Create or update a signed dataset.
+    Create {
+        name: String,
+        #[arg(long, default_value = "")]
+        description: String,
+        #[arg(long)]
+        retention_days: Option<u32>,
+        #[arg(long, env = "RF_NODE")]
+        node: String,
+        #[arg(long, env = "RF_OPERATOR_KEY")]
+        key: Option<PathBuf>,
+        #[arg(long, env = "RF_CLUSTER_SECRET")]
+        secret: String,
+    },
+    /// Tombstone a dataset definition.
+    Delete {
+        name: String,
+        #[arg(long, env = "RF_NODE")]
+        node: String,
+        #[arg(long, env = "RF_OPERATOR_KEY")]
+        key: Option<PathBuf>,
+        #[arg(long, env = "RF_CLUSTER_SECRET")]
+        secret: String,
+    },
+    /// Write one JSON data point.
+    Write {
+        name: String,
+        point: String,
+        #[arg(long, env = "RF_NODE")]
+        node: String,
+        #[arg(long, env = "RF_CLUSTER_SECRET")]
+        secret: String,
+    },
+    /// Show one dataset's hour, day and lifetime counters.
+    Stats {
+        name: String,
+        #[arg(long, env = "RF_NODE")]
+        node: String,
+        #[arg(long, env = "RF_CLUSTER_SECRET")]
+        secret: String,
+    },
+    /// Read the newest events.
+    Events {
+        name: String,
+        #[arg(long, default_value_t = 100)]
+        limit: usize,
+        #[arg(long)]
+        before: Option<u64>,
+        #[arg(long, env = "RF_NODE")]
+        node: String,
+        #[arg(long, env = "RF_CLUSTER_SECRET")]
+        secret: String,
+    },
+    /// Group events by a blob/index dimension and optionally aggregate a double.
+    Group {
+        name: String,
+        #[arg(long, default_value = "blob")]
+        dimension: String,
+        #[arg(long, default_value_t = 0)]
+        dimension_index: usize,
+        #[arg(long)]
+        double_index: Option<usize>,
+        #[arg(long, default_value_t = 0)]
+        since: u64,
+        #[arg(long, default_value_t = 20)]
+        limit: usize,
         #[arg(long, env = "RF_NODE")]
         node: String,
         #[arg(long, env = "RF_CLUSTER_SECRET")]
@@ -910,6 +997,142 @@ async fn async_main(cli: Cli) -> Result<()> {
                 Ok(())
             }
         },
+        Cmd::Analytics { cmd } => match cmd {
+            AnalyticsCmd::List { node, secret } => {
+                let client = PeerClient::new(secret_bytes(&secret)?);
+                let records = client
+                    .resource_heads(&node, Some(rf::analytics::DATASET_KIND))
+                    .await?;
+                let mut datasets = Vec::new();
+                for view in records.into_iter().filter(|view| !view.resource.deleted) {
+                    let spec = rf::analytics::dataset_spec(&view.resource)?;
+                    let stats = client
+                        .analytics_stats(&node, &view.resource.name)
+                        .await
+                        .ok();
+                    datasets.push(serde_json::json!({
+                        "name": view.resource.name,
+                        "version": view.resource.version,
+                        "digest": view.digest,
+                        "spec": spec,
+                        "stats": stats,
+                    }));
+                }
+                println!("{}", serde_json::to_string_pretty(&datasets)?);
+                Ok(())
+            }
+            AnalyticsCmd::Create {
+                name,
+                description,
+                retention_days,
+                node,
+                key,
+                secret,
+            } => {
+                let client = PeerClient::new(secret_bytes(&secret)?);
+                let head = client
+                    .resource_head(&node, rf::analytics::DATASET_KIND, &name)
+                    .await?;
+                let record = rf::analytics::prepare_dataset_after(
+                    &name,
+                    rf::analytics::DatasetSpec {
+                        description,
+                        retention_days,
+                    },
+                    false,
+                    head.as_ref(),
+                )?;
+                let envelope = rf_core::envelope::Envelope::seal_any(&record, &operator_key(key)?);
+                client.post_resource(&node, &envelope).await?;
+                println!(
+                    "Analytics 数据集 {} 已更新至 v{}",
+                    record.name, record.version
+                );
+                Ok(())
+            }
+            AnalyticsCmd::Delete {
+                name,
+                node,
+                key,
+                secret,
+            } => {
+                let client = PeerClient::new(secret_bytes(&secret)?);
+                let head = client
+                    .resource_head(&node, rf::analytics::DATASET_KIND, &name)
+                    .await?
+                    .with_context(|| format!("Analytics 数据集 {name} 不存在"))?;
+                if head.resource.deleted {
+                    anyhow::bail!("Analytics 数据集 {name} 已删除");
+                }
+                let spec = rf::analytics::dataset_spec(&head.resource)?;
+                let record = rf::analytics::prepare_dataset_after(&name, spec, true, Some(&head))?;
+                let envelope = rf_core::envelope::Envelope::seal_any(&record, &operator_key(key)?);
+                client.post_resource(&node, &envelope).await?;
+                println!(
+                    "Analytics 数据集 {} 已删除（v{}）",
+                    record.name, record.version
+                );
+                Ok(())
+            }
+            AnalyticsCmd::Write {
+                name,
+                point,
+                node,
+                secret,
+            } => {
+                let point: rf::analytics::DataPoint =
+                    serde_json::from_str(&point).context("数据点必须是 Analytics JSON 对象")?;
+                let written = PeerClient::new(secret_bytes(&secret)?)
+                    .analytics_write(&node, &name, &[point])
+                    .await?;
+                println!("已写入 {written} 个 Analytics 数据点");
+                Ok(())
+            }
+            AnalyticsCmd::Stats { name, node, secret } => {
+                let stats = PeerClient::new(secret_bytes(&secret)?)
+                    .analytics_stats(&node, &name)
+                    .await?;
+                println!("{}", serde_json::to_string_pretty(&stats)?);
+                Ok(())
+            }
+            AnalyticsCmd::Events {
+                name,
+                limit,
+                before,
+                node,
+                secret,
+            } => {
+                let events = PeerClient::new(secret_bytes(&secret)?)
+                    .analytics_recent(&node, &name, before, limit)
+                    .await?;
+                println!("{}", serde_json::to_string_pretty(&events)?);
+                Ok(())
+            }
+            AnalyticsCmd::Group {
+                name,
+                dimension,
+                dimension_index,
+                double_index,
+                since,
+                limit,
+                node,
+                secret,
+            } => {
+                let groups = PeerClient::new(secret_bytes(&secret)?)
+                    .analytics_group(
+                        &node,
+                        &name,
+                        &dimension,
+                        dimension_index,
+                        double_index,
+                        since,
+                        limit,
+                    )
+                    .await?;
+                println!("{}", serde_json::to_string_pretty(&groups)?);
+                Ok(())
+            }
+        },
         Cmd::Log {
             worker,
             node,
@@ -1343,6 +1566,9 @@ async fn run(config_path: PathBuf) -> Result<()> {
     let qbind_port = rf::qbind::serve(node.clone()).await?;
     node.set_qbind_port(qbind_port);
     tracing::info!("queue binding on 127.0.0.1:{qbind_port}");
+    let analyticsbind_port = rf::analyticsbind::serve(node.clone()).await?;
+    node.set_analyticsbind_port(analyticsbind_port);
+    tracing::info!("Analytics binding on 127.0.0.1:{analyticsbind_port}");
 
     let _gossip = rf::gossip::start(node.clone()).await?;
     durable.spawn_ensurer();
