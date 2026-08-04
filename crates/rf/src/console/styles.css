@@ -172,6 +172,30 @@ td small { color: var(--muted); margin-top: 4px; max-width: 220px; overflow: hid
 .project-icon, .project-avatar { display: grid; place-items: center; border: 1px solid #393939; border-radius: 6px; background: #151515; font-weight: 700; }
 .project-icon { width: 32px; height: 32px; font-size: 11px; }
 .project-avatar { width: 44px; height: 44px; font-size: 15px; }
+.new-project-head { max-width: 720px; margin: 2px 0 24px; }
+.new-project-head h2 { margin: 7px 0 8px; font-size: 28px; letter-spacing: -.04em; }
+.new-project-head p:last-child { margin-bottom: 0; }
+.new-project-layout { display: grid; grid-template-columns: minmax(0, 1fr) 300px; gap: 18px; align-items: start; }
+.new-project-main { display: grid; gap: 14px; min-width: 0; }
+.import-panel { padding: 24px; }
+.import-panel > .muted { margin: -5px 0 20px; }
+.method-divider { display: flex; align-items: center; gap: 12px; color: var(--faint); font-size: 10px; }
+.method-divider::before, .method-divider::after { content: ""; height: 1px; flex: 1; background: var(--line-soft); }
+.import-sidebar { position: sticky; top: 18px; padding: 20px; }
+.capability-list { display: grid; gap: 0; margin-top: 14px; }
+.capability-list > div, .source-connection { display: grid; grid-template-columns: 9px minmax(0, 1fr); gap: 10px; align-items: start; padding: 12px 0; border-bottom: 1px solid var(--line-soft); }
+.capability-list .dot, .source-connection .dot { margin-top: 4px; }
+.capability-list p, .source-connection p { margin: 0; }
+.capability-list strong, .capability-list small, .source-connection strong, .source-connection small { display: block; }
+.capability-list strong, .source-connection strong { font-size: 11px; }
+.capability-list small, .source-connection small { margin-top: 4px; color: var(--muted); font-size: 10px; line-height: 1.45; }
+.security-steps { display: grid; gap: 14px; margin-top: 22px; padding-top: 20px; border-top: 1px solid var(--line); }
+.security-steps > div, .guidance-list > div { display: grid; grid-template-columns: 25px minmax(0, 1fr); gap: 10px; align-items: start; }
+.security-steps > div > span, .guidance-list > div > span { display: grid; place-items: center; width: 24px; height: 24px; border: 1px solid var(--line); border-radius: 50%; color: var(--muted); font: 10px "Geist Mono", monospace; }
+.security-steps p, .guidance-list p { margin: 1px 0 0; }
+.security-steps strong, .security-steps small, .guidance-list strong, .guidance-list small { display: block; }
+.security-steps strong, .guidance-list strong { font-size: 11px; }
+.security-steps small, .guidance-list small { margin-top: 4px; color: var(--muted); font-size: 10px; line-height: 1.55; }
 .disclosure-panel { padding: 0; margin: 16px 0; overflow: hidden; }
 .disclosure-panel > summary { display: flex; align-items: center; justify-content: space-between; padding: 17px 20px; list-style: none; cursor: pointer; }
 .disclosure-panel > summary::-webkit-details-marker { display: none; }
@@ -222,6 +246,33 @@ td small { color: var(--muted); margin-top: 4px; max-width: 220px; overflow: hid
 .project-tabs button.active { color: #fff; border-bottom-color: #fff; }
 .project-tab { display: none; }
 .project-tab.active { display: block; }
+.domain-overview { display: grid; grid-template-columns: repeat(3, 1fr); gap: 10px; margin-bottom: 16px; }
+.domain-metric { min-height: 100px; padding: 16px; border: 1px solid var(--line-soft); border-radius: 7px; background: var(--surface); }
+.domain-metric span, .domain-metric strong, .domain-metric small { display: block; }
+.domain-metric span { color: var(--muted); font-size: 10px; }
+.domain-metric strong { margin-top: 11px; font-size: 17px; }
+.domain-metric small { margin-top: 5px; color: var(--muted); font-size: 10px; line-height: 1.45; }
+.domain-panel { padding-bottom: 16px; }
+.domain-list { display: grid; }
+.domain-row { display: grid; grid-template-columns: 30px minmax(160px, 1.2fr) minmax(120px, .7fr) minmax(200px, 1fr) auto; gap: 12px; align-items: center; padding: 14px 0; border-top: 1px solid var(--line-soft); }
+.domain-icon { display: grid; place-items: center; width: 28px; height: 28px; border: 1px solid var(--line); border-radius: 50%; color: var(--muted); }
+.domain-primary a { color: var(--text); font: 600 12px "Geist Mono", monospace; text-decoration: none; }
+.domain-primary a:hover { text-decoration: underline; }
+.domain-primary small, .domain-route small, .domain-certificate small { display: block; margin-top: 5px; color: var(--muted); font-size: 9px; line-height: 1.4; overflow-wrap: anywhere; }
+.status-chip { display: inline-flex; align-items: center; gap: 5px; font-size: 10px; }
+.status-chip::before { content: ""; width: 6px; height: 6px; border-radius: 50%; background: var(--faint); }
+.status-chip.ok { color: var(--success); }
+.status-chip.ok::before { background: var(--success); }
+.status-chip.wait { color: var(--warning); }
+.status-chip.wait::before { background: var(--warning); }
+.status-chip.error { color: var(--danger); }
+.status-chip.error::before { background: var(--danger); }
+.domain-add-form { grid-template-columns: minmax(0, 1fr) auto; align-items: end; margin-top: 16px; padding-top: 16px; border-top: 1px solid var(--line); }
+.dns-guide { display: grid; grid-template-columns: minmax(180px, .55fr) minmax(0, 1.45fr); gap: 36px; margin-top: 16px; }
+.guidance-list { display: grid; gap: 16px; }
+.source-status { margin-top: 18px; }
+.source-status .webhook-grid { grid-template-columns: 70px minmax(0, 1fr); }
+.settings-identifiers { margin: 0; }
 .detail-stack { display: grid; gap: 15px; }
 .deployment-version { display: flex; align-items: center; gap: 12px; padding: 13px; border: 1px solid var(--line-soft); border-radius: 7px; background: #070707; }
 .deployment-version strong { font: 600 17px "Geist Mono", monospace; }
@@ -276,6 +327,10 @@ dialog::backdrop { background: #000c; backdrop-filter: blur(3px); }
   .build-row { grid-template-columns: 9px minmax(150px, 1fr) auto; }
   .build-stage { display: none; }
   .settings-panel { grid-template-columns: 1fr; gap: 22px; }
+  .new-project-layout { grid-template-columns: 1fr; }
+  .import-sidebar { position: static; }
+  .domain-row { grid-template-columns: 30px minmax(160px, 1fr) minmax(180px, 1fr) auto; }
+  .domain-route { display: none; }
 }
 
 @media (max-width: 760px) {
@@ -314,6 +369,13 @@ dialog::backdrop { background: #000c; backdrop-filter: blur(3px); }
   .project-actions > * { flex: 1; text-align: center; }
   .project-identity p:last-child { white-space: normal; }
   .settings-panel { padding: 18px; }
+  .new-project-head h2 { font-size: 24px; }
+  .import-panel { padding: 18px; }
+  .domain-overview { grid-template-columns: 1fr; }
+  .domain-row { grid-template-columns: 30px minmax(0, 1fr) auto; align-items: start; }
+  .domain-row > button { grid-column: 3; grid-row: 1; }
+  .domain-certificate { grid-column: 2 / -1; grid-row: 2; }
+  .domain-add-form, .dns-guide { grid-template-columns: 1fr; }
   .danger-zone { align-items: stretch; flex-direction: column; }
   .content-metrics { grid-template-columns: 1fr; }
   .content-metrics div { border-right: 0; border-bottom: 1px solid var(--line-soft); }

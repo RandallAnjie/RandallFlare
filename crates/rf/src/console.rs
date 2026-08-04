@@ -698,6 +698,28 @@ async fn worker_get(
             .map(|record| serde_json::to_value(record).unwrap_or(Value::Null)),
         ConsoleMode::Local { .. } => None,
     };
+    let tls = match &state.mode {
+        ConsoleMode::Public { node, .. } => worker_tls_view(node, &manifest.hostnames),
+        ConsoleMode::Local { .. } => json!({
+            "enabled": false,
+            "acme_enabled": false,
+            "acme_ready": false,
+            "include_worker_hostnames": false,
+            "zone": null,
+            "dns_target": null,
+            "certificates": manifest.hostnames.iter().map(|hostname| json!({
+                "hostname": hostname,
+                "status": "unknown",
+                "source": "unknown",
+                "coverage": "unknown",
+                "covered_by": null,
+                "issued_ms": null,
+                "expires_ms": null,
+                "days_remaining": null,
+                "auto_managed": false,
+            })).collect::<Vec<_>>(),
+        }),
+    };
     Ok(Json(json!({
         "worker": {
             "name": manifest.name,
@@ -714,7 +736,177 @@ async fn worker_get(
             "durable_objects": durable_objects,
         },
         "source": source,
+        "tls": tls,
     })))
+}
+
+fn worker_tls_view(node: &Node, hostnames: &[String]) -> Value {
+    const DAY_MS: u64 = 24 * 60 * 60 * 1000;
+    const RENEWAL_MS: u64 = 30 * DAY_MS;
+
+    let https_enabled = node.cfg.ingress.https.is_some();
+    let acme = node.cfg.acme.as_ref();
+    let zone = acme
+        .and_then(|cfg| cfg.zone.clone())
+        .or_else(|| node.cfg.dns.as_ref().map(|cfg| cfg.zone.clone()));
+    let configured: Vec<String> = acme
+        .map(|cfg| {
+            cfg.hostnames
+                .iter()
+                .map(|hostname| hostname.trim().trim_end_matches('.').to_ascii_lowercase())
+                .collect()
+        })
+        .unwrap_or_default();
+    let include_worker_hostnames = acme
+        .map(|cfg| cfg.include_worker_hostnames)
+        .unwrap_or(false);
+    let token_env = acme
+        .and_then(|cfg| cfg.api_token_env.clone())
+        .or_else(|| node.cfg.dns.as_ref().map(|cfg| cfg.api_token_env.clone()))
+        .unwrap_or_else(|| "CF_API_TOKEN".into());
+    let acme_ready = acme.is_some()
+        && zone.is_some()
+        && std::env::var(&token_env)
+            .ok()
+            .is_some_and(|token| !token.is_empty());
+    let cert_dir = node.cfg.data_dir.join("certs");
+    let now = now_ms();
+
+    let certificates = hostnames
+        .iter()
+        .map(|hostname| {
+            let hostname = hostname.trim().trim_end_matches('.').to_ascii_lowercase();
+            let wildcard = hostname
+                .split_once('.')
+                .map(|(_, suffix)| format!("*.{suffix}"));
+            let candidates = std::iter::once((hostname.clone(), "exact"))
+                .chain(wildcard.clone().map(|name| (name, "wildcard")));
+
+            let mut record = None;
+            let mut manual = None;
+            for (candidate, coverage) in candidates {
+                if record.is_none() {
+                    record = node
+                        .kv_get(crate::acme::NS, &crate::acme::cert_kv_key(&candidate))
+                        .and_then(|raw| {
+                            serde_json::from_slice::<crate::acme::CertRecord>(&raw).ok()
+                        })
+                        .map(|record| (candidate.clone(), coverage, record));
+                }
+                if manual.is_none() {
+                    let stem = crate::acme::file_stem(&candidate);
+                    if cert_dir.join(format!("{stem}.crt")).is_file()
+                        && cert_dir.join(format!("{stem}.key")).is_file()
+                    {
+                        manual = Some((candidate, coverage));
+                    }
+                }
+            }
+
+            let zone_match = zone.as_deref().is_some_and(|zone| {
+                let zone = zone.trim().trim_end_matches('.').to_ascii_lowercase();
+                hostname == zone || hostname.ends_with(&format!(".{zone}"))
+            });
+            let configured_name = configured
+                .iter()
+                .find(|name| **name == hostname || wildcard.as_ref() == Some(*name))
+                .cloned();
+            let auto_managed = acme.is_some()
+                && (configured_name.is_some() || (include_worker_hostnames && zone_match));
+
+            let (status, source, coverage, covered_by, issued_ms, expires_ms, days_remaining) =
+                if !https_enabled {
+                    ("https_disabled", "none", "none", None, None, None, None)
+                } else if let Some((covered_by, coverage, record)) = record {
+                    let remaining = record.expires_ms.saturating_sub(now);
+                    let status = if record.expires_ms <= now {
+                        "expired"
+                    } else if remaining < RENEWAL_MS {
+                        "renewing"
+                    } else {
+                        "active"
+                    };
+                    (
+                        status,
+                        "acme",
+                        coverage,
+                        Some(covered_by),
+                        Some(record.issued_ms),
+                        Some(record.expires_ms),
+                        Some(remaining / DAY_MS),
+                    )
+                } else if let Some((covered_by, coverage)) = manual {
+                    (
+                        "installed",
+                        "manual",
+                        coverage,
+                        Some(covered_by),
+                        None,
+                        None,
+                        None,
+                    )
+                } else if auto_managed && acme_ready {
+                    (
+                        "provisioning",
+                        "acme",
+                        if configured_name
+                            .as_deref()
+                            .is_some_and(|name| name.starts_with("*."))
+                        {
+                            "wildcard"
+                        } else {
+                            "exact"
+                        },
+                        configured_name.or_else(|| Some(hostname.clone())),
+                        None,
+                        None,
+                        None,
+                    )
+                } else if auto_managed {
+                    (
+                        "acme_unavailable",
+                        "acme",
+                        if configured_name
+                            .as_deref()
+                            .is_some_and(|name| name.starts_with("*."))
+                        {
+                            "wildcard"
+                        } else {
+                            "exact"
+                        },
+                        configured_name.or_else(|| Some(hostname.clone())),
+                        None,
+                        None,
+                        None,
+                    )
+                } else {
+                    ("missing", "none", "none", None, None, None, None)
+                };
+
+            json!({
+                "hostname": hostname,
+                "status": status,
+                "source": source,
+                "coverage": coverage,
+                "covered_by": covered_by,
+                "issued_ms": issued_ms,
+                "expires_ms": expires_ms,
+                "days_remaining": days_remaining,
+                "auto_managed": auto_managed,
+            })
+        })
+        .collect::<Vec<_>>();
+
+    json!({
+        "enabled": https_enabled,
+        "http_enabled": node.cfg.ingress.http.is_some(),
+        "acme_enabled": acme.is_some(),
+        "acme_ready": acme_ready,
+        "include_worker_hostnames": include_worker_hostnames,
+        "zone": zone,
+        "dns_target": node.cfg.dns.as_ref().map(|cfg| cfg.hostname.clone()),
+        "certificates": certificates,
+    })
 }
 
 fn valid_compatibility_date(value: &str) -> bool {
@@ -1555,6 +1747,14 @@ mod tests {
             [peer_api]
             listen = "127.0.0.1:17382"
             advertise = "127.0.0.1:17382"
+            [ingress]
+            http = "127.0.0.1:18080"
+            https = "127.0.0.1:18443"
+            [acme]
+            email = "ops@example.com"
+            hostnames = ["*.example.com"]
+            include_worker_hostnames = true
+            zone = "example.com"
             "#,
             data_dir = data_dir.display(),
             operator = operator.signer_id(),
@@ -1563,6 +1763,36 @@ mod tests {
         let node = Arc::new(Node::open(config, Keypair::from_seed([20u8; 32])).unwrap());
         let state = ConsoleState::public(node.clone(), false).unwrap();
         (state, node, operator)
+    }
+
+    #[test]
+    fn worker_tls_view_reports_certificate_without_exposing_key_material() {
+        let (_, node, _) = public_state();
+        let now = now_ms();
+        let record = crate::acme::CertRecord {
+            hostname: "*.example.com".into(),
+            cert_pem: "CERTIFICATE-MATERIAL".into(),
+            key_pem: "PRIVATE-KEY-MATERIAL".into(),
+            issued_ms: now,
+            expires_ms: now + 60 * 24 * 60 * 60 * 1000,
+        };
+        node.kv_put(
+            crate::acme::NS,
+            &crate::acme::cert_kv_key("*.example.com"),
+            Some(serde_json::to_vec(&record).unwrap()),
+            None,
+        )
+        .unwrap();
+
+        let view = worker_tls_view(&node, &["api.example.com".into()]);
+        assert_eq!(view["enabled"], true);
+        assert_eq!(view["include_worker_hostnames"], true);
+        assert_eq!(view["certificates"][0]["status"], "active");
+        assert_eq!(view["certificates"][0]["coverage"], "wildcard");
+        assert_eq!(view["certificates"][0]["covered_by"], "*.example.com");
+        let encoded = view.to_string();
+        assert!(!encoded.contains("CERTIFICATE-MATERIAL"));
+        assert!(!encoded.contains("PRIVATE-KEY-MATERIAL"));
     }
 
     #[tokio::test]

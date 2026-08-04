@@ -794,7 +794,7 @@ async fn run(config_path: PathBuf) -> Result<()> {
 
     // Certs issued anywhere in the cluster materialize on every node.
     rf::acme::spawn_materializer(node.clone());
-    if let Some(acme_cfg) = node.cfg.acme.clone() {
+    if let Some(mut acme_cfg) = node.cfg.acme.clone() {
         let zone = acme_cfg
             .zone
             .clone()
@@ -809,6 +809,7 @@ async fn run(config_path: PathBuf) -> Result<()> {
             std::env::var(&token_env).ok().filter(|t| !t.is_empty()),
         ) {
             (Some(zone), Some(token)) => {
+                acme_cfg.zone = Some(zone.clone());
                 let dns_api = match &acme_cfg.dns_api_base {
                     Some(base) => rf::dns::DnsApi::new(base.clone(), token, zone),
                     None => rf::dns::DnsApi::cloudflare(token, zone),
