@@ -14,7 +14,7 @@ See [DESIGN.md](./DESIGN.md) for the architecture and consistency
 model. For a repeatable first-server rollout, use the
 [VPS deployment runbook](./docs/DEPLOYMENT.md).
 
-## Status: v0.8.0 (pre-release)
+## Status: v0.8.1 (pre-release)
 
 Working today, verified by multi-process fault-injection e2e tests:
 
@@ -124,6 +124,7 @@ zone = "example.com"
 email = "you@example.com"
 hostnames = ["edge.example.com", "*.edge.example.com"]
 include_worker_hostnames = true      # exact Worker domains inside zone
+dns_propagation_seconds = 20         # wait before asking the CA to validate
 # zone/token default to [dns]'s. One node claims each renewal task,
 # orders via DNS-01, and the cert replicates to every node's
 # <data_dir>/certs through cluster KV.

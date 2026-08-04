@@ -1010,6 +1010,7 @@ email = "test@example.com"
 hostnames = ["acme.test"]
 zone = "test.zone"
 api_token_env = "RF_TEST_CF_TOKEN"
+dns_propagation_seconds = 0
 directory_url = "https://localhost:{pebble_port}/dir"
 ca_root = "{ca}"
 dns_api_base = "{cf_base}"

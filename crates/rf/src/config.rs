@@ -177,6 +177,11 @@ pub struct AcmeConfig {
     /// so an imported manifest cannot unexpectedly consume CA rate limits.
     #[serde(default)]
     pub include_worker_hostnames: bool,
+    /// Seconds to wait after publishing the DNS-01 TXT record before
+    /// notifying the CA. Cloudflare's API can acknowledge a write slightly
+    /// before every authoritative nameserver serves it.
+    #[serde(default = "default_acme_dns_propagation_seconds")]
+    pub dns_propagation_seconds: u64,
     /// Cloudflare zone the TXT challenges live in. Falls back to
     /// [dns].zone when unset.
     #[serde(default)]
@@ -194,6 +199,10 @@ pub struct AcmeConfig {
     /// Override the DNS API base (mock server in tests).
     #[serde(default)]
     pub dns_api_base: Option<String>,
+}
+
+fn default_acme_dns_propagation_seconds() -> u64 {
+    20
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]
@@ -362,6 +371,13 @@ impl NodeConfig {
         {
             anyhow::bail!("enabled update.repo and update.api_base must not be empty");
         }
+        if self
+            .acme
+            .as_ref()
+            .is_some_and(|acme| acme.dns_propagation_seconds > 600)
+        {
+            anyhow::bail!("acme.dns_propagation_seconds must not exceed 600");
+        }
         if self.build.timeout_seconds == 0 || self.build.timeout_seconds > 6 * 60 * 60 {
             anyhow::bail!("build.timeout_seconds must be between 1 and 21600");
         }
@@ -430,6 +446,27 @@ mod tests {
         )
         .unwrap();
         assert!(cfg.cluster_secret_bytes().is_err());
+    }
+
+    #[test]
+    fn acme_dns_propagation_wait_defaults_and_is_bounded() {
+        let raw = r#"
+            data_dir = "/var/lib/rf"
+            operator = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+            cluster_secret = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+            [gossip]
+            listen = "127.0.0.1:7381"
+            [peer_api]
+            listen = "127.0.0.1:7382"
+            [acme]
+            email = "ops@example.com"
+            hostnames = ["example.com"]
+            zone = "example.com"
+        "#;
+        let mut cfg: NodeConfig = toml::from_str(raw).unwrap();
+        assert_eq!(cfg.acme.as_ref().unwrap().dns_propagation_seconds, 20);
+        cfg.acme.as_mut().unwrap().dns_propagation_seconds = 601;
+        assert!(cfg.validate().is_err());
     }
 
     #[test]
