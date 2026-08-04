@@ -14,6 +14,7 @@ const state = {
   authChallenge: null,
   authTimer: null,
   approvalTimer: null,
+  approvalComplete: null,
   sources: [],
   builds: [],
   buildTimer: null,
@@ -26,6 +27,7 @@ const state = {
 const titles = {
   overview: ["集群控制", "概览"],
   workers: ["签名清单", "Worker"],
+  "worker-new": ["Worker 项目", "新建项目"],
   "worker-detail": ["Worker 项目", "项目详情"],
   kv: ["分布式数据", "KV 存储"],
   d1: ["分布式 SQLite", "D1 数据库"],
@@ -165,7 +167,8 @@ async function pollAuthorization() {
 
 function switchView(view) {
   state.view = view;
-  $$(".nav-item").forEach((item) => item.classList.toggle("active", item.dataset.view === view));
+  const navView = view.startsWith("worker-") ? "workers" : view;
+  $$(".nav-item").forEach((item) => item.classList.toggle("active", item.dataset.view === navView));
   $$(".view").forEach((item) => item.classList.toggle("active", item.id === `view-${view}`));
   const title = titles[view] || titles.overview;
   $("#section-eyebrow").textContent = title[0];
@@ -301,21 +304,10 @@ function renderSources(data) {
   const cap = $("#build-capabilities");
   const gitReady = Boolean(capabilities.git);
   const sandboxReady = Boolean(capabilities.sandbox);
-  cap.innerHTML = `<span class="dot ${gitReady ? "online" : "offline"}"></span><strong>${gitReady ? "构建节点已就绪" : "Git 不可用"}</strong><span>git ${gitReady ? "✓" : "×"}</span><span>bwrap ${sandboxReady ? "✓" : "可选"}</span><span>私有仓库令牌 ${capabilities.github_token_configured ? "✓" : "未配置"}</span>`;
-  $("#source-count").textContent = `已连接 ${state.sources.length} 个`;
-  const list = $("#source-list");
-  list.classList.toggle("empty-state", state.sources.length === 0);
-  list.innerHTML = state.sources.length ? state.sources.map((source) => `
-    <article class="source-card">
-      <div class="source-icon">GH</div>
-      <div class="source-main">
-        <div class="source-title"><strong>${escapeHtml(source.worker)}</strong><span class="badge">代码源 v${escapeHtml(source.version)}</span>${source.webhook ? '<span class="badge active">已启用推送触发</span>' : ""}</div>
-        <a href="${escapeHtml(source.repository.replace(/\.git$/, ""))}" target="_blank" rel="noreferrer">${escapeHtml(source.repository.replace(/\.git$/, ""))}</a>
-        <div class="source-meta"><span>分支 <code>${escapeHtml(source.branch)}</code></span><span>项目目录 <code>${escapeHtml(source.root)}</code></span><span>产物目录 <code>${escapeHtml(source.output_dir)}</code></span><span>${source.build_command ? "沙箱构建" : "零配置构建"}</span></div>
-        ${source.webhook ? `<details><summary>配置 GitHub Webhook</summary><div class="webhook-grid"><span>回调地址</span><code>${escapeHtml(`${location.origin}${source.webhook_path}`)}</code><span>密钥</span><code>${escapeHtml(source.webhook_secret || "不可用")}</code><span>事件</span><code>仅推送事件</code></div></details>` : ""}
-      </div>
-      <div class="source-actions"><button class="primary" data-source-action="build" data-worker="${escapeHtml(source.worker)}">立即构建</button><button class="mini-button" data-source-action="edit" data-worker="${escapeHtml(source.worker)}">编辑</button><button class="mini-button danger" data-source-action="disconnect" data-worker="${escapeHtml(source.worker)}">断开连接</button></div>
-    </article>`).join("") : "尚未连接 GitHub 仓库。请先在上方连接仓库，以启用构建和推送部署。";
+  cap.innerHTML = `
+    <div><span class="dot ${gitReady ? "online" : "offline"}"></span><p><strong>${gitReady ? "构建节点已就绪" : "Git 不可用"}</strong><small>Git ${gitReady ? "可用" : "缺失"}</small></p></div>
+    <div><span class="dot ${sandboxReady ? "online" : "pending"}"></span><p><strong>${sandboxReady ? "构建沙箱已启用" : "仅支持零配置构建"}</strong><small>bwrap ${sandboxReady ? "可用" : "未配置"}</small></p></div>
+    <div><span class="dot ${capabilities.github_token_configured ? "online" : "pending"}"></span><p><strong>${capabilities.github_token_configured ? "可访问私有仓库" : "仅公开仓库"}</strong><small>节点令牌${capabilities.github_token_configured ? "已配置" : "未配置"}</small></p></div>`;
   if (state.overview?.workers) renderWorkers(state.overview.workers);
 }
 
@@ -336,9 +328,6 @@ function buildRowsHtml(jobs, approveNode) {
 
 function renderBuilds(jobs, approveNode) {
   state.builds = jobs || [];
-  const list = $("#build-list");
-  list.classList.toggle("empty-state", state.builds.length === 0);
-  list.innerHTML = buildRowsHtml(state.builds, approveNode);
   if (state.activeWorker) {
     $("#detail-builds").innerHTML = buildRowsHtml(
       state.builds.filter((job) => job.worker === state.activeWorker),
@@ -354,9 +343,9 @@ function formatBytes(bytes) {
   return `${(value / (1024 * 1024)).toFixed(1)} MiB`;
 }
 
-function workerUrl(hostname) {
+function workerUrl(hostname, tlsEnabled = location.protocol === "https:") {
   if (!hostname) return "";
-  return `${location.protocol}//${hostname}`;
+  return `${tlsEnabled ? "https:" : "http:"}//${hostname}`;
 }
 
 function mapToLines(values) {
@@ -385,6 +374,75 @@ function switchProjectTab(tab) {
   if (tab === "deployments") loadDetailHistory();
 }
 
+function certificateStatusLabel(status) {
+  return {
+    active: "证书有效",
+    installed: "证书已安装",
+    renewing: "即将续期",
+    provisioning: "正在签发",
+    acme_unavailable: "ACME 未就绪",
+    expired: "证书已过期",
+    missing: "缺少受信任证书",
+    https_disabled: "HTTPS 未启用",
+    unknown: "状态不可用",
+  }[status] || status || "状态不可用";
+}
+
+function certificateStateClass(status) {
+  if (status === "active" || status === "installed") return "ok";
+  if (status === "renewing" || status === "provisioning") return "wait";
+  return "error";
+}
+
+function renderProjectDomains(worker, tls = {}) {
+  const hostnames = worker.hostnames || [];
+  const certificates = new Map((tls.certificates || []).map((item) => [item.hostname, item]));
+  const trusted = (tls.certificates || []).filter((item) => ["active", "installed", "renewing"].includes(item.status)).length;
+  const automaticConfigured = Boolean(tls.acme_enabled && tls.include_worker_hostnames);
+  const automatic = Boolean(automaticConfigured && tls.acme_ready);
+  $("#project-domain-count").textContent = `${hostnames.length} 个域名`;
+  $("#domain-tls-summary").innerHTML = `
+    <article class="domain-metric"><span>路由状态</span><strong>${hostnames.length ? "已发布" : "待配置"}</strong><small>${hostnames.length} 个域名写入当前清单</small></article>
+    <article class="domain-metric"><span>HTTPS 入口</span><strong>${tls.enabled ? "已启用" : "未启用"}</strong><small>${tls.enabled ? "节点正在监听 HTTPS" : "请先在节点配置 ingress.https"}</small></article>
+    <article class="domain-metric"><span>受信任证书</span><strong>${trusted}/${hostnames.length}</strong><small>${automatic ? "新增域名可由 ACME 自动签发" : automaticConfigured ? "ACME 缺少可用的 DNS 区域或令牌" : tls.acme_enabled ? "ACME 仅管理节点配置中的域名" : "当前节点未配置 ACME"}</small></article>`;
+
+  const list = $("#project-domain-list");
+  list.classList.toggle("empty-state", hostnames.length === 0);
+  list.innerHTML = hostnames.length ? hostnames.map((hostname) => {
+    const cert = certificates.get(hostname) || { status: "unknown", source: "unknown", coverage: "unknown" };
+    const url = workerUrl(hostname, Boolean(tls.enabled));
+    const source = cert.source === "acme" ? "ACME 自动管理" : cert.source === "manual" ? "手动证书" : "无证书";
+    const coverage = cert.coverage === "wildcard"
+      ? `通配符 ${cert.covered_by || ""}`
+      : cert.coverage === "exact" ? "精确域名" : "未覆盖";
+    const expiry = cert.expires_ms
+      ? `有效至 ${new Date(cert.expires_ms).toLocaleDateString("zh-CN")}${cert.days_remaining != null ? ` · 剩余 ${cert.days_remaining} 天` : ""}`
+      : cert.status === "installed" ? "有效期由手动证书决定" : "尚无有效期信息";
+    return `<div class="domain-row">
+      <span class="domain-icon">↗</span>
+      <div class="domain-primary"><a href="${escapeHtml(url)}" target="_blank" rel="noreferrer">${escapeHtml(hostname)}</a><small>${escapeHtml(url)}</small></div>
+      <div class="domain-route"><span class="status-chip ok">路由已发布</span><small>Worker v${escapeHtml(worker.version)}</small></div>
+      <div class="domain-certificate"><span class="status-chip ${certificateStateClass(cert.status)}">${escapeHtml(certificateStatusLabel(cert.status))}</span><small>${escapeHtml(source)} · ${escapeHtml(coverage)}</small><small>${escapeHtml(expiry)}</small></div>
+      <button class="mini-button danger" type="button" data-remove-domain="${escapeHtml(hostname)}">移除</button>
+    </div>`;
+  }).join("") : "尚未绑定域名。添加域名后，所有节点会从同一份签名清单建立路由。";
+
+  const dnsInstruction = tls.dns_target
+    ? `将域名的 CNAME 指向 ${tls.dns_target}；RandallFlare 的 DNS 轮换会维护可用边缘节点。`
+    : "将域名的 A/AAAA 或 CNAME 记录指向承担入口流量的 RandallFlare 公网节点。";
+  const certificateInstruction = automatic
+    ? `域名位于 ${tls.zone || "已配置区域"} 内时，集群会抢占签发任务，并通过 DNS-01 自动申请和续期。`
+    : automaticConfigured
+      ? "Worker 域名自动签发已开启，但当前节点缺少 DNS 区域或 API 令牌；补全节点侧 ACME 配置后才会开始签发。"
+    : tls.acme_enabled
+      ? "如需自动签发新绑定的域名，请在节点的 [acme] 中启用 include_worker_hostnames，或预先配置覆盖它的通配符证书。"
+      : "请在节点的 [acme] 中配置 DNS-01，或把 .crt/.key 证书放入 data_dir/certs；证书会热加载。";
+  $("#project-domain-guidance").innerHTML = `
+    <div><span>1</span><p><strong>发布路由</strong><small>这里的添加或移除操作会生成新的签名 Worker 清单。</small></p></div>
+    <div><span>2</span><p><strong>配置 DNS</strong><small>${escapeHtml(dnsInstruction)}</small></p></div>
+    <div><span>3</span><p><strong>启用 HTTPS</strong><small>${escapeHtml(certificateInstruction)}</small></p></div>`;
+}
+
 function renderWorkerDetail(data) {
   const worker = data.worker;
   const summary = (state.overview?.workers || []).find((item) => item.name === worker.name) || {};
@@ -393,7 +451,7 @@ function renderWorkerDetail(data) {
   const modules = worker.modules || [];
   const assets = worker.assets || [];
   const totalBytes = [...modules, ...assets].reduce((total, item) => total + Number(item.size || 0), 0);
-  const openUrl = workerUrl(worker.hostnames?.[0]);
+  const openUrl = workerUrl(worker.hostnames?.[0], Boolean(data.tls?.enabled));
 
   $("#project-title").textContent = worker.name;
   $("#project-subtitle").textContent = source
@@ -421,7 +479,7 @@ function renderWorkerDetail(data) {
   $("#detail-content").innerHTML = `
     <div class="content-metrics"><div><strong>${modules.length}</strong><span>模块</span></div><div><strong>${assets.length}</strong><span>静态资源</span></div><div><strong>${formatBytes(totalBytes)}</strong><span>总大小</span></div></div>
     <div class="content-files"><strong>主要内容</strong>${[...modules, ...assets].slice(0, 6).map((file) => `<span><code>${escapeHtml(file.path)}</code><small>${formatBytes(file.size)}</small></span>`).join("") || '<span class="muted">清单中没有文件</span>'}</div>`;
-  $("#project-hostnames").value = (worker.hostnames || []).join("\n");
+  renderProjectDomains(worker, data.tls || {});
   $("#project-env").value = mapToLines(worker.env);
   $("#project-kv-bindings").value = mapToLines(worker.kv_bindings);
   $("#project-crons").value = (worker.crons || []).join("\n");
@@ -437,6 +495,15 @@ function renderWorkerDetail(data) {
     ? "编辑仓库、分支与构建命令。源码配置也由管理员签名并在集群内复制。"
     : "该项目尚未连接 GitHub；填写配置即可接入构建与推送部署。";
   $("#project-source-form button[type=submit]").textContent = source ? "保存 Git 配置" : "连接 GitHub 仓库";
+  $("#project-source-disconnect").classList.toggle("hidden", !source);
+  $("#project-source-status").innerHTML = source ? `
+    <div class="source-connection"><span class="dot online"></span><p><strong>已连接</strong><small>代码源 v${escapeHtml(source.version)} · ${source.webhook ? "推送自动构建已启用" : "仅手动构建"}</small></p></div>
+    ${source.webhook ? `<div class="webhook-grid"><span>回调地址</span><code>${escapeHtml(`${location.origin}${source.webhook_path}`)}</code><span>密钥</span><code>${escapeHtml(source.webhook_secret || "不可用")}</code><span>事件</span><code>仅推送事件</code></div>` : ""}` : '<div class="source-connection"><span class="dot pending"></span><p><strong>尚未连接</strong><small>填写右侧表单即可启用 GitHub 构建。</small></p></div>';
+  $("#project-identifiers").innerHTML = `
+    <div><dt>Worker 名称</dt><dd class="mono">${escapeHtml(worker.name)}</dd></div>
+    <div><dt>当前版本</dt><dd class="mono">v${escapeHtml(worker.version)}</dd></div>
+    <div><dt>清单摘要</dt><dd class="mono">${escapeHtml(worker.digest)}</dd></div>
+    <div><dt>入口模块</dt><dd class="mono">${escapeHtml(worker.main || "静态资源项目")}</dd></div>`;
   $("#detail-builds").innerHTML = buildRowsHtml(state.builds.filter((job) => job.worker === worker.name));
 }
 
@@ -505,23 +572,48 @@ async function updateWorkerSettings(payload, summary) {
 
 async function saveProjectDomains(event) {
   event.preventDefault();
-  const hostnames = $("#project-hostnames").value.split(/\r?\n/).map((value) => value.trim()).filter(Boolean);
-  await updateWorkerSettings({ hostnames }, `更新 ${state.activeWorker} 的域名路由。`);
+  const hostname = $("#project-domain-input").value.trim().replace(/^https?:\/\//, "").split("/")[0].replace(/\.$/, "").toLowerCase();
+  const current = state.workerDetail?.worker?.hostnames || [];
+  if (current.includes(hostname)) {
+    toast(`${hostname} 已绑定到当前 Worker`, true);
+    return;
+  }
+  const hostnames = [...current, hostname];
+  await updateWorkerSettings({ hostnames }, `为 ${state.activeWorker} 添加域名 ${hostname}。`);
+  $("#project-domain-input").value = "";
 }
 
-async function saveProjectSettings(event) {
+async function removeProjectDomain(hostname) {
+  if (!window.confirm(`要从 ${state.activeWorker} 移除域名“${hostname}”吗？`)) return;
+  const hostnames = (state.workerDetail?.worker?.hostnames || []).filter((item) => item !== hostname);
+  await updateWorkerSettings({ hostnames }, `从 ${state.activeWorker} 移除域名 ${hostname}。`);
+}
+
+async function saveProjectBindings(event) {
   event.preventDefault();
   try {
     const payload = {
       env: linesToMap($("#project-env").value, "环境变量"),
       kv_bindings: linesToMap($("#project-kv-bindings").value, "KV 绑定"),
-      crons: $("#project-crons").value.split(/\r?\n/).map((value) => value.trim()).filter(Boolean),
-      compatibility_date: $("#project-compatibility-date").value,
     };
-    await updateWorkerSettings(payload, `更新 ${state.activeWorker} 的运行配置。`);
+    await updateWorkerSettings(payload, `更新 ${state.activeWorker} 的变量与绑定。`);
   } catch (error) {
     toast(error.message, true);
   }
+}
+
+async function saveProjectTriggers(event) {
+  event.preventDefault();
+  const crons = $("#project-crons").value.split(/\r?\n/).map((value) => value.trim()).filter(Boolean);
+  await updateWorkerSettings({ crons }, `更新 ${state.activeWorker} 的定时触发器。`);
+}
+
+async function saveProjectSettings(event) {
+  event.preventDefault();
+  await updateWorkerSettings(
+    { compatibility_date: $("#project-compatibility-date").value },
+    `更新 ${state.activeWorker} 的兼容日期。`,
+  );
 }
 
 async function saveProjectSource(event) {
@@ -569,7 +661,10 @@ async function connectSource(event) {
   };
   try {
     const result = await api("/api/sources", { method: "POST", body: JSON.stringify(payload) });
-    showApproval(result, `将 ${payload.worker} 连接到 GitHub。`);
+    showApproval(result, `将 ${payload.worker} 连接到 GitHub。`, async () => {
+      switchView("workers");
+      await triggerBuild(payload.worker);
+    });
   } catch (error) {
     toast(error.message, true);
   }
@@ -785,8 +880,9 @@ async function browserBundleFiles() {
   return files;
 }
 
-function showApproval(result, fallbackSummary) {
+function showApproval(result, fallbackSummary, onComplete = null) {
   clearTimeout(state.approvalTimer);
+  state.approvalComplete = onComplete;
   const approval = result.approval;
   const command = authorizationCommand(approval.code, result.approve_node);
   $("#approval-title").textContent = result.name
@@ -811,6 +907,12 @@ async function pollApproval(id) {
       await loadOverview({ quiet: true });
       await loadWorkerOps();
       if (state.activeWorker) await openWorkerDetail(state.activeWorker, state.projectTab);
+      const onComplete = state.approvalComplete;
+      state.approvalComplete = null;
+      if (onComplete) {
+        if ($("#approval-dialog").open) $("#approval-dialog").close();
+        await onComplete(result);
+      }
       return;
     }
     if (result.state === "failed") {
@@ -910,7 +1012,9 @@ async function deployWorker(event) {
       body: JSON.stringify(payload),
     });
     if (result.pending_approval) {
-      showApproval(result, `${result.name} v${result.version} 已准备就绪，等待签名。`);
+      showApproval(result, `${result.name} v${result.version} 已准备就绪，等待签名。`, async () => {
+        await openWorkerDetail(result.name);
+      });
     } else {
       toast(`已部署 ${result.name} v${result.version}`);
       await loadOverview({ quiet: true });
@@ -972,7 +1076,9 @@ async function boot() {
     $("#deploy-local-fields").classList.toggle("hidden", consoleMode === "public");
     $("#deploy-public-fields").classList.toggle("hidden", consoleMode !== "public");
     $("#deploy-path").required = consoleMode === "local";
-    $("#git-workspace").classList.toggle("hidden", consoleMode !== "public");
+    $("#github-import").classList.toggle("hidden", consoleMode !== "public");
+    $("#import-divider").classList.toggle("hidden", consoleMode !== "public");
+    $("#import-sidebar").classList.toggle("hidden", consoleMode !== "public");
     $("#deploy-mode").textContent = state.session.read_only
       ? "尚未加载管理员密钥，所有写操作均已禁用。"
       : consoleMode === "public"
@@ -985,7 +1091,7 @@ async function boot() {
     $("#security-copy").innerHTML = consoleMode === "public"
       ? "此节点不保存<br>任何私钥。"
       : "密钥仅保留在本地<br>控制台进程中。";
-    $$("#deploy-form button, #source-form button, #kv-editor-form button, #d1-create-form button, #d1-exec-form button, #project-domains-form button, #project-settings-form button, #project-source-form button, #project-redeploy, #project-delete")
+    $$("#deploy-form button, #source-form button, #kv-editor-form button, #d1-create-form button, #d1-exec-form button, #project-domain-add-form button, #project-bindings-form button, #project-triggers-form button, #project-settings-form button, #project-source-form button, #project-redeploy, #project-delete")
       .forEach((button) => { button.disabled = state.session.read_only; });
     await loadOverview({ quiet: true });
     await loadWorkerOps();
@@ -1008,10 +1114,13 @@ $("#overview-workers").addEventListener("click", (event) => {
   if (button) openWorkerDetail(button.dataset.openWorker);
 });
 $("#new-project").addEventListener("click", () => {
-  $("#create-project-panel").open = true;
-  $("#create-project-panel").scrollIntoView({ behavior: "smooth", block: "start" });
+  state.activeWorker = null;
+  state.workerDetail = null;
+  switchView("worker-new");
+  window.scrollTo({ top: 0, behavior: "smooth" });
   setTimeout(() => $("#source-worker").focus(), 300);
 });
+$("#new-project-back").addEventListener("click", () => switchView("workers"));
 $("#project-back").addEventListener("click", () => {
   state.activeWorker = null;
   state.workerDetail = null;
@@ -1022,14 +1131,17 @@ $("#project-redeploy").addEventListener("click", () => {
   if (state.sources.some((source) => source.worker === state.activeWorker)) {
     triggerBuild(state.activeWorker);
   } else {
-    switchProjectTab("settings");
+    switchProjectTab("source");
     $("#project-source-repository").focus();
     toast("请先连接 GitHub 仓库，再触发自动构建", true);
   }
 });
-$("#project-domains-form").addEventListener("submit", saveProjectDomains);
+$("#project-domain-add-form").addEventListener("submit", saveProjectDomains);
+$("#project-bindings-form").addEventListener("submit", saveProjectBindings);
+$("#project-triggers-form").addEventListener("submit", saveProjectTriggers);
 $("#project-settings-form").addEventListener("submit", saveProjectSettings);
 $("#project-source-form").addEventListener("submit", saveProjectSource);
+$("#project-source-disconnect").addEventListener("click", () => state.activeWorker && disconnectSource(state.activeWorker));
 $("#project-delete").addEventListener("click", () => state.activeWorker && deleteWorker(state.activeWorker));
 $("#detail-refresh-logs").addEventListener("click", loadDetailLogs);
 $("#refresh").addEventListener("click", () => loadOverview());
@@ -1037,7 +1149,6 @@ $("#deploy-form").addEventListener("submit", deployWorker);
 $("#deploy-file-picker").addEventListener("click", () => $("#deploy-files").click());
 $("#deploy-files").addEventListener("change", updateDeployFileStatus);
 $("#source-form").addEventListener("submit", connectSource);
-$("#build-refresh").addEventListener("click", () => loadWorkerOps({ quiet: false }));
 $("#kv-search-form").addEventListener("submit", (event) => { event.preventDefault(); loadKeys(); });
 $("#kv-editor-form").addEventListener("submit", saveKey);
 $("#kv-new").addEventListener("click", clearKey);
@@ -1071,18 +1182,9 @@ $("#workers-table").addEventListener("click", (event) => {
   if (button.dataset.action === "runtime") openRuntimeLog(button.dataset.worker);
   if (button.dataset.action === "delete-worker") deleteWorker(button.dataset.worker);
 });
-$("#source-list").addEventListener("click", (event) => {
-  const button = event.target.closest("button[data-source-action]");
-  if (!button) return;
-  if (button.dataset.sourceAction === "build") triggerBuild(button.dataset.worker);
-  if (button.dataset.sourceAction === "edit") editSource(button.dataset.worker);
-  if (button.dataset.sourceAction === "disconnect") disconnectSource(button.dataset.worker);
-});
-$("#build-list").addEventListener("click", (event) => {
-  const button = event.target.closest("button[data-build-action]");
-  if (!button) return;
-  if (button.dataset.buildAction === "log") openBuildLog(button.dataset.build);
-  if (button.dataset.buildAction === "approve") approveBuild(button.dataset.build, button.dataset.node);
+$("#project-domain-list").addEventListener("click", (event) => {
+  const button = event.target.closest("button[data-remove-domain]");
+  if (button) removeProjectDomain(button.dataset.removeDomain);
 });
 $("#detail-builds").addEventListener("click", (event) => {
   const button = event.target.closest("button[data-build-action]");

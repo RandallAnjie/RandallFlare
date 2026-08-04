@@ -24,6 +24,7 @@ use instant_acme::{
     Account, AuthorizationStatus, ChallengeType, Identifier, NewAccount, NewOrder, RetryPolicy,
 };
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeSet;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -118,7 +119,22 @@ pub fn spawn_materializer(node: Arc<Node>) {
 pub fn spawn_renewer(node: Arc<Node>, cfg: AcmeConfig, dns: DnsApi) {
     tokio::spawn(async move {
         loop {
-            for hostname in cfg.hostnames.clone() {
+            let mut hostnames: BTreeSet<String> = cfg.hostnames.iter().cloned().collect();
+            if cfg.include_worker_hostnames {
+                if let Some(zone) = cfg.zone.as_deref() {
+                    let zone = zone.trim().trim_end_matches('.').to_ascii_lowercase();
+                    for manifest in node.live_manifests() {
+                        for hostname in manifest.hostnames {
+                            let hostname =
+                                hostname.trim().trim_end_matches('.').to_ascii_lowercase();
+                            if hostname == zone || hostname.ends_with(&format!(".{zone}")) {
+                                hostnames.insert(hostname);
+                            }
+                        }
+                    }
+                }
+            }
+            for hostname in hostnames {
                 if !needs_renewal(&node, &hostname) {
                     continue;
                 }

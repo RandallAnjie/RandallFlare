@@ -172,6 +172,11 @@ pub struct AcmeConfig {
     /// Hostnames to keep certified; "*.edge.example.com" works
     /// (wildcards need DNS-01, which is what we do anyway).
     pub hostnames: Vec<String>,
+    /// Also issue certificates for exact hostnames attached to live Worker
+    /// manifests. Only names inside `zone` are accepted. Disabled by default
+    /// so an imported manifest cannot unexpectedly consume CA rate limits.
+    #[serde(default)]
+    pub include_worker_hostnames: bool,
     /// Cloudflare zone the TXT challenges live in. Falls back to
     /// [dns].zone when unset.
     #[serde(default)]
