@@ -439,12 +439,33 @@ async fn module_worker_on_real_workerd() {
             "env":{"GREETING":"hi from env"},"kv":{"CACHE":"ns1"},
             "d1":{"DB":"worker-db"},"queues":{"EVENTS":"events"},
             "analytics":{"METRICS":"web-metrics"},
-            "pipelines":{"ARCHIVE":"events-pipe"}}"#,
+            "pipelines":{"ARCHIVE":"events-pipe"},
+            "workflows":{"ORDER_WORKFLOW":"order-flow"}}"#,
     )
     .unwrap();
     std::fs::write(
         dir.join("index.js"),
-        r#"export default {
+        r#"import { WorkflowEntrypoint } from "randallflare:workers";
+
+export class OrderWorkflow extends WorkflowEntrypoint {
+  async run(input, step) {
+    const prepared = await step.do("prepare-order", async () => {
+      const count = Number(await this.env.CACHE.get("workflow-prepare-count") || "0") + 1;
+      await this.env.CACHE.put("workflow-prepare-count", String(count));
+      return { orderId: input.orderId, prepared: true };
+    });
+    await step.sleep("payment-window", 100);
+    const payment = await step.waitForSignal("paid");
+    const confirmation = await step.do("confirm-order", { retries: { limit: 2, delay: 1 } }, async () => ({
+      orderId: input.orderId,
+      method: payment.method,
+      confirmed: true,
+    }));
+    return { prepared, payment, confirmation };
+  }
+}
+
+export default {
   async fetch(req, env) {
     const url = new URL(req.url);
     if (url.pathname === "/env") return new Response(env.GREETING);
@@ -504,6 +525,10 @@ async fn module_worker_on_real_workerd() {
         { kind: "worker", sequence: 2 },
       ]);
       return new Response("accepted");
+    }
+    if (url.pathname === "/workflow-trigger") {
+      const instance = await env.ORDER_WORKFLOW.create({ id: "order-e2e", params: { orderId: "RF-1001" } });
+      return Response.json({ id: instance.id, status: await instance.status() });
     }
     return new Response("module worker up");
   },
@@ -626,6 +651,29 @@ async fn module_worker_on_real_workerd() {
         )
         .await
         .unwrap();
+    let workflow_record = rf::workflow::prepare_workflow_after(
+        "order-flow",
+        rf::workflow::WorkflowSpec {
+            description: "真实 workerd 耐久订单流程".into(),
+            worker: "api".into(),
+            entrypoint: "OrderWorkflow".into(),
+            suspended: false,
+            suspend_reason: String::new(),
+            retention_days: 30,
+            instance_retries: 3,
+            instance_timeout_seconds: 120,
+        },
+        false,
+        None,
+    )
+    .unwrap();
+    client
+        .post_resource(
+            &n.api,
+            &rf_core::envelope::Envelope::seal_any(&workflow_record, &op_any),
+        )
+        .await
+        .unwrap();
     rf::deploy::deploy(&bundle, &client, &n.api, &op_any)
         .await
         .unwrap();
@@ -644,11 +692,115 @@ async fn module_worker_on_real_workerd() {
         if ok {
             break;
         }
+        if Instant::now() >= deadline {
+            dump_node_logs(&[&n]);
+            panic!("module worker never came up via ingress");
+        }
+        tokio::time::sleep(Duration::from_millis(300)).await;
+    }
+    let workflow_trigger: serde_json::Value = http
+        .get(format!("http://127.0.0.1:{}/workflow-trigger", n.ingress))
+        .header("host", "api.test")
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let workflow_instance = workflow_trigger["id"].as_str().unwrap().to_string();
+    assert_eq!(workflow_trigger["status"]["id"], workflow_instance);
+    // The Worker binding's explicit id is an idempotency key, not mutable
+    // state: retrying the trigger must return the same durable instance.
+    let workflow_retry: serde_json::Value = http
+        .get(format!("http://127.0.0.1:{}/workflow-trigger", n.ingress))
+        .header("host", "api.test")
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(workflow_retry["id"], workflow_instance);
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        let detail = client
+            .workflow_instance(&n.api, "order-flow", &workflow_instance)
+            .await
+            .unwrap();
+        if detail["instance"]["status"] == "waiting" && detail["instance"]["waiting_for"] == "paid"
+        {
+            assert_eq!(
+                client
+                    .kv_get(&n.api, "ns1", "workflow-prepare-count")
+                    .await
+                    .unwrap()
+                    .as_deref(),
+                Some(b"1".as_slice()),
+                "the completed step body must not re-run after durable sleep replay"
+            );
+            assert!(detail["steps"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|step| step["name"] == "prepare-order" && step["status"] == "ok"));
+            break;
+        }
         assert!(
             Instant::now() < deadline,
-            "module worker never came up via ingress"
+            "Workflow did not replay through sleep and park on signal"
         );
-        tokio::time::sleep(Duration::from_millis(300)).await;
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    let signal_id = client
+        .workflow_signal(
+            &n.api,
+            "order-flow",
+            &workflow_instance,
+            "paid",
+            serde_json::json!({ "method": "alipay" }),
+        )
+        .await
+        .unwrap();
+    assert!(signal_id.starts_with("sig_"));
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        let detail = client
+            .workflow_instance(&n.api, "order-flow", &workflow_instance)
+            .await
+            .unwrap();
+        if detail["instance"]["status"] == "complete" {
+            assert_eq!(detail["instance"]["output"]["payment"]["method"], "alipay");
+            assert_eq!(
+                detail["instance"]["output"]["confirmation"]["confirmed"],
+                true
+            );
+            assert_eq!(detail["steps"].as_array().unwrap().len(), 3);
+            assert_eq!(
+                detail["events"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .filter(|event| event["kind"] == "created")
+                    .count(),
+                1,
+                "idempotent creates must not duplicate the audit trail"
+            );
+            assert!(detail["events"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|event| event["kind"] == "signal_delivered"));
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "Workflow did not resume and complete after its signal"
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
     }
     let pipeline_response = http
         .get(format!("http://127.0.0.1:{}/pipeline", n.ingress))

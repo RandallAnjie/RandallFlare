@@ -42,33 +42,36 @@
         </div>
         <nav aria-label="控制台栏目">
           <button class="nav-item active" data-view="overview">
-            <span class="nav-glyph">⌁</span><span>概览</span>
+            <span class="nav-glyph" aria-hidden="true">⌁</span><span>概览</span>
           </button>
           <button class="nav-item" data-view="workers">
-            <span class="nav-glyph">◇</span><span>Worker</span><span id="worker-nav-count" class="count">0</span>
+            <span class="nav-glyph" aria-hidden="true">◇</span><span>Worker</span><span id="worker-nav-count" class="count">0</span>
           </button>
           <button class="nav-item" data-view="kv">
-            <span class="nav-glyph">≋</span><span>KV 存储</span>
+            <span class="nav-glyph" aria-hidden="true">≋</span><span>KV 存储</span>
           </button>
           <button class="nav-item" data-view="r2">
-            <span class="nav-glyph">⬡</span><span>R2 对象存储</span><span id="r2-nav-count" class="count">0</span>
+            <span class="nav-glyph" aria-hidden="true">⬡</span><span>R2 对象存储</span><span id="r2-nav-count" class="count">0</span>
           </button>
           <button class="nav-item" data-view="d1">
-            <span class="nav-glyph">◫</span><span>D1 数据库</span>
+            <span class="nav-glyph" aria-hidden="true">◫</span><span>D1 数据库</span>
           </button>
           <button class="nav-item" data-view="queues">
-            <span class="nav-glyph">⇄</span><span>队列</span><span id="queue-nav-count" class="count">0</span>
+            <span class="nav-glyph" aria-hidden="true">⇄</span><span>队列</span><span id="queue-nav-count" class="count">0</span>
           </button>
           <button class="nav-item" data-view="analytics">
-            <span class="nav-glyph">⌁</span><span>Analytics</span><span id="analytics-nav-count" class="count">0</span>
+            <span class="nav-glyph" aria-hidden="true">⌁</span><span>Analytics</span><span id="analytics-nav-count" class="count">0</span>
           </button>
           <button class="nav-item" data-view="pipelines">
-            <span class="nav-glyph">⋙</span><span>Pipeline</span><span id="pipeline-nav-count" class="count">0</span>
+            <span class="nav-glyph" aria-hidden="true">⋙</span><span>Pipeline</span><span id="pipeline-nav-count" class="count">0</span>
+          </button>
+          <button class="nav-item" data-view="workflows">
+            <span class="nav-glyph" aria-hidden="true">↯</span><span>Workflow</span><span id="workflow-nav-count" class="count">0</span>
           </button>
         </nav>
         <div class="sidebar-foot">
           <p class="sidebar-tagline">一次构建，一次验证，处处运行。</p>
-          <div class="security-note"><span>●</span> 管理员身份已验证</div>
+          <div class="security-note"><span aria-hidden="true">●</span> 管理员身份已验证</div>
           <small id="security-copy">此节点不保存<br>任何私钥。</small>
         </div>
       </aside>
@@ -82,7 +85,7 @@
           <div class="topbar-actions">
             <div class="connection"><span id="connection-dot" class="dot pending"></span><span id="connection-text">正在连接</span></div>
             <button id="logout" class="secondary compact hidden" type="button">退出登录</button>
-            <button id="refresh" class="icon-button" type="button" aria-label="刷新数据">↻</button>
+            <button id="refresh" class="icon-button" type="button" aria-label="刷新数据"><span aria-hidden="true">↻</span></button>
           </div>
         </header>
 
@@ -101,6 +104,7 @@
             <article class="metric"><span>队列</span><strong id="metric-queues">—</strong><small>多数派租约与死信</small></article>
             <article class="metric"><span>Analytics 数据集</span><strong id="metric-analytics">—</strong><small>时序事件与维度聚合</small></article>
             <article class="metric"><span>Pipeline</span><strong id="metric-pipelines">—</strong><small>持久批次与 R2 输出</small></article>
+            <article class="metric"><span>Workflow</span><strong id="metric-workflows">—</strong><small>可恢复步骤与外部信号</small></article>
             <article class="metric"><span>内容块状态</span><strong id="metric-blobs">—</strong><small>本地缺失数</small></article>
           </div>
 
@@ -252,7 +256,7 @@
           </div>
 
           <div id="project-tab-bindings" class="project-tab">
-            <article class="panel settings-panel"><div class="settings-copy"><p class="eyebrow">运行配置</p><h2>变量与绑定</h2><p class="muted">环境变量与平台绑定会随签名清单复制。敏感凭据请使用节点侧密钥能力，不要写入普通变量。</p></div><form id="project-bindings-form" class="settings-form"><label><span>环境变量 <em>每行 KEY=value</em></span><textarea id="project-env" class="code-input" rows="8"></textarea></label><label><span>KV 绑定 <em>每行 BINDING=namespace</em></span><textarea id="project-kv-bindings" class="code-input" rows="6"></textarea></label><label><span>R2 绑定 <em>每行 BINDING=bucket</em></span><textarea id="project-r2-bindings" class="code-input" rows="5"></textarea></label><label><span>D1 绑定 <em>每行 BINDING=database</em></span><textarea id="project-d1-bindings" class="code-input" rows="5"></textarea></label><label><span>Queue 生产者绑定 <em>每行 BINDING=queue</em></span><textarea id="project-queue-bindings" class="code-input" rows="5"></textarea></label><label><span>Analytics Engine 绑定 <em>每行 BINDING=dataset</em></span><textarea id="project-analytics-bindings" class="code-input" rows="5"></textarea></label><label><span>Pipeline 绑定 <em>每行 BINDING=pipeline</em></span><textarea id="project-pipeline-bindings" class="code-input" rows="5"></textarea></label><button class="primary" type="submit">保存变量与绑定</button></form></article>
+            <article class="panel settings-panel"><div class="settings-copy"><p class="eyebrow">运行配置</p><h2>变量与绑定</h2><p class="muted">环境变量与平台绑定会随签名清单复制。敏感凭据请使用节点侧密钥能力，不要写入普通变量。</p></div><form id="project-bindings-form" class="settings-form"><label><span>环境变量 <em>每行 KEY=value</em></span><textarea id="project-env" class="code-input" rows="8"></textarea></label><label><span>KV 绑定 <em>每行 BINDING=namespace</em></span><textarea id="project-kv-bindings" class="code-input" rows="6"></textarea></label><label><span>R2 绑定 <em>每行 BINDING=bucket</em></span><textarea id="project-r2-bindings" class="code-input" rows="5"></textarea></label><label><span>D1 绑定 <em>每行 BINDING=database</em></span><textarea id="project-d1-bindings" class="code-input" rows="5"></textarea></label><label><span>Queue 生产者绑定 <em>每行 BINDING=queue</em></span><textarea id="project-queue-bindings" class="code-input" rows="5"></textarea></label><label><span>Analytics Engine 绑定 <em>每行 BINDING=dataset</em></span><textarea id="project-analytics-bindings" class="code-input" rows="5"></textarea></label><label><span>Pipeline 绑定 <em>每行 BINDING=pipeline</em></span><textarea id="project-pipeline-bindings" class="code-input" rows="5"></textarea></label><label><span>Workflow 绑定 <em>每行 BINDING=workflow</em></span><textarea id="project-workflow-bindings" class="code-input" rows="5"></textarea></label><button class="primary" type="submit">保存变量与绑定</button></form></article>
           </div>
 
           <div id="project-tab-triggers" class="project-tab">
@@ -514,6 +518,73 @@
               <article class="panel">
                 <div class="panel-head"><div><p class="eyebrow">输出审计</p><h2>最近批次</h2></div><button id="pipeline-refresh" class="secondary compact" type="button">刷新</button></div>
                 <div id="pipeline-batches" class="build-list empty-state">暂无输出批次。</div>
+              </article>
+            </div>
+          </div>
+        </section>
+
+        <section id="view-workflows" class="view" aria-labelledby="section-title">
+          <div class="projects-header">
+            <div><p class="eyebrow">耐久执行</p><h2>Workflow</h2><p class="muted">用户代码在 Worker 内运行；每个步骤、睡眠和信号边界写入独立 D1 法定人数账本。节点退出后，其他节点从最后一个已提交步骤继续。</p></div>
+            <span id="workflow-count" class="badge">0 个 Workflow</span>
+          </div>
+          <div class="grid r2-grid">
+            <div class="r2-sidebar-stack">
+              <article class="panel">
+                <div class="panel-head"><div><p class="eyebrow">签名定义</p><h2>创建或编辑 Workflow</h2></div><span class="badge">可重放</span></div>
+                <form id="workflow-form" class="stack-form">
+                  <label><span>名称</span><input id="workflow-name" pattern="[a-z0-9-]{1,63}" placeholder="order-lifecycle" required></label>
+                  <label><span>执行 Worker</span><select id="workflow-worker" required><option value="">请选择 Worker</option></select></label>
+                  <label><span>入口类</span><input id="workflow-entrypoint" class="code-input" value="MyWorkflow" pattern="[A-Za-z_$][A-Za-z0-9_$]{0,127}" required></label>
+                  <label><span>说明</span><textarea id="workflow-description" rows="3" placeholder="处理订单、等待付款并发送确认"></textarea></label>
+                  <div class="form-grid">
+                    <label><span>记录保留（天）</span><input id="workflow-retention" type="number" min="1" max="365" value="30" required></label>
+                    <label><span>系统重试次数</span><input id="workflow-retries" type="number" min="0" max="100" value="3" required></label>
+                  </div>
+                  <label><span>单次推进超时（秒）</span><input id="workflow-timeout" type="number" min="30" max="43200" value="1500" required></label>
+                  <label class="check-label"><input id="workflow-suspended" type="checkbox"><span>暂停新实例与自动推进</span></label>
+                  <label><span>暂停原因</span><input id="workflow-suspend-reason" placeholder="维护窗口"></label>
+                  <button class="primary" type="submit">保存 Workflow</button>
+                </form>
+              </article>
+              <article class="panel">
+                <div class="panel-head"><div><p class="eyebrow">Workflow 目录</p><h2>全部 Workflow</h2></div></div>
+                <div id="workflow-list" class="database-list empty-state">暂无 Workflow。</div>
+              </article>
+            </div>
+            <div class="r2-sidebar-stack">
+              <article class="panel">
+                <div class="panel-head"><div><p class="eyebrow">执行概况</p><h2 id="workflow-active-name">请选择 Workflow</h2><p id="workflow-summary" class="muted compact-copy">选择后可触发实例并查看实时执行状态。</p></div><button id="workflow-delete" class="danger ghost hidden" type="button">删除定义</button></div>
+                <div class="metrics compact-metrics">
+                  <article class="metric"><span>排队 / 运行</span><strong id="workflow-active-count">—</strong></article>
+                  <article class="metric"><span>等待</span><strong id="workflow-waiting-count">—</strong></article>
+                  <article class="metric"><span>已完成</span><strong id="workflow-complete-count">—</strong></article>
+                  <article class="metric"><span>失败</span><strong id="workflow-failed-count">—</strong></article>
+                </div>
+              </article>
+              <article class="panel">
+                <div class="panel-head"><div><p class="eyebrow">调试触发</p><h2>创建实例</h2><p class="muted compact-copy">幂等键可安全重试；同一 Workflow 下重复键只返回原实例。</p></div></div>
+                <form id="workflow-trigger-form" class="stack-form hidden">
+                  <label><span>幂等键 <em>可选</em></span><input id="workflow-instance-key" class="code-input" placeholder="order-20260805-001"></label>
+                  <label><span>输入（JSON）</span><textarea id="workflow-input" class="code-input" rows="6">{"orderId":"demo-1"}</textarea></label>
+                  <button class="secondary" type="submit">触发实例</button>
+                </form>
+              </article>
+              <article class="panel">
+                <div class="panel-head"><div><p class="eyebrow">实例目录</p><h2>最近执行</h2></div><button id="workflow-refresh" class="secondary compact" type="button">刷新</button></div>
+                <div id="workflow-instances" class="build-list empty-state">暂无实例。</div>
+              </article>
+              <article id="workflow-instance-panel" class="panel hidden">
+                <div class="panel-head"><div><p class="eyebrow">实例详情</p><h2 id="workflow-instance-title">—</h2><p id="workflow-instance-meta" class="muted compact-copy">—</p></div><span id="workflow-instance-status" class="badge">—</span></div>
+                <div id="workflow-instance-actions" class="button-row"></div>
+                <form id="workflow-signal-form" class="inline-form hidden">
+                  <label><span>信号名称</span><input id="workflow-signal-name" placeholder="approved" required></label>
+                  <label><span>负载 JSON</span><input id="workflow-signal-payload" class="code-input" value="{}" required></label>
+                  <button class="secondary" type="submit">发送信号</button>
+                </form>
+                <div class="divider"></div>
+                <h3>步骤</h3><div id="workflow-steps" class="build-list empty-state">暂无步骤。</div>
+                <h3>审计时间线</h3><div id="workflow-events" class="build-list empty-state">暂无事件。</div>
               </article>
             </div>
           </div>

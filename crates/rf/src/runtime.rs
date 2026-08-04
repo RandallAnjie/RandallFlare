@@ -267,6 +267,7 @@ impl Runtime {
             src.join("__rf_entry.js"),
             rf_entry_source(m, &d1_bindings, &event_token),
         )?;
+        std::fs::write(src.join("__rf_workflow.js"), WORKFLOW_SHIM_SOURCE)?;
         let durable_dir = self.node.cfg.data_dir.join("durable").join(&m.name);
         std::fs::create_dir_all(&durable_dir)?;
 
@@ -294,6 +295,7 @@ impl Runtime {
                 queue: self.node.qbind_port(),
                 analytics: self.node.analyticsbind_port(),
                 pipeline: self.node.pbind_port(),
+                workflow: self.node.workflowbind_port(),
             },
             &durable_dir,
         );
@@ -345,7 +347,23 @@ impl Runtime {
         let mut healthy = false;
         for _ in 0..50 {
             if let Ok(Some(status)) = child.try_wait() {
-                anyhow::bail!("Worker {} 的 workerd 在启动期间退出：{status}", m.name);
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                let tail = self
+                    .node
+                    .runtime_logs(&m.name, 20)
+                    .into_iter()
+                    .map(|line| line.message)
+                    .collect::<Vec<_>>()
+                    .join(" | ");
+                anyhow::bail!(
+                    "Worker {} 的 workerd 在启动期间退出：{status}{}",
+                    m.name,
+                    if tail.is_empty() {
+                        String::new()
+                    } else {
+                        format!("；日志：{tail}")
+                    }
+                );
             }
             if tokio::net::TcpStream::connect(("127.0.0.1", port))
                 .await
@@ -448,6 +466,12 @@ fn rf_entry_source(
             .collect::<Vec<_>>(),
     )
     .expect("Pipeline binding names are serializable");
+    let workflow_names = serde_json::to_string(
+        &crate::deploy::workflow_bindings(manifest)
+            .keys()
+            .collect::<Vec<_>>(),
+    )
+    .expect("Workflow binding names are serializable");
     let event_token = serde_json::to_string(event_token).expect("event token is serializable");
     let mut durable_wrappers = String::new();
     let mut seen = std::collections::BTreeSet::new();
@@ -465,6 +489,7 @@ fn rf_entry_source(
         .replace("__RF_QUEUE_BINDING_NAMES__", &queue_names)
         .replace("__RF_ANALYTICS_BINDING_NAMES__", &analytics_names)
         .replace("__RF_PIPELINE_BINDING_NAMES__", &pipeline_names)
+        .replace("__RF_WORKFLOW_BINDING_NAMES__", &workflow_names)
         .replace("__RF_EVENT_TOKEN__", &event_token)
         .replace("__RF_DURABLE_WRAPPERS__", &durable_wrappers)
 }
@@ -595,10 +620,49 @@ class RandallFlarePipeline {
   }
 }
 
+class RandallFlareWorkflowInstance {
+  constructor(service, id) { this._service = service; this.id = String(id); }
+  async _call(op, extra = {}) {
+    const response = await this._service.fetch("http://workflow-binding/binding", {
+      method: "POST", headers: { "content-type": "application/json" },
+      body: JSON.stringify({ op, id: this.id, ...extra }),
+    });
+    if (!response.ok) throw new Error("WORKFLOW_ERROR: " + response.status + " " + await response.text());
+    return await response.json();
+  }
+  status() { return this._call("status"); }
+  pause() { return this._call("pause"); }
+  resume() { return this._call("resume"); }
+  terminate() { return this._call("terminate"); }
+  restart() { return this._call("restart"); }
+  sendEvent(event) {
+    if (!event || typeof event.type !== "string" || !event.type) throw new TypeError("sendEvent() requires { type, payload }");
+    return this._call("send_event", { event_type: event.type, payload: event.payload ?? null });
+  }
+}
+
+class RandallFlareWorkflowBinding {
+  constructor(service) { this._service = service; }
+  async create(options = {}) {
+    const response = await this._service.fetch("http://workflow-binding/binding", {
+      method: "POST", headers: { "content-type": "application/json" },
+      body: JSON.stringify({ op: "create", id: options.id == null ? null : String(options.id), params: options.params ?? {} }),
+    });
+    if (!response.ok) throw new Error("WORKFLOW_ERROR: " + response.status + " " + await response.text());
+    const out = await response.json();
+    return new RandallFlareWorkflowInstance(this._service, out.id);
+  }
+  get(id) {
+    if (id == null || String(id) === "") throw new TypeError("Workflow get(id): id is required");
+    return new RandallFlareWorkflowInstance(this._service, id);
+  }
+}
+
 const __rfD1Names = __RF_D1_BINDING_NAMES__;
 const __rfQueueNames = __RF_QUEUE_BINDING_NAMES__;
 const __rfAnalyticsNames = __RF_ANALYTICS_BINDING_NAMES__;
 const __rfPipelineNames = __RF_PIPELINE_BINDING_NAMES__;
+const __rfWorkflowNames = __RF_WORKFLOW_BINDING_NAMES__;
 const __rfEventToken = __RF_EVENT_TOKEN__;
 function __rfWrapEnv(env, context) {
   const wrapped = Object.create(env);
@@ -622,7 +686,146 @@ function __rfWrapEnv(env, context) {
       value: new RandallFlarePipeline(env[name], context), enumerable: true, configurable: false,
     });
   }
+  for (const name of __rfWorkflowNames) {
+    Object.defineProperty(wrapped, name, {
+      value: new RandallFlareWorkflowBinding(env[name]), enumerable: true, configurable: false,
+    });
+  }
   return wrapped;
+}
+
+function __rfWorkflowDuration(value, fallback = 0) {
+  if (value == null) return fallback;
+  if (typeof value === "number") return Math.max(0, Math.floor(value));
+  const match = /^\s*(\d+(?:\.\d+)?)\s*([a-z]+)?\s*$/i.exec(String(value));
+  if (!match) return fallback;
+  const unit = (match[2] || "ms").toLowerCase();
+  const units = {
+    ms: 1, millisecond: 1, milliseconds: 1,
+    s: 1000, sec: 1000, second: 1000, seconds: 1000,
+    m: 60000, min: 60000, minute: 60000, minutes: 60000,
+    h: 3600000, hour: 3600000, hours: 3600000,
+    d: 86400000, day: 86400000, days: 86400000,
+  };
+  return Math.max(0, Math.floor(Number(match[1]) * (units[unit] || 0))) || fallback;
+}
+
+async function __rfWorkflowCall(service, payload) {
+  const response = await service.fetch("http://workflow-binding/step", {
+    method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(payload),
+  });
+  if (!response.ok) throw new Error("WORKFLOW_STEP_ERROR: " + response.status + " " + await response.text());
+  return await response.json();
+}
+
+function __rfWorkflowStep(env, advance) {
+  const service = env.__RF_WORKFLOW_SERVICE;
+  const base = {
+    workflow: advance.workflow,
+    instance_id: advance.instance_id,
+    lease: advance.lease,
+  };
+  const park = (kind, name, extra = {}) => {
+    const error = new Error("workflow-" + kind + ":" + name);
+    error.__rf_workflow_parked__ = { kind, name, ...extra };
+    throw error;
+  };
+  const sleep = async (name, duration) => {
+    if (typeof name !== "string" || !name) throw new TypeError("step.sleep(name, duration): name is required");
+    const out = await __rfWorkflowCall(service, { ...base, op: "sleep", name, duration_ms: __rfWorkflowDuration(duration, 0) });
+    if (out.status === "wake") return;
+    park("sleep", name, { wake_at_ms: out.wake_at_ms });
+  };
+  return {
+    async do(name, configOrFn, maybeFn) {
+      if (typeof name !== "string" || !name) throw new TypeError("step.do(name[, config], fn): name is required");
+      const config = typeof configOrFn === "function" ? {} : (configOrFn || {});
+      const fn = typeof configOrFn === "function" ? configOrFn : maybeFn;
+      if (typeof fn !== "function") throw new TypeError("step.do(): fn must be a function");
+      const cached = await __rfWorkflowCall(service, { ...base, op: "lookup", name });
+      if (cached.cached) return cached.result;
+      if (cached.already_failed) throw new Error("step \"" + name + "\" already failed: " + cached.error);
+      const retry = config.retries || {};
+      const limit = Number.isFinite(retry.limit) ? Math.max(0, Math.min(100, Math.floor(retry.limit))) : 5;
+      const delay = __rfWorkflowDuration(retry.delay, 1000);
+      const backoff = retry.backoff || "exponential";
+      const timeout = __rfWorkflowDuration(config.timeout, 0);
+      let result;
+      let lastError;
+      let attempts = 0;
+      for (let attempt = 0; attempt <= limit; attempt++) {
+        attempts = attempt + 1;
+        try {
+          const run = Promise.resolve().then(fn);
+          if (timeout > 0) {
+            result = await Promise.race([
+              run,
+              new Promise((_, reject) => setTimeout(() => reject(new Error("step \"" + name + "\" timed out")), timeout)),
+            ]);
+          } else result = await run;
+          lastError = null;
+          break;
+        } catch (error) {
+          lastError = error;
+          if ((error && error.name === "NonRetryableError") || attempt >= limit) break;
+          let wait = delay;
+          if (backoff === "exponential") wait *= Math.pow(2, attempt);
+          else if (backoff === "linear") wait *= attempt + 1;
+          wait = Math.min(wait, 5 * 60 * 1000);
+          if (wait > 0) await new Promise((resolve) => setTimeout(resolve, wait));
+        }
+      }
+      if (lastError) {
+        await __rfWorkflowCall(service, {
+          ...base, op: "record", name, status: "failed", attempts,
+          error: String(lastError && lastError.message || lastError),
+        });
+        throw lastError;
+      }
+      let safe;
+      try { safe = JSON.parse(JSON.stringify(result === undefined ? null : result)); }
+      catch { throw new TypeError("step.do() result must be JSON serializable"); }
+      await __rfWorkflowCall(service, { ...base, op: "record", name, status: "ok", attempts, result: safe });
+      return safe;
+    },
+    sleep,
+    sleepUntil(name, timestamp) {
+      const raw = timestamp instanceof Date ? timestamp.getTime() : Number(timestamp);
+      if (!Number.isFinite(raw)) throw new TypeError("step.sleepUntil(): timestamp must be a Date or number");
+      const target = raw < 1e12 ? raw * 1000 : raw;
+      return sleep(name, Math.max(0, target - Date.now()));
+    },
+    async waitForSignal(name) {
+      if (typeof name !== "string" || !name) throw new TypeError("step.waitForSignal(name): name is required");
+      const out = await __rfWorkflowCall(service, { ...base, op: "signal", name });
+      if (out.status === "delivered") return out.payload;
+      park("signal", name);
+    },
+  };
+}
+
+async function __rfWorkflowEvent(request, env, context) {
+  let advance;
+  try { advance = await request.json(); }
+  catch { return Response.json({ status: "failed", error: "Workflow 推进请求不是有效 JSON" }); }
+  const Entry = __rfUserModule[advance.entrypoint];
+  if (typeof Entry !== "function") {
+    return Response.json({ status: "failed", error: "Worker 未导出 Workflow 入口类 " + advance.entrypoint });
+  }
+  const wrapped = __rfWrapEnv(env, context);
+  const step = __rfWorkflowStep(wrapped, advance);
+  try {
+    const entry = new Entry({ instanceId: advance.instance_id }, wrapped);
+    if (!entry || typeof entry.run !== "function") throw new TypeError("Workflow 入口类必须实现 run(input, step)");
+    const output = await entry.run(advance.input, step);
+    return Response.json({ status: "complete", output: output === undefined ? null : output });
+  } catch (error) {
+    if (error && error.__rf_workflow_parked__) return Response.json({ status: "parked" });
+    return Response.json({
+      status: "failed",
+      error: String(error && error.stack || error).slice(0, 4000),
+    });
+  }
 }
 
 async function __rfQueueEvent(request, env, context) {
@@ -689,6 +892,9 @@ __rfOut.fetch = (request, env, context) => {
   if (url.pathname === "/.rf/internal/queue" && request.headers.get("x-rf-internal-event") === __rfEventToken) {
     return __rfQueueEvent(request, env, context);
   }
+  if (url.pathname === "/.rf/internal/workflow" && request.headers.get("x-rf-internal-event") === __rfEventToken) {
+    return __rfWorkflowEvent(request, env, context);
+  }
   if (__rfUserDefault && typeof __rfUserDefault.fetch === "function") {
     return __rfUserDefault.fetch(request, __rfWrapEnv(env, context), context);
   }
@@ -707,6 +913,20 @@ export default __rfOut;
 __RF_DURABLE_WRAPPERS__
 "#;
 
+const WORKFLOW_SHIM_SOURCE: &str = r#"// generated by RandallFlare — durable Workflow API
+export class WorkflowEntrypoint {
+  constructor(ctx, env) { this.ctx = ctx; this.env = env; }
+}
+
+export class NonRetryableError extends Error {
+  constructor(message) { super(message); this.name = "NonRetryableError"; }
+}
+
+// The generated RandallFlare entrypoint intercepts advance requests, so this
+// compatibility helper intentionally returns null for ordinary user fetches.
+export async function handleWorkflowRequest() { return null; }
+"#;
+
 /// Emit the workerd capnp config for one worker.
 #[derive(Debug, Clone, Copy)]
 pub struct BindingPorts {
@@ -716,6 +936,7 @@ pub struct BindingPorts {
     pub queue: u16,
     pub analytics: u16,
     pub pipeline: u16,
+    pub workflow: u16,
 }
 
 pub fn generate_config(
@@ -731,10 +952,14 @@ pub fn generate_config(
         queue: qbind_port,
         analytics: analyticsbind_port,
         pipeline: pbind_port,
+        workflow: workflowbind_port,
     } = binding_ports;
     let mut modules = String::new();
     modules
         .push_str("        (name = \"__rf_entry.js\", esModule = embed \"src/__rf_entry.js\"),\n");
+    modules.push_str(
+        "        (name = \"randallflare:workers\", esModule = embed \"src/__rf_workflow.js\"),\n",
+    );
     for module in &m.modules {
         let kind = match module.kind {
             ModuleKind::EsModule => "esModule",
@@ -758,6 +983,7 @@ pub fn generate_config(
             || k == crate::deploy::QUEUE_METADATA_ENV
             || k == crate::deploy::ANALYTICS_METADATA_ENV
             || k == crate::deploy::PIPELINE_METADATA_ENV
+            || k == crate::deploy::WORKFLOW_METADATA_ENV
         {
             continue;
         }
@@ -865,6 +1091,32 @@ pub fn generate_config(
             pipeline = capnp_string(&pipeline),
         ));
     }
+    let mut workflow_services = String::new();
+    for (binding, workflow) in crate::deploy::workflow_bindings(m) {
+        let service = format!("workflow-{binding}");
+        bindings.push_str(&format!(
+            "        (name = {binding}, service = {service}),\n",
+            binding = capnp_string(&binding),
+            service = capnp_string(&service),
+        ));
+        workflow_services.push_str(&format!(
+            "    (name = {service}, external = (address = \"127.0.0.1:{workflowbind_port}\", \
+             http = (injectRequestHeaders = [(name = \"{workflow_header}\", value = {workflow})]))),\n",
+            service = capnp_string(&service),
+            workflow_header = crate::workflowbind::WORKFLOW_HEADER,
+            workflow = capnp_string(&workflow),
+        ));
+    }
+    // Every Worker gets a private replay-log service, fenced on its signed
+    // Worker name. The generated entrypoint is the only normal consumer.
+    bindings
+        .push_str("        (name = \"__RF_WORKFLOW_SERVICE\", service = \"workflow-internal\"),\n");
+    workflow_services.push_str(&format!(
+        "    (name = \"workflow-internal\", external = (address = \"127.0.0.1:{workflowbind_port}\", \
+         http = (injectRequestHeaders = [(name = \"{worker_header}\", value = {worker})]))),\n",
+        worker_header = crate::workflowbind::WORKER_HEADER,
+        worker = capnp_string(&m.name),
+    ));
     let durable_objects = crate::deploy::durable_objects(m);
     let mut durable_namespaces = String::new();
     let mut seen_durable = std::collections::BTreeSet::new();
@@ -911,7 +1163,7 @@ const config :Workerd.Config = (
       bindings = [
 {bindings}      ],
 {durable_worker}    )),
-{kv_services}{r2_services}{d1_services}{queue_services}{analytics_services}{pipeline_services}{durable_service}  ],
+{kv_services}{r2_services}{d1_services}{queue_services}{analytics_services}{pipeline_services}{workflow_services}{durable_service}  ],
   sockets = [
     (name = "http", address = "127.0.0.1:{port}", http = (), service = "main"),
   ],
@@ -1005,6 +1257,14 @@ mod tests {
             )]))
             .unwrap(),
         );
+        m.env.insert(
+            crate::deploy::WORKFLOW_METADATA_ENV.into(),
+            serde_json::to_string(&BTreeMap::from([(
+                "ORDER_FLOW".to_string(),
+                "order-flow".to_string(),
+            )]))
+            .unwrap(),
+        );
         let cfg = generate_config(
             &m,
             30111,
@@ -1015,6 +1275,7 @@ mod tests {
                 queue: 7385,
                 analytics: 7386,
                 pipeline: 7387,
+                workflow: 7388,
             },
             std::path::Path::new("/tmp/rf-do"),
         );
@@ -1041,6 +1302,11 @@ mod tests {
         assert!(cfg.contains("(name = \"EVENT_PIPE\", service = \"pipeline-EVENT_PIPE\")"));
         assert!(cfg.contains("address = \"127.0.0.1:7387\""));
         assert!(cfg.contains("x-rf-pipeline\", value = \"event-archive\""));
+        assert!(cfg.contains("(name = \"ORDER_FLOW\", service = \"workflow-ORDER_FLOW\")"));
+        assert!(cfg.contains("address = \"127.0.0.1:7388\""));
+        assert!(cfg.contains("x-rf-workflow\", value = \"order-flow\""));
+        assert!(cfg.contains("x-rf-worker\", value = \"w\""));
+        assert!(cfg.contains("name = \"randallflare:workers\""));
         assert!(cfg.contains("compatibilityDate = \"2026-07-31\""));
         assert!(cfg.contains("durableObjectNamespace = (className = \"Counter\")"));
         assert!(cfg.contains("uniqueKey = \"rf--w--Counter\", enableSql = true"));
@@ -1094,6 +1360,14 @@ mod tests {
             )]))
             .unwrap(),
         );
+        manifest.env.insert(
+            crate::deploy::WORKFLOW_METADATA_ENV.into(),
+            serde_json::to_string(&BTreeMap::from([(
+                "FLOW".to_string(),
+                "order-flow".to_string(),
+            )]))
+            .unwrap(),
+        );
         let source = rf_entry_source(
             &manifest,
             &crate::deploy::d1_bindings(&manifest),
@@ -1103,6 +1377,9 @@ mod tests {
         assert!(source.contains("new RandallFlareQueue(env[name])"));
         assert!(source.contains("new RandallFlareAnalyticsDataset(env[name], context)"));
         assert!(source.contains("new RandallFlarePipeline(env[name], context)"));
+        assert!(source.contains("new RandallFlareWorkflowBinding(env[name])"));
+        assert!(source.contains("/.rf/internal/workflow"));
+        assert!(source.contains("waitForSignal"));
         assert!(source.contains("test-token"));
         assert!(source.contains("/.rf/internal/queue"));
         assert!(source.contains("export class Counter extends __rfUserModule.Counter"));

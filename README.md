@@ -75,6 +75,15 @@ Working today, verified by multi-process fault-injection e2e tests:
   are signed; plaintext is shown once. Public/custom ingest domains, automatic
   TLS discovery, Worker `env.ARCHIVE.send()`, status/batch audit, CLI and the
   Chinese console are covered by real-workerd and public-ingress tests.
+- **Durable Workflows**: operator-signed definitions use an independent D1
+  micro-quorum for idempotent instances, replay logs, external signals and an
+  append-only audit trail. Export a `WorkflowEntrypoint` from the same Worker;
+  `step.do()` commits JSON results exactly once across replays, while
+  `sleep()` / `sleepUntil()` and `waitForSignal()` park without occupying a
+  process. Fenced five-minute leases, minute heartbeats, bounded system retry,
+  pause/resume/terminate/restart, retention GC, Worker bindings, encrypted API,
+  CLI and the Chinese instance/step timeline are exercised against real
+  workerd.
 
 Also in: HTTPS ingress (SNI cert store, hot-reload, wildcard files,
 self-signed fallback) and **native workerd kvNamespace bindings** —
@@ -284,7 +293,8 @@ my-worker/
                    #  "r2":{"OBJECTS":"assets"},"d1":{"DB":"mydb"},
                    #  "queues":{"EVENTS":"events"},
                    #  "analytics":{"METRICS":"web-metrics"},
-                   #  "pipelines":{"ARCHIVE":"event-archive"}}
+                   #  "pipelines":{"ARCHIVE":"event-archive"},
+                   #  "workflows":{"ORDER_FLOW":"order-flow"}}
   index.js         # omit "main" entirely for a pure static site
   public/…
 
@@ -295,6 +305,32 @@ rf kv put ns1 greeting hello
 rf kv list ns1 --prefix greet
 rf kv delete ns1 greeting
 rf worker-delete site
+```
+
+Workflow classes import RandallFlare's built-in runtime module; no npm package
+or central orchestrator is required:
+
+```js
+import { WorkflowEntrypoint } from "randallflare:workers";
+
+export class OrderWorkflow extends WorkflowEntrypoint {
+  async run(input, step) {
+    const order = await step.do("prepare", () => createOrder(input));
+    await step.sleep("payment-window", "10 minutes");
+    const payment = await step.waitForSignal("paid");
+    return await step.do("confirm", () => confirmOrder(order, payment));
+  }
+}
+```
+
+Create the signed definition, trigger it with an idempotency key, and inspect
+the durable timeline from any node:
+
+```bash
+rf workflow create order-flow --worker site --entrypoint OrderWorkflow
+rf workflow trigger order-flow --idempotency-key order-1001 --input '{"orderId":"1001"}'
+rf workflow instances order-flow
+rf workflow signal order-flow <instance-id> paid --payload '{"method":"card"}'
 ```
 
 Durable Object bindings use the exported class name; `unique_key` is

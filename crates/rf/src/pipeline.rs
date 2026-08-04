@@ -334,6 +334,7 @@ pub async fn ingest(node: &Node, pipeline: &str, events: Vec<Value>) -> Result<u
         .transpose()
         .map_err(|error| anyhow::anyhow!("Pipeline JSON Schema 无效：{error}"))?;
     let received_at_ms = now_ms();
+    let ingest_id = new_id();
     let mut encoded = Vec::with_capacity(events.len());
     let mut total = 0usize;
     for (index, event) in events.iter().enumerate() {
@@ -350,7 +351,10 @@ pub async fn ingest(node: &Node, pipeline: &str, events: Vec<Value>) -> Result<u
         if total > MAX_INGEST_BYTES {
             bail!("Pipeline 规范化后的事件不得超过 32 MiB");
         }
-        encoded.push((new_id(), payload));
+        // IDs are random across requests but sortable within one request, so
+        // a JSON array/NDJSON upload retains its caller-visible event order
+        // even when every event shares the same millisecond timestamp.
+        encoded.push((format!("{ingest_id}-{index:05}"), payload));
     }
     ensure_schema(node, pipeline).await?;
     for chunk in encoded.chunks(100) {

@@ -734,6 +734,132 @@ impl PeerClient {
         )?)
     }
 
+    pub async fn workflow_create(
+        &self,
+        base: &str,
+        workflow: &str,
+        instance_key: Option<&str>,
+        input: serde_json::Value,
+    ) -> Result<crate::workflow::WorkflowInstance> {
+        let raw = self
+            .post(
+                base,
+                &format!("/v1/workflow/{}/instances", component(workflow)),
+                serde_json::to_vec(&serde_json::json!({
+                    "instance_key": instance_key,
+                    "input": input,
+                }))?,
+            )
+            .await?;
+        Ok(serde_json::from_slice(&raw)?)
+    }
+
+    pub async fn workflow_instances(
+        &self,
+        base: &str,
+        workflow: &str,
+        status: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<crate::workflow::WorkflowInstance>> {
+        let mut path = format!(
+            "/v1/workflow/{}/instances?limit={}",
+            component(workflow),
+            limit.clamp(1, 1_000)
+        );
+        if let Some(status) = status {
+            path.push_str("&status=");
+            path.push_str(&component(status));
+        }
+        let raw = self.get(base, &path).await?;
+        let response: serde_json::Value = serde_json::from_slice(&raw)?;
+        Ok(serde_json::from_value(
+            response
+                .get("instances")
+                .cloned()
+                .unwrap_or_else(|| serde_json::json!([])),
+        )?)
+    }
+
+    pub async fn workflow_instance(
+        &self,
+        base: &str,
+        workflow: &str,
+        id: &str,
+    ) -> Result<serde_json::Value> {
+        let raw = self
+            .get(
+                base,
+                &format!(
+                    "/v1/workflow/{}/instances/{}",
+                    component(workflow),
+                    component(id)
+                ),
+            )
+            .await?;
+        Ok(serde_json::from_slice(&raw)?)
+    }
+
+    pub async fn workflow_signal(
+        &self,
+        base: &str,
+        workflow: &str,
+        id: &str,
+        name: &str,
+        payload: serde_json::Value,
+    ) -> Result<String> {
+        let raw = self
+            .post(
+                base,
+                &format!(
+                    "/v1/workflow/{}/instances/{}/signal",
+                    component(workflow),
+                    component(id)
+                ),
+                serde_json::to_vec(&serde_json::json!({ "name": name, "payload": payload }))?,
+            )
+            .await?;
+        let response: serde_json::Value = serde_json::from_slice(&raw)?;
+        response["signal_id"]
+            .as_str()
+            .map(str::to_string)
+            .context("Workflow 信号响应缺少 signal_id")
+    }
+
+    pub async fn workflow_action(
+        &self,
+        base: &str,
+        workflow: &str,
+        id: &str,
+        action: &str,
+    ) -> Result<()> {
+        if !matches!(action, "pause" | "resume" | "terminate" | "restart") {
+            anyhow::bail!("Workflow 操作无效");
+        }
+        self.post(
+            base,
+            &format!(
+                "/v1/workflow/{}/instances/{}/{}",
+                component(workflow),
+                component(id),
+                action
+            ),
+            vec![],
+        )
+        .await?;
+        Ok(())
+    }
+
+    pub async fn workflow_stats(
+        &self,
+        base: &str,
+        workflow: &str,
+    ) -> Result<crate::workflow::WorkflowStats> {
+        let raw = self
+            .get(base, &format!("/v1/workflow/{}/stats", component(workflow)))
+            .await?;
+        Ok(serde_json::from_slice(&raw)?)
+    }
+
     /// Execute SQL against a D1 database, following leader hints
     /// (bounded) — callers can point at ANY cluster node.
     pub async fn d1_exec(

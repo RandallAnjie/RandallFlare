@@ -36,6 +36,10 @@ const state = {
   pipelines: [],
   pipelineActive: null,
   pipelineBatches: [],
+  workflows: [],
+  workflowActive: null,
+  workflowInstances: [],
+  workflowInstanceActive: null,
 };
 
 const titles = {
@@ -49,6 +53,7 @@ const titles = {
   queues: ["事件驱动", "队列"],
   analytics: ["可观测数据", "Analytics Engine"],
   pipelines: ["数据传输", "Pipeline"],
+  workflows: ["耐久执行", "Workflow"],
 };
 
 function escapeHtml(value) {
@@ -218,6 +223,7 @@ function renderOverview(data) {
   const queues = Array.isArray(data.queues) ? data.queues : [];
   const analyticsDatasets = Array.isArray(data.analytics_datasets) ? data.analytics_datasets : [];
   const pipelines = Array.isArray(data.pipelines) ? data.pipelines : [];
+  const workflows = Array.isArray(data.workflows) ? data.workflows : [];
   const allNodes = [
     {
       id: data.node,
@@ -242,6 +248,8 @@ function renderOverview(data) {
   $("#analytics-nav-count").textContent = String(analyticsDatasets.length);
   $("#metric-pipelines").textContent = String(pipelines.length);
   $("#pipeline-nav-count").textContent = String(pipelines.length);
+  $("#metric-workflows").textContent = String(workflows.length);
+  $("#workflow-nav-count").textContent = String(workflows.length);
   $("#metric-r2-backend").textContent = data.storage?.rclone ? "本地副本与 rclone 已就绪" : "集群本地多数派副本";
   $("#r2-nav-count").textContent = String(buckets.length);
   $("#metric-blobs").textContent = String(data.missing_blobs ?? 0);
@@ -527,6 +535,7 @@ function renderWorkerDetail(data) {
     <div><dt>Queue 绑定</dt><dd>${escapeHtml(Object.keys(worker.queue_bindings || {}).length)} 项</dd></div>
     <div><dt>Analytics 绑定</dt><dd>${escapeHtml(Object.keys(worker.analytics_bindings || {}).length)} 项</dd></div>
     <div><dt>Pipeline 绑定</dt><dd>${escapeHtml(Object.keys(worker.pipeline_bindings || {}).length)} 项</dd></div>
+    <div><dt>Workflow 绑定</dt><dd>${escapeHtml(Object.keys(worker.workflow_bindings || {}).length)} 项</dd></div>
     <div><dt>定时任务</dt><dd>${escapeHtml(worker.crons?.length || 0)} 条</dd></div>`;
   $("#detail-distribution-count").textContent = `${distribution.ready}/${distribution.total} 个节点`;
   $("#detail-distribution").innerHTML = (distribution.nodes || []).map((node) => {
@@ -544,6 +553,7 @@ function renderWorkerDetail(data) {
   $("#project-queue-bindings").value = mapToLines(worker.queue_bindings);
   $("#project-analytics-bindings").value = mapToLines(worker.analytics_bindings);
   $("#project-pipeline-bindings").value = mapToLines(worker.pipeline_bindings);
+  $("#project-workflow-bindings").value = mapToLines(worker.workflow_bindings);
   $("#project-crons").value = (worker.crons || []).join("\n");
   $("#project-compatibility-date").value = worker.compatibility_date;
   $("#project-source-repository").value = source?.repository?.replace(/\.git$/, "") || "";
@@ -669,6 +679,7 @@ async function saveProjectBindings(event) {
       queue_bindings: linesToMap($("#project-queue-bindings").value, "Queue 绑定"),
       analytics_bindings: linesToMap($("#project-analytics-bindings").value, "Analytics 绑定"),
       pipeline_bindings: linesToMap($("#project-pipeline-bindings").value, "Pipeline 绑定"),
+      workflow_bindings: linesToMap($("#project-workflow-bindings").value, "Workflow 绑定"),
     };
     await updateWorkerSettings(payload, `更新 ${state.activeWorker} 的变量与绑定。`);
   } catch (error) {
@@ -1696,6 +1707,249 @@ async function deletePipeline() {
   }
 }
 
+function workflowStatusLabel(status) {
+  return {
+    queued: "已排队",
+    running: "运行中",
+    waiting: "等待中",
+    paused: "已暂停",
+    complete: "已完成",
+    failed: "失败",
+    terminated: "已终止",
+    ok: "成功",
+    slept: "已睡眠",
+    pending: "执行中",
+  }[status] || status || "未知";
+}
+
+function workflowStatusClass(status) {
+  if (status === "complete" || status === "ok") return "success";
+  if (status === "failed" || status === "terminated") return "failed";
+  return "active";
+}
+
+function updateWorkflowWorkerOptions(selected = "") {
+  const workers = state.overview?.workers || [];
+  const select = $("#workflow-worker");
+  select.innerHTML = `<option value="">请选择 Worker</option>${workers.map((worker) => `<option value="${escapeHtml(worker.name)}">${escapeHtml(worker.name)} · v${escapeHtml(worker.version)}</option>`).join("")}`;
+  select.value = selected;
+}
+
+function fillWorkflowForm(workflow) {
+  const spec = workflow?.spec || {};
+  $("#workflow-name").value = workflow?.name || "";
+  updateWorkflowWorkerOptions(spec.worker || "");
+  $("#workflow-entrypoint").value = spec.entrypoint || "MyWorkflow";
+  $("#workflow-description").value = spec.description || "";
+  $("#workflow-retention").value = spec.retention_days || 30;
+  $("#workflow-retries").value = spec.instance_retries ?? 3;
+  $("#workflow-timeout").value = spec.instance_timeout_seconds || 1500;
+  $("#workflow-suspended").checked = Boolean(spec.suspended);
+  $("#workflow-suspend-reason").value = spec.suspend_reason || "";
+}
+
+function renderWorkflows() {
+  $("#workflow-count").textContent = `${state.workflows.length} 个 Workflow`;
+  $("#workflow-nav-count").textContent = String(state.workflows.length);
+  const list = $("#workflow-list");
+  list.classList.toggle("empty-state", state.workflows.length === 0);
+  list.innerHTML = state.workflows.length
+    ? state.workflows.map((workflow) => {
+      const stats = workflow.stats || {};
+      const active = workflow.name === state.workflowActive ? " active" : "";
+      const copy = workflow.spec?.suspended
+        ? "已暂停"
+        : `${Number(stats.queued || 0) + Number(stats.running || 0)} 活跃 · ${stats.waiting || 0} 等待`;
+      return `<button class="database-item${active}" type="button" data-workflow="${escapeHtml(workflow.name)}"><span><strong>${escapeHtml(workflow.name)}</strong><small>${escapeHtml(workflow.spec?.worker || "未配置 Worker")} · ${escapeHtml(copy)}</small></span><span>${workflow.spec?.suspended ? "已暂停" : "打开 →"}</span></button>`;
+    }).join("")
+    : "暂无 Workflow。";
+}
+
+async function loadWorkflows({ quiet = false } = {}) {
+  try {
+    const data = await api("/api/workflows");
+    state.workflows = data.workflows || [];
+    if (state.workflowActive && !state.workflows.some((item) => item.name === state.workflowActive)) {
+      state.workflowActive = null;
+      state.workflowInstances = [];
+      state.workflowInstanceActive = null;
+      $("#workflow-active-name").textContent = "请选择 Workflow";
+      $("#workflow-trigger-form").classList.add("hidden");
+      $("#workflow-delete").classList.add("hidden");
+      $("#workflow-instance-panel").classList.add("hidden");
+    }
+    updateWorkflowWorkerOptions($("#workflow-worker").value);
+    renderWorkflows();
+    if (!quiet) toast("Workflow 已刷新");
+  } catch (error) {
+    if (!quiet) toast(error.message, true);
+  }
+}
+
+function renderWorkflowInstances() {
+  const list = $("#workflow-instances");
+  list.classList.toggle("empty-state", state.workflowInstances.length === 0);
+  list.innerHTML = state.workflowInstances.length
+    ? state.workflowInstances.map((instance) => `<button class="build-row" type="button" data-workflow-instance="${escapeHtml(instance.id)}"><span class="pipeline-state ${workflowStatusClass(instance.status)}"></span><div><strong>${escapeHtml(instance.instance_key || shortId(instance.id, 22))}</strong><small>${escapeHtml(new Date(instance.started_at_ms).toLocaleString("zh-CN"))}${instance.waiting_for ? ` · 等待 ${escapeHtml(instance.waiting_for)}` : ""}</small><code>${escapeHtml(instance.id)}</code></div><span class="badge">${escapeHtml(workflowStatusLabel(instance.status))}</span></button>`).join("")
+    : "暂无实例。";
+}
+
+async function selectWorkflow(name) {
+  const workflow = state.workflows.find((item) => item.name === name);
+  if (!workflow) return;
+  const workflowChanged = state.workflowActive !== name;
+  state.workflowActive = name;
+  if (workflowChanged) state.workflowInstanceActive = null;
+  fillWorkflowForm(workflow);
+  renderWorkflows();
+  $("#workflow-active-name").textContent = name;
+  $("#workflow-summary").textContent = `${workflow.spec.worker} · ${workflow.spec.entrypoint} · 定义 v${workflow.version}`;
+  $("#workflow-trigger-form").classList.remove("hidden");
+  $("#workflow-delete").classList.remove("hidden");
+  if (workflowChanged) $("#workflow-instance-panel").classList.add("hidden");
+  const stats = workflow.stats || {};
+  $("#workflow-active-count").textContent = String(Number(stats.queued || 0) + Number(stats.running || 0));
+  $("#workflow-waiting-count").textContent = String(stats.waiting || 0);
+  $("#workflow-complete-count").textContent = String(stats.complete || 0);
+  $("#workflow-failed-count").textContent = String(stats.failed || 0);
+  await loadWorkflowInstances();
+}
+
+async function loadWorkflowInstances() {
+  if (!state.workflowActive) return;
+  try {
+    const data = await api(`/api/workflows/${encodeURIComponent(state.workflowActive)}/instances?limit=100`);
+    state.workflowInstances = data.instances || [];
+    renderWorkflowInstances();
+    if (state.workflowInstanceActive && state.workflowInstances.some((item) => item.id === state.workflowInstanceActive)) {
+      await openWorkflowInstance(state.workflowInstanceActive);
+    }
+  } catch (error) {
+    toast(error.message, true);
+  }
+}
+
+function renderWorkflowSteps(steps) {
+  const list = $("#workflow-steps");
+  list.classList.toggle("empty-state", steps.length === 0);
+  list.innerHTML = steps.length
+    ? steps.map((step) => `<article class="build-row ${step.status === "failed" ? "failed" : ""}"><span class="pipeline-state ${workflowStatusClass(step.status)}"></span><div><strong>${escapeHtml(step.seq)}. ${escapeHtml(step.name)}</strong><small>${escapeHtml(step.kind)} · ${escapeHtml(workflowStatusLabel(step.status))} · ${escapeHtml(step.attempts)} 次尝试${step.wake_at_ms ? ` · ${escapeHtml(new Date(step.wake_at_ms).toLocaleString("zh-CN"))} 唤醒` : ""}</small><code>${escapeHtml(step.error || (step.result == null ? "" : JSON.stringify(step.result)))}</code></div></article>`).join("")
+    : "暂无步骤。";
+}
+
+function renderWorkflowEvents(events) {
+  const labels = {
+    created: "实例已创建", advance_claimed: "节点取得推进租约", step_complete: "步骤已提交",
+    step_failed: "步骤失败", sleep: "进入耐久睡眠", signal_wait: "等待外部信号",
+    signal_received: "收到外部信号", signal_ready: "信号已就绪，重新排队", signal_delivered: "信号已交付", complete: "实例完成",
+    failed: "实例失败", paused: "实例已暂停", resumed: "实例已恢复", terminated: "实例已终止",
+    restarted: "实例已重启", system_retry: "系统故障后重试",
+  };
+  const list = $("#workflow-events");
+  list.classList.toggle("empty-state", events.length === 0);
+  list.innerHTML = events.length
+    ? events.slice().reverse().map((event) => `<article class="build-row"><span class="pipeline-state active"></span><div><strong>${escapeHtml(labels[event.kind] || event.kind)}</strong><small>${escapeHtml(new Date(event.created_at_ms).toLocaleString("zh-CN"))} · 序号 ${escapeHtml(event.seq)}</small><code>${escapeHtml(JSON.stringify(event.detail || {}))}</code></div></article>`).join("")
+    : "暂无事件。";
+}
+
+async function openWorkflowInstance(id) {
+  if (!state.workflowActive) return;
+  state.workflowInstanceActive = id;
+  try {
+    const data = await api(`/api/workflows/${encodeURIComponent(state.workflowActive)}/instances/${encodeURIComponent(id)}`);
+    if (state.workflowInstanceActive !== id) return;
+    const instance = data.instance;
+    $("#workflow-instance-panel").classList.remove("hidden");
+    $("#workflow-instance-title").textContent = instance.instance_key || shortId(instance.id, 28);
+    $("#workflow-instance-status").textContent = workflowStatusLabel(instance.status);
+    $("#workflow-instance-meta").textContent = `${instance.id} · ${new Date(instance.started_at_ms).toLocaleString("zh-CN")}${instance.last_error ? ` · ${instance.last_error}` : ""}`;
+    const actions = [];
+    if (["queued", "running", "waiting"].includes(instance.status)) actions.push(["pause", "暂停"], ["terminate", "终止"]);
+    if (instance.status === "paused") actions.push(["resume", "恢复"], ["terminate", "终止"]);
+    if (["complete", "failed", "terminated"].includes(instance.status)) actions.push(["restart", "从耐久边界重启"]);
+    $("#workflow-instance-actions").innerHTML = actions.map(([action, label]) => `<button class="${action === "terminate" ? "danger ghost" : "secondary"} compact" type="button" data-workflow-action="${action}">${label}</button>`).join("");
+    $("#workflow-signal-form").classList.toggle("hidden", !["queued", "running", "waiting", "paused"].includes(instance.status));
+    renderWorkflowSteps(data.steps || []);
+    renderWorkflowEvents(data.events || []);
+  } catch (error) {
+    toast(error.message, true);
+  }
+}
+
+async function saveWorkflow(event) {
+  event.preventDefault();
+  const payload = {
+    name: $("#workflow-name").value.trim(), worker: $("#workflow-worker").value,
+    entrypoint: $("#workflow-entrypoint").value.trim(), description: $("#workflow-description").value.trim(),
+    retention_days: Number($("#workflow-retention").value), instance_retries: Number($("#workflow-retries").value),
+    instance_timeout_seconds: Number($("#workflow-timeout").value), suspended: $("#workflow-suspended").checked,
+    suspend_reason: $("#workflow-suspend-reason").value.trim(),
+  };
+  try {
+    const result = await api("/api/workflows", { method: "POST", body: JSON.stringify(payload) });
+    const complete = async () => { await loadWorkflows({ quiet: true }); await selectWorkflow(payload.name); };
+    if (result.pending_approval) showApproval(result, `批准后，Workflow ${payload.name} 的签名定义将传播到集群。`, complete);
+    else { toast(`Workflow ${payload.name} 已保存`); await complete(); }
+  } catch (error) { toast(error.message, true); }
+}
+
+async function triggerWorkflow(event) {
+  event.preventDefault();
+  if (!state.workflowActive) return;
+  let input;
+  try { input = JSON.parse($("#workflow-input").value); }
+  catch (error) { toast(`输入不是有效 JSON：${error.message}`, true); return; }
+  try {
+    const data = await api(`/api/workflows/${encodeURIComponent(state.workflowActive)}/instances`, {
+      method: "POST", body: JSON.stringify({ instance_key: $("#workflow-instance-key").value.trim() || null, input }),
+    });
+    toast(`Workflow 实例 ${shortId(data.instance.id, 20)} 已触发`);
+    await loadWorkflows({ quiet: true });
+    await selectWorkflow(state.workflowActive);
+    await openWorkflowInstance(data.instance.id);
+  } catch (error) { toast(error.message, true); }
+}
+
+async function sendWorkflowSignal(event) {
+  event.preventDefault();
+  if (!state.workflowActive || !state.workflowInstanceActive) return;
+  let payload;
+  try { payload = JSON.parse($("#workflow-signal-payload").value); }
+  catch (error) { toast(`信号负载不是有效 JSON：${error.message}`, true); return; }
+  try {
+    await api(`/api/workflows/${encodeURIComponent(state.workflowActive)}/instances/${encodeURIComponent(state.workflowInstanceActive)}/signal`, {
+      method: "POST", body: JSON.stringify({ name: $("#workflow-signal-name").value.trim(), payload }),
+    });
+    toast("外部信号已持久化");
+    await loadWorkflowInstances();
+  } catch (error) { toast(error.message, true); }
+}
+
+async function runWorkflowAction(action) {
+  if (!state.workflowActive || !state.workflowInstanceActive) return;
+  const workflowName = state.workflowActive;
+  const instanceId = state.workflowInstanceActive;
+  if (action === "terminate" && !window.confirm("要终止这个 Workflow 实例吗？正在运行的推进结果将被丢弃。")) return;
+  try {
+    await api(`/api/workflows/${encodeURIComponent(workflowName)}/instances/${encodeURIComponent(instanceId)}/${action}`, { method: "POST", body: "{}" });
+    toast(`Workflow 实例已${{ pause: "暂停", resume: "恢复", terminate: "终止", restart: "重启" }[action] || "更新"}`);
+    await loadWorkflows({ quiet: true });
+    await selectWorkflow(workflowName);
+    await openWorkflowInstance(instanceId);
+  } catch (error) { toast(error.message, true); }
+}
+
+async function deleteWorkflow() {
+  const name = state.workflowActive;
+  if (!name || !window.confirm(`要删除 Workflow“${name}”吗？定义会写入可验证墓碑，历史账本按保留策略清理。`)) return;
+  try {
+    const result = await api(`/api/workflows/${encodeURIComponent(name)}`, { method: "DELETE" });
+    const complete = async () => { state.workflowActive = null; state.workflowInstanceActive = null; fillWorkflowForm(null); await loadWorkflows({ quiet: true }); };
+    if (result.pending_approval) showApproval(result, `批准后，Workflow ${name} 将停止创建与推进实例。`, complete);
+    else await complete();
+  } catch (error) { toast(error.message, true); }
+}
+
 async function loadOverview({ quiet = false } = {}) {
   try {
     const data = await api("/api/overview");
@@ -2010,7 +2264,7 @@ async function boot() {
     $("#security-copy").innerHTML = consoleMode === "public"
       ? "此节点不保存<br>任何私钥。"
       : "密钥仅保留在本地<br>控制台进程中。";
-    $$("#deploy-form button, #source-form button, #kv-editor-form button, #d1-create-form button, #d1-exec-form button, #r2-bucket-form button, #r2-upload-form button, #r2-delete-bucket, #queue-form button, #queue-send-form button, #queue-delete, #analytics-form button, #analytics-write-form button, #analytics-delete, #pipeline-form button, #pipeline-token-form button, #pipeline-ingest-form button, #pipeline-flush, #pipeline-delete, #project-domain-add-form button, #project-bindings-form button, #project-triggers-form button, #project-settings-form button, #project-source-form button, #project-redeploy, #project-delete")
+    $$("#deploy-form button, #source-form button, #kv-editor-form button, #d1-create-form button, #d1-exec-form button, #r2-bucket-form button, #r2-upload-form button, #r2-delete-bucket, #queue-form button, #queue-send-form button, #queue-delete, #analytics-form button, #analytics-write-form button, #analytics-delete, #pipeline-form button, #pipeline-token-form button, #pipeline-ingest-form button, #pipeline-flush, #pipeline-delete, #workflow-form button, #workflow-trigger-form button, #workflow-signal-form button, #workflow-delete, #project-domain-add-form button, #project-bindings-form button, #project-triggers-form button, #project-settings-form button, #project-source-form button, #project-redeploy, #project-delete")
       .forEach((button) => { button.disabled = state.session.read_only; });
     await loadOverview({ quiet: true });
     await loadWorkerOps();
@@ -2019,6 +2273,7 @@ async function boot() {
     await loadQueues({ quiet: true });
     await loadAnalytics({ quiet: true });
     await loadPipelines({ quiet: true });
+    await loadWorkflows({ quiet: true });
   } catch (error) {
     if (consoleMode === "public" && error.status === 401) {
       state.session = null;
@@ -2073,6 +2328,7 @@ $("#refresh").addEventListener("click", async () => {
   await loadQueues({ quiet: true });
   await loadAnalytics({ quiet: true });
   await loadPipelines({ quiet: true });
+  await loadWorkflows({ quiet: true });
 });
 $("#deploy-form").addEventListener("submit", deployWorker);
 $("#deploy-file-picker").addEventListener("click", () => $("#deploy-files").click());
@@ -2111,6 +2367,11 @@ $("#pipeline-flush").addEventListener("click", flushPipeline);
 $("#pipeline-refresh").addEventListener("click", () => state.pipelineActive && selectPipeline(state.pipelineActive));
 $("#pipeline-delete").addEventListener("click", deletePipeline);
 $("#pipeline-copy-token").addEventListener("click", () => copyText($("#pipeline-new-token").textContent, $("#pipeline-copy-token")));
+$("#workflow-form").addEventListener("submit", saveWorkflow);
+$("#workflow-trigger-form").addEventListener("submit", triggerWorkflow);
+$("#workflow-signal-form").addEventListener("submit", sendWorkflowSignal);
+$("#workflow-refresh").addEventListener("click", loadWorkflowInstances);
+$("#workflow-delete").addEventListener("click", deleteWorkflow);
 $("#r2-object-file").addEventListener("change", () => {
   const file = $("#r2-object-file").files?.[0];
   if (file && !$("#r2-object-key").value) $("#r2-object-key").value = file.name;
@@ -2202,6 +2463,18 @@ $("#pipeline-token-list").addEventListener("click", (event) => {
   const button = event.target.closest("button[data-pipeline-token-revoke]");
   if (button) revokePipelineToken(button.dataset.pipelineTokenRevoke);
 });
+$("#workflow-list").addEventListener("click", (event) => {
+  const button = event.target.closest("button[data-workflow]");
+  if (button) selectWorkflow(button.dataset.workflow);
+});
+$("#workflow-instances").addEventListener("click", (event) => {
+  const button = event.target.closest("button[data-workflow-instance]");
+  if (button) openWorkflowInstance(button.dataset.workflowInstance);
+});
+$("#workflow-instance-actions").addEventListener("click", (event) => {
+  const button = event.target.closest("button[data-workflow-action]");
+  if (button) runWorkflowAction(button.dataset.workflowAction);
+});
 
 setInterval(() => {
   if (state.session) {
@@ -2214,6 +2487,9 @@ setInterval(() => {
     });
     if (state.view === "pipelines") loadPipelines({ quiet: true }).then(() => {
       if (state.pipelineActive) selectPipeline(state.pipelineActive);
+    });
+    if (state.view === "workflows") loadWorkflows({ quiet: true }).then(() => {
+      if (state.workflowActive) selectWorkflow(state.workflowActive);
     });
   }
 }, 10_000);

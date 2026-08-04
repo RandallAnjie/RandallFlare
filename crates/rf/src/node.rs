@@ -89,6 +89,7 @@ pub struct Inner {
     pub qbind_port: u16,
     pub analyticsbind_port: u16,
     pub pbind_port: u16,
+    pub workflowbind_port: u16,
     /// Per-process unguessable tokens used only for rf → workerd event
     /// delivery. They are regenerated on every Worker start and never gossip.
     pub worker_event_tokens: HashMap<String, String>,
@@ -106,6 +107,7 @@ pub struct Node {
     queue_schemas: Mutex<HashSet<String>>,
     analytics_schemas: Mutex<HashSet<String>>,
     pipeline_schemas: Mutex<HashSet<String>>,
+    workflow_schemas: Mutex<HashSet<String>>,
     events: broadcast::Sender<NodeEvent>,
 }
 
@@ -149,6 +151,7 @@ impl Node {
             qbind_port: 0,
             analyticsbind_port: 0,
             pbind_port: 0,
+            workflowbind_port: 0,
             worker_event_tokens: HashMap::new(),
         };
         // Hydrate: static stability means booting entirely from disk.
@@ -179,6 +182,7 @@ impl Node {
             queue_schemas: Mutex::new(HashSet::new()),
             analytics_schemas: Mutex::new(HashSet::new()),
             pipeline_schemas: Mutex::new(HashSet::new()),
+            workflow_schemas: Mutex::new(HashSet::new()),
             events,
         })
     }
@@ -874,6 +878,14 @@ impl Node {
         self.inner.lock().unwrap().pbind_port
     }
 
+    pub fn set_workflowbind_port(&self, port: u16) {
+        self.inner.lock().unwrap().workflowbind_port = port;
+    }
+
+    pub fn workflowbind_port(&self) -> u16 {
+        self.inner.lock().unwrap().workflowbind_port
+    }
+
     pub fn set_worker_event_token(&self, worker: &str, token: String) {
         self.inner
             .lock()
@@ -929,6 +941,14 @@ impl Node {
 
     pub(crate) fn mark_pipeline_schema_ready(&self, database: String) {
         self.pipeline_schemas.lock().unwrap().insert(database);
+    }
+
+    pub(crate) fn workflow_schema_ready(&self, database: &str) -> bool {
+        self.workflow_schemas.lock().unwrap().contains(database)
+    }
+
+    pub(crate) fn mark_workflow_schema_ready(&self, database: String) {
+        self.workflow_schemas.lock().unwrap().insert(database);
     }
 
     /// Periodic GC of dead claims + KV tombstones.

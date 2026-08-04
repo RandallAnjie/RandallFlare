@@ -130,6 +130,11 @@ enum Cmd {
         #[command(subcommand)]
         cmd: PipelineCmd,
     },
+    /// Durable Worker Workflow definitions and instances.
+    Workflow {
+        #[command(subcommand)]
+        cmd: WorkflowCmd,
+    },
     /// Fetch and verify a worker's transparency log (hash chain).
     Log {
         worker: String,
@@ -593,6 +598,124 @@ enum PipelineCmd {
         #[arg(long, env = "RF_CLUSTER_SECRET")]
         secret: String,
     },
+}
+
+#[derive(Subcommand)]
+enum WorkflowCmd {
+    /// List signed Workflows with instance counters.
+    List {
+        #[arg(long, env = "RF_NODE")]
+        node: String,
+        #[arg(long, env = "RF_CLUSTER_SECRET")]
+        secret: String,
+    },
+    /// Create or update a signed Workflow definition.
+    Create {
+        name: String,
+        #[arg(long)]
+        worker: String,
+        #[arg(long, default_value = "MyWorkflow")]
+        entrypoint: String,
+        #[arg(long, default_value = "")]
+        description: String,
+        #[arg(long, default_value_t = 30)]
+        retention_days: u16,
+        #[arg(long, default_value_t = 3)]
+        instance_retries: u16,
+        #[arg(long, default_value_t = 1500)]
+        instance_timeout_seconds: u64,
+        #[arg(long)]
+        suspended: bool,
+        #[arg(long, default_value = "")]
+        suspend_reason: String,
+        #[arg(long, env = "RF_NODE")]
+        node: String,
+        #[arg(long, env = "RF_OPERATOR_KEY")]
+        key: Option<PathBuf>,
+        #[arg(long, env = "RF_CLUSTER_SECRET")]
+        secret: String,
+    },
+    /// Tombstone a Workflow definition.
+    Delete {
+        name: String,
+        #[arg(long, env = "RF_NODE")]
+        node: String,
+        #[arg(long, env = "RF_OPERATOR_KEY")]
+        key: Option<PathBuf>,
+        #[arg(long, env = "RF_CLUSTER_SECRET")]
+        secret: String,
+    },
+    /// Create an instance. Reusing --idempotency-key returns the existing instance.
+    Trigger {
+        name: String,
+        #[arg(long, default_value = "{}")]
+        input: String,
+        #[arg(long)]
+        idempotency_key: Option<String>,
+        #[arg(long, env = "RF_NODE")]
+        node: String,
+        #[arg(long, env = "RF_CLUSTER_SECRET")]
+        secret: String,
+    },
+    /// List recent instances.
+    Instances {
+        name: String,
+        #[arg(long)]
+        status: Option<String>,
+        #[arg(long, default_value_t = 100)]
+        limit: usize,
+        #[arg(long, env = "RF_NODE")]
+        node: String,
+        #[arg(long, env = "RF_CLUSTER_SECRET")]
+        secret: String,
+    },
+    /// Show one instance, steps, signals and audit events.
+    Instance {
+        name: String,
+        id: String,
+        #[arg(long, env = "RF_NODE")]
+        node: String,
+        #[arg(long, env = "RF_CLUSTER_SECRET")]
+        secret: String,
+    },
+    /// Deliver an external signal to a waiting instance.
+    Signal {
+        name: String,
+        id: String,
+        signal: String,
+        #[arg(long, default_value = "null")]
+        payload: String,
+        #[arg(long, env = "RF_NODE")]
+        node: String,
+        #[arg(long, env = "RF_CLUSTER_SECRET")]
+        secret: String,
+    },
+    /// Pause an active instance.
+    Pause(WorkflowActionArgs),
+    /// Resume a paused instance.
+    Resume(WorkflowActionArgs),
+    /// Terminate an active instance.
+    Terminate(WorkflowActionArgs),
+    /// Restart a terminal instance from its durable step boundary.
+    Restart(WorkflowActionArgs),
+    /// Show per-status instance counters.
+    Stats {
+        name: String,
+        #[arg(long, env = "RF_NODE")]
+        node: String,
+        #[arg(long, env = "RF_CLUSTER_SECRET")]
+        secret: String,
+    },
+}
+
+#[derive(clap::Args)]
+struct WorkflowActionArgs {
+    name: String,
+    id: String,
+    #[arg(long, env = "RF_NODE")]
+    node: String,
+    #[arg(long, env = "RF_CLUSTER_SECRET")]
+    secret: String,
 }
 
 fn secret_bytes(s: &str) -> Result<[u8; 32]> {
@@ -1435,6 +1558,172 @@ async fn async_main(cli: Cli) -> Result<()> {
                 Ok(())
             }
         },
+        Cmd::Workflow { cmd } => match cmd {
+            WorkflowCmd::List { node, secret } => {
+                let client = PeerClient::new(secret_bytes(&secret)?);
+                let records = client
+                    .resource_heads(&node, Some(rf::workflow::WORKFLOW_KIND))
+                    .await?;
+                let mut workflows = Vec::new();
+                for view in records.into_iter().filter(|view| !view.resource.deleted) {
+                    let spec = rf::workflow::workflow_spec(&view.resource)?;
+                    let stats = client.workflow_stats(&node, &view.resource.name).await.ok();
+                    workflows.push(serde_json::json!({
+                        "name": view.resource.name,
+                        "version": view.resource.version,
+                        "digest": view.digest,
+                        "spec": spec,
+                        "stats": stats,
+                    }));
+                }
+                println!("{}", serde_json::to_string_pretty(&workflows)?);
+                Ok(())
+            }
+            WorkflowCmd::Create {
+                name,
+                worker,
+                entrypoint,
+                description,
+                retention_days,
+                instance_retries,
+                instance_timeout_seconds,
+                suspended,
+                suspend_reason,
+                node,
+                key,
+                secret,
+            } => {
+                let client = PeerClient::new(secret_bytes(&secret)?);
+                let head = client
+                    .resource_head(&node, rf::workflow::WORKFLOW_KIND, &name)
+                    .await?;
+                let spec = rf::workflow::WorkflowSpec {
+                    description,
+                    worker,
+                    entrypoint,
+                    suspended,
+                    suspend_reason,
+                    retention_days,
+                    instance_retries,
+                    instance_timeout_seconds,
+                };
+                let record =
+                    rf::workflow::prepare_workflow_after(&name, spec, false, head.as_ref())?;
+                let envelope = rf_core::envelope::Envelope::seal_any(&record, &operator_key(key)?);
+                client.post_resource(&node, &envelope).await?;
+                println!("Workflow {} 已更新至 v{}", record.name, record.version);
+                Ok(())
+            }
+            WorkflowCmd::Delete {
+                name,
+                node,
+                key,
+                secret,
+            } => {
+                let client = PeerClient::new(secret_bytes(&secret)?);
+                let head = client
+                    .resource_head(&node, rf::workflow::WORKFLOW_KIND, &name)
+                    .await?
+                    .filter(|view| !view.resource.deleted)
+                    .with_context(|| format!("Workflow {name} 不存在"))?;
+                let spec = rf::workflow::workflow_spec(&head.resource)?;
+                let record = rf::workflow::prepare_workflow_after(&name, spec, true, Some(&head))?;
+                let envelope = rf_core::envelope::Envelope::seal_any(&record, &operator_key(key)?);
+                client.post_resource(&node, &envelope).await?;
+                println!("Workflow {} 已删除（v{}）", record.name, record.version);
+                Ok(())
+            }
+            WorkflowCmd::Trigger {
+                name,
+                input,
+                idempotency_key,
+                node,
+                secret,
+            } => {
+                let input = serde_json::from_str(&input).context("Workflow 输入必须是有效 JSON")?;
+                let instance = PeerClient::new(secret_bytes(&secret)?)
+                    .workflow_create(&node, &name, idempotency_key.as_deref(), input)
+                    .await?;
+                println!("{}", serde_json::to_string_pretty(&instance)?);
+                Ok(())
+            }
+            WorkflowCmd::Instances {
+                name,
+                status,
+                limit,
+                node,
+                secret,
+            } => {
+                let instances = PeerClient::new(secret_bytes(&secret)?)
+                    .workflow_instances(&node, &name, status.as_deref(), limit)
+                    .await?;
+                println!("{}", serde_json::to_string_pretty(&instances)?);
+                Ok(())
+            }
+            WorkflowCmd::Instance {
+                name,
+                id,
+                node,
+                secret,
+            } => {
+                let instance = PeerClient::new(secret_bytes(&secret)?)
+                    .workflow_instance(&node, &name, &id)
+                    .await?;
+                println!("{}", serde_json::to_string_pretty(&instance)?);
+                Ok(())
+            }
+            WorkflowCmd::Signal {
+                name,
+                id,
+                signal,
+                payload,
+                node,
+                secret,
+            } => {
+                let payload =
+                    serde_json::from_str(&payload).context("Workflow 信号负载必须是有效 JSON")?;
+                let signal_id = PeerClient::new(secret_bytes(&secret)?)
+                    .workflow_signal(&node, &name, &id, &signal, payload)
+                    .await?;
+                println!("Workflow 信号已写入：{signal_id}");
+                Ok(())
+            }
+            WorkflowCmd::Pause(args) => {
+                PeerClient::new(secret_bytes(&args.secret)?)
+                    .workflow_action(&args.node, &args.name, &args.id, "pause")
+                    .await?;
+                println!("Workflow 实例 {} 已暂停", args.id);
+                Ok(())
+            }
+            WorkflowCmd::Resume(args) => {
+                PeerClient::new(secret_bytes(&args.secret)?)
+                    .workflow_action(&args.node, &args.name, &args.id, "resume")
+                    .await?;
+                println!("Workflow 实例 {} 已恢复", args.id);
+                Ok(())
+            }
+            WorkflowCmd::Terminate(args) => {
+                PeerClient::new(secret_bytes(&args.secret)?)
+                    .workflow_action(&args.node, &args.name, &args.id, "terminate")
+                    .await?;
+                println!("Workflow 实例 {} 已终止", args.id);
+                Ok(())
+            }
+            WorkflowCmd::Restart(args) => {
+                PeerClient::new(secret_bytes(&args.secret)?)
+                    .workflow_action(&args.node, &args.name, &args.id, "restart")
+                    .await?;
+                println!("Workflow 实例 {} 已重启", args.id);
+                Ok(())
+            }
+            WorkflowCmd::Stats { name, node, secret } => {
+                let stats = PeerClient::new(secret_bytes(&secret)?)
+                    .workflow_stats(&node, &name)
+                    .await?;
+                println!("{}", serde_json::to_string_pretty(&stats)?);
+                Ok(())
+            }
+        },
         Cmd::Log {
             worker,
             node,
@@ -1874,12 +2163,16 @@ async fn run(config_path: PathBuf) -> Result<()> {
     let pbind_port = rf::pbind::serve(node.clone()).await?;
     node.set_pbind_port(pbind_port);
     tracing::info!("Pipeline binding on 127.0.0.1:{pbind_port}");
+    let workflowbind_port = rf::workflowbind::serve(node.clone()).await?;
+    node.set_workflowbind_port(workflowbind_port);
+    tracing::info!("Workflow binding on 127.0.0.1:{workflowbind_port}");
 
     let _gossip = rf::gossip::start(node.clone()).await?;
     durable.spawn_ensurer();
     durable.spawn_checkpointer();
     rf::gossip::spawn_blob_fetcher(node.clone());
     rf::pipeline::spawn_driver(node.clone());
+    rf::workflow::spawn_driver(node.clone());
     tracing::info!("gossip on {}", node.cfg.gossip.listen);
 
     tokio::spawn(rf::runtime::Runtime::new(node.clone(), durable.clone()).run());

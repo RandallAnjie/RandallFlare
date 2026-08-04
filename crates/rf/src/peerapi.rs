@@ -114,6 +114,23 @@ pub fn router(api: Api) -> Router {
         .route("/v1/pipeline/{pipeline}/status", get(pipeline_status))
         .route("/v1/pipeline/{pipeline}/batches", get(pipeline_batches))
         .route("/v1/pipeline/{pipeline}/flush", post(pipeline_flush))
+        .route(
+            "/v1/workflow/{workflow}/instances",
+            post(workflow_create).get(workflow_instances),
+        )
+        .route(
+            "/v1/workflow/{workflow}/instances/{id}",
+            get(workflow_instance),
+        )
+        .route(
+            "/v1/workflow/{workflow}/instances/{id}/signal",
+            post(workflow_signal),
+        )
+        .route(
+            "/v1/workflow/{workflow}/instances/{id}/{action}",
+            post(workflow_action),
+        )
+        .route("/v1/workflow/{workflow}/stats", get(workflow_stats))
         .route("/v1/do/{worker}/proxy", post(do_proxy))
         .route("/v1/r2/{bucket}", get(r2_list))
         .route("/v1/r2-blob/{sha}", get(r2_blob_get))
@@ -420,6 +437,7 @@ async fn status(
                 && !name.starts_with("queue-")
                 && !name.starts_with("analytics-")
                 && !name.starts_with("pipeline-")
+                && !name.starts_with("workflow-")
         })
         .collect();
     let buckets: Vec<serde_json::Value> = crate::r2::bucket_records(node)
@@ -466,6 +484,17 @@ async fn status(
             })
         })
         .collect();
+    let workflows: Vec<serde_json::Value> = crate::workflow::workflow_records(node)
+        .into_iter()
+        .map(|(view, spec)| {
+            serde_json::json!({
+                "name": view.resource.name,
+                "version": view.resource.version,
+                "digest": view.digest,
+                "spec": spec,
+            })
+        })
+        .collect();
     axum::Json(serde_json::json!({
         "node": node.id_hex(),
         "label": node.cfg.label,
@@ -481,6 +510,7 @@ async fn status(
         "queues": queues,
         "analytics_datasets": analytics_datasets,
         "pipelines": pipelines,
+        "workflows": workflows,
         "storage": {
             "local": true,
             "rclone": node.cfg.storage.rclone_binary.is_some(),
@@ -1305,6 +1335,191 @@ async fn pipeline_flush(
     }
     match crate::pipeline::flush_once(&api.node, &pipeline, true).await {
         Ok(batch) => axum::Json(serde_json::json!({ "batch": batch })).into_response(),
+        Err(error) => (StatusCode::UNPROCESSABLE_ENTITY, error.to_string()).into_response(),
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WorkflowCreateReq {
+    instance_key: Option<String>,
+    #[serde(default)]
+    input: serde_json::Value,
+}
+
+async fn workflow_create(
+    State(api): State<Api>,
+    ConnectInfo(remote): ConnectInfo<SocketAddr>,
+    Path(workflow): Path<String>,
+    method: Method,
+    uri: Uri,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    if let Err(response) = check(&api, &remote, &headers, &method, &uri, &body) {
+        return response.into_response();
+    }
+    let Ok(request) = serde_json::from_slice::<WorkflowCreateReq>(&body) else {
+        return (StatusCode::BAD_REQUEST, "Workflow 创建请求无效").into_response();
+    };
+    match crate::workflow::create_instance(
+        &api.node,
+        &workflow,
+        request.instance_key.as_deref(),
+        request.input,
+    )
+    .await
+    {
+        Ok(instance) => axum::Json(instance).into_response(),
+        Err(error) => (StatusCode::UNPROCESSABLE_ENTITY, error.to_string()).into_response(),
+    }
+}
+
+#[derive(Deserialize)]
+struct WorkflowListQuery {
+    status: Option<String>,
+    limit: Option<usize>,
+}
+
+async fn workflow_instances(
+    State(api): State<Api>,
+    ConnectInfo(remote): ConnectInfo<SocketAddr>,
+    Path(workflow): Path<String>,
+    Query(query): Query<WorkflowListQuery>,
+    method: Method,
+    uri: Uri,
+    headers: HeaderMap,
+) -> Response {
+    if let Err(response) = check(&api, &remote, &headers, &method, &uri, b"") {
+        return response.into_response();
+    }
+    match crate::workflow::instances(
+        &api.node,
+        &workflow,
+        query.status.as_deref(),
+        query.limit.unwrap_or(100),
+    )
+    .await
+    {
+        Ok(instances) => axum::Json(serde_json::json!({ "instances": instances })).into_response(),
+        Err(error) => (StatusCode::UNPROCESSABLE_ENTITY, error.to_string()).into_response(),
+    }
+}
+
+async fn workflow_instance(
+    State(api): State<Api>,
+    ConnectInfo(remote): ConnectInfo<SocketAddr>,
+    Path((workflow, id)): Path<(String, String)>,
+    method: Method,
+    uri: Uri,
+    headers: HeaderMap,
+) -> Response {
+    if let Err(response) = check(&api, &remote, &headers, &method, &uri, b"") {
+        return response.into_response();
+    }
+    let instance = match crate::workflow::instance(&api.node, &workflow, &id).await {
+        Ok(Some(instance)) => instance,
+        Ok(None) => return (StatusCode::NOT_FOUND, "Workflow 实例不存在").into_response(),
+        Err(error) => return (StatusCode::UNPROCESSABLE_ENTITY, error.to_string()).into_response(),
+    };
+    let (steps, signals, events) = tokio::join!(
+        crate::workflow::steps(&api.node, &workflow, &id),
+        crate::workflow::signals(&api.node, &workflow, &id),
+        crate::workflow::events(&api.node, &workflow, &id, 500),
+    );
+    match (steps, signals, events) {
+        (Ok(steps), Ok(signals), Ok(events)) => axum::Json(serde_json::json!({
+            "instance": instance,
+            "steps": steps,
+            "signals": signals,
+            "events": events,
+        }))
+        .into_response(),
+        (steps, signals, events) => {
+            let error = steps
+                .err()
+                .or_else(|| signals.err())
+                .or_else(|| events.err())
+                .expect("one branch failed");
+            (StatusCode::UNPROCESSABLE_ENTITY, error.to_string()).into_response()
+        }
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WorkflowSignalReq {
+    name: String,
+    #[serde(default)]
+    payload: serde_json::Value,
+}
+
+async fn workflow_signal(
+    State(api): State<Api>,
+    ConnectInfo(remote): ConnectInfo<SocketAddr>,
+    Path((workflow, id)): Path<(String, String)>,
+    method: Method,
+    uri: Uri,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    if let Err(response) = check(&api, &remote, &headers, &method, &uri, &body) {
+        return response.into_response();
+    }
+    let Ok(request) = serde_json::from_slice::<WorkflowSignalReq>(&body) else {
+        return (StatusCode::BAD_REQUEST, "Workflow 信号请求无效").into_response();
+    };
+    match crate::workflow::send_signal(&api.node, &workflow, &id, &request.name, request.payload)
+        .await
+    {
+        Ok(signal_id) => axum::Json(serde_json::json!({ "signal_id": signal_id })).into_response(),
+        Err(error) => (StatusCode::UNPROCESSABLE_ENTITY, error.to_string()).into_response(),
+    }
+}
+
+async fn workflow_action(
+    State(api): State<Api>,
+    ConnectInfo(remote): ConnectInfo<SocketAddr>,
+    Path((workflow, id, action)): Path<(String, String, String)>,
+    method: Method,
+    uri: Uri,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    if let Err(response) = check(&api, &remote, &headers, &method, &uri, &body) {
+        return response.into_response();
+    }
+    let changed = match action.as_str() {
+        "pause" => crate::workflow::pause(&api.node, &workflow, &id).await,
+        "resume" => crate::workflow::resume(&api.node, &workflow, &id).await,
+        "terminate" => crate::workflow::terminate(&api.node, &workflow, &id).await,
+        "restart" => crate::workflow::restart(&api.node, &workflow, &id).await,
+        _ => return (StatusCode::NOT_FOUND, "Workflow 操作不存在").into_response(),
+    };
+    match changed {
+        Ok(true) => axum::Json(serde_json::json!({ "ok": true })).into_response(),
+        Ok(false) => (
+            StatusCode::CONFLICT,
+            "Workflow 实例不存在或当前状态不允许此操作",
+        )
+            .into_response(),
+        Err(error) => (StatusCode::UNPROCESSABLE_ENTITY, error.to_string()).into_response(),
+    }
+}
+
+async fn workflow_stats(
+    State(api): State<Api>,
+    ConnectInfo(remote): ConnectInfo<SocketAddr>,
+    Path(workflow): Path<String>,
+    method: Method,
+    uri: Uri,
+    headers: HeaderMap,
+) -> Response {
+    if let Err(response) = check(&api, &remote, &headers, &method, &uri, b"") {
+        return response.into_response();
+    }
+    match crate::workflow::stats(&api.node, &workflow).await {
+        Ok(stats) => axum::Json(stats).into_response(),
         Err(error) => (StatusCode::UNPROCESSABLE_ENTITY, error.to_string()).into_response(),
     }
 }

@@ -256,6 +256,24 @@ pub fn router(state: ConsoleState) -> Router {
         .route("/api/pipelines/{name}/status", get(pipeline_status))
         .route("/api/pipelines/{name}/batches", get(pipeline_batches))
         .route("/api/pipelines/{name}/flush", post(pipeline_flush))
+        .route("/api/workflows", get(workflow_list).post(workflow_apply))
+        .route("/api/workflows/{name}", delete(workflow_delete))
+        .route(
+            "/api/workflows/{name}/instances",
+            get(workflow_instances).post(workflow_trigger),
+        )
+        .route(
+            "/api/workflows/{name}/instances/{id}",
+            get(workflow_instance),
+        )
+        .route(
+            "/api/workflows/{name}/instances/{id}/signal",
+            post(workflow_signal),
+        )
+        .route(
+            "/api/workflows/{name}/instances/{id}/{action}",
+            post(workflow_action),
+        )
         .route("/api/auth/logout", post(logout))
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
@@ -730,6 +748,8 @@ struct WorkerSettingsRequest {
     #[serde(default)]
     pipeline_bindings: Option<BTreeMap<String, String>>,
     #[serde(default)]
+    workflow_bindings: Option<BTreeMap<String, String>>,
+    #[serde(default)]
     crons: Option<Vec<String>>,
     #[serde(default)]
     compatibility_date: Option<String>,
@@ -786,12 +806,14 @@ async fn worker_get(
     env.remove(deploy::QUEUE_METADATA_ENV);
     env.remove(deploy::ANALYTICS_METADATA_ENV);
     env.remove(deploy::PIPELINE_METADATA_ENV);
+    env.remove(deploy::WORKFLOW_METADATA_ENV);
     let durable_objects = deploy::durable_objects(&manifest);
     let r2_bindings = deploy::r2_bindings(&manifest);
     let d1_bindings = deploy::d1_bindings(&manifest);
     let queue_bindings = deploy::queue_bindings(&manifest);
     let analytics_bindings = deploy::analytics_bindings(&manifest);
     let pipeline_bindings = deploy::pipeline_bindings(&manifest);
+    let workflow_bindings = deploy::workflow_bindings(&manifest);
     let source = match &state.mode {
         ConsoleMode::Public { node, .. } => crate::build::source_head(node, &name)
             .filter(|record| !record.source.deleted)
@@ -845,6 +867,7 @@ async fn worker_get(
             "queue_bindings": queue_bindings,
             "analytics_bindings": analytics_bindings,
             "pipeline_bindings": pipeline_bindings,
+            "workflow_bindings": workflow_bindings,
             "crons": manifest.crons,
             "compatibility_date": manifest.compatibility_date,
             "durable_objects": durable_objects,
@@ -1090,6 +1113,7 @@ fn apply_worker_settings(
         queue_bindings,
         analytics_bindings,
         pipeline_bindings,
+        workflow_bindings,
         crons,
         compatibility_date,
     } = request;
@@ -1101,6 +1125,7 @@ fn apply_worker_settings(
         && queue_bindings.is_none()
         && analytics_bindings.is_none()
         && pipeline_bindings.is_none()
+        && workflow_bindings.is_none()
         && crons.is_none()
         && compatibility_date.is_none()
     {
@@ -1126,6 +1151,7 @@ fn apply_worker_settings(
             || env.contains_key(deploy::QUEUE_METADATA_ENV)
             || env.contains_key(deploy::ANALYTICS_METADATA_ENV)
             || env.contains_key(deploy::PIPELINE_METADATA_ENV)
+            || env.contains_key(deploy::WORKFLOW_METADATA_ENV)
         {
             return Err(ApiError::bad_request(
                 "不能修改 RandallFlare 保留的环境变量",
@@ -1149,6 +1175,9 @@ fn apply_worker_settings(
         }
         if let Some(pipelines) = manifest.env.get(deploy::PIPELINE_METADATA_ENV).cloned() {
             env.insert(deploy::PIPELINE_METADATA_ENV.into(), pipelines);
+        }
+        if let Some(workflows) = manifest.env.get(deploy::WORKFLOW_METADATA_ENV).cloned() {
+            env.insert(deploy::WORKFLOW_METADATA_ENV.into(), workflows);
         }
         manifest.env = env;
     }
@@ -1290,6 +1319,32 @@ fn apply_worker_settings(
             );
         }
     }
+    if let Some(workflow_bindings) = workflow_bindings {
+        validate_settings_map(&workflow_bindings, "Workflow 绑定")?;
+        let identifier = |value: &str| {
+            let mut chars = value.chars();
+            chars.next().is_some_and(|character| {
+                character.is_ascii_alphabetic() || matches!(character, '_' | '$')
+            }) && chars.all(|character| {
+                character.is_ascii_alphanumeric() || matches!(character, '_' | '$')
+            })
+        };
+        for (binding, workflow) in &workflow_bindings {
+            if !identifier(binding) || !valid_name(workflow) {
+                return Err(ApiError::bad_request(format!(
+                    "Workflow 绑定 {binding} 或 Workflow 名称无效"
+                )));
+            }
+        }
+        if workflow_bindings.is_empty() {
+            manifest.env.remove(deploy::WORKFLOW_METADATA_ENV);
+        } else {
+            manifest.env.insert(
+                deploy::WORKFLOW_METADATA_ENV.into(),
+                serde_json::to_string(&workflow_bindings)?,
+            );
+        }
+    }
     if let Some(crons) = crons {
         if crons.len() > 256 {
             return Err(ApiError::bad_request(
@@ -1321,6 +1376,7 @@ fn apply_worker_settings(
         .chain(deploy::queue_bindings(&manifest).keys())
         .chain(deploy::analytics_bindings(&manifest).keys())
         .chain(deploy::pipeline_bindings(&manifest).keys())
+        .chain(deploy::workflow_bindings(&manifest).keys())
     {
         if !binding_names.insert(name.clone()) {
             return Err(ApiError::bad_request(format!("绑定名称 {name} 被重复使用")));
@@ -2842,6 +2898,246 @@ async fn pipeline_flush(
     Ok(Json(json!({ "ok": true, "batch": batch })))
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WorkflowRequest {
+    name: String,
+    worker: String,
+    #[serde(default = "workflow_default_entrypoint")]
+    entrypoint: String,
+    #[serde(default)]
+    description: String,
+    #[serde(default = "workflow_default_retention_days")]
+    retention_days: u16,
+    #[serde(default = "workflow_default_retries")]
+    instance_retries: u16,
+    #[serde(default = "workflow_default_timeout")]
+    instance_timeout_seconds: u64,
+    #[serde(default)]
+    suspended: bool,
+    #[serde(default)]
+    suspend_reason: String,
+}
+
+fn workflow_default_entrypoint() -> String {
+    "MyWorkflow".into()
+}
+
+fn workflow_default_retention_days() -> u16 {
+    30
+}
+
+fn workflow_default_retries() -> u16 {
+    3
+}
+
+fn workflow_default_timeout() -> u64 {
+    25 * 60
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WorkflowTriggerRequest {
+    instance_key: Option<String>,
+    #[serde(default)]
+    input: Value,
+}
+
+#[derive(Debug, Deserialize)]
+struct WorkflowInstancesQuery {
+    status: Option<String>,
+    limit: Option<usize>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WorkflowSignalRequest {
+    name: String,
+    #[serde(default)]
+    payload: Value,
+}
+
+async fn workflow_list(State(state): State<ConsoleState>) -> ApiResult<Json<Value>> {
+    let records = state
+        .client
+        .resource_heads(&state.node, Some(crate::workflow::WORKFLOW_KIND))
+        .await?;
+    let mut workflows = Vec::new();
+    for view in records.into_iter().filter(|view| !view.resource.deleted) {
+        let spec = crate::workflow::workflow_spec(&view.resource)?;
+        let stats = state
+            .client
+            .workflow_stats(&state.node, &view.resource.name)
+            .await
+            .ok();
+        workflows.push(json!({
+            "name": view.resource.name,
+            "version": view.resource.version,
+            "digest": view.digest,
+            "spec": spec,
+            "stats": stats,
+        }));
+    }
+    Ok(Json(json!({ "workflows": workflows })))
+}
+
+async fn workflow_apply(
+    State(state): State<ConsoleState>,
+    Extension(principal): Extension<ConsolePrincipal>,
+    Json(request): Json<WorkflowRequest>,
+) -> ApiResult<Json<Value>> {
+    state.require_mutation()?;
+    current_manifest(&state, &request.worker)
+        .await
+        .map_err(|_| ApiError::bad_request("Workflow 执行 Worker 不存在或部署链无效"))?;
+    let head = state
+        .client
+        .resource_head(&state.node, crate::workflow::WORKFLOW_KIND, &request.name)
+        .await?;
+    let spec = crate::workflow::WorkflowSpec {
+        description: request.description,
+        worker: request.worker,
+        entrypoint: request.entrypoint,
+        suspended: request.suspended,
+        suspend_reason: request.suspend_reason,
+        retention_days: request.retention_days,
+        instance_retries: request.instance_retries,
+        instance_timeout_seconds: request.instance_timeout_seconds,
+    };
+    let record =
+        crate::workflow::prepare_workflow_after(&request.name, spec, false, head.as_ref())?;
+    submit_workflow_resource(
+        &state,
+        &principal,
+        record,
+        format!("创建或更新 Workflow {}", request.name),
+    )
+    .await
+}
+
+async fn workflow_delete(
+    State(state): State<ConsoleState>,
+    Extension(principal): Extension<ConsolePrincipal>,
+    Path(name): Path<String>,
+) -> ApiResult<Json<Value>> {
+    state.require_mutation()?;
+    let head = state
+        .client
+        .resource_head(&state.node, crate::workflow::WORKFLOW_KIND, &name)
+        .await?
+        .filter(|view| !view.resource.deleted)
+        .ok_or_else(|| ApiError::not_found("Workflow 不存在"))?;
+    let spec = crate::workflow::workflow_spec(&head.resource)?;
+    let record = crate::workflow::prepare_workflow_after(&name, spec, true, Some(&head))?;
+    submit_workflow_resource(&state, &principal, record, format!("删除 Workflow {name}")).await
+}
+
+async fn submit_workflow_resource(
+    state: &ConsoleState,
+    principal: &ConsolePrincipal,
+    record: crate::resource::ResourceRecord,
+    description: String,
+) -> ApiResult<Json<Value>> {
+    match &state.mode {
+        ConsoleMode::Local { .. } => {
+            let envelope = rf_core::envelope::Envelope::seal_any(&record, state.operator()?);
+            state.client.post_resource(&state.node, &envelope).await?;
+            Ok(Json(json!({
+                "ok": true,
+                "name": record.name,
+                "version": record.version,
+            })))
+        }
+        ConsoleMode::Public { node, .. } => {
+            let approval = node.management.create_resource(
+                principal.session_id,
+                &record,
+                format!("{description} v{}", record.version),
+            )?;
+            Ok(Json(json!({
+                "ok": true,
+                "pending_approval": true,
+                "name": record.name,
+                "version": record.version,
+                "approval": approval,
+                "approve_node": node.cfg.peer_api_advertise().to_string(),
+            })))
+        }
+    }
+}
+
+async fn workflow_trigger(
+    State(state): State<ConsoleState>,
+    Path(name): Path<String>,
+    Json(request): Json<WorkflowTriggerRequest>,
+) -> ApiResult<Json<Value>> {
+    state.require_mutation()?;
+    let instance = state
+        .client
+        .workflow_create(
+            &state.node,
+            &name,
+            request.instance_key.as_deref(),
+            request.input,
+        )
+        .await?;
+    Ok(Json(json!({ "ok": true, "instance": instance })))
+}
+
+async fn workflow_instances(
+    State(state): State<ConsoleState>,
+    Path(name): Path<String>,
+    Query(query): Query<WorkflowInstancesQuery>,
+) -> ApiResult<Json<Value>> {
+    let instances = state
+        .client
+        .workflow_instances(
+            &state.node,
+            &name,
+            query.status.as_deref(),
+            query.limit.unwrap_or(100),
+        )
+        .await?;
+    Ok(Json(json!({ "instances": instances })))
+}
+
+async fn workflow_instance(
+    State(state): State<ConsoleState>,
+    Path((name, id)): Path<(String, String)>,
+) -> ApiResult<Json<Value>> {
+    Ok(Json(
+        state
+            .client
+            .workflow_instance(&state.node, &name, &id)
+            .await?,
+    ))
+}
+
+async fn workflow_signal(
+    State(state): State<ConsoleState>,
+    Path((name, id)): Path<(String, String)>,
+    Json(request): Json<WorkflowSignalRequest>,
+) -> ApiResult<Json<Value>> {
+    state.require_mutation()?;
+    let signal_id = state
+        .client
+        .workflow_signal(&state.node, &name, &id, &request.name, request.payload)
+        .await?;
+    Ok(Json(json!({ "ok": true, "signal_id": signal_id })))
+}
+
+async fn workflow_action(
+    State(state): State<ConsoleState>,
+    Path((name, id, action)): Path<(String, String, String)>,
+) -> ApiResult<Json<Value>> {
+    state.require_mutation()?;
+    state
+        .client
+        .workflow_action(&state.node, &name, &id, &action)
+        .await?;
+    Ok(Json(json!({ "ok": true })))
+}
+
 async fn r2_object_list(
     State(state): State<ConsoleState>,
     Path(bucket): Path<String>,
@@ -3112,6 +3408,10 @@ mod tests {
                     "web-metrics".into(),
                 )])),
                 pipeline_bindings: Some(BTreeMap::from([("ARCHIVE".into(), "event-pipe".into())])),
+                workflow_bindings: Some(BTreeMap::from([(
+                    "ORDER_FLOW".into(),
+                    "order-flow".into(),
+                )])),
                 crons: Some(vec!["*/5 * * * *".into()]),
                 compatibility_date: Some("2026-08-04".into()),
             },
@@ -3130,6 +3430,10 @@ mod tests {
             "web-metrics"
         );
         assert_eq!(deploy::pipeline_bindings(&updated)["ARCHIVE"], "event-pipe");
+        assert_eq!(
+            deploy::workflow_bindings(&updated)["ORDER_FLOW"],
+            "order-flow"
+        );
         assert_eq!(updated.kv_bindings["CACHE"], "shared");
         assert_eq!(updated.crons, vec!["*/5 * * * *"]);
     }
