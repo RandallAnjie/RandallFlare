@@ -504,6 +504,74 @@ impl PeerClient {
         }
     }
 
+    pub async fn queue_send(
+        &self,
+        base: &str,
+        queue: &str,
+        messages: &[crate::queue::SendMessage],
+    ) -> Result<Vec<String>> {
+        let body = serde_json::to_vec(&serde_json::json!({ "messages": messages }))?;
+        let raw = self
+            .post(
+                base,
+                &format!("/v1/queue/{}/messages", component(queue)),
+                body,
+            )
+            .await?;
+        let response: serde_json::Value = serde_json::from_slice(&raw)?;
+        Ok(response["message_ids"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|id| id.as_str().map(str::to_string))
+            .collect())
+    }
+
+    pub async fn queue_stats(&self, base: &str, queue: &str) -> Result<crate::queue::QueueStats> {
+        let raw = self
+            .get(base, &format!("/v1/queue/{}/stats", component(queue)))
+            .await?;
+        Ok(serde_json::from_slice(&raw)?)
+    }
+
+    pub async fn queue_dead_letters(
+        &self,
+        base: &str,
+        queue: &str,
+        limit: usize,
+    ) -> Result<Vec<crate::queue::DeadLetter>> {
+        let raw = self
+            .get(
+                base,
+                &format!(
+                    "/v1/queue/{}/dead?limit={}",
+                    component(queue),
+                    limit.clamp(1, 1_000)
+                ),
+            )
+            .await?;
+        let response: serde_json::Value = serde_json::from_slice(&raw)?;
+        Ok(serde_json::from_value(
+            response
+                .get("dead_letters")
+                .cloned()
+                .unwrap_or_else(|| serde_json::json!([])),
+        )?)
+    }
+
+    pub async fn queue_redrive(&self, base: &str, queue: &str, id: &str) -> Result<bool> {
+        let path = format!(
+            "/v1/queue/{}/dead/{}/redrive",
+            component(queue),
+            component(id)
+        );
+        match self.post(base, &path, vec![]).await {
+            Ok(_) => Ok(true),
+            Err(error) if peer_http_status(&error) == Some(404) => Ok(false),
+            Err(error) => Err(error),
+        }
+    }
+
     /// Execute SQL against a D1 database, following leader hints
     /// (bounded) — callers can point at ANY cluster node.
     pub async fn d1_exec(

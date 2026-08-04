@@ -86,6 +86,10 @@ pub struct Inner {
     /// Loopback port of the native workerd R2 binding adapter.
     pub r2bind_port: u16,
     pub d1bind_port: u16,
+    pub qbind_port: u16,
+    /// Per-process unguessable tokens used only for rf → workerd event
+    /// delivery. They are regenerated on every Worker start and never gossip.
+    pub worker_event_tokens: HashMap<String, String>,
 }
 
 pub struct Node {
@@ -97,6 +101,7 @@ pub struct Node {
     pub management: Management,
     pub inner: Mutex<Inner>,
     r2_schemas: Mutex<HashSet<String>>,
+    queue_schemas: Mutex<HashSet<String>>,
     events: broadcast::Sender<NodeEvent>,
 }
 
@@ -137,6 +142,8 @@ impl Node {
             kvbind_port: 0,
             r2bind_port: 0,
             d1bind_port: 0,
+            qbind_port: 0,
+            worker_event_tokens: HashMap::new(),
         };
         // Hydrate: static stability means booting entirely from disk.
         for env in store.load_manifests()? {
@@ -163,6 +170,7 @@ impl Node {
             management: Management::default(),
             inner: Mutex::new(inner),
             r2_schemas: Mutex::new(HashSet::new()),
+            queue_schemas: Mutex::new(HashSet::new()),
             events,
         })
     }
@@ -811,12 +819,53 @@ impl Node {
         self.inner.lock().unwrap().d1bind_port
     }
 
+    pub fn set_qbind_port(&self, port: u16) {
+        self.inner.lock().unwrap().qbind_port = port;
+    }
+
+    pub fn qbind_port(&self) -> u16 {
+        self.inner.lock().unwrap().qbind_port
+    }
+
+    pub fn set_worker_event_token(&self, worker: &str, token: String) {
+        self.inner
+            .lock()
+            .unwrap()
+            .worker_event_tokens
+            .insert(worker.to_string(), token);
+    }
+
+    pub fn remove_worker_event_token(&self, worker: &str) {
+        self.inner
+            .lock()
+            .unwrap()
+            .worker_event_tokens
+            .remove(worker);
+    }
+
+    pub fn worker_event_token(&self, worker: &str) -> Option<String> {
+        self.inner
+            .lock()
+            .unwrap()
+            .worker_event_tokens
+            .get(worker)
+            .cloned()
+    }
+
     pub(crate) fn r2_schema_ready(&self, database: &str) -> bool {
         self.r2_schemas.lock().unwrap().contains(database)
     }
 
     pub(crate) fn mark_r2_schema_ready(&self, database: String) {
         self.r2_schemas.lock().unwrap().insert(database);
+    }
+
+    pub(crate) fn queue_schema_ready(&self, database: &str) -> bool {
+        self.queue_schemas.lock().unwrap().contains(database)
+    }
+
+    pub(crate) fn mark_queue_schema_ready(&self, database: String) {
+        self.queue_schemas.lock().unwrap().insert(database);
     }
 
     /// Periodic GC of dead claims + KV tombstones.

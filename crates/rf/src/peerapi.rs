@@ -100,6 +100,10 @@ pub fn router(api: Api) -> Router {
         .route("/v1/quorum/{db}", post(quorum_msg))
         .route("/v1/d1/create", post(d1_create))
         .route("/v1/d1/{db}/exec", post(d1_exec))
+        .route("/v1/queue/{queue}/messages", post(queue_send))
+        .route("/v1/queue/{queue}/stats", get(queue_stats))
+        .route("/v1/queue/{queue}/dead", get(queue_dead_letters))
+        .route("/v1/queue/{queue}/dead/{id}/redrive", post(queue_redrive))
         .route("/v1/do/{worker}/proxy", post(do_proxy))
         .route("/v1/r2/{bucket}", get(r2_list))
         .route("/v1/r2-blob/{sha}", get(r2_blob_get))
@@ -400,9 +404,22 @@ async fn status(
         .kv_list(crate::acme::NS, "d1/", 10_000)
         .into_iter()
         .filter_map(|key| key.strip_prefix("d1/").map(str::to_string))
-        .filter(|name| !name.starts_with("r2-") && !name.starts_with("rfdo-"))
+        .filter(|name| {
+            !name.starts_with("r2-") && !name.starts_with("rfdo-") && !name.starts_with("queue-")
+        })
         .collect();
     let buckets: Vec<serde_json::Value> = crate::r2::bucket_records(node)
+        .into_iter()
+        .map(|(view, spec)| {
+            serde_json::json!({
+                "name": view.resource.name,
+                "version": view.resource.version,
+                "digest": view.digest,
+                "spec": spec,
+            })
+        })
+        .collect();
+    let queues: Vec<serde_json::Value> = crate::queue::queue_records(node)
         .into_iter()
         .map(|(view, spec)| {
             serde_json::json!({
@@ -425,6 +442,7 @@ async fn status(
         "workers": workers,
         "databases": databases,
         "r2_buckets": buckets,
+        "queues": queues,
         "storage": {
             "local": true,
             "rclone": node.cfg.storage.rclone_binary.is_some(),
@@ -958,6 +976,94 @@ async fn d1_exec(
         Ok(Ok(Err(e))) => (StatusCode::UNPROCESSABLE_ENTITY, e.to_string()).into_response(),
         Ok(Err(_)) => (StatusCode::SERVICE_UNAVAILABLE, "driver dropped").into_response(),
         Err(_) => (StatusCode::GATEWAY_TIMEOUT, "commit timed out").into_response(),
+    }
+}
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct QueueSendReq {
+    messages: Vec<crate::queue::SendMessage>,
+}
+
+#[derive(serde::Deserialize)]
+struct QueueDeadQuery {
+    limit: Option<usize>,
+}
+
+async fn queue_send(
+    State(api): State<Api>,
+    ConnectInfo(remote): ConnectInfo<SocketAddr>,
+    Path(queue): Path<String>,
+    method: Method,
+    uri: Uri,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    if let Err(response) = check(&api, &remote, &headers, &method, &uri, &body) {
+        return response.into_response();
+    }
+    let Ok(request) = serde_json::from_slice::<QueueSendReq>(&body) else {
+        return (StatusCode::BAD_REQUEST, "bad queue send request").into_response();
+    };
+    match crate::queue::enqueue(&api.node, &queue, request.messages).await {
+        Ok(ids) => axum::Json(serde_json::json!({ "message_ids": ids })).into_response(),
+        Err(error) => (StatusCode::UNPROCESSABLE_ENTITY, error.to_string()).into_response(),
+    }
+}
+
+async fn queue_stats(
+    State(api): State<Api>,
+    ConnectInfo(remote): ConnectInfo<SocketAddr>,
+    Path(queue): Path<String>,
+    method: Method,
+    uri: Uri,
+    headers: HeaderMap,
+) -> Response {
+    if let Err(response) = check(&api, &remote, &headers, &method, &uri, b"") {
+        return response.into_response();
+    }
+    match crate::queue::stats(&api.node, &queue).await {
+        Ok(stats) => axum::Json(stats).into_response(),
+        Err(error) => (StatusCode::UNPROCESSABLE_ENTITY, error.to_string()).into_response(),
+    }
+}
+
+async fn queue_dead_letters(
+    State(api): State<Api>,
+    ConnectInfo(remote): ConnectInfo<SocketAddr>,
+    Path(queue): Path<String>,
+    Query(query): Query<QueueDeadQuery>,
+    method: Method,
+    uri: Uri,
+    headers: HeaderMap,
+) -> Response {
+    if let Err(response) = check(&api, &remote, &headers, &method, &uri, b"") {
+        return response.into_response();
+    }
+    match crate::queue::list_dead_letters(&api.node, &queue, query.limit.unwrap_or(100)).await {
+        Ok(dead_letters) => {
+            axum::Json(serde_json::json!({ "dead_letters": dead_letters })).into_response()
+        }
+        Err(error) => (StatusCode::UNPROCESSABLE_ENTITY, error.to_string()).into_response(),
+    }
+}
+
+async fn queue_redrive(
+    State(api): State<Api>,
+    ConnectInfo(remote): ConnectInfo<SocketAddr>,
+    Path((queue, id)): Path<(String, String)>,
+    method: Method,
+    uri: Uri,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    if let Err(response) = check(&api, &remote, &headers, &method, &uri, &body) {
+        return response.into_response();
+    }
+    match crate::queue::redrive_dead_letter(&api.node, &queue, &id).await {
+        Ok(true) => axum::Json(serde_json::json!({ "ok": true })).into_response(),
+        Ok(false) => (StatusCode::NOT_FOUND, "dead letter not found").into_response(),
+        Err(error) => (StatusCode::UNPROCESSABLE_ENTITY, error.to_string()).into_response(),
     }
 }
 

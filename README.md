@@ -55,6 +55,12 @@ Working today, verified by multi-process fault-injection e2e tests:
   Stock workerd receives native `R2Bucket` bindings; public buckets get
   `r2-<bucket>.<default_domain>` plus optional custom hostnames, CORS and
   ETag/Range-aware object delivery.
+- **Decentralized Queues**: operator-signed queue definitions and independent
+  D1 micro-quorum ledgers provide delayed JSON messages, batches, visibility
+  leases, bounded retries, durable dead letters and redrive. Workers produce
+  with `env.EVENTS.send()/sendBatch()` and consume with `queue(batch, env,
+  context)`; real-workerd tests cover automatic acknowledgement, retry and
+  dead-letter transitions.
 
 Also in: HTTPS ingress (SNI cert store, hot-reload, wildcard files,
 self-signed fallback) and **native workerd kvNamespace bindings** —
@@ -260,7 +266,9 @@ rf console                         # http://127.0.0.1:7390
 my-worker/
   rf.json          # {"name":"site","main":"index.js","assets":"public",
                    #  "hostnames":["site.example.com"],"crons":["*/5 * * * *"],
-                   #  "env":{"K":"V"},"kv":{"CACHE":"ns1"}}
+                   #  "env":{"K":"V"},"kv":{"CACHE":"ns1"},
+                   #  "r2":{"OBJECTS":"assets"},"d1":{"DB":"mydb"},
+                   #  "queues":{"EVENTS":"events"}}
   index.js         # omit "main" entirely for a pure static site
   public/…
 

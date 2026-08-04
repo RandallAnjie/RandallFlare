@@ -232,6 +232,11 @@ pub fn router(state: ConsoleState) -> Router {
                 .put(r2_object_put)
                 .delete(r2_object_delete),
         )
+        .route("/api/queues", get(queue_list).post(queue_apply))
+        .route("/api/queues/{name}", delete(queue_delete))
+        .route("/api/queues/{name}/messages", post(queue_send))
+        .route("/api/queues/{name}/dead", get(queue_dead_letters))
+        .route("/api/queues/{name}/dead/{id}/redrive", post(queue_redrive))
         .route("/api/auth/logout", post(logout))
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
@@ -700,6 +705,8 @@ struct WorkerSettingsRequest {
     #[serde(default)]
     d1_bindings: Option<BTreeMap<String, String>>,
     #[serde(default)]
+    queue_bindings: Option<BTreeMap<String, String>>,
+    #[serde(default)]
     crons: Option<Vec<String>>,
     #[serde(default)]
     compatibility_date: Option<String>,
@@ -753,9 +760,11 @@ async fn worker_get(
     env.remove(deploy::DO_METADATA_ENV);
     env.remove(deploy::R2_METADATA_ENV);
     env.remove(deploy::D1_METADATA_ENV);
+    env.remove(deploy::QUEUE_METADATA_ENV);
     let durable_objects = deploy::durable_objects(&manifest);
     let r2_bindings = deploy::r2_bindings(&manifest);
     let d1_bindings = deploy::d1_bindings(&manifest);
+    let queue_bindings = deploy::queue_bindings(&manifest);
     let source = match &state.mode {
         ConsoleMode::Public { node, .. } => crate::build::source_head(node, &name)
             .filter(|record| !record.source.deleted)
@@ -806,6 +815,7 @@ async fn worker_get(
             "kv_bindings": manifest.kv_bindings,
             "r2_bindings": r2_bindings,
             "d1_bindings": d1_bindings,
+            "queue_bindings": queue_bindings,
             "crons": manifest.crons,
             "compatibility_date": manifest.compatibility_date,
             "durable_objects": durable_objects,
@@ -1048,6 +1058,7 @@ fn apply_worker_settings(
         kv_bindings,
         r2_bindings,
         d1_bindings,
+        queue_bindings,
         crons,
         compatibility_date,
     } = request;
@@ -1056,6 +1067,7 @@ fn apply_worker_settings(
         && kv_bindings.is_none()
         && r2_bindings.is_none()
         && d1_bindings.is_none()
+        && queue_bindings.is_none()
         && crons.is_none()
         && compatibility_date.is_none()
     {
@@ -1078,6 +1090,7 @@ fn apply_worker_settings(
         if env.contains_key(deploy::DO_METADATA_ENV)
             || env.contains_key(deploy::R2_METADATA_ENV)
             || env.contains_key(deploy::D1_METADATA_ENV)
+            || env.contains_key(deploy::QUEUE_METADATA_ENV)
         {
             return Err(ApiError::bad_request(
                 "不能修改 RandallFlare 保留的环境变量",
@@ -1092,6 +1105,9 @@ fn apply_worker_settings(
         }
         if let Some(d1) = manifest.env.get(deploy::D1_METADATA_ENV).cloned() {
             env.insert(deploy::D1_METADATA_ENV.into(), d1);
+        }
+        if let Some(queues) = manifest.env.get(deploy::QUEUE_METADATA_ENV).cloned() {
+            env.insert(deploy::QUEUE_METADATA_ENV.into(), queues);
         }
         manifest.env = env;
     }
@@ -1155,6 +1171,32 @@ fn apply_worker_settings(
             );
         }
     }
+    if let Some(queue_bindings) = queue_bindings {
+        validate_settings_map(&queue_bindings, "Queue 绑定")?;
+        let identifier = |value: &str| {
+            let mut chars = value.chars();
+            chars.next().is_some_and(|character| {
+                character.is_ascii_alphabetic() || matches!(character, '_' | '$')
+            }) && chars.all(|character| {
+                character.is_ascii_alphanumeric() || matches!(character, '_' | '$')
+            })
+        };
+        for (binding, queue) in &queue_bindings {
+            if !identifier(binding) || !valid_name(queue) {
+                return Err(ApiError::bad_request(format!(
+                    "Queue 绑定 {binding} 或队列名称无效"
+                )));
+            }
+        }
+        if queue_bindings.is_empty() {
+            manifest.env.remove(deploy::QUEUE_METADATA_ENV);
+        } else {
+            manifest.env.insert(
+                deploy::QUEUE_METADATA_ENV.into(),
+                serde_json::to_string(&queue_bindings)?,
+            );
+        }
+    }
     if let Some(crons) = crons {
         if crons.len() > 256 {
             return Err(ApiError::bad_request(
@@ -1173,6 +1215,21 @@ fn apply_worker_settings(
             return Err(ApiError::bad_request("兼容日期必须采用 YYYY-MM-DD 格式"));
         }
         manifest.compatibility_date = compatibility_date;
+    }
+    let mut binding_names = std::collections::BTreeSet::new();
+    for name in manifest
+        .env
+        .keys()
+        .filter(|name| !name.starts_with("__RF_"))
+        .chain(manifest.kv_bindings.keys())
+        .chain(deploy::durable_objects(&manifest).keys())
+        .chain(deploy::r2_bindings(&manifest).keys())
+        .chain(deploy::d1_bindings(&manifest).keys())
+        .chain(deploy::queue_bindings(&manifest).keys())
+    {
+        if !binding_names.insert(name.clone()) {
+            return Err(ApiError::bad_request(format!("绑定名称 {name} 被重复使用")));
+        }
     }
     manifest.version = manifest.version.saturating_add(1);
     manifest.prev = Some(digest);
@@ -1927,6 +1984,210 @@ async fn r2_bucket_delete(
     }
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct QueueRequest {
+    name: String,
+    #[serde(default)]
+    description: String,
+    #[serde(default)]
+    consumer_worker: Option<String>,
+    #[serde(default = "queue_default_batch_size")]
+    batch_size: u16,
+    #[serde(default = "queue_default_wait_ms")]
+    max_wait_ms: u64,
+    #[serde(default = "queue_default_retries")]
+    max_retries: u16,
+    #[serde(default = "queue_default_visibility_ms")]
+    visibility_timeout_ms: u64,
+    #[serde(default = "queue_default_retention_seconds")]
+    retention_seconds: u64,
+    #[serde(default)]
+    dead_letter_queue: Option<String>,
+    #[serde(default)]
+    suspended: bool,
+}
+
+fn queue_default_batch_size() -> u16 {
+    10
+}
+fn queue_default_wait_ms() -> u64 {
+    5_000
+}
+fn queue_default_retries() -> u16 {
+    3
+}
+fn queue_default_visibility_ms() -> u64 {
+    120_000
+}
+fn queue_default_retention_seconds() -> u64 {
+    7 * 24 * 60 * 60
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct QueueSendRequest {
+    messages: Vec<crate::queue::SendMessage>,
+}
+
+#[derive(Debug, Deserialize)]
+struct QueueDeadQuery {
+    limit: Option<usize>,
+}
+
+async fn queue_list(State(state): State<ConsoleState>) -> ApiResult<Json<Value>> {
+    let records = state
+        .client
+        .resource_heads(&state.node, Some(crate::queue::QUEUE_KIND))
+        .await?;
+    let mut queues = Vec::new();
+    for view in records.into_iter().filter(|view| !view.resource.deleted) {
+        let spec = crate::queue::queue_spec(&view.resource)?;
+        let stats = state
+            .client
+            .queue_stats(&state.node, &view.resource.name)
+            .await;
+        queues.push(json!({
+            "name": view.resource.name,
+            "version": view.resource.version,
+            "digest": view.digest,
+            "spec": spec,
+            "stats": stats.ok(),
+        }));
+    }
+    Ok(Json(json!({ "queues": queues })))
+}
+
+async fn queue_apply(
+    State(state): State<ConsoleState>,
+    Extension(principal): Extension<ConsolePrincipal>,
+    Json(request): Json<QueueRequest>,
+) -> ApiResult<Json<Value>> {
+    state.require_mutation()?;
+    let spec = crate::queue::QueueSpec {
+        description: request.description,
+        consumer_worker: request
+            .consumer_worker
+            .filter(|worker| !worker.trim().is_empty()),
+        batch_size: request.batch_size,
+        max_wait_ms: request.max_wait_ms,
+        max_retries: request.max_retries,
+        visibility_timeout_ms: request.visibility_timeout_ms,
+        retention_seconds: request.retention_seconds,
+        dead_letter_queue: request
+            .dead_letter_queue
+            .filter(|queue| !queue.trim().is_empty()),
+        suspended: request.suspended,
+    };
+    let head = state
+        .client
+        .resource_head(&state.node, crate::queue::QUEUE_KIND, &request.name)
+        .await?;
+    let record = crate::queue::prepare_queue_after(&request.name, spec, false, head.as_ref())?;
+    match &state.mode {
+        ConsoleMode::Local { .. } => {
+            let envelope = rf_core::envelope::Envelope::seal_any(&record, state.operator()?);
+            state.client.post_resource(&state.node, &envelope).await?;
+            Ok(Json(json!({
+                "ok": true,
+                "name": record.name,
+                "version": record.version,
+            })))
+        }
+        ConsoleMode::Public { node, .. } => {
+            let approval = node.management.create_resource(
+                principal.session_id,
+                &record,
+                format!("创建或更新队列 {} v{}", record.name, record.version),
+            )?;
+            Ok(Json(json!({
+                "ok": true,
+                "pending_approval": true,
+                "name": record.name,
+                "version": record.version,
+                "approval": approval,
+                "approve_node": node.cfg.peer_api_advertise().to_string(),
+            })))
+        }
+    }
+}
+
+async fn queue_delete(
+    State(state): State<ConsoleState>,
+    Extension(principal): Extension<ConsolePrincipal>,
+    Path(name): Path<String>,
+) -> ApiResult<Json<Value>> {
+    state.require_mutation()?;
+    let head = state
+        .client
+        .resource_head(&state.node, crate::queue::QUEUE_KIND, &name)
+        .await?
+        .ok_or_else(|| ApiError::not_found("队列不存在"))?;
+    if head.resource.deleted {
+        return Err(ApiError::not_found("队列已删除"));
+    }
+    let spec = crate::queue::queue_spec(&head.resource)?;
+    let record = crate::queue::prepare_queue_after(&name, spec, true, Some(&head))?;
+    match &state.mode {
+        ConsoleMode::Local { .. } => {
+            let envelope = rf_core::envelope::Envelope::seal_any(&record, state.operator()?);
+            state.client.post_resource(&state.node, &envelope).await?;
+            Ok(Json(json!({ "ok": true, "name": name })))
+        }
+        ConsoleMode::Public { node, .. } => {
+            let approval = node.management.create_resource(
+                principal.session_id,
+                &record,
+                format!("删除队列 {}（生成 v{} 墓碑）", name, record.version),
+            )?;
+            Ok(Json(json!({
+                "ok": true,
+                "pending_approval": true,
+                "name": name,
+                "version": record.version,
+                "approval": approval,
+                "approve_node": node.cfg.peer_api_advertise().to_string(),
+            })))
+        }
+    }
+}
+
+async fn queue_send(
+    State(state): State<ConsoleState>,
+    Path(name): Path<String>,
+    Json(request): Json<QueueSendRequest>,
+) -> ApiResult<Json<Value>> {
+    state.require_mutation()?;
+    let ids = state
+        .client
+        .queue_send(&state.node, &name, &request.messages)
+        .await?;
+    Ok(Json(json!({ "ok": true, "message_ids": ids })))
+}
+
+async fn queue_dead_letters(
+    State(state): State<ConsoleState>,
+    Path(name): Path<String>,
+    Query(query): Query<QueueDeadQuery>,
+) -> ApiResult<Json<Value>> {
+    let dead_letters = state
+        .client
+        .queue_dead_letters(&state.node, &name, query.limit.unwrap_or(100))
+        .await?;
+    Ok(Json(json!({ "dead_letters": dead_letters })))
+}
+
+async fn queue_redrive(
+    State(state): State<ConsoleState>,
+    Path((name, id)): Path<(String, String)>,
+) -> ApiResult<Json<Value>> {
+    state.require_mutation()?;
+    if !state.client.queue_redrive(&state.node, &name, &id).await? {
+        return Err(ApiError::not_found("死信不存在"));
+    }
+    Ok(Json(json!({ "ok": true })))
+}
+
 async fn r2_object_list(
     State(state): State<ConsoleState>,
     Path(bucket): Path<String>,
@@ -2156,6 +2417,10 @@ mod tests {
             deploy::D1_METADATA_ENV.into(),
             r#"{"OLD_DB":"archive"}"#.into(),
         );
+        env.insert(
+            deploy::QUEUE_METADATA_ENV.into(),
+            r#"{"OLD_QUEUE":"archive"}"#.into(),
+        );
         let manifest = WorkerManifest {
             name: "demo".into(),
             version: 4,
@@ -2179,6 +2444,7 @@ mod tests {
                 kv_bindings: Some(BTreeMap::from([("CACHE".into(), "shared".into())])),
                 r2_bindings: Some(BTreeMap::from([("ASSETS".into(), "assets".into())])),
                 d1_bindings: Some(BTreeMap::from([("DB".into(), "primary".into())])),
+                queue_bindings: Some(BTreeMap::from([("JOBS".into(), "jobs".into())])),
                 crons: Some(vec!["*/5 * * * *".into()]),
                 compatibility_date: Some("2026-08-04".into()),
             },
@@ -2191,6 +2457,7 @@ mod tests {
         assert!(updated.env.contains_key(deploy::DO_METADATA_ENV));
         assert_eq!(deploy::r2_bindings(&updated)["ASSETS"], "assets");
         assert_eq!(deploy::d1_bindings(&updated)["DB"], "primary");
+        assert_eq!(deploy::queue_bindings(&updated)["JOBS"], "jobs");
         assert_eq!(updated.kv_bindings["CACHE"], "shared");
         assert_eq!(updated.crons, vec!["*/5 * * * *"]);
     }

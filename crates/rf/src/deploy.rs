@@ -21,6 +21,7 @@ use std::path::{Path, PathBuf};
 pub const DO_METADATA_ENV: &str = "__RF_DURABLE_OBJECTS_V1";
 pub const R2_METADATA_ENV: &str = "__RF_R2_BINDINGS_V1";
 pub const D1_METADATA_ENV: &str = "__RF_D1_BINDINGS_V1";
+pub const QUEUE_METADATA_ENV: &str = "__RF_QUEUE_BINDINGS_V1";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DurableObjectBinding {
@@ -52,6 +53,13 @@ pub fn d1_bindings(m: &WorkerManifest) -> BTreeMap<String, String> {
         .unwrap_or_default()
 }
 
+pub fn queue_bindings(m: &WorkerManifest) -> BTreeMap<String, String> {
+    m.env
+        .get(QUEUE_METADATA_ENV)
+        .and_then(|raw| serde_json::from_str(raw).ok())
+        .unwrap_or_default()
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct DeploySpec {
@@ -74,6 +82,9 @@ pub struct DeploySpec {
     /// binding name → D1 database name.
     #[serde(default)]
     pub d1: BTreeMap<String, String>,
+    /// binding name → signed Queue resource name.
+    #[serde(default)]
+    pub queues: BTreeMap<String, String>,
     #[serde(default)]
     pub crons: Vec<String>,
     /// Relative dir of static assets.
@@ -101,8 +112,23 @@ fn validate_spec(spec: &DeploySpec) -> Result<()> {
     if spec.env.contains_key(DO_METADATA_ENV)
         || spec.env.contains_key(R2_METADATA_ENV)
         || spec.env.contains_key(D1_METADATA_ENV)
+        || spec.env.contains_key(QUEUE_METADATA_ENV)
     {
         bail!("env keys beginning with __RF_ are reserved by rf");
+    }
+    let mut binding_names = std::collections::BTreeSet::new();
+    for name in spec
+        .env
+        .keys()
+        .chain(spec.kv.keys())
+        .chain(spec.durable_objects.keys())
+        .chain(spec.r2.keys())
+        .chain(spec.d1.keys())
+        .chain(spec.queues.keys())
+    {
+        if !binding_names.insert(name) {
+            bail!("binding name {name:?} is used more than once");
+        }
     }
     if let Some(assets) = &spec.assets {
         let path = Path::new(assets);
@@ -122,9 +148,9 @@ fn validate_bundle(bundle: &Bundle) -> Result<()> {
     if bundle
         .modules
         .iter()
-        .any(|(path, _, _)| path == "__rf_d1_entry.js")
+        .any(|(path, _, _)| path == "__rf_entry.js" || path == "__rf_d1_entry.js")
     {
-        bail!("module path __rf_d1_entry.js is reserved by rf");
+        bail!("module paths beginning with __rf_ are reserved by rf");
     }
     if let Some(main) = &bundle.spec.main {
         if !bundle.modules.iter().any(|(path, _, _)| path == main) {
@@ -429,6 +455,25 @@ fn manifest_from_bundle(
         env.insert(
             D1_METADATA_ENV.into(),
             serde_json::to_string(&bundle.spec.d1)?,
+        );
+    }
+    if !bundle.spec.queues.is_empty() {
+        let identifier = |value: &str| {
+            let mut characters = value.chars();
+            characters.next().is_some_and(|character| {
+                character.is_ascii_alphabetic() || character == '_' || character == '$'
+            }) && characters.all(|character| {
+                character.is_ascii_alphanumeric() || character == '_' || character == '$'
+            })
+        };
+        for (binding, queue) in &bundle.spec.queues {
+            if !identifier(binding) || !rf_core::manifest::valid_name(queue) {
+                bail!("invalid Queue binding {binding:?}");
+            }
+        }
+        env.insert(
+            QUEUE_METADATA_ENV.into(),
+            serde_json::to_string(&bundle.spec.queues)?,
         );
     }
     let manifest = WorkerManifest {

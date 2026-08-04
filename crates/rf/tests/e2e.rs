@@ -437,7 +437,7 @@ async fn module_worker_on_real_workerd() {
         dir.join("rf.json"),
         r#"{"name":"api","main":"index.js","hostnames":["api.test"],
             "env":{"GREETING":"hi from env"},"kv":{"CACHE":"ns1"},
-            "d1":{"DB":"worker-db"}}"#,
+            "d1":{"DB":"worker-db"},"queues":{"EVENTS":"events"}}"#,
     )
     .unwrap();
     std::fs::write(
@@ -482,12 +482,57 @@ async fn module_worker_on_real_workerd() {
       const raw = await env.DB.prepare("SELECT id, name FROM users ORDER BY id").raw({columnNames: true});
       return Response.json({inserted, batch, first, all, raw});
     }
+    if (url.pathname === "/queue-send") {
+      await env.EVENTS.send({ id: "ack", mode: "ack" });
+      await env.EVENTS.send({ id: "retry", mode: "retry-once" });
+      await env.EVENTS.send({ id: "dead", mode: "always-retry" });
+      return new Response("queued");
+    }
     return new Response("module worker up");
+  },
+  async queue(batch, env, context) {
+    for (const message of batch.messages) {
+      if (message.body.mode === "retry-once" && message.attempts === 1) {
+        message.retry({ delaySeconds: 0, error: "first attempt requested retry" });
+        continue;
+      }
+      if (message.body.mode === "always-retry") {
+        message.retry({ delaySeconds: 0, error: "permanent queue failure" });
+        continue;
+      }
+      context.waitUntil(env.CACHE.put(
+        `queue-${message.body.id}`,
+        JSON.stringify({ attempts: message.attempts, queue: batch.queue }),
+      ));
+    }
   }
 };"#,
     )
     .unwrap();
     let bundle = rf::deploy::read_bundle(&dir).unwrap();
+    let queue_record = rf::resource::prepare_after(
+        rf::queue::QUEUE_KIND,
+        "events",
+        serde_json::to_value(rf::queue::QueueSpec {
+            consumer_worker: Some("api".into()),
+            batch_size: 10,
+            max_wait_ms: 100,
+            max_retries: 1,
+            visibility_timeout_ms: 2_000,
+            ..Default::default()
+        })
+        .unwrap(),
+        false,
+        None,
+    )
+    .unwrap();
+    client
+        .post_resource(
+            &n.api,
+            &rf_core::envelope::Envelope::seal_any(&queue_record, &op_any),
+        )
+        .await
+        .unwrap();
     rf::deploy::deploy(&bundle, &client, &n.api, &op_any)
         .await
         .unwrap();
@@ -587,6 +632,49 @@ async fn module_worker_on_real_workerd() {
     assert_eq!(d1["all"]["results"][1]["name"], "Randall");
     assert_eq!(d1["batch"][1]["results"][0]["id"], 1);
     assert_eq!(d1["raw"][0], serde_json::json!(["id", "name"]));
+    let queued = http
+        .get(format!("http://127.0.0.1:{}/queue-send", n.ingress))
+        .header("host", "api.test")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(queued.text().await.unwrap(), "queued");
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        let ack = client.kv_get(&n.api, "ns1", "queue-ack").await.unwrap();
+        let retry = client.kv_get(&n.api, "ns1", "queue-retry").await.unwrap();
+        let dead = client
+            .queue_dead_letters(&n.api, "events", 10)
+            .await
+            .unwrap_or_default();
+        if let (Some(ack), Some(retry), Some(dead_message)) = (
+            ack,
+            retry,
+            dead.iter().find(|item| item.body["id"] == "dead"),
+        ) {
+            let ack: serde_json::Value = serde_json::from_slice(&ack).unwrap();
+            let retry: serde_json::Value = serde_json::from_slice(&retry).unwrap();
+            assert_eq!(ack["attempts"], 1);
+            assert_eq!(ack["queue"], "events");
+            assert_eq!(retry["attempts"], 2);
+            assert_eq!(dead_message.attempts, 2);
+            assert!(dead_message
+                .last_error
+                .as_deref()
+                .unwrap_or_default()
+                .contains("permanent queue failure"));
+            assert!(client
+                .queue_redrive(&n.api, "events", &dead_message.id)
+                .await
+                .unwrap());
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "queue binding/consumer did not settle"
+        );
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
     // The worker's write is a real cluster KV write, visible via the
     // peer API too.
     assert_eq!(

@@ -61,13 +61,13 @@ surface yet.
 | runtime/build logs and cluster distribution | done | request logs, analytics and retention |
 | previews and pull-request deployments | planned | deterministic preview hostnames and cleanup |
 | service bindings and placement tags | planned | loopback/mesh service router |
-| R2, D1, Queue, Analytics, Pipeline, Email, Binary bindings | partial | native R2 and CF-shaped D1 bindings + console editors done; event-product bindings remain |
+| R2, D1, Queue, Analytics, Pipeline, Email, Binary bindings | partial | native R2, CF-shaped D1 and Queue producer/consumer bindings + console editors done; remaining event-product bindings remain |
 
 ### Data and storage
 
 | Capability | State | Remaining acceptance work |
 | --- | --- | --- |
-| KV get/put/delete/list/TTL | done | metadata, bulk operations, console pagination/import/export |
+| KV get/put/delete/list/TTL | done | metadata and bulk get are workerd-tested; console pagination/import/export remain |
 | D1 replicated SQL | partial | Worker prepare/bind/all/first/run/raw/exec/batch/withSession done; schema console, import/export, atomic batch and metrics remain |
 | Durable Objects | partial | full CF API audit, alarm retry controls, websocket failover soak |
 | R2 objects | partial | native binding + get/head/put/delete/list, metadata, ranges, conditions and delimiter cursors done; streaming multi-GiB IO remains |
@@ -82,7 +82,7 @@ surface yet.
 
 | Capability | State | Remaining acceptance work |
 | --- | --- | --- |
-| Queues | planned | producer bindings, batching, visibility leases, retries and DLQ |
+| Queues | partial | signed definitions, per-queue D1 ledger, delayed JSON send/sendBatch binding, concurrent batching, quorum visibility leases, retry budget, 30-day dead letters, redrive, CLI/API and Chinese console are real-workerd tested; binary/v8 payload encoding, pause-aware producer policy and multi-node fault soak remain |
 | Analytics Engine | planned | dataset bindings, buffered writes and query UI |
 | Pipelines | planned | authenticated ingest, JSON-schema validation, gzip JSONL batches to R2 |
 | Workflow | planned | idempotent instances, replayed steps, sleep, signals, retry/cancel/heartbeat |

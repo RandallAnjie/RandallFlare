@@ -56,6 +56,9 @@
           <button class="nav-item" data-view="d1">
             <span class="nav-glyph">◫</span><span>D1 数据库</span>
           </button>
+          <button class="nav-item" data-view="queues">
+            <span class="nav-glyph">⇄</span><span>队列</span><span id="queue-nav-count" class="count">0</span>
+          </button>
         </nav>
         <div class="sidebar-foot">
           <p class="sidebar-tagline">一次构建，一次验证，处处运行。</p>
@@ -89,6 +92,7 @@
             <article class="metric"><span>Worker</span><strong id="metric-workers">—</strong><small id="metric-routes">暂无路由数据</small></article>
             <article class="metric"><span>D1 数据库</span><strong id="metric-databases">—</strong><small>多数派复制保障一致性</small></article>
             <article class="metric"><span>R2 bucket</span><strong id="metric-r2">—</strong><small id="metric-r2-backend">内容寻址对象存储</small></article>
+            <article class="metric"><span>队列</span><strong id="metric-queues">—</strong><small>多数派租约与死信</small></article>
             <article class="metric"><span>内容块状态</span><strong id="metric-blobs">—</strong><small>本地缺失数</small></article>
           </div>
 
@@ -240,7 +244,7 @@
           </div>
 
           <div id="project-tab-bindings" class="project-tab">
-            <article class="panel settings-panel"><div class="settings-copy"><p class="eyebrow">运行配置</p><h2>变量与绑定</h2><p class="muted">环境变量、KV、R2 与 D1 绑定会随签名清单复制。敏感凭据请使用节点侧密钥能力，不要写入普通变量。</p></div><form id="project-bindings-form" class="settings-form"><label><span>环境变量 <em>每行 KEY=value</em></span><textarea id="project-env" class="code-input" rows="8"></textarea></label><label><span>KV 绑定 <em>每行 BINDING=namespace</em></span><textarea id="project-kv-bindings" class="code-input" rows="6"></textarea></label><label><span>R2 绑定 <em>每行 BINDING=bucket</em></span><textarea id="project-r2-bindings" class="code-input" rows="5"></textarea></label><label><span>D1 绑定 <em>每行 BINDING=database</em></span><textarea id="project-d1-bindings" class="code-input" rows="5"></textarea></label><button class="primary" type="submit">保存变量与绑定</button></form></article>
+            <article class="panel settings-panel"><div class="settings-copy"><p class="eyebrow">运行配置</p><h2>变量与绑定</h2><p class="muted">环境变量、KV、R2、D1 与 Queue 绑定会随签名清单复制。敏感凭据请使用节点侧密钥能力，不要写入普通变量。</p></div><form id="project-bindings-form" class="settings-form"><label><span>环境变量 <em>每行 KEY=value</em></span><textarea id="project-env" class="code-input" rows="8"></textarea></label><label><span>KV 绑定 <em>每行 BINDING=namespace</em></span><textarea id="project-kv-bindings" class="code-input" rows="6"></textarea></label><label><span>R2 绑定 <em>每行 BINDING=bucket</em></span><textarea id="project-r2-bindings" class="code-input" rows="5"></textarea></label><label><span>D1 绑定 <em>每行 BINDING=database</em></span><textarea id="project-d1-bindings" class="code-input" rows="5"></textarea></label><label><span>Queue 生产者绑定 <em>每行 BINDING=queue</em></span><textarea id="project-queue-bindings" class="code-input" rows="5"></textarea></label><button class="primary" type="submit">保存变量与绑定</button></form></article>
           </div>
 
           <div id="project-tab-triggers" class="project-tab">
@@ -346,6 +350,53 @@
                 <button id="r2-load-more" class="secondary hidden" type="button">加载更多</button>
               </div>
             </article>
+          </div>
+        </section>
+
+        <section id="view-queues" class="view" aria-labelledby="section-title">
+          <div class="projects-header">
+            <div><p class="eyebrow">事件驱动</p><h2>队列</h2><p class="muted">消息、租约、重试与死信都写入每个队列独立的 D1 多数派数据库；任意节点故障后都可继续投递。</p></div>
+            <span id="queue-count" class="badge">0 个队列</span>
+          </div>
+          <div class="grid r2-grid">
+            <div class="r2-sidebar-stack">
+              <article class="panel">
+                <div class="panel-head"><div><p class="eyebrow">签名资源</p><h2>创建或编辑队列</h2></div><span class="badge">至少一次</span></div>
+                <form id="queue-form" class="stack-form">
+                  <label><span>队列名称</span><input id="queue-name" pattern="[a-z0-9-]{1,63}" placeholder="jobs" required></label>
+                  <label><span>说明</span><input id="queue-description" placeholder="后台任务"></label>
+                  <label><span>消费者 Worker <em>可选</em></span><input id="queue-consumer" pattern="[a-z0-9-]{1,63}" placeholder="job-consumer"></label>
+                  <div class="form-grid">
+                    <label><span>每批条数</span><input id="queue-batch-size" type="number" min="1" max="100" value="10" required></label>
+                    <label><span>批处理等待（毫秒）</span><input id="queue-max-wait" type="number" min="100" max="60000" value="5000" required></label>
+                    <label><span>最大重试次数</span><input id="queue-max-retries" type="number" min="0" max="100" value="3" required></label>
+                    <label><span>可见性超时（毫秒）</span><input id="queue-visibility" type="number" min="1000" max="43200000" value="120000" required></label>
+                  </div>
+                  <label><span>保留时间（秒）</span><input id="queue-retention" type="number" min="60" max="1209600" value="604800" required></label>
+                  <label><span>死信转发队列 <em>可选</em></span><input id="queue-dead-target" pattern="[a-z0-9-]{1,63}" placeholder="failed-jobs"></label>
+                  <label class="check-label"><input id="queue-suspended" type="checkbox"><span>暂停消费（仍允许生产消息）</span></label>
+                  <button class="primary" type="submit">保存队列</button>
+                </form>
+              </article>
+              <article class="panel">
+                <div class="panel-head"><div><p class="eyebrow">队列目录</p><h2>所有队列</h2></div></div>
+                <div id="queue-list" class="database-list empty-state">暂无队列。</div>
+              </article>
+            </div>
+            <div class="r2-sidebar-stack">
+              <article class="panel">
+                <div class="panel-head"><div><p class="eyebrow">调试投递</p><h2 id="queue-active-name">请选择队列</h2><p id="queue-summary" class="muted compact-copy">选择左侧队列后，可发送测试消息并检查死信。</p></div><button id="queue-delete" class="danger ghost hidden" type="button">删除队列</button></div>
+                <form id="queue-send-form" class="stack-form hidden">
+                  <label><span>JSON 消息体</span><textarea id="queue-message-body" class="code-input" rows="8">{"hello":"RandallFlare"}</textarea></label>
+                  <label><span>延迟投递（秒）</span><input id="queue-message-delay" type="number" min="0" max="43200" value="0"></label>
+                  <button class="primary" type="submit">发送消息</button>
+                </form>
+              </article>
+              <article class="panel">
+                <div class="panel-head"><div><p class="eyebrow">失败处理</p><h2>死信</h2></div><button id="queue-refresh-dead" class="secondary compact" type="button">刷新</button></div>
+                <div id="queue-dead-list" class="build-list empty-state">暂无死信。</div>
+              </article>
+            </div>
           </div>
         </section>
 

@@ -26,6 +26,9 @@ const state = {
   r2Active: null,
   r2Cursor: null,
   r2Objects: [],
+  queues: [],
+  queueActive: null,
+  queueDeadLetters: [],
 };
 
 const titles = {
@@ -36,6 +39,7 @@ const titles = {
   kv: ["分布式数据", "KV 存储"],
   r2: ["对象存储", "R2 bucket"],
   d1: ["分布式 SQLite", "D1 数据库"],
+  queues: ["事件驱动", "队列"],
 };
 
 function escapeHtml(value) {
@@ -202,6 +206,7 @@ function renderOverview(data) {
   const workers = Array.isArray(data.workers) ? data.workers : [];
   const databases = Array.isArray(data.databases) ? data.databases : [];
   const buckets = Array.isArray(data.r2_buckets) ? data.r2_buckets : [];
+  const queues = Array.isArray(data.queues) ? data.queues : [];
   const allNodes = [
     {
       id: data.node,
@@ -220,6 +225,8 @@ function renderOverview(data) {
   $("#metric-routes").textContent = `${routeCount} 条主机名路由`;
   $("#metric-databases").textContent = String(databases.length);
   $("#metric-r2").textContent = String(buckets.length);
+  $("#metric-queues").textContent = String(queues.length);
+  $("#queue-nav-count").textContent = String(queues.length);
   $("#metric-r2-backend").textContent = data.storage?.rclone ? "本地副本与 rclone 已就绪" : "集群本地多数派副本";
   $("#r2-nav-count").textContent = String(buckets.length);
   $("#metric-blobs").textContent = String(data.missing_blobs ?? 0);
@@ -502,6 +509,7 @@ function renderWorkerDetail(data) {
     <div><dt>KV 绑定</dt><dd>${escapeHtml(Object.keys(worker.kv_bindings || {}).length)} 项</dd></div>
     <div><dt>R2 绑定</dt><dd>${escapeHtml(Object.keys(worker.r2_bindings || {}).length)} 项</dd></div>
     <div><dt>D1 绑定</dt><dd>${escapeHtml(Object.keys(worker.d1_bindings || {}).length)} 项</dd></div>
+    <div><dt>Queue 绑定</dt><dd>${escapeHtml(Object.keys(worker.queue_bindings || {}).length)} 项</dd></div>
     <div><dt>定时任务</dt><dd>${escapeHtml(worker.crons?.length || 0)} 条</dd></div>`;
   $("#detail-distribution-count").textContent = `${distribution.ready}/${distribution.total} 个节点`;
   $("#detail-distribution").innerHTML = (distribution.nodes || []).map((node) => {
@@ -516,6 +524,7 @@ function renderWorkerDetail(data) {
   $("#project-kv-bindings").value = mapToLines(worker.kv_bindings);
   $("#project-r2-bindings").value = mapToLines(worker.r2_bindings);
   $("#project-d1-bindings").value = mapToLines(worker.d1_bindings);
+  $("#project-queue-bindings").value = mapToLines(worker.queue_bindings);
   $("#project-crons").value = (worker.crons || []).join("\n");
   $("#project-compatibility-date").value = worker.compatibility_date;
   $("#project-source-repository").value = source?.repository?.replace(/\.git$/, "") || "";
@@ -638,6 +647,7 @@ async function saveProjectBindings(event) {
       kv_bindings: linesToMap($("#project-kv-bindings").value, "KV 绑定"),
       r2_bindings: linesToMap($("#project-r2-bindings").value, "R2 绑定"),
       d1_bindings: linesToMap($("#project-d1-bindings").value, "D1 绑定"),
+      queue_bindings: linesToMap($("#project-queue-bindings").value, "Queue 绑定"),
     };
     await updateWorkerSettings(payload, `更新 ${state.activeWorker} 的变量与绑定。`);
   } catch (error) {
@@ -1066,6 +1076,180 @@ async function deleteR2Bucket() {
   }
 }
 
+function queueStatsCopy(stats) {
+  if (!stats) return "统计正在收敛";
+  return `${stats.ready || 0} 待处理 · ${stats.inflight || 0} 处理中 · ${stats.dead_letters || 0} 死信`;
+}
+
+function renderQueues() {
+  $("#queue-count").textContent = `${state.queues.length} 个队列`;
+  $("#queue-nav-count").textContent = String(state.queues.length);
+  const list = $("#queue-list");
+  list.classList.toggle("empty-state", state.queues.length === 0);
+  list.innerHTML = state.queues.length
+    ? state.queues.map((queue) => {
+      const active = queue.name === state.queueActive ? " active" : "";
+      const consumer = queue.spec?.consumer_worker || "未绑定消费者";
+      return `<button class="database-item${active}" type="button" data-queue="${escapeHtml(queue.name)}"><span><strong>${escapeHtml(queue.name)}</strong><small>${escapeHtml(consumer)} · ${escapeHtml(queueStatsCopy(queue.stats))}</small></span><span>${queue.spec?.suspended ? "已暂停" : "打开 →"}</span></button>`;
+    }).join("")
+    : "暂无队列。";
+}
+
+function fillQueueForm(queue) {
+  const spec = queue?.spec || {};
+  $("#queue-name").value = queue?.name || "";
+  $("#queue-description").value = spec.description || "";
+  $("#queue-consumer").value = spec.consumer_worker || "";
+  $("#queue-batch-size").value = spec.batch_size ?? 10;
+  $("#queue-max-wait").value = spec.max_wait_ms ?? 5000;
+  $("#queue-max-retries").value = spec.max_retries ?? 3;
+  $("#queue-visibility").value = spec.visibility_timeout_ms ?? 120000;
+  $("#queue-retention").value = spec.retention_seconds ?? 604800;
+  $("#queue-dead-target").value = spec.dead_letter_queue || "";
+  $("#queue-suspended").checked = Boolean(spec.suspended);
+}
+
+async function loadQueues({ quiet = false } = {}) {
+  try {
+    const data = await api("/api/queues");
+    state.queues = data.queues || [];
+    if (state.queueActive && !state.queues.some((queue) => queue.name === state.queueActive)) {
+      state.queueActive = null;
+      state.queueDeadLetters = [];
+      $("#queue-active-name").textContent = "请选择队列";
+      $("#queue-summary").textContent = "选择左侧队列后，可发送测试消息并检查死信。";
+      $("#queue-send-form").classList.add("hidden");
+      $("#queue-delete").classList.add("hidden");
+    }
+    renderQueues();
+    if (!quiet) toast("队列已刷新");
+  } catch (error) {
+    if (!quiet) toast(error.message, true);
+  }
+}
+
+async function selectQueue(name) {
+  const queue = state.queues.find((item) => item.name === name);
+  if (!queue) return;
+  state.queueActive = name;
+  fillQueueForm(queue);
+  $("#queue-active-name").textContent = name;
+  $("#queue-summary").textContent = `${queueStatsCopy(queue.stats)} · 批量 ${queue.spec.batch_size} · 最多重试 ${queue.spec.max_retries} 次`;
+  $("#queue-send-form").classList.remove("hidden");
+  $("#queue-delete").classList.remove("hidden");
+  renderQueues();
+  await loadQueueDeadLetters();
+}
+
+async function saveQueue(event) {
+  event.preventDefault();
+  const payload = {
+    name: $("#queue-name").value.trim(),
+    description: $("#queue-description").value.trim(),
+    consumer_worker: $("#queue-consumer").value.trim() || null,
+    batch_size: Number($("#queue-batch-size").value),
+    max_wait_ms: Number($("#queue-max-wait").value),
+    max_retries: Number($("#queue-max-retries").value),
+    visibility_timeout_ms: Number($("#queue-visibility").value),
+    retention_seconds: Number($("#queue-retention").value),
+    dead_letter_queue: $("#queue-dead-target").value.trim() || null,
+    suspended: $("#queue-suspended").checked,
+  };
+  try {
+    const result = await api("/api/queues", { method: "POST", body: JSON.stringify(payload) });
+    const complete = async () => {
+      await loadQueues({ quiet: true });
+      await selectQueue(payload.name);
+    };
+    if (result.pending_approval) {
+      showApproval(result, `批准后，队列 ${payload.name} 的签名配置将传播到集群。`, complete);
+    } else {
+      toast(`队列 ${payload.name} 已保存`);
+      await complete();
+    }
+  } catch (error) {
+    toast(error.message, true);
+  }
+}
+
+async function sendQueueMessage(event) {
+  event.preventDefault();
+  if (!state.queueActive) return;
+  let body;
+  try {
+    body = JSON.parse($("#queue-message-body").value);
+  } catch (error) {
+    toast(`消息体不是有效 JSON：${error.message}`, true);
+    return;
+  }
+  try {
+    const result = await api(`/api/queues/${encodeURIComponent(state.queueActive)}/messages`, {
+      method: "POST",
+      body: JSON.stringify({ messages: [{ body, delay_seconds: Number($("#queue-message-delay").value || 0) }] }),
+    });
+    toast(`消息已入队：${shortId(result.message_ids?.[0], 16)}`);
+    await loadQueues({ quiet: true });
+    await selectQueue(state.queueActive);
+  } catch (error) {
+    toast(error.message, true);
+  }
+}
+
+function renderQueueDeadLetters() {
+  const list = $("#queue-dead-list");
+  list.classList.toggle("empty-state", state.queueDeadLetters.length === 0);
+  list.innerHTML = state.queueDeadLetters.length
+    ? state.queueDeadLetters.map((item) => `<article class="build-row failed"><span class="pipeline-state failed"></span><div><strong>${escapeHtml(shortId(item.id, 22))}</strong><small>${escapeHtml(new Date(item.dead_letter_at_ms).toLocaleString("zh-CN"))} · 尝试 ${escapeHtml(item.attempts)} 次</small><code>${escapeHtml(JSON.stringify(item.body))}</code></div><div><small>${escapeHtml(item.last_error || "处理程序请求重试")}</small></div><button class="mini-button" data-queue-redrive="${escapeHtml(item.id)}">重新入队</button></article>`).join("")
+    : "暂无死信。";
+}
+
+async function loadQueueDeadLetters() {
+  if (!state.queueActive) {
+    state.queueDeadLetters = [];
+    renderQueueDeadLetters();
+    return;
+  }
+  try {
+    const data = await api(`/api/queues/${encodeURIComponent(state.queueActive)}/dead?limit=100`);
+    state.queueDeadLetters = data.dead_letters || [];
+    renderQueueDeadLetters();
+  } catch (error) {
+    toast(error.message, true);
+  }
+}
+
+async function redriveQueueMessage(id) {
+  if (!state.queueActive) return;
+  try {
+    await api(`/api/queues/${encodeURIComponent(state.queueActive)}/dead/${encodeURIComponent(id)}/redrive`, { method: "POST", body: "{}" });
+    toast("死信已重新入队");
+    await loadQueueDeadLetters();
+  } catch (error) {
+    toast(error.message, true);
+  }
+}
+
+async function deleteQueue() {
+  const name = state.queueActive;
+  if (!name || !window.confirm(`要删除队列“${name}”吗？已签名的历史与数据库将保留供审计。`)) return;
+  try {
+    const result = await api(`/api/queues/${encodeURIComponent(name)}`, { method: "DELETE" });
+    const complete = async () => {
+      state.queueActive = null;
+      fillQueueForm(null);
+      await loadQueues({ quiet: true });
+    };
+    if (result.pending_approval) {
+      showApproval(result, `批准后，队列 ${name} 将写入可验证的墓碑版本。`, complete);
+    } else {
+      toast(`队列 ${name} 已删除`);
+      await complete();
+    }
+  } catch (error) {
+    toast(error.message, true);
+  }
+}
+
 async function loadOverview({ quiet = false } = {}) {
   try {
     const data = await api("/api/overview");
@@ -1380,12 +1564,13 @@ async function boot() {
     $("#security-copy").innerHTML = consoleMode === "public"
       ? "此节点不保存<br>任何私钥。"
       : "密钥仅保留在本地<br>控制台进程中。";
-    $$("#deploy-form button, #source-form button, #kv-editor-form button, #d1-create-form button, #d1-exec-form button, #r2-bucket-form button, #r2-upload-form button, #r2-delete-bucket, #project-domain-add-form button, #project-bindings-form button, #project-triggers-form button, #project-settings-form button, #project-source-form button, #project-redeploy, #project-delete")
+    $$("#deploy-form button, #source-form button, #kv-editor-form button, #d1-create-form button, #d1-exec-form button, #r2-bucket-form button, #r2-upload-form button, #r2-delete-bucket, #queue-form button, #queue-send-form button, #queue-delete, #project-domain-add-form button, #project-bindings-form button, #project-triggers-form button, #project-settings-form button, #project-source-form button, #project-redeploy, #project-delete")
       .forEach((button) => { button.disabled = state.session.read_only; });
     await loadOverview({ quiet: true });
     await loadWorkerOps();
     await loadKeys();
     await loadR2({ quiet: true });
+    await loadQueues({ quiet: true });
   } catch (error) {
     if (consoleMode === "public" && error.status === 401) {
       state.session = null;
@@ -1437,6 +1622,7 @@ $("#detail-refresh-logs").addEventListener("click", loadDetailLogs);
 $("#refresh").addEventListener("click", async () => {
   await loadOverview();
   await loadR2({ quiet: true });
+  await loadQueues({ quiet: true });
 });
 $("#deploy-form").addEventListener("submit", deployWorker);
 $("#deploy-file-picker").addEventListener("click", () => $("#deploy-files").click());
@@ -1456,6 +1642,10 @@ $("#r2-object-search").addEventListener("submit", (event) => { event.preventDefa
 $("#r2-upload-form").addEventListener("submit", uploadR2Object);
 $("#r2-load-more").addEventListener("click", () => loadR2Objects({ append: true }));
 $("#r2-delete-bucket").addEventListener("click", deleteR2Bucket);
+$("#queue-form").addEventListener("submit", saveQueue);
+$("#queue-send-form").addEventListener("submit", sendQueueMessage);
+$("#queue-delete").addEventListener("click", deleteQueue);
+$("#queue-refresh-dead").addEventListener("click", loadQueueDeadLetters);
 $("#r2-object-file").addEventListener("change", () => {
   const file = $("#r2-object-file").files?.[0];
   if (file && !$("#r2-object-key").value) $("#r2-object-key").value = file.name;
@@ -1525,12 +1715,21 @@ $("#r2-object-table").addEventListener("click", (event) => {
   if (button.dataset.r2Action === "download") downloadR2Object(button.dataset.r2Key);
   if (button.dataset.r2Action === "delete") deleteR2Object(button.dataset.r2Key);
 });
+$("#queue-list").addEventListener("click", (event) => {
+  const button = event.target.closest("button[data-queue]");
+  if (button) selectQueue(button.dataset.queue);
+});
+$("#queue-dead-list").addEventListener("click", (event) => {
+  const button = event.target.closest("button[data-queue-redrive]");
+  if (button) redriveQueueMessage(button.dataset.queueRedrive);
+});
 
 setInterval(() => {
   if (state.session) {
     loadOverview({ quiet: true });
     loadWorkerOps();
     if (state.view === "r2") loadR2({ quiet: true });
+    if (state.view === "queues") loadQueues({ quiet: true });
   }
 }, 10_000);
 boot();

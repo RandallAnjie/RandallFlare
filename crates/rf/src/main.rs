@@ -115,6 +115,11 @@ enum Cmd {
         #[command(subcommand)]
         cmd: R2Cmd,
     },
+    /// Decentralized Queue operations.
+    Queue {
+        #[command(subcommand)]
+        cmd: QueueCmd,
+    },
     /// Fetch and verify a worker's transparency log (hash chain).
     Log {
         worker: String,
@@ -293,6 +298,93 @@ enum R2Cmd {
     Delete {
         bucket: String,
         object: String,
+        #[arg(long, env = "RF_NODE")]
+        node: String,
+        #[arg(long, env = "RF_CLUSTER_SECRET")]
+        secret: String,
+    },
+}
+
+#[derive(Subcommand)]
+enum QueueCmd {
+    /// List signed queue definitions and current depths.
+    List {
+        #[arg(long, env = "RF_NODE")]
+        node: String,
+        #[arg(long, env = "RF_CLUSTER_SECRET")]
+        secret: String,
+    },
+    /// Create or update a signed queue definition.
+    Create {
+        name: String,
+        #[arg(long, default_value = "")]
+        description: String,
+        #[arg(long)]
+        consumer: Option<String>,
+        #[arg(long, default_value_t = 10)]
+        batch_size: u16,
+        #[arg(long, default_value_t = 5_000)]
+        max_wait_ms: u64,
+        #[arg(long, default_value_t = 3)]
+        max_retries: u16,
+        #[arg(long, default_value_t = 120_000)]
+        visibility_timeout_ms: u64,
+        #[arg(long, default_value_t = 604_800)]
+        retention_seconds: u64,
+        #[arg(long)]
+        dead_letter_queue: Option<String>,
+        #[arg(long)]
+        suspended: bool,
+        #[arg(long, env = "RF_NODE")]
+        node: String,
+        #[arg(long, env = "RF_OPERATOR_KEY")]
+        key: Option<PathBuf>,
+        #[arg(long, env = "RF_CLUSTER_SECRET")]
+        secret: String,
+    },
+    /// Tombstone a queue definition.
+    Delete {
+        name: String,
+        #[arg(long, env = "RF_NODE")]
+        node: String,
+        #[arg(long, env = "RF_OPERATOR_KEY")]
+        key: Option<PathBuf>,
+        #[arg(long, env = "RF_CLUSTER_SECRET")]
+        secret: String,
+    },
+    /// Send one JSON message.
+    Send {
+        name: String,
+        body: String,
+        #[arg(long, default_value_t = 0)]
+        delay_seconds: u64,
+        #[arg(long, env = "RF_NODE")]
+        node: String,
+        #[arg(long, env = "RF_CLUSTER_SECRET")]
+        secret: String,
+    },
+    /// Show ready, inflight, dead-letter and lifetime counters.
+    Stats {
+        name: String,
+        #[arg(long, env = "RF_NODE")]
+        node: String,
+        #[arg(long, env = "RF_CLUSTER_SECRET")]
+        secret: String,
+    },
+    /// List dead letters.
+    Dead {
+        name: String,
+        #[arg(long, default_value_t = 100)]
+        limit: usize,
+        #[arg(long, env = "RF_NODE")]
+        node: String,
+        #[arg(long, env = "RF_CLUSTER_SECRET")]
+        secret: String,
+    },
+    /// Move one dead letter back to the ready queue.
+    Redrive {
+        name: String,
+        id: String,
         #[arg(long, env = "RF_NODE")]
         node: String,
         #[arg(long, env = "RF_CLUSTER_SECRET")]
@@ -682,6 +774,139 @@ async fn async_main(cli: Cli) -> Result<()> {
                     anyhow::bail!("R2 对象 {bucket}/{object} 不存在");
                 }
                 println!("R2 对象 {bucket}/{object} 已删除");
+                Ok(())
+            }
+        },
+        Cmd::Queue { cmd } => match cmd {
+            QueueCmd::List { node, secret } => {
+                let client = PeerClient::new(secret_bytes(&secret)?);
+                let records = client
+                    .resource_heads(&node, Some(rf::queue::QUEUE_KIND))
+                    .await?;
+                let mut queues = Vec::new();
+                for view in records.into_iter().filter(|view| !view.resource.deleted) {
+                    let spec = rf::queue::queue_spec(&view.resource)?;
+                    let stats = client.queue_stats(&node, &view.resource.name).await.ok();
+                    queues.push(serde_json::json!({
+                        "name": view.resource.name,
+                        "version": view.resource.version,
+                        "digest": view.digest,
+                        "spec": spec,
+                        "stats": stats,
+                    }));
+                }
+                println!("{}", serde_json::to_string_pretty(&queues)?);
+                Ok(())
+            }
+            QueueCmd::Create {
+                name,
+                description,
+                consumer,
+                batch_size,
+                max_wait_ms,
+                max_retries,
+                visibility_timeout_ms,
+                retention_seconds,
+                dead_letter_queue,
+                suspended,
+                node,
+                key,
+                secret,
+            } => {
+                let client = PeerClient::new(secret_bytes(&secret)?);
+                let head = client
+                    .resource_head(&node, rf::queue::QUEUE_KIND, &name)
+                    .await?;
+                let spec = rf::queue::QueueSpec {
+                    description,
+                    consumer_worker: consumer,
+                    batch_size,
+                    max_wait_ms,
+                    max_retries,
+                    visibility_timeout_ms,
+                    retention_seconds,
+                    dead_letter_queue,
+                    suspended,
+                };
+                let record = rf::queue::prepare_queue_after(&name, spec, false, head.as_ref())?;
+                let operator = operator_key(key)?;
+                let envelope = rf_core::envelope::Envelope::seal_any(&record, &operator);
+                client.post_resource(&node, &envelope).await?;
+                println!("队列 {} 已更新至 v{}", record.name, record.version);
+                Ok(())
+            }
+            QueueCmd::Delete {
+                name,
+                node,
+                key,
+                secret,
+            } => {
+                let client = PeerClient::new(secret_bytes(&secret)?);
+                let head = client
+                    .resource_head(&node, rf::queue::QUEUE_KIND, &name)
+                    .await?
+                    .with_context(|| format!("队列 {name} 不存在"))?;
+                if head.resource.deleted {
+                    anyhow::bail!("队列 {name} 已删除");
+                }
+                let spec = rf::queue::queue_spec(&head.resource)?;
+                let record = rf::queue::prepare_queue_after(&name, spec, true, Some(&head))?;
+                let operator = operator_key(key)?;
+                let envelope = rf_core::envelope::Envelope::seal_any(&record, &operator);
+                client.post_resource(&node, &envelope).await?;
+                println!("队列 {} 已删除（v{}）", record.name, record.version);
+                Ok(())
+            }
+            QueueCmd::Send {
+                name,
+                body,
+                delay_seconds,
+                node,
+                secret,
+            } => {
+                let body = serde_json::from_str(&body).context("队列消息体必须是 JSON")?;
+                let client = PeerClient::new(secret_bytes(&secret)?);
+                let ids = client
+                    .queue_send(
+                        &node,
+                        &name,
+                        &[rf::queue::SendMessage {
+                            body,
+                            delay_seconds,
+                        }],
+                    )
+                    .await?;
+                println!("{}", serde_json::to_string_pretty(&ids)?);
+                Ok(())
+            }
+            QueueCmd::Stats { name, node, secret } => {
+                let client = PeerClient::new(secret_bytes(&secret)?);
+                let stats = client.queue_stats(&node, &name).await?;
+                println!("{}", serde_json::to_string_pretty(&stats)?);
+                Ok(())
+            }
+            QueueCmd::Dead {
+                name,
+                limit,
+                node,
+                secret,
+            } => {
+                let client = PeerClient::new(secret_bytes(&secret)?);
+                let messages = client.queue_dead_letters(&node, &name, limit).await?;
+                println!("{}", serde_json::to_string_pretty(&messages)?);
+                Ok(())
+            }
+            QueueCmd::Redrive {
+                name,
+                id,
+                node,
+                secret,
+            } => {
+                let client = PeerClient::new(secret_bytes(&secret)?);
+                if !client.queue_redrive(&node, &name, &id).await? {
+                    anyhow::bail!("死信 {id} 不存在");
+                }
+                println!("死信 {id} 已重新入队");
                 Ok(())
             }
         },
@@ -1115,6 +1340,9 @@ async fn run(config_path: PathBuf) -> Result<()> {
     let d1bind_port = rf::d1bind::serve(node.clone()).await?;
     node.set_d1bind_port(d1bind_port);
     tracing::info!("d1bind on 127.0.0.1:{d1bind_port}");
+    let qbind_port = rf::qbind::serve(node.clone()).await?;
+    node.set_qbind_port(qbind_port);
+    tracing::info!("queue binding on 127.0.0.1:{qbind_port}");
 
     let _gossip = rf::gossip::start(node.clone()).await?;
     durable.spawn_ensurer();
@@ -1138,6 +1366,7 @@ async fn run(config_path: PathBuf) -> Result<()> {
     }
 
     rf::cron_driver::spawn(node.clone());
+    rf::queue::spawn_dispatcher(node.clone());
 
     if let Some(dns_cfg) = node.cfg.dns.clone() {
         match std::env::var(&dns_cfg.api_token_env) {

@@ -22,6 +22,8 @@ pub mod node;
 pub mod objectstore;
 pub mod peerapi;
 pub mod peers;
+pub mod qbind;
+pub mod queue;
 pub mod r2;
 pub mod r2bind;
 pub mod resource;
