@@ -125,6 +125,11 @@ pub struct Raft {
     pub commit: u64,
     applied: u64,
     role: Role,
+    /// Volatile routing hint learned from valid Append/snapshot
+    /// traffic. This is distinct from `voted_for`: a candidate may
+    /// vote for itself, lose the election in the same epoch, and then
+    /// observe the actual leader's heartbeat.
+    leader: Option<PublicId>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -151,6 +156,7 @@ impl Raft {
             commit: 0,
             applied: 0,
             role: Role::Follower,
+            leader: None,
         }
     }
 
@@ -221,7 +227,7 @@ impl Raft {
         if self.is_leader() {
             Some(self.me)
         } else {
-            self.voted_for
+            self.leader.or(self.voted_for)
         }
     }
 
@@ -263,6 +269,7 @@ impl Raft {
         }
         self.epoch += 1;
         self.voted_for = Some(self.me);
+        self.leader = None;
         self.role = Role::Candidate {
             votes: vec![self.me],
         };
@@ -318,6 +325,7 @@ impl Raft {
         if bump {
             self.epoch = epoch;
             self.voted_for = None;
+            self.leader = None;
         }
         self.role = Role::Follower;
         let mut actions = vec![];
@@ -493,7 +501,10 @@ impl Raft {
                 }
                 let mut actions = self.become_follower(epoch);
                 // Heartbeats double as leadership discovery for
-                // forwarding: remember who leads this epoch.
+                // forwarding. Keep this separate from voted_for: a
+                // losing candidate can observe the winner in the same
+                // epoch without rewriting its durable vote.
+                self.leader = Some(from);
                 if self.voted_for.is_none() {
                     self.voted_for = Some(from);
                     actions.push(Action::PersistMeta);
@@ -571,6 +582,7 @@ impl Raft {
                     )];
                 }
                 let mut actions = self.become_follower(epoch);
+                self.leader = Some(from);
                 if self.voted_for.is_none() {
                     self.voted_for = Some(from);
                     actions.push(Action::PersistMeta);
@@ -971,6 +983,36 @@ mod tests {
         assert!(
             leaders <= 1,
             "split vote must not elect two leaders in one epoch"
+        );
+    }
+
+    #[test]
+    fn losing_candidate_routes_to_winner_in_same_epoch() {
+        let group = vec![pid(1), pid(2), pid(3)];
+        let mut node = Raft::new(pid(2), group);
+        node.tick_election();
+        assert_eq!(node.voted_for, Some(pid(2)));
+        assert_eq!(node.leader_hint(), Some(pid(2)));
+
+        // Node 3 won epoch 1 with node 1's vote. Node 2 must preserve
+        // its durable self-vote while routing requests to the winner
+        // after observing the winner's heartbeat.
+        node.handle(
+            pid(3),
+            Msg::Append {
+                epoch: 1,
+                prev_seq: 0,
+                prev_epoch: 0,
+                entries: vec![],
+                commit: 0,
+            },
+        );
+        assert!(!node.is_leader());
+        assert_eq!(node.voted_for, Some(pid(2)));
+        assert_eq!(node.leader_hint(), Some(pid(3)));
+        assert_eq!(
+            node.propose(b"must-forward".to_vec()).unwrap_err().hint,
+            Some(pid(3))
         );
     }
 

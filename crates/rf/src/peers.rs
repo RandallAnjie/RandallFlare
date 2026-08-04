@@ -40,6 +40,22 @@ fn component(value: &str) -> String {
     utf8_percent_encode(value, NON_ALPHANUMERIC).to_string()
 }
 
+fn peer_api_candidates(base: &str, status: &serde_json::Value) -> Vec<String> {
+    let mut candidates = vec![base.to_string()];
+    for api in status["peers"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|peer| peer["api"].as_str())
+        .filter(|api| !api.is_empty())
+    {
+        if !candidates.iter().any(|candidate| candidate == api) {
+            candidates.push(api.to_string());
+        }
+    }
+    candidates
+}
+
 #[derive(Clone)]
 pub struct PeerClient {
     http: reqwest::Client,
@@ -349,6 +365,9 @@ impl PeerClient {
             .to_string()
             .into_bytes();
         let mut target = base.to_string();
+        let mut candidates = vec![target.clone()];
+        let mut candidate_cursor = 0usize;
+        let mut candidates_loaded = false;
         for _ in 0..25 {
             match self
                 .post(&target, &format!("/v1/d1/{db}/exec"), body.clone())
@@ -366,33 +385,51 @@ impl PeerClient {
                                     value["leader_hint"].as_str().filter(|h| !h.is_empty())
                                 {
                                     target = hint.to_string();
+                                    candidate_cursor = match candidates
+                                        .iter()
+                                        .position(|candidate| candidate == &target)
+                                    {
+                                        Some(position) => position,
+                                        None => {
+                                            candidates.push(target.clone());
+                                            candidates.len() - 1
+                                        }
+                                    };
                                     tokio::time::sleep(std::time::Duration::from_millis(300)).await;
                                     continue;
                                 }
                             }
-                            // Election in progress and no useful hint.
-                            tokio::time::sleep(std::time::Duration::from_millis(700)).await;
-                            continue;
+                            // Election in progress and no useful hint:
+                            // probe another known node below.
                         }
-                        // A hinted node may not have learned the DB's
-                        // membership record yet.
-                        if http_error.status == 404 {
-                            target = base.to_string();
-                            tokio::time::sleep(std::time::Duration::from_millis(700)).await;
-                            continue;
+                        if http_error.status != 404 && http_error.status != 421 {
+                            return Err(e);
+                        }
+                    } else {
+                        // A hinted-at node may just have died. Only
+                        // retry connection failures; application errors
+                        // must not replay a possibly mutating statement.
+                        let cause = format!("{e:#}");
+                        if !cause.contains("tcp connect error")
+                            && !cause.contains("error sending request")
+                        {
+                            return Err(e);
                         }
                     }
-                    // A hinted-at node may not have synced the db's
-                    // existence yet, or may just have died.
-                    let cause = format!("{e:#}");
-                    if cause.contains("tcp connect error")
-                        || cause.contains("error sending request")
-                    {
-                        target = base.to_string();
-                        tokio::time::sleep(std::time::Duration::from_millis(700)).await;
-                        continue;
+
+                    // A 404 means this node has not learned the
+                    // database catalog yet. Discover its encrypted
+                    // membership view once and rotate candidates,
+                    // rather than retrying the same stale node 25 times.
+                    if !candidates_loaded {
+                        if let Ok(status) = self.status(base).await {
+                            candidates = peer_api_candidates(base, &status);
+                        }
+                        candidates_loaded = true;
                     }
-                    return Err(e);
+                    candidate_cursor = (candidate_cursor + 1) % candidates.len();
+                    target = candidates[candidate_cursor].clone();
+                    tokio::time::sleep(std::time::Duration::from_millis(700)).await;
                 }
             }
         }
@@ -408,4 +445,24 @@ pub fn encode_envelopes(envs: &[Envelope]) -> Vec<u8> {
 pub fn decode_envelopes(bytes: &[u8]) -> Result<Vec<Envelope>> {
     let raw: Vec<Vec<u8>> = postcard::from_bytes(bytes).context("envelope list decode")?;
     raw.iter().map(|b| Ok(Envelope::from_bytes(b)?)).collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::peer_api_candidates;
+
+    #[test]
+    fn d1_fallback_candidates_are_deduplicated() {
+        let status = serde_json::json!({
+            "peers": [
+                {"api": "127.0.0.1:7383"},
+                {"api": "127.0.0.1:7382"},
+                {"api": null}
+            ]
+        });
+        assert_eq!(
+            peer_api_candidates("127.0.0.1:7382", &status),
+            vec!["127.0.0.1:7382", "127.0.0.1:7383"]
+        );
+    }
 }
