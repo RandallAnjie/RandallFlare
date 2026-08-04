@@ -878,16 +878,9 @@ async fn d1_quorum_replicates_and_survives_replica_loss() {
     let c = start("d1c", &operator, &[a.gossip]);
     wait_ping(&b.api, Duration::from_secs(15)).await;
     wait_ping(&c.api, Duration::from_secs(15)).await;
-    // Let membership settle so the replica group sees all three.
-    let deadline = Instant::now() + Duration::from_secs(15);
-    loop {
-        let status = client.status(&a.api).await.unwrap_or_default();
-        if status["peers"].as_array().map(|p| p.len()).unwrap_or(0) >= 2 {
-            break;
-        }
-        assert!(Instant::now() < deadline, "membership never converged");
-        tokio::time::sleep(Duration::from_millis(300)).await;
-    }
+    // Let every node's address view settle before freezing the
+    // database's replica group.
+    wait_full_membership(&client, &[&a, &b, &c], Duration::from_secs(20)).await;
 
     client
         .post(&a.api, "/v1/d1/create", br#"{"name":"appdb"}"#.to_vec())
