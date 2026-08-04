@@ -531,6 +531,17 @@ function bytesToBase64(bytes) {
   return btoa(binary);
 }
 
+function updateDeployFileStatus() {
+  const selected = Array.from($("#deploy-files").files || []);
+  if (!selected.length) {
+    $("#deploy-file-status").textContent = "尚未选择目录";
+    return;
+  }
+  const firstPath = selected[0].webkitRelativePath || selected[0].name;
+  const directory = firstPath.includes("/") ? firstPath.split("/")[0] : "所选目录";
+  $("#deploy-file-status").textContent = `${directory} · ${selected.length} 个文件`;
+}
+
 async function browserBundleFiles() {
   const selected = Array.from($("#deploy-files").files || []);
   if (!selected.length) throw new Error("请选择 Worker 包目录");
@@ -737,7 +748,6 @@ async function boot() {
     $("#deploy-local-fields").classList.toggle("hidden", consoleMode === "public");
     $("#deploy-public-fields").classList.toggle("hidden", consoleMode !== "public");
     $("#deploy-path").required = consoleMode === "local";
-    $("#deploy-files").required = consoleMode === "public";
     $("#git-workspace").classList.toggle("hidden", consoleMode !== "public");
     $("#deploy-mode").textContent = state.session.read_only
       ? "尚未加载管理员密钥，所有写操作均已禁用。"
@@ -771,6 +781,8 @@ $$(".nav-item").forEach((button) => button.addEventListener("click", () => switc
 $$('[data-go]').forEach((button) => button.addEventListener("click", () => switchView(button.dataset.go)));
 $("#refresh").addEventListener("click", () => loadOverview());
 $("#deploy-form").addEventListener("submit", deployWorker);
+$("#deploy-file-picker").addEventListener("click", () => $("#deploy-files").click());
+$("#deploy-files").addEventListener("change", updateDeployFileStatus);
 $("#source-form").addEventListener("submit", connectSource);
 $("#build-refresh").addEventListener("click", () => loadWorkerOps({ quiet: false }));
 $("#kv-search-form").addEventListener("submit", (event) => { event.preventDefault(); loadKeys(); });

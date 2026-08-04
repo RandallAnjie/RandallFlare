@@ -14,7 +14,7 @@ See [DESIGN.md](./DESIGN.md) for the architecture and consistency
 model. For a repeatable first-server rollout, use the
 [VPS deployment runbook](./docs/DEPLOYMENT.md).
 
-## Status: v0.6.4 (pre-release)
+## Status: v0.6.5 (pre-release)
 
 Working today, verified by multi-process fault-injection e2e tests:
 

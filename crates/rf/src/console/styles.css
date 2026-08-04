@@ -133,6 +133,8 @@ button:disabled { opacity: .45; cursor: not-allowed; }
 .inline-form { grid-template-columns: 1fr 1fr auto; align-items: end; margin-bottom: 16px; }
 .stack-form { margin-top: 18px; }
 .button-row { gap: 8px; flex-wrap: wrap; }
+.file-picker { display: flex; align-items: center; gap: 10px; margin-top: 7px; }
+.file-picker span { min-width: 0; overflow: hidden; color: var(--muted); font-size: 11px; text-overflow: ellipsis; white-space: nowrap; }
 .divider { border-top: 1px solid var(--line-soft); margin: 24px 0; }
 
 .table-wrap { overflow-x: auto; }

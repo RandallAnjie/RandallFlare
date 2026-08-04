@@ -139,7 +139,11 @@
               <p class="muted">此入口适用于预构建产物或紧急发布。Git 构建同样使用已签名的部署清单（Manifest）与相同的分发协议。</p>
               <form id="deploy-form">
                 <div id="deploy-local-fields"><label for="deploy-path">本地 Worker 包路径</label><input id="deploy-path" name="path" type="text" placeholder="/absolute/path/to/worker" autocomplete="off"></div>
-                <div id="deploy-public-fields" class="hidden"><label for="deploy-files">Worker 包目录</label><input id="deploy-files" name="files" type="file" webkitdirectory multiple></div>
+                <div id="deploy-public-fields" class="hidden">
+                  <label>Worker 包目录</label>
+                  <input id="deploy-files" name="files" type="file" webkitdirectory multiple hidden>
+                  <div class="file-picker"><button id="deploy-file-picker" class="secondary" type="button">选择目录</button><span id="deploy-file-status">尚未选择目录</span></div>
+                </div>
                 <button class="secondary" type="submit">准备直接发布</button>
               </form>
               <div id="deploy-mode" class="form-note"></div>

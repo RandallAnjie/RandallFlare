@@ -1276,6 +1276,7 @@ mod tests {
         assert!(body.contains("RandallFlare 管理控制台"));
         assert!(body.contains(r#"<html lang="zh-CN">"#));
         assert!(body.contains("一次构建，一次验证，处处运行。"));
+        assert!(body.contains("尚未选择目录"));
         assert!(!body.contains(">Overview<"));
         assert!(!body.contains(">Sign out<"));
         assert!(body.contains(state.local_token()));
