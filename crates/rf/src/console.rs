@@ -11,8 +11,9 @@ use crate::management::{ApprovalState, ConsoleGrant};
 use crate::node::{now_ms, Node};
 use crate::peers::PeerClient;
 use anyhow::{bail, Context, Result};
+use axum::body::Bytes;
 use axum::extract::{DefaultBodyLimit, Extension, Path, Query, State};
-use axum::http::{header, HeaderValue, Method, Request, StatusCode};
+use axum::http::{header, HeaderMap, HeaderValue, Method, Request, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::{Html, IntoResponse, Response};
 use axum::routing::{delete, get, post};
@@ -195,6 +196,16 @@ pub fn router(state: ConsoleState) -> Router {
         .route("/api/workers/deploy", post(worker_deploy))
         .route("/api/workers/{name}", delete(worker_delete))
         .route("/api/workers/{name}/log", get(worker_log))
+        .route("/api/workers/{name}/runtime-log", get(worker_runtime_log))
+        .route("/api/workers/{name}/build", post(worker_build))
+        .route(
+            "/api/workers/{name}/rollback/{version}",
+            post(worker_rollback),
+        )
+        .route("/api/sources", get(source_list).post(source_connect))
+        .route("/api/sources/{name}", delete(source_disconnect))
+        .route("/api/builds", get(build_list))
+        .route("/api/builds/{id}", get(build_get))
         .route("/api/approvals/{id}", get(approval_status))
         .route("/api/kv", get(kv_list))
         .route("/api/kv/value", get(kv_get).put(kv_put).delete(kv_delete))
@@ -211,6 +222,7 @@ pub fn router(state: ConsoleState) -> Router {
         .route("/styles.css", get(styles_css))
         .route("/api/auth/challenge", post(auth_challenge))
         .route("/api/auth/challenge/{id}", get(auth_poll))
+        .route("/api/webhooks/github/{name}", post(github_webhook))
         .merge(api)
         .fallback(not_found)
         .with_state(state)
@@ -661,12 +673,248 @@ async fn approval_status(
     Path(id): Path<String>,
 ) -> ApiResult<Json<Value>> {
     let node = state.public_node()?;
-    let poll = node.management.poll_manifest(&id, principal.session_id)?;
+    let poll = node.management.poll_console(&id, principal.session_id)?;
     Ok(Json(json!({
         "state": poll.state,
         "summary": poll.summary,
         "error": poll.error,
     })))
+}
+
+#[derive(Deserialize)]
+struct BuildQuery {
+    #[serde(default)]
+    worker: Option<String>,
+}
+
+async fn source_list(State(state): State<ConsoleState>) -> ApiResult<Json<Value>> {
+    let node = state.public_node()?;
+    let sources: Vec<Value> = crate::build::live_sources(node)
+        .into_iter()
+        .map(|record| {
+            let secret = crate::build::webhook_secret(node, &record.source.worker).ok();
+            json!({
+                "worker": record.source.worker,
+                "version": record.source.version,
+                "digest": record.digest,
+                "repository": record.source.repository,
+                "branch": record.source.branch,
+                "root": record.source.root,
+                "build_command": record.source.build_command,
+                "output_dir": record.source.output_dir,
+                "use_github_token": record.source.use_github_token,
+                "webhook": record.source.webhook,
+                "webhook_path": format!("/api/webhooks/github/{}", record.source.worker),
+                "webhook_secret": secret,
+            })
+        })
+        .collect();
+    Ok(Json(json!({
+        "sources": sources,
+        "capabilities": {
+            "enabled": node.cfg.build.enabled,
+            "git": crate::build::configured_binary(node.cfg.build.git.as_deref(), "git"),
+            "sandbox": crate::build::configured_binary(node.cfg.build.sandbox.as_deref(), "bwrap"),
+            "github_token_configured": std::env::var_os(&node.cfg.build.github_token_env).is_some(),
+            "github_token_env": node.cfg.build.github_token_env,
+            "timeout_seconds": node.cfg.build.timeout_seconds,
+        }
+    })))
+}
+
+async fn source_connect(
+    State(state): State<ConsoleState>,
+    Extension(principal): Extension<ConsolePrincipal>,
+    Json(input): Json<crate::build::SourceInput>,
+) -> ApiResult<Json<Value>> {
+    state.require_mutation()?;
+    let node = state.public_node()?;
+    let source = crate::build::prepare_source(node, input)?;
+    let approval = node.management.create_source(
+        principal.session_id,
+        &source,
+        format!(
+            "Connect Worker {} to {} branch {}",
+            source.worker, source.repository, source.branch
+        ),
+    )?;
+    Ok(Json(json!({
+        "ok": true,
+        "pending_approval": true,
+        "name": source.worker,
+        "version": source.version,
+        "approval": approval,
+        "approve_node": node.cfg.peer_api_advertise().to_string(),
+    })))
+}
+
+async fn source_disconnect(
+    State(state): State<ConsoleState>,
+    Extension(principal): Extension<ConsolePrincipal>,
+    Path(name): Path<String>,
+) -> ApiResult<Json<Value>> {
+    state.require_mutation()?;
+    let node = state.public_node()?;
+    let source = crate::build::prepare_source_delete(node, &name)?;
+    let approval = node.management.create_source(
+        principal.session_id,
+        &source,
+        format!("Disconnect GitHub repository from Worker {name}"),
+    )?;
+    Ok(Json(json!({
+        "ok": true,
+        "pending_approval": true,
+        "name": name,
+        "version": source.version,
+        "approval": approval,
+        "approve_node": node.cfg.peer_api_advertise().to_string(),
+    })))
+}
+
+async fn worker_build(
+    State(state): State<ConsoleState>,
+    Extension(principal): Extension<ConsolePrincipal>,
+    Path(name): Path<String>,
+) -> ApiResult<Json<Value>> {
+    state.require_mutation()?;
+    if !valid_name(&name) {
+        return Err(ApiError::bad_request("invalid worker name"));
+    }
+    let node = state.public_node()?.clone();
+    let job = crate::build::start_build(node, &name, "manual", Some(principal.session_id), None)?;
+    Ok(Json(json!({ "ok": true, "job": job })))
+}
+
+async fn build_list(
+    State(state): State<ConsoleState>,
+    Query(query): Query<BuildQuery>,
+) -> ApiResult<Json<Value>> {
+    let node = state.public_node()?;
+    if let Some(worker) = query.worker.as_deref() {
+        if !valid_name(worker) {
+            return Err(ApiError::bad_request("invalid worker name"));
+        }
+    }
+    Ok(Json(json!({
+        "jobs": crate::build::build_jobs(node, query.worker.as_deref()),
+        "approve_node": node.cfg.peer_api_advertise().to_string(),
+    })))
+}
+
+async fn build_get(
+    State(state): State<ConsoleState>,
+    Path(id): Path<String>,
+) -> ApiResult<Json<Value>> {
+    let node = state.public_node()?;
+    let job = crate::build::build_job(node, &id)
+        .ok_or_else(|| ApiError::not_found("build job not found"))?;
+    Ok(Json(json!({
+        "job": job,
+        "approve_node": node.cfg.peer_api_advertise().to_string(),
+    })))
+}
+
+async fn worker_rollback(
+    State(state): State<ConsoleState>,
+    Extension(principal): Extension<ConsolePrincipal>,
+    Path((name, version)): Path<(String, u64)>,
+) -> ApiResult<Json<Value>> {
+    state.require_mutation()?;
+    if !valid_name(&name) {
+        return Err(ApiError::bad_request("invalid worker name"));
+    }
+    let node = state.public_node()?;
+    let envelopes = node.manifest_log(&name)?;
+    let chain = rf_core::manifest::verify_chain(&envelopes, &node.cfg.operator)
+        .map_err(|error| ApiError::upstream(error.to_string()))?;
+    let historical = chain
+        .into_iter()
+        .find(|manifest| manifest.version == version && !manifest.deleted)
+        .ok_or_else(|| ApiError::not_found("deployable historical version not found"))?;
+    let manifest = crate::build::rollback_manifest(node, &historical)?;
+    let approval = node.management.create_manifest(
+        principal.session_id,
+        &manifest,
+        format!(
+            "Rollback Worker {name} to the content of v{version} as v{}",
+            manifest.version
+        ),
+    )?;
+    Ok(Json(json!({
+        "ok": true,
+        "pending_approval": true,
+        "name": name,
+        "version": manifest.version,
+        "approval": approval,
+        "approve_node": node.cfg.peer_api_advertise().to_string(),
+    })))
+}
+
+async fn github_webhook(
+    State(state): State<ConsoleState>,
+    Path(name): Path<String>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> ApiResult<Json<Value>> {
+    if !valid_name(&name) || body.len() > 2 * 1024 * 1024 {
+        return Err(ApiError::bad_request("invalid webhook request"));
+    }
+    let node = state.public_node()?.clone();
+    let source = crate::build::source_head(&node, &name)
+        .filter(|record| !record.source.deleted && record.source.webhook)
+        .ok_or_else(|| ApiError::not_found("GitHub webhook is not enabled for this Worker"))?;
+    let signature = headers
+        .get("x-hub-signature-256")
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default();
+    let secret = crate::build::webhook_secret(&node, &name)?;
+    if !crate::build::verify_webhook(&secret, signature, &body) {
+        return Err(ApiError::unauthorized("invalid GitHub webhook signature"));
+    }
+    let event = headers
+        .get("x-github-event")
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default();
+    if event == "ping" {
+        return Ok(Json(json!({ "ok": true, "pong": true })));
+    }
+    if event != "push" {
+        return Err(ApiError::bad_request(
+            "only GitHub push webhooks are supported",
+        ));
+    }
+    let payload: Value = serde_json::from_slice(&body)
+        .map_err(|_| ApiError::bad_request("invalid GitHub webhook JSON"))?;
+    let git_ref = payload
+        .get("ref")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    if git_ref != format!("refs/heads/{}", source.source.branch) {
+        return Ok(Json(json!({ "ok": true, "ignored": "branch" })));
+    }
+    if payload.get("deleted").and_then(Value::as_bool) == Some(true) {
+        return Ok(Json(json!({ "ok": true, "ignored": "deleted branch" })));
+    }
+    let delivery = headers
+        .get("x-github-delivery")
+        .and_then(|value| value.to_str().ok())
+        .filter(|value| !value.is_empty() && value.len() <= 128)
+        .unwrap_or("unknown");
+    let trigger = format!("github:{delivery}");
+    let commit = payload
+        .get("after")
+        .and_then(Value::as_str)
+        .filter(|value| value.len() == 40 && value.chars().all(|c| c.is_ascii_hexdigit()))
+        .ok_or_else(|| ApiError::bad_request("GitHub push omitted a valid after commit"))?
+        .to_string();
+    if let Some(job) = crate::build::build_jobs(&node, Some(&name))
+        .into_iter()
+        .find(|job| job.trigger == trigger)
+    {
+        return Ok(Json(json!({ "ok": true, "duplicate": true, "job": job })));
+    }
+    let job = crate::build::start_build(node, &name, trigger, None, Some(commit))?;
+    Ok(Json(json!({ "ok": true, "job": job })))
 }
 
 async fn worker_log(
@@ -699,6 +947,32 @@ async fn worker_log(
         "chain_ok": true,
         "signer": signer.map(|value| value.to_string()),
         "entries": entries,
+    })))
+}
+
+#[derive(Deserialize)]
+struct RuntimeLogQuery {
+    #[serde(default = "default_log_limit")]
+    limit: usize,
+}
+
+fn default_log_limit() -> usize {
+    300
+}
+
+async fn worker_runtime_log(
+    State(state): State<ConsoleState>,
+    Path(name): Path<String>,
+    Query(query): Query<RuntimeLogQuery>,
+) -> ApiResult<Json<Value>> {
+    if !valid_name(&name) {
+        return Err(ApiError::bad_request("invalid worker name"));
+    }
+    let node = state.public_node()?;
+    Ok(Json(json!({
+        "worker": name,
+        "node": node.id_hex(),
+        "lines": node.runtime_logs(&name, query.limit),
     })))
 }
 

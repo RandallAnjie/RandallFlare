@@ -8,7 +8,13 @@ user, a hardened systemd unit, and an end-to-end smoke test.
 
 Use an x86_64 systemd distribution with glibc 2.35 or newer. Ubuntu 22.04/24.04
 and Debian 12 are suitable starting points. The host needs `curl`, `tar`,
-`sha256sum`, `awk`, `sed`, and the standard user/systemd utilities.
+`sha256sum`, `awk`, `sed`, `git`, `bubblewrap`, and the standard user/systemd
+utilities. `git` checks out sources; `bubblewrap` is mandatory for any custom
+build command:
+
+```bash
+apt-get update && apt-get install -y git bubblewrap
+```
 
 Open only the required ports:
 
@@ -34,7 +40,7 @@ Use the binary produced by GitHub Actions. Verify the published checksum before
 using it to create or validate credentials:
 
 ```bash
-RF_VERSION=v0.5.0
+RF_VERSION=v0.6.0
 curl -fLO "https://github.com/RandallAnjie/RandallFlare/releases/download/$RF_VERSION/rf-linux-x86_64"
 curl -fLO "https://github.com/RandallAnjie/RandallFlare/releases/download/$RF_VERSION/rf-linux-x86_64.sha256"
 sha256sum --check --strict rf-linux-x86_64.sha256
@@ -79,9 +85,9 @@ scp first-vps/rf.toml root@203.0.113.7:/root/rf.toml
 scp first-vps/rf.env root@203.0.113.7:/root/rf.env  # only when used
 ssh root@203.0.113.7
 curl -fLo /tmp/install-randallflare-release.sh \
-  https://raw.githubusercontent.com/RandallAnjie/RandallFlare/v0.5.0/infra/install-release.sh
+  https://raw.githubusercontent.com/RandallAnjie/RandallFlare/v0.6.0/infra/install-release.sh
 bash /tmp/install-randallflare-release.sh \
-  --version v0.5.0 --config /root/rf.toml --env /root/rf.env
+  --version v0.6.0 --config /root/rf.toml --env /root/rf.env
 ```
 
 Omit both `scp` of `rf.env` and `--env` when no environment file is needed.
@@ -162,6 +168,13 @@ HTTP is acceptable only for an isolated first-node test. Configure HTTPS before
 production use. The legacy `rf console` loopback command remains available for
 offline/emergency administration.
 
+The Workers page also provides GitHub repository connection, sandboxed builds,
+push webhooks, live build/runtime logs, cluster-wide rollout status, and signed
+rollback. For a private repository, add a read-only `RF_GITHUB_TOKEN` to
+`/etc/rf.env`; it remains local to this node and is stripped from the build
+sandbox. Repository configuration and every produced Manifest still require a
+one-time operator signature.
+
 ## 6. Upgrade
 
 Run the release installer on the VPS without `--config`. It downloads the exact
@@ -171,8 +184,8 @@ restarting the service:
 
 ```bash
 curl -fLo /tmp/install-randallflare-release.sh \
-  https://raw.githubusercontent.com/RandallAnjie/RandallFlare/v0.5.0/infra/install-release.sh
-sudo bash /tmp/install-randallflare-release.sh --version v0.5.0
+  https://raw.githubusercontent.com/RandallAnjie/RandallFlare/v0.6.0/infra/install-release.sh
+sudo bash /tmp/install-randallflare-release.sh --version v0.6.0
 ```
 
 The default hardened unit deliberately prevents the unprivileged daemon from

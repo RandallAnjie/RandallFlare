@@ -8,6 +8,7 @@
 //!   rf:mdig         manifest-set digest (hex)
 //!   rf:kdig:<ns>    KV namespace digest (hex)
 //!   rf:claim:<task> base64 claim envelope (our own live claims)
+//!   rf:deploy:<worker> compact JSON local deployment/runtime state
 //!
 //! Digest mismatch against a peer triggers an HTTP anti-entropy pull;
 //! claim keys are ingested directly off the gossip state. Claims and
@@ -34,6 +35,7 @@ pub const K_IP4: &str = "rf:ip4";
 pub const K_MDIG: &str = "rf:mdig";
 pub const K_KDIG_PREFIX: &str = "rf:kdig:";
 pub const K_CLAIM_PREFIX: &str = "rf:claim:";
+pub const K_DEPLOY_PREFIX: &str = "rf:deploy:";
 
 fn b64() -> base64::engine::GeneralPurpose {
     base64::engine::general_purpose::STANDARD
@@ -134,6 +136,12 @@ pub async fn start(node: Arc<Node>) -> Result<Gossip> {
             b64().encode(env.to_bytes()),
         ));
     }
+    for (worker, status) in node.deployment_statuses() {
+        initial.push((
+            format!("{K_DEPLOY_PREFIX}{worker}"),
+            serde_json::to_string(&status)?,
+        ));
+    }
 
     let config = ChitchatConfig {
         chitchat_id,
@@ -169,6 +177,7 @@ async fn publisher(node: Arc<Node>, chitchat: Arc<tokio::sync::Mutex<chitchat::C
         tokio::time::sleep(Duration::from_millis(50)).await;
         let mut cc = chitchat.lock().await;
         let state = cc.self_node_state();
+        let publish_deployments = matches!(&ev, NodeEvent::Manifests | NodeEvent::Runtime);
         match ev {
             NodeEvent::Manifests => {
                 state.set(K_MDIG, node.manifest_digest_hex());
@@ -201,6 +210,31 @@ async fn publisher(node: Arc<Node>, chitchat: Arc<tokio::sync::Mutex<chitchat::C
                     if state.get(&k) != Some(v.as_str()) {
                         state.set(k, v);
                     }
+                }
+            }
+            NodeEvent::Runtime => {}
+        }
+        if publish_deployments {
+            let deployments: BTreeMap<String, String> = node
+                .deployment_statuses()
+                .into_iter()
+                .filter_map(|(worker, status)| {
+                    serde_json::to_string(&status)
+                        .ok()
+                        .map(|value| (format!("{K_DEPLOY_PREFIX}{worker}"), value))
+                })
+                .collect();
+            let stale: Vec<String> = state
+                .iter_prefix(K_DEPLOY_PREFIX)
+                .filter(|(key, _)| !deployments.contains_key(*key))
+                .map(|(key, _)| key.to_string())
+                .collect();
+            for key in stale {
+                state.delete(&key);
+            }
+            for (key, value) in deployments {
+                if state.get(&key) != Some(value.as_str()) {
+                    state.set(key, value);
                 }
             }
         }
@@ -245,6 +279,11 @@ async fn observer(node: Arc<Node>, chitchat: Arc<tokio::sync::Mutex<chitchat::Ch
                 for (k, v) in state.key_values() {
                     if let Some(ns) = k.strip_prefix(K_KDIG_PREFIX) {
                         view.kv_digests.insert(ns.to_string(), v.to_string());
+                    }
+                    if let Some(worker) = k.strip_prefix(K_DEPLOY_PREFIX) {
+                        if let Ok(status) = serde_json::from_str(v) {
+                            view.deployments.insert(worker.to_string(), status);
+                        }
                     }
                 }
                 let seen_key = (id.node_id.clone(), id.generation_id);
@@ -336,6 +375,7 @@ pub fn spawn_blob_fetcher(node: Arc<Node>) {
                         Ok(bytes) => match node.blobs.put_verified(&sha, &bytes) {
                             Ok(()) => {
                                 tracing::info!("fetched blob {}", hex::encode(sha));
+                                node.notify_blobs_changed();
                                 continue 'blobs;
                             }
                             Err(e) => tracing::warn!("peer sent bad blob: {e}"),

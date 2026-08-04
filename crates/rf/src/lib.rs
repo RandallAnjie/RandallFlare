@@ -4,6 +4,7 @@ pub mod acme;
 pub mod anchor;
 pub mod auth;
 pub mod blob;
+pub mod build;
 pub mod config;
 pub mod console;
 pub mod cron_driver;

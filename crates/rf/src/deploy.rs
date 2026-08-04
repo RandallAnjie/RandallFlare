@@ -8,6 +8,7 @@
 //!                    unless the worker is assets-only)
 //!   <assets dir>/    optional static asset tree
 
+use crate::node::Node;
 use crate::peers::PeerClient;
 use anyhow::{bail, Context, Result};
 use rf_core::envelope::Envelope;
@@ -274,6 +275,43 @@ pub async fn prepare_manifest(
         });
     }
 
+    manifest_from_bundle(bundle, version, prev, modules, assets)
+}
+
+/// Node-local counterpart of [`prepare_manifest`], used by Git builds. Blobs
+/// enter the same content-addressed store and are then available to peers
+/// through the normal blob fetch API.
+pub fn prepare_manifest_local(bundle: &Bundle, node: &Node) -> Result<WorkerManifest> {
+    let head = node.manifest_head(&bundle.spec.name);
+    let version = head.map(|(value, _)| value).unwrap_or(0) + 1;
+    let prev = head.map(|(_, digest)| digest);
+    let mut modules = Vec::new();
+    for (path, bytes, kind) in &bundle.modules {
+        modules.push(Module {
+            path: path.clone(),
+            sha256: node.blobs.put(bytes)?,
+            kind: *kind,
+            size: bytes.len() as u64,
+        });
+    }
+    let mut assets = Vec::new();
+    for (path, bytes) in &bundle.assets {
+        assets.push(AssetFile {
+            path: path.clone(),
+            sha256: node.blobs.put(bytes)?,
+            size: bytes.len() as u64,
+        });
+    }
+    manifest_from_bundle(bundle, version, prev, modules, assets)
+}
+
+fn manifest_from_bundle(
+    bundle: &Bundle,
+    version: u64,
+    prev: Option<[u8; 32]>,
+    modules: Vec<Module>,
+    assets: Vec<AssetFile>,
+) -> Result<WorkerManifest> {
     let mut durable_objects = bundle.spec.durable_objects.clone();
     for binding in durable_objects.values_mut() {
         if binding.unique_key.is_empty() {

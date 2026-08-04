@@ -112,34 +112,59 @@
         </section>
 
         <section id="view-workers" class="view" aria-labelledby="section-title">
-          <div class="grid one-two">
+          <div class="worker-hero">
+            <div><p class="eyebrow">GIT-NATIVE EDGE DELIVERY</p><h2>Build once. Verify once. Run everywhere.</h2><p class="muted">Every repository configuration and release artifact is operator-signed. Builds happen on this node; immutable blobs and manifests fan out directly across the cluster.</p></div>
+            <div id="build-capabilities" class="capability-strip"><span class="dot pending"></span> Checking build host…</div>
+          </div>
+
+          <div id="git-workspace" class="grid one-one">
+            <article class="panel">
+              <div class="panel-head"><div><p class="eyebrow">SOURCE</p><h2>Connect a GitHub repository</h2></div><span class="badge">operator signed</span></div>
+              <form id="source-form" class="source-form">
+                <label><span>Worker name</span><input id="source-worker" pattern="[a-z0-9-]{1,63}" placeholder="api" required></label>
+                <label class="wide"><span>Repository URL</span><input id="source-repository" type="url" placeholder="https://github.com/owner/repository" required></label>
+                <label><span>Branch</span><input id="source-branch" value="main" required></label>
+                <label><span>Monorepo root</span><input id="source-root" value="." required></label>
+                <label class="wide"><span>Build command <em>optional · sandboxed</em></span><input id="source-command" class="code-input" placeholder="npm ci && npm run build"></label>
+                <label><span>Output directory</span><input id="source-output" value="." required></label>
+                <label class="check-label"><input id="source-private" type="checkbox"><span>Private repository token</span></label>
+                <label class="check-label"><input id="source-webhook" type="checkbox" checked><span>Build on GitHub push</span></label>
+                <button class="primary wide" type="submit">Review & sign repository connection</button>
+              </form>
+              <p class="form-note">Private repositories read <code>RF_GITHUB_TOKEN</code> from this node only. The token is never stored, replicated, or exposed to the build command.</p>
+            </article>
+
             <article class="panel deploy-panel">
-              <p class="eyebrow">SIGNED RELEASE</p>
-              <h2>Deploy a Worker</h2>
-              <p class="muted">Select a bundle containing <code>rf.json</code>. The node prepares its exact manifest; your operator CLI signs that payload before the cluster accepts it.</p>
+              <div class="panel-head"><div><p class="eyebrow">DIRECT RELEASE</p><h2>Upload a ready bundle</h2></div><span class="badge">rf.json</span></div>
+              <p class="muted">Use this path for prebuilt or emergency releases. Git-backed releases below use the same signed Manifest and distribution protocol.</p>
               <form id="deploy-form">
-                <div id="deploy-local-fields">
-                  <label for="deploy-path">Local bundle path</label>
-                  <input id="deploy-path" name="path" type="text" placeholder="/absolute/path/to/worker" autocomplete="off">
-                </div>
-                <div id="deploy-public-fields" class="hidden">
-                  <label for="deploy-files">Worker bundle directory</label>
-                  <input id="deploy-files" name="files" type="file" webkitdirectory multiple>
-                </div>
-                <button class="primary" type="submit">Prepare signed deployment</button>
+                <div id="deploy-local-fields"><label for="deploy-path">Local bundle path</label><input id="deploy-path" name="path" type="text" placeholder="/absolute/path/to/worker" autocomplete="off"></div>
+                <div id="deploy-public-fields" class="hidden"><label for="deploy-files">Worker bundle directory</label><input id="deploy-files" name="files" type="file" webkitdirectory multiple></div>
+                <button class="secondary" type="submit">Prepare direct release</button>
               </form>
               <div id="deploy-mode" class="form-note"></div>
             </article>
-            <article class="panel">
-              <div class="panel-head"><div><p class="eyebrow">MANIFESTS</p><h2>Worker inventory</h2></div><span id="worker-count" class="badge">0 live</span></div>
-              <div class="table-wrap">
-                <table>
-                  <thead><tr><th>Worker</th><th>Version</th><th>Content</th><th>Routes</th><th>Durable state</th><th><span class="sr-only">Actions</span></th></tr></thead>
-                  <tbody id="workers-table"><tr><td colspan="6" class="empty-state">No workers found.</td></tr></tbody>
-                </table>
-              </div>
-            </article>
           </div>
+
+          <article class="panel">
+            <div class="panel-head"><div><p class="eyebrow">REPOSITORIES</p><h2>Connected sources</h2></div><span id="source-count" class="badge">0 connected</span></div>
+            <div id="source-list" class="source-list empty-state">No GitHub repositories connected.</div>
+          </article>
+
+          <article class="panel">
+            <div class="panel-head"><div><p class="eyebrow">BUILD PIPELINE</p><h2>Build activity</h2></div><button id="build-refresh" class="text-button" type="button">Refresh builds ↻</button></div>
+            <div id="build-list" class="build-list empty-state">No builds yet.</div>
+          </article>
+
+          <article class="panel">
+            <div class="panel-head"><div><p class="eyebrow">GLOBAL DEPLOYMENTS</p><h2>Worker inventory</h2></div><span id="worker-count" class="badge">0 live</span></div>
+            <div class="table-wrap">
+              <table>
+                <thead><tr><th>Worker</th><th>Release</th><th>Content</th><th>Routes</th><th>Distribution</th><th><span class="sr-only">Actions</span></th></tr></thead>
+                <tbody id="workers-table"><tr><td colspan="6" class="empty-state">No workers found.</td></tr></tbody>
+              </table>
+            </div>
+          </article>
         </section>
 
         <section id="view-kv" class="view" aria-labelledby="section-title">
@@ -216,6 +241,11 @@
       <label for="approval-command">Run on an operator machine</label>
       <div class="command-row"><code id="approval-command">—</code><button id="approval-copy" class="secondary" type="button">Copy</button></div>
       <div class="auth-state"><span id="approval-dot" class="dot pending"></span><span id="approval-status">Waiting for signature</span></div>
+    </dialog>
+    <dialog id="log-dialog" class="log-dialog">
+      <div class="dialog-head"><div><p class="eyebrow" id="log-eyebrow">BUILD LOG</p><h2 id="log-title">Activity</h2></div><button id="log-close" class="icon-button" aria-label="Close">×</button></div>
+      <div id="log-meta" class="muted"></div>
+      <pre id="log-content" class="result log-output">Waiting for log data…</pre>
     </dialog>
     <div id="toast" class="toast" role="status" aria-live="polite"></div>
     <script src="/app.js" defer></script>

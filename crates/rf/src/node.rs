@@ -13,7 +13,8 @@ use rf_core::hlc::{Clock, Hlc};
 use rf_core::identity::{Keypair, PublicId};
 use rf_core::kv::{KvEntry, Merge, Namespace};
 use rf_core::manifest::{ManifestIngest, ManifestSet, WorkerManifest};
-use std::collections::{BTreeMap, HashMap};
+use serde::{Deserialize, Serialize};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::net::SocketAddr;
 use std::sync::Mutex;
 use tokio::sync::broadcast;
@@ -29,6 +30,25 @@ pub enum NodeEvent {
     OwnClaims,
     /// A KV namespace changed locally.
     Kv(String),
+    /// Local Worker materialization/runtime status changed.
+    Runtime,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeploymentStatus {
+    pub version: u64,
+    pub state: String,
+    #[serde(default)]
+    pub detail: String,
+    pub updated_at_ms: u64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct RuntimeLogLine {
+    pub at_ms: u64,
+    pub version: u64,
+    pub stream: String,
+    pub message: String,
 }
 
 /// What we know about a live peer, scraped from its gossip state.
@@ -40,6 +60,7 @@ pub struct PeerView {
     pub ipv4: Option<String>,
     pub manifest_digest: String,
     pub kv_digests: BTreeMap<String, String>,
+    pub deployments: BTreeMap<String, DeploymentStatus>,
     pub generation: u64,
 }
 
@@ -52,6 +73,8 @@ pub struct Inner {
     pub peers: BTreeMap<String, PeerView>,
     /// worker name → local workerd port (published by the runtime).
     pub worker_ports: HashMap<String, u16>,
+    pub runtime_status: HashMap<String, DeploymentStatus>,
+    pub runtime_logs: HashMap<String, VecDeque<RuntimeLogLine>>,
     /// Loopback port of the kvbind server (set at daemon start).
     pub kvbind_port: u16,
 }
@@ -90,6 +113,8 @@ impl Node {
             kv: HashMap::new(),
             peers: BTreeMap::new(),
             worker_ports: HashMap::new(),
+            runtime_status: HashMap::new(),
+            runtime_logs: HashMap::new(),
             kvbind_port: 0,
         };
         // Hydrate: static stability means booting entirely from disk.
@@ -190,6 +215,10 @@ impl Node {
             }
         }
         missing
+    }
+
+    pub fn notify_blobs_changed(&self) {
+        self.emit(NodeEvent::Runtime);
     }
 
     // ---- claims ----
@@ -480,11 +509,153 @@ impl Node {
     }
 
     pub fn set_worker_ports(&self, ports: HashMap<String, u16>) {
-        self.inner.lock().unwrap().worker_ports = ports;
+        let changed = {
+            let mut inner = self.inner.lock().unwrap();
+            if inner.worker_ports == ports {
+                false
+            } else {
+                inner.worker_ports = ports;
+                true
+            }
+        };
+        if changed {
+            self.emit(NodeEvent::Runtime);
+        }
     }
 
     pub fn worker_port(&self, name: &str) -> Option<u16> {
         self.inner.lock().unwrap().worker_ports.get(name).copied()
+    }
+
+    pub fn set_runtime_status(
+        &self,
+        name: &str,
+        version: u64,
+        state: &str,
+        detail: impl Into<String>,
+    ) {
+        let detail = detail.into();
+        let changed = {
+            let mut inner = self.inner.lock().unwrap();
+            let same = inner
+                .runtime_status
+                .get(name)
+                .map(|prior| {
+                    prior.version == version && prior.state == state && prior.detail == detail
+                })
+                .unwrap_or(false);
+            if same {
+                false
+            } else {
+                inner.runtime_status.insert(
+                    name.to_string(),
+                    DeploymentStatus {
+                        version,
+                        state: state.to_string(),
+                        detail,
+                        updated_at_ms: now_ms(),
+                    },
+                );
+                true
+            }
+        };
+        if changed {
+            self.emit(NodeEvent::Runtime);
+        }
+    }
+
+    pub fn append_runtime_log(&self, name: &str, version: u64, stream: &str, message: &str) {
+        const MAX_LINES: usize = 1_000;
+        let mut message = message.replace(['\r', '\0'], "");
+        if message.len() > 4_000 {
+            message.truncate(4_000);
+            message.push('…');
+        }
+        let mut inner = self.inner.lock().unwrap();
+        let lines = inner.runtime_logs.entry(name.to_string()).or_default();
+        lines.push_back(RuntimeLogLine {
+            at_ms: now_ms(),
+            version,
+            stream: stream.to_string(),
+            message,
+        });
+        while lines.len() > MAX_LINES {
+            lines.pop_front();
+        }
+    }
+
+    pub fn runtime_logs(&self, name: &str, limit: usize) -> Vec<RuntimeLogLine> {
+        let inner = self.inner.lock().unwrap();
+        inner
+            .runtime_logs
+            .get(name)
+            .map(|lines| {
+                lines
+                    .iter()
+                    .skip(lines.len().saturating_sub(limit.min(1_000)))
+                    .cloned()
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// Local, per-Worker materialization state advertised through gossip.
+    pub fn deployment_statuses(&self) -> BTreeMap<String, DeploymentStatus> {
+        let (manifests, ports, explicit) = {
+            let inner = self.inner.lock().unwrap();
+            (
+                inner
+                    .manifests
+                    .live()
+                    .map(|record| record.manifest.clone())
+                    .collect::<Vec<_>>(),
+                inner.worker_ports.clone(),
+                inner.runtime_status.clone(),
+            )
+        };
+        manifests
+            .into_iter()
+            .map(|manifest| {
+                let missing = manifest.blob_refs().any(|sha| !self.blobs.has(&sha));
+                let status = if missing {
+                    DeploymentStatus {
+                        version: manifest.version,
+                        state: "waiting_blobs".into(),
+                        detail: "fetching immutable blobs from peers".into(),
+                        updated_at_ms: now_ms(),
+                    }
+                } else if manifest.main.is_empty() {
+                    DeploymentStatus {
+                        version: manifest.version,
+                        state: "ready".into(),
+                        detail: "static assets ready".into(),
+                        updated_at_ms: now_ms(),
+                    }
+                } else if let Some(port) = ports.get(&manifest.name) {
+                    DeploymentStatus {
+                        version: manifest.version,
+                        state: "running".into(),
+                        detail: format!("workerd on 127.0.0.1:{port}"),
+                        updated_at_ms: explicit
+                            .get(&manifest.name)
+                            .map(|status| status.updated_at_ms)
+                            .unwrap_or_else(now_ms),
+                    }
+                } else {
+                    explicit
+                        .get(&manifest.name)
+                        .cloned()
+                        .filter(|status| status.version == manifest.version)
+                        .unwrap_or(DeploymentStatus {
+                            version: manifest.version,
+                            state: "starting".into(),
+                            detail: "waiting for local runtime".into(),
+                            updated_at_ms: now_ms(),
+                        })
+                };
+                (manifest.name, status)
+            })
+            .collect()
     }
 
     pub fn set_kvbind_port(&self, port: u16) {

@@ -45,6 +45,57 @@ pub struct NodeConfig {
     pub d1: D1Config,
     #[serde(default)]
     pub update: UpdateConfig,
+    /// Node-local Git checkout and sandboxed Worker build settings.
+    /// Repository definitions and deploy artifacts replicate through the
+    /// cluster, but credentials and build processes deliberately do not.
+    #[serde(default)]
+    pub build: BuildConfig,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BuildConfig {
+    /// Accept build jobs on this node.
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// git executable. None = discover it on PATH.
+    #[serde(default)]
+    pub git: Option<PathBuf>,
+    /// bubblewrap executable used for every custom build command.
+    /// None = discover `bwrap` on PATH.
+    #[serde(default)]
+    pub sandbox: Option<PathBuf>,
+    /// Name of the node-local environment variable containing a read-only
+    /// GitHub token. Its value is never persisted or replicated.
+    #[serde(default = "default_github_token_env")]
+    pub github_token_env: String,
+    /// Hard wall-clock limit for clone + build.
+    #[serde(default = "default_build_timeout")]
+    pub timeout_seconds: u64,
+}
+
+impl Default for BuildConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            git: None,
+            sandbox: None,
+            github_token_env: default_github_token_env(),
+            timeout_seconds: default_build_timeout(),
+        }
+    }
+}
+
+fn default_true() -> bool {
+    true
+}
+
+fn default_github_token_env() -> String {
+    "RF_GITHUB_TOKEN".into()
+}
+
+fn default_build_timeout() -> u64 {
+    20 * 60
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -305,6 +356,18 @@ impl NodeConfig {
             && (self.update.repo.trim().is_empty() || self.update.api_base.trim().is_empty())
         {
             anyhow::bail!("enabled update.repo and update.api_base must not be empty");
+        }
+        if self.build.timeout_seconds == 0 || self.build.timeout_seconds > 6 * 60 * 60 {
+            anyhow::bail!("build.timeout_seconds must be between 1 and 21600");
+        }
+        if self.build.github_token_env.trim().is_empty()
+            || !self
+                .build
+                .github_token_env
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '_')
+        {
+            anyhow::bail!("build.github_token_env must be a valid environment variable name");
         }
         Ok(())
     }

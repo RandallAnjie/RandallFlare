@@ -24,6 +24,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::sync::Arc;
+use tokio::io::{AsyncBufReadExt, AsyncRead, BufReader};
 use tokio::process::{Child, Command};
 
 pub struct Runtime {
@@ -90,6 +91,18 @@ impl Runtime {
             if let Some(child) = &mut rw.child {
                 if let Ok(Some(status)) = child.try_wait() {
                     tracing::warn!("workerd for {name} exited: {status}");
+                    self.node.set_runtime_status(
+                        name,
+                        rw.version,
+                        "failed",
+                        format!("workerd exited: {status}"),
+                    );
+                    self.node.append_runtime_log(
+                        name,
+                        rw.version,
+                        "system",
+                        &format!("workerd exited: {status}"),
+                    );
                     rw.child = None;
                 }
             }
@@ -136,6 +149,14 @@ impl Runtime {
                 }
                 tracing::info!("stopped worker {name}");
             }
+            if let Some(manifest) = self.node.manifest(&name) {
+                self.node.set_runtime_status(
+                    &name,
+                    manifest.version,
+                    "standby",
+                    "runtime is not the active Durable Object owner on this node",
+                );
+            }
         }
 
         for m in desired {
@@ -151,11 +172,27 @@ impl Runtime {
                 .any(|s| m.blob_refs().any(|r| r == *s))
             {
                 tracing::debug!("worker {} waiting for blobs", m.name);
+                self.node.set_runtime_status(
+                    &m.name,
+                    m.version,
+                    "waiting_blobs",
+                    "fetching immutable blobs from peers",
+                );
                 continue;
             }
             match self.start_worker(&m).await {
                 Ok(()) => {}
-                Err(e) => tracing::warn!("starting worker {}: {e:#}", m.name),
+                Err(e) => {
+                    self.node
+                        .set_runtime_status(&m.name, m.version, "failed", format!("{e:#}"));
+                    self.node.append_runtime_log(
+                        &m.name,
+                        m.version,
+                        "system",
+                        &format!("startup failed: {e:#}"),
+                    );
+                    tracing::warn!("starting worker {}: {e:#}", m.name)
+                }
             }
         }
         // Publish the port table for ingress.
@@ -184,8 +221,16 @@ impl Runtime {
 
     async fn start_worker(&mut self, m: &WorkerManifest) -> Result<()> {
         let Some(workerd) = &self.workerd else {
+            self.node.set_runtime_status(
+                &m.name,
+                m.version,
+                "runtime_unavailable",
+                "workerd binary is not installed",
+            );
             return Ok(()); // no runtime on this node
         };
+        self.node
+            .set_runtime_status(&m.name, m.version, "starting", "materializing Worker");
         let port = self
             .running
             .get(&m.name)
@@ -236,8 +281,8 @@ impl Runtime {
         }
         cmd.arg(dir.join("config.capnp"))
             .current_dir(&dir)
-            .stdout(Stdio::null())
-            .stderr(Stdio::inherit())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
             .kill_on_drop(true);
         // Die with the daemon: a SIGKILLed rf must not leave orphan
         // workerds squatting on worker ports with stale code.
@@ -251,6 +296,24 @@ impl Runtime {
         let mut child = cmd
             .spawn()
             .with_context(|| format!("spawning workerd for {}", m.name))?;
+        if let Some(stdout) = child.stdout.take() {
+            spawn_log_reader(
+                self.node.clone(),
+                m.name.clone(),
+                m.version,
+                "stdout",
+                stdout,
+            );
+        }
+        if let Some(stderr) = child.stderr.take() {
+            spawn_log_reader(
+                self.node.clone(),
+                m.name.clone(),
+                m.version,
+                "stderr",
+                stderr,
+            );
+        }
 
         // Wait until the socket actually answers (or the child dies) —
         // a bind failure otherwise looks like success for 10 seconds.
@@ -274,6 +337,18 @@ impl Runtime {
         }
 
         tracing::info!("worker {} v{} on 127.0.0.1:{port}", m.name, m.version);
+        self.node.set_runtime_status(
+            &m.name,
+            m.version,
+            "running",
+            format!("workerd on 127.0.0.1:{port}"),
+        );
+        self.node.append_runtime_log(
+            &m.name,
+            m.version,
+            "system",
+            &format!("Worker started on 127.0.0.1:{port}"),
+        );
         self.running.insert(
             m.name.clone(),
             RunningWorker {
@@ -284,6 +359,23 @@ impl Runtime {
         );
         Ok(())
     }
+}
+
+fn spawn_log_reader<R>(
+    node: Arc<Node>,
+    worker: String,
+    version: u64,
+    stream: &'static str,
+    reader: R,
+) where
+    R: AsyncRead + Unpin + Send + 'static,
+{
+    tokio::spawn(async move {
+        let mut lines = BufReader::new(reader).lines();
+        while let Ok(Some(line)) = lines.next_line().await {
+            node.append_runtime_log(&worker, version, stream, &line);
+        }
+    });
 }
 
 use sha2::Digest;

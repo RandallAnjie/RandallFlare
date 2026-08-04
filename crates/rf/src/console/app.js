@@ -14,6 +14,10 @@ const state = {
   authChallenge: null,
   authTimer: null,
   approvalTimer: null,
+  sources: [],
+  builds: [],
+  buildTimer: null,
+  activeLog: null,
 };
 
 const titles = {
@@ -87,7 +91,7 @@ async function api(path, options = {}) {
 }
 
 function authorizationCommand(code, node) {
-  return `RF_NODE=${node} rf authorize ${code}`;
+  return `RF_NODE=${node} RF_CLUSTER_SECRET='YOUR_64_HEX_CLUSTER_SECRET' RF_OPERATOR_KEY=~/.rf/operator.key rf authorize ${code}`;
 }
 
 async function copyText(text, button) {
@@ -235,19 +239,197 @@ function renderWorkers(workers) {
       const content = worker.modules
         ? `${worker.modules} module${worker.modules === 1 ? "" : "s"} · ${worker.assets || 0} assets`
         : `${worker.assets || 0} asset${worker.assets === 1 ? "" : "s"}`;
-      const durable = worker.durable_objects
-        ? `<span class="${worker.durable_owner ? "state-ok" : "state-wait"}">${worker.durable_owner ? `owner ${escapeHtml(shortId(worker.durable_owner))}` : "electing owner"}</span>`
-        : '<span class="muted">stateless</span>';
+      const distribution = worker.distribution || { ready: 0, total: 1, nodes: [] };
+      const complete = distribution.ready === distribution.total;
+      const nodeStates = (distribution.nodes || []).map((node) => {
+        const status = node.status || {};
+        return `${node.label || shortId(node.node)}: ${status.state || "unknown"} v${status.version || "—"}`;
+      }).join("\n");
       return `<tr>
         <td><strong>${escapeHtml(worker.name)}</strong><small>${worker.crons?.length || 0} cron trigger${worker.crons?.length === 1 ? "" : "s"}</small></td>
         <td class="mono">v${escapeHtml(worker.version)}</td>
         <td>${escapeHtml(content)}</td>
         <td><small>${escapeHtml(worker.hostnames?.join(", ") || "—")}</small></td>
-        <td>${durable}</td>
-        <td><div class="table-actions"><button class="mini-button" data-action="history" data-worker="${escapeHtml(worker.name)}">History</button><button class="mini-button danger" data-action="delete-worker" data-worker="${escapeHtml(worker.name)}"${mutationDisabled}>Delete</button></div></td>
+        <td><span class="${complete ? "state-ok" : "state-wait"}" title="${escapeHtml(nodeStates)}">${escapeHtml(distribution.ready)}/${escapeHtml(distribution.total)} nodes</span><small>${complete ? "fully distributed" : "converging"}</small></td>
+        <td><div class="table-actions"><button class="mini-button" data-action="runtime" data-worker="${escapeHtml(worker.name)}">Runtime log</button><button class="mini-button" data-action="history" data-worker="${escapeHtml(worker.name)}">History</button><button class="mini-button danger" data-action="delete-worker" data-worker="${escapeHtml(worker.name)}"${mutationDisabled}>Delete</button></div></td>
       </tr>`;
     }).join("")
     : '<tr><td colspan="6" class="empty-state">No workers found.</td></tr>';
+}
+
+function buildStateLabel(stateName) {
+  return {
+    queued: "Queued",
+    cloning: "Cloning",
+    building: "Building",
+    packaging: "Packaging",
+    awaiting_approval: "Awaiting signature",
+    deployed: "Deployed",
+    failed: "Failed",
+  }[stateName] || stateName || "Unknown";
+}
+
+function renderSources(data) {
+  state.sources = data.sources || [];
+  const capabilities = data.capabilities || {};
+  const cap = $("#build-capabilities");
+  const gitReady = Boolean(capabilities.git);
+  const sandboxReady = Boolean(capabilities.sandbox);
+  cap.innerHTML = `<span class="dot ${gitReady ? "online" : "offline"}"></span><strong>${gitReady ? "Build host ready" : "Git unavailable"}</strong><span>git ${gitReady ? "✓" : "×"}</span><span>bwrap ${sandboxReady ? "✓" : "optional"}</span><span>private token ${capabilities.github_token_configured ? "✓" : "not set"}</span>`;
+  $("#source-count").textContent = `${state.sources.length} connected`;
+  const list = $("#source-list");
+  list.classList.toggle("empty-state", state.sources.length === 0);
+  list.innerHTML = state.sources.length ? state.sources.map((source) => `
+    <article class="source-card">
+      <div class="source-icon">GH</div>
+      <div class="source-main">
+        <div class="source-title"><strong>${escapeHtml(source.worker)}</strong><span class="badge">source v${escapeHtml(source.version)}</span>${source.webhook ? '<span class="badge active">push enabled</span>' : ""}</div>
+        <a href="${escapeHtml(source.repository.replace(/\.git$/, ""))}" target="_blank" rel="noreferrer">${escapeHtml(source.repository.replace(/\.git$/, ""))}</a>
+        <div class="source-meta"><span>branch <code>${escapeHtml(source.branch)}</code></span><span>root <code>${escapeHtml(source.root)}</code></span><span>output <code>${escapeHtml(source.output_dir)}</code></span><span>${source.build_command ? "sandboxed build" : "zero-config"}</span></div>
+        ${source.webhook ? `<details><summary>GitHub webhook setup</summary><div class="webhook-grid"><span>Payload URL</span><code>${escapeHtml(`${location.origin}${source.webhook_path}`)}</code><span>Secret</span><code>${escapeHtml(source.webhook_secret || "unavailable")}</code><span>Events</span><code>Just the push event</code></div></details>` : ""}
+      </div>
+      <div class="source-actions"><button class="primary" data-source-action="build" data-worker="${escapeHtml(source.worker)}">Build now</button><button class="mini-button" data-source-action="edit" data-worker="${escapeHtml(source.worker)}">Edit</button><button class="mini-button danger" data-source-action="disconnect" data-worker="${escapeHtml(source.worker)}">Disconnect</button></div>
+    </article>`).join("") : "No GitHub repositories connected. Connect one above to enable builds and push deployments.";
+}
+
+function renderBuilds(jobs, approveNode) {
+  state.builds = jobs || [];
+  const list = $("#build-list");
+  list.classList.toggle("empty-state", state.builds.length === 0);
+  list.innerHTML = state.builds.length ? state.builds.map((job) => {
+    const terminal = job.state === "deployed" || job.state === "failed";
+    const short = job.commit ? job.commit.slice(0, 12) : "pending";
+    const approval = job.approval && job.state === "awaiting_approval"
+      ? `<button class="primary" data-build-action="approve" data-build="${escapeHtml(job.id)}" data-node="${escapeHtml(job.approve_node || approveNode || "")}">Sign release</button>` : "";
+    return `<article class="build-row ${job.state === "failed" ? "failed" : ""}">
+      <span class="pipeline-state ${terminal ? job.state : "active"}"></span>
+      <div><strong>${escapeHtml(job.worker)}</strong><small>${escapeHtml(job.trigger)} · ${escapeHtml(job.branch)} · <code>${escapeHtml(short)}</code></small></div>
+      <div class="build-stage"><span class="badge ${job.state === "deployed" ? "active" : ""}">${escapeHtml(buildStateLabel(job.state))}</span><small>${job.version ? `release v${escapeHtml(job.version)}` : "artifact pending"}</small></div>
+      <div class="table-actions">${approval}<button class="mini-button" data-build-action="log" data-build="${escapeHtml(job.id)}">View log</button></div>
+    </article>`;
+  }).join("") : "No builds yet. Connect a repository and start the first build.";
+}
+
+async function loadWorkerOps({ quiet = true } = {}) {
+  if (consoleMode !== "public" || !state.session) return;
+  try {
+    const [sources, builds] = await Promise.all([api("/api/sources"), api("/api/builds")]);
+    renderSources(sources);
+    renderBuilds(builds.jobs, builds.approve_node);
+  } catch (error) {
+    if (!quiet) toast(error.message, true);
+  }
+}
+
+async function connectSource(event) {
+  event.preventDefault();
+  const payload = {
+    worker: $("#source-worker").value.trim(),
+    repository: $("#source-repository").value.trim(),
+    branch: $("#source-branch").value.trim(),
+    root: $("#source-root").value.trim(),
+    build_command: $("#source-command").value,
+    output_dir: $("#source-output").value.trim(),
+    use_github_token: $("#source-private").checked,
+    webhook: $("#source-webhook").checked,
+  };
+  try {
+    const result = await api("/api/sources", { method: "POST", body: JSON.stringify(payload) });
+    showApproval(result, `Connect ${payload.worker} to GitHub.`);
+  } catch (error) {
+    toast(error.message, true);
+  }
+}
+
+function editSource(worker) {
+  const source = state.sources.find((item) => item.worker === worker);
+  if (!source) return;
+  $("#source-worker").value = source.worker;
+  $("#source-repository").value = source.repository.replace(/\.git$/, "");
+  $("#source-branch").value = source.branch;
+  $("#source-root").value = source.root;
+  $("#source-command").value = source.build_command;
+  $("#source-output").value = source.output_dir;
+  $("#source-private").checked = source.use_github_token;
+  $("#source-webhook").checked = source.webhook;
+  $("#source-form").scrollIntoView({ behavior: "smooth", block: "center" });
+}
+
+async function disconnectSource(worker) {
+  if (!window.confirm(`Disconnect GitHub from “${worker}”? Deployed releases keep running.`)) return;
+  try {
+    const result = await api(`/api/sources/${encodeURIComponent(worker)}`, { method: "DELETE" });
+    showApproval(result, `Disconnect the repository from ${worker}.`);
+  } catch (error) {
+    toast(error.message, true);
+  }
+}
+
+async function triggerBuild(worker) {
+  try {
+    const result = await api(`/api/workers/${encodeURIComponent(worker)}/build`, { method: "POST", body: "{}" });
+    toast(`Build queued for ${worker}`);
+    await loadWorkerOps();
+    openBuildLog(result.job.id);
+  } catch (error) {
+    toast(error.message, true);
+  }
+}
+
+async function openBuildLog(id) {
+  clearTimeout(state.buildTimer);
+  state.activeLog = { type: "build", id };
+  $("#log-eyebrow").textContent = "LIVE BUILD LOG";
+  $("#log-title").textContent = "Build activity";
+  $("#log-dialog").showModal();
+  await refreshBuildLog(id);
+}
+
+async function refreshBuildLog(id) {
+  if (state.activeLog?.type !== "build" || state.activeLog.id !== id) return;
+  try {
+    const data = await api(`/api/builds/${encodeURIComponent(id)}`);
+    const job = data.job;
+    $("#log-title").textContent = `${job.worker} · ${buildStateLabel(job.state)}`;
+    $("#log-meta").textContent = `${job.repository} · ${job.branch}${job.commit ? ` · ${job.commit}` : ""}`;
+    $("#log-content").textContent = (job.log || []).join("\n") || "Waiting for build output…";
+    $("#log-content").scrollTop = $("#log-content").scrollHeight;
+    if (job.state === "awaiting_approval" || job.state === "deployed" || job.state === "failed") {
+      await loadWorkerOps();
+    }
+    if (job.state !== "deployed" && job.state !== "failed") {
+      state.buildTimer = setTimeout(() => refreshBuildLog(id), 1000);
+    }
+  } catch (error) {
+    $("#log-content").textContent += `\n${error.message}`;
+  }
+}
+
+function approveBuild(id, approveNode) {
+  const job = state.builds.find((item) => item.id === id);
+  if (!job?.approval) return;
+  showApproval({
+    name: job.worker,
+    version: job.version,
+    approval: job.approval,
+    approve_node: approveNode,
+  }, `Deploy the immutable artifact built for ${job.worker}.`);
+}
+
+async function openRuntimeLog(worker) {
+  clearTimeout(state.buildTimer);
+  state.activeLog = { type: "runtime", worker };
+  $("#log-eyebrow").textContent = "LOCAL RUNTIME LOG";
+  $("#log-title").textContent = worker;
+  $("#log-dialog").showModal();
+  try {
+    const data = await api(`/api/workers/${encodeURIComponent(worker)}/runtime-log?limit=500`);
+    $("#log-meta").textContent = `Node ${shortId(data.node, 20)} · bounded in-memory log`;
+    $("#log-content").textContent = (data.lines || []).map((line) => `${new Date(line.at_ms).toISOString()} [v${line.version}] [${line.stream}] ${line.message}`).join("\n") || "No runtime output captured on this node.";
+    $("#log-content").scrollTop = $("#log-content").scrollHeight;
+  } catch (error) {
+    $("#log-content").textContent = error.message;
+  }
 }
 
 function renderDatabases(databases) {
@@ -289,8 +471,19 @@ async function loadHistory(name) {
     $("#history-title").textContent = `${name} history`;
     $("#history-content").innerHTML = `
       <p class="muted"><span class="state-ok">✓ Hash chain verified</span> · signer ${escapeHtml(shortId(data.signer, 24))}</p>
-      ${data.entries.map((entry) => `<div class="history-entry"><div class="version">v${escapeHtml(entry.version)}${entry.deleted ? " · deleted" : ""}</div><div>${escapeHtml(entry.hostnames?.join(", ") || "No routes")}<code>${escapeHtml(entry.digest)}</code></div></div>`).join("") || '<p class="empty-state">No log entries.</p>'}`;
+      ${data.entries.slice().reverse().map((entry, index) => `<div class="history-entry"><div class="version">v${escapeHtml(entry.version)}${entry.deleted ? " · deleted" : ""}</div><div>${escapeHtml(entry.hostnames?.join(", ") || "No routes")}<code>${escapeHtml(entry.digest)}</code></div>${!entry.deleted && index > 0 ? `<button class="mini-button" data-rollback-worker="${escapeHtml(name)}" data-rollback-version="${escapeHtml(entry.version)}">Rollback</button>` : ""}</div>`).join("") || '<p class="empty-state">No log entries.</p>'}`;
     $("#history-dialog").showModal();
+  } catch (error) {
+    toast(error.message, true);
+  }
+}
+
+async function rollbackWorker(worker, version) {
+  if (!window.confirm(`Deploy the content of ${worker} v${version} as a new signed version?`)) return;
+  try {
+    const result = await api(`/api/workers/${encodeURIComponent(worker)}/rollback/${encodeURIComponent(version)}`, { method: "POST", body: "{}" });
+    $("#history-dialog").close();
+    showApproval(result, `Rollback ${worker} to v${version}.`);
   } catch (error) {
     toast(error.message, true);
   }
@@ -364,6 +557,7 @@ async function pollApproval(id) {
       $("#approval-status").textContent = "Signed and committed across the cluster";
       toast(result.summary || "Cluster change committed");
       await loadOverview({ quiet: true });
+      await loadWorkerOps();
       return;
     }
     if (result.state === "failed") {
@@ -526,6 +720,7 @@ async function boot() {
     $("#deploy-public-fields").classList.toggle("hidden", consoleMode !== "public");
     $("#deploy-path").required = consoleMode === "local";
     $("#deploy-files").required = consoleMode === "public";
+    $("#git-workspace").classList.toggle("hidden", consoleMode !== "public");
     $("#deploy-mode").textContent = state.session.read_only
       ? "No operator key loaded. All mutations are disabled."
       : consoleMode === "public"
@@ -538,9 +733,10 @@ async function boot() {
     $("#security-copy").innerHTML = consoleMode === "public"
       ? "No private key is stored<br>on this node."
       : "Secrets remain in the local<br>console process.";
-    $$("#deploy-form button, #kv-editor-form button, #d1-create-form button, #d1-exec-form button")
+    $$("#deploy-form button, #source-form button, #kv-editor-form button, #d1-create-form button, #d1-exec-form button")
       .forEach((button) => { button.disabled = state.session.read_only; });
     await loadOverview({ quiet: true });
+    await loadWorkerOps();
     await loadKeys();
   } catch (error) {
     if (consoleMode === "public" && error.status === 401) {
@@ -557,6 +753,8 @@ $$(".nav-item").forEach((button) => button.addEventListener("click", () => switc
 $$('[data-go]').forEach((button) => button.addEventListener("click", () => switchView(button.dataset.go)));
 $("#refresh").addEventListener("click", () => loadOverview());
 $("#deploy-form").addEventListener("submit", deployWorker);
+$("#source-form").addEventListener("submit", connectSource);
+$("#build-refresh").addEventListener("click", () => loadWorkerOps({ quiet: false }));
 $("#kv-search-form").addEventListener("submit", (event) => { event.preventDefault(); loadKeys(); });
 $("#kv-editor-form").addEventListener("submit", saveKey);
 $("#kv-new").addEventListener("click", clearKey);
@@ -564,6 +762,11 @@ $("#kv-delete").addEventListener("click", removeKey);
 $("#d1-create-form").addEventListener("submit", createDatabase);
 $("#d1-exec-form").addEventListener("submit", executeSql);
 $("#history-close").addEventListener("click", () => $("#history-dialog").close());
+$("#log-close").addEventListener("click", () => {
+  clearTimeout(state.buildTimer);
+  state.activeLog = null;
+  $("#log-dialog").close();
+});
 $("#approval-close").addEventListener("click", () => $("#approval-dialog").close());
 $("#auth-retry").addEventListener("click", beginAuthorization);
 $("#auth-copy").addEventListener("click", () => copyText($("#auth-command").textContent, $("#auth-copy")));
@@ -581,7 +784,25 @@ $("#workers-table").addEventListener("click", (event) => {
   const button = event.target.closest("button[data-action]");
   if (!button) return;
   if (button.dataset.action === "history") loadHistory(button.dataset.worker);
+  if (button.dataset.action === "runtime") openRuntimeLog(button.dataset.worker);
   if (button.dataset.action === "delete-worker") deleteWorker(button.dataset.worker);
+});
+$("#source-list").addEventListener("click", (event) => {
+  const button = event.target.closest("button[data-source-action]");
+  if (!button) return;
+  if (button.dataset.sourceAction === "build") triggerBuild(button.dataset.worker);
+  if (button.dataset.sourceAction === "edit") editSource(button.dataset.worker);
+  if (button.dataset.sourceAction === "disconnect") disconnectSource(button.dataset.worker);
+});
+$("#build-list").addEventListener("click", (event) => {
+  const button = event.target.closest("button[data-build-action]");
+  if (!button) return;
+  if (button.dataset.buildAction === "log") openBuildLog(button.dataset.build);
+  if (button.dataset.buildAction === "approve") approveBuild(button.dataset.build, button.dataset.node);
+});
+$("#history-content").addEventListener("click", (event) => {
+  const button = event.target.closest("button[data-rollback-worker]");
+  if (button) rollbackWorker(button.dataset.rollbackWorker, button.dataset.rollbackVersion);
 });
 $("#kv-keys").addEventListener("click", (event) => {
   const button = event.target.closest("button[data-key]");
@@ -595,6 +816,9 @@ $("#database-list").addEventListener("click", (event) => {
 });
 
 setInterval(() => {
-  if (state.session) loadOverview({ quiet: true });
+  if (state.session) {
+    loadOverview({ quiet: true });
+    loadWorkerOps();
+  }
 }, 10_000);
 boot();

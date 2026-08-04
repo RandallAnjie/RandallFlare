@@ -14,7 +14,7 @@ See [DESIGN.md](./DESIGN.md) for the architecture and consistency
 model. For a repeatable first-server rollout, use the
 [VPS deployment runbook](./docs/DEPLOYMENT.md).
 
-## Status: v0.5 (pre-release)
+## Status: v0.6 (pre-release)
 
 Working today, verified by multi-process fault-injection e2e tests:
 
@@ -42,6 +42,12 @@ Working today, verified by multi-process fault-injection e2e tests:
   are independently verified by every node; there is no account database or
   central authentication service. Worker changes use one-time CLI approval so
   operator private keys never live on nodes or in browsers.
+- **Git-native Worker delivery**: connect a public or private GitHub repository,
+  select a branch and monorepo root, run zero-config or bubblewrap-sandboxed
+  builds, watch live logs, approve the exact output Manifest, and observe its
+  rollout on every node. Push webhooks, immutable build history, runtime logs,
+  and signed rollback are built in. Repository settings are operator-signed and
+  replicated; tokens and build processes stay node-local.
 
 Also in: HTTPS ingress (SNI cert store, hot-reload, wildcard files,
 self-signed fallback) and **native workerd kvNamespace bindings** —
@@ -126,6 +132,13 @@ enabled = false                      # hardened service uses external upgrades
 # repo = "RandallAnjie/RandallFlare"
 # interval_minutes = 30
 
+[build]                              # Git-backed Workers
+enabled = true
+git = "/usr/bin/git"
+sandbox = "/usr/bin/bwrap"          # mandatory for custom build commands
+github_token_env = "RF_GITHUB_TOKEN" # optional, private repositories only
+timeout_seconds = 1200
+
 rf run --config rf.toml
 ```
 
@@ -173,6 +186,29 @@ can validate it independently. KV and D1 operations use that grant directly.
 Worker deploy/delete requests prepare a canonical manifest and display another
 one-time code; `rf authorize <code>` signs that exact manifest before it can
 enter the transparency log.
+
+### GitHub builds
+
+Open **Workers → Connect a GitHub repository**. The signed source record covers
+the repository, branch, monorepo root, build command, output directory, private
+token policy, and webhook policy. A zero-config source uses the selected output
+directory as-is; it must contain `rf.json`. A custom command always executes in
+`bubblewrap` with only the checkout writable and no RandallFlare credentials in
+its environment.
+
+For a private repository, put a read-only contents token in the environment of
+the node that will build it:
+
+```bash
+RF_GITHUB_TOKEN=github_pat_…
+```
+
+The console shows a per-Worker webhook URL and derived HMAC secret. Configure a
+GitHub repository webhook for the push event with content type
+`application/json`. Any cluster node can receive a verified push and build;
+the result still waits for `rf authorize <code>` before deployment. After
+approval, content-addressed blobs and the Manifest distribute peer-to-peer and
+the UI reports ready nodes versus total live nodes.
 
 Use HTTPS before treating a public management session as production-safe. The
 first-VPS HTTP address is suitable for isolated testing, but HTTP cannot protect

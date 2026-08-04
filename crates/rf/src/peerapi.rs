@@ -295,8 +295,10 @@ async fn status(
         return r.into_response();
     }
     let node = &api.node;
-    let peers: Vec<serde_json::Value> = node
-        .peers()
+    let peer_views = node.peers();
+    let local_deployments = node.deployment_statuses();
+    let peers: Vec<serde_json::Value> = peer_views
+        .clone()
         .into_iter()
         .map(|(id, v)| {
             serde_json::json!({
@@ -305,6 +307,7 @@ async fn status(
                 "public": v.public,
                 "api": v.api_addr.map(|a| a.to_string()),
                 "ip4": v.ipv4,
+                "deployments": v.deployments,
             })
         })
         .collect();
@@ -318,6 +321,31 @@ async fn status(
             } else {
                 None
             };
+            let mut deployments = vec![serde_json::json!({
+                "node": node.id_hex(),
+                "label": node.cfg.label,
+                "local": true,
+                "status": local_deployments.get(&m.name),
+            })];
+            for (id, peer) in &peer_views {
+                deployments.push(serde_json::json!({
+                    "node": id,
+                    "label": peer.label,
+                    "local": false,
+                    "status": peer.deployments.get(&m.name),
+                }));
+            }
+            let ready_nodes = deployments
+                .iter()
+                .filter(|deployment| {
+                    let status = &deployment["status"];
+                    status["version"].as_u64() == Some(m.version)
+                        && matches!(
+                            status["state"].as_str(),
+                            Some("ready" | "running" | "standby")
+                        )
+                })
+                .count();
             serde_json::json!({
                 "name": m.name,
                 "version": m.version,
@@ -328,6 +356,11 @@ async fn status(
                 "durable_objects": has_do,
                 "durable_owner": do_owner,
                 "durable_owned_here": has_do && api.durable.is_owner(&m.name),
+                "distribution": {
+                    "ready": ready_nodes,
+                    "total": deployments.len(),
+                    "nodes": deployments,
+                },
             })
         })
         .collect();
@@ -546,8 +579,16 @@ async fn authorization_post(
             Err(error) => return (StatusCode::FORBIDDEN, error.to_string()).into_response(),
         };
 
-    if approved.kind == crate::management::ApprovalKind::Manifest {
-        let result = ingest_manifest_envelope(&api, &approved.envelope);
+    if approved.kind != crate::management::ApprovalKind::Login {
+        let result = match approved.kind {
+            crate::management::ApprovalKind::Manifest => {
+                ingest_manifest_envelope(&api, &approved.envelope)
+            }
+            crate::management::ApprovalKind::Source => {
+                crate::build::ingest_source(&api.node, &approved.envelope).map(|_| ())
+            }
+            crate::management::ApprovalKind::Login => unreachable!(),
+        };
         match result {
             Ok(()) => api.node.management.complete(&approved.id, Ok(())),
             Err(error) => {

@@ -479,6 +479,32 @@ fn describe_approval(
                 manifest.crons.len(),
             ))
         }
+        rf::management::ApprovalKind::Source => {
+            let source: rf::build::WorkerSource =
+                postcard::from_bytes(payload).context("node returned an invalid Worker source")?;
+            source
+                .validate()
+                .context("refusing invalid Worker source")?;
+            if source.deleted {
+                Ok(format!(
+                    "Disconnect GitHub repository from Worker {} (source v{})",
+                    source.worker, source.version
+                ))
+            } else {
+                Ok(format!(
+                    "Connect Worker {} to {} branch {} (source v{})\n  root: {}\n  build: {}\n  output: {}\n  private token: {}\n  webhook: {}",
+                    source.worker,
+                    source.repository,
+                    source.branch,
+                    source.version,
+                    source.root,
+                    if source.build_command.is_empty() { "zero-config" } else { &source.build_command },
+                    source.output_dir,
+                    source.use_github_token,
+                    source.webhook,
+                ))
+            }
+        }
     }
 }
 
@@ -501,6 +527,8 @@ fn doctor(config: PathBuf, json: bool) -> Result<()> {
             .filter(|out| out.status.success())
             .map(|out| String::from_utf8_lossy(&out.stdout).trim().to_string())
     });
+    let git = rf::build::configured_binary(cfg.build.git.as_deref(), "git");
+    let sandbox = rf::build::configured_binary(cfg.build.sandbox.as_deref(), "bwrap");
     if let (Some(path), None) = (&configured_workerd, &workerd_version) {
         anyhow::bail!(
             "configured workerd could not be executed successfully: {}",
@@ -510,6 +538,14 @@ fn doctor(config: PathBuf, json: bool) -> Result<()> {
     let mut warnings = Vec::new();
     if workerd_version.is_none() {
         warnings.push("workerd not found; module workers and Durable Objects will be unavailable");
+    }
+    if cfg.build.enabled && git.is_none() {
+        warnings.push("Git builds are enabled but git was not found");
+    }
+    if cfg.build.enabled && sandbox.is_none() {
+        warnings.push(
+            "bubblewrap was not found; zero-config builds work, custom build commands do not",
+        );
     }
     if cfg.public && cfg.ingress.http.is_none() && cfg.ingress.https.is_none() {
         warnings.push("public node has no HTTP or HTTPS ingress listener");
@@ -556,6 +592,10 @@ fn doctor(config: PathBuf, json: bool) -> Result<()> {
         "ingress_https": cfg.ingress.https,
         "workerd": workerd,
         "workerd_version": workerd_version,
+        "build_enabled": cfg.build.enabled,
+        "git": git,
+        "build_sandbox": sandbox,
+        "github_token_configured": std::env::var_os(&cfg.build.github_token_env).is_some(),
         "warnings": warnings,
     });
     if json {
@@ -578,6 +618,15 @@ fn doctor(config: PathBuf, json: bool) -> Result<()> {
         match report["workerd_version"].as_str() {
             Some(version) => println!("runtime: {version}"),
             None => println!("runtime: unavailable (assets-only mode)"),
+        }
+        if cfg.build.enabled {
+            println!(
+                "builds: git={} sandbox={}",
+                report["git"].as_str().unwrap_or("unavailable"),
+                report["build_sandbox"].as_str().unwrap_or("unavailable")
+            );
+        } else {
+            println!("builds: disabled");
         }
         for warning in report["warnings"].as_array().into_iter().flatten() {
             println!("warning: {}", warning.as_str().unwrap_or("unknown warning"));
@@ -692,6 +741,7 @@ async fn run(config_path: PathBuf) -> Result<()> {
     tracing::info!("node {} ({})", keypair.public().short(), cfg.label);
 
     let node = Arc::new(Node::open(cfg, keypair)?);
+    rf::build::recover_interrupted(&node);
 
     let d1_registry: rf::d1::Registry = Default::default();
     let d1_leadership: rf::d1::Leadership = Default::default();

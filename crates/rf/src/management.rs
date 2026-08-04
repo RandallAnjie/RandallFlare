@@ -24,6 +24,7 @@ use std::sync::{Arc, Mutex};
 pub const CONSOLE_GRANT_VERSION: u8 = 1;
 pub const LOGIN_APPROVAL_TTL_MS: u64 = 5 * 60 * 1000;
 pub const MANIFEST_APPROVAL_TTL_MS: u64 = 10 * 60 * 1000;
+pub const SOURCE_APPROVAL_TTL_MS: u64 = 10 * 60 * 1000;
 pub const CONSOLE_SESSION_TTL_MS: u64 = 60 * 60 * 1000;
 pub const MAX_CONSOLE_SESSION_TTL_MS: u64 = 12 * 60 * 60 * 1000;
 const MAX_PENDING: usize = 1024;
@@ -75,9 +76,10 @@ impl ConsoleGrant {
 pub enum ApprovalKind {
     Login,
     Manifest,
+    Source,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CreatedApproval {
     pub id: String,
     pub code: String,
@@ -196,6 +198,44 @@ impl Management {
         )
     }
 
+    /// A manifest produced without a browser session (for example by a
+    /// verified GitHub webhook) is still safe: the operator signs the exact
+    /// canonical manifest, while any authenticated console may observe it.
+    pub fn create_manifest_scoped(
+        &self,
+        session_id: Option<[u8; 32]>,
+        manifest: &WorkerManifest,
+        summary: String,
+    ) -> Result<CreatedApproval> {
+        manifest
+            .validate()
+            .map_err(|error| anyhow::anyhow!("invalid manifest: {error}"))?;
+        let payload = postcard::to_stdvec(manifest)?;
+        self.create(
+            ApprovalKind::Manifest,
+            summary,
+            payload,
+            session_id,
+            MANIFEST_APPROVAL_TTL_MS,
+        )
+    }
+
+    pub fn create_source(
+        &self,
+        session_id: [u8; 32],
+        source: &crate::build::WorkerSource,
+        summary: String,
+    ) -> Result<CreatedApproval> {
+        source.validate()?;
+        self.create(
+            ApprovalKind::Source,
+            summary,
+            postcard::to_stdvec(source)?,
+            Some(session_id),
+            SOURCE_APPROVAL_TTL_MS,
+        )
+    }
+
     fn create(
         &self,
         kind: ApprovalKind,
@@ -305,6 +345,13 @@ impl Management {
                     .map_err(|error| anyhow::anyhow!("invalid manifest: {error}"))?;
                 approval.status = Status::Approved(envelope.clone());
             }
+            ApprovalKind::Source => {
+                let source: crate::build::WorkerSource = envelope
+                    .open(Some(operator))
+                    .map_err(|error| anyhow::anyhow!("invalid source approval: {error}"))?;
+                source.validate()?;
+                approval.status = Status::Approved(envelope.clone());
+            }
         }
         Ok(ApprovedPayload {
             id,
@@ -336,6 +383,40 @@ impl Management {
         self.poll(id, Some(session_id), ApprovalKind::Manifest)
     }
 
+    pub fn poll_source(&self, id: &str, session_id: [u8; 32]) -> Result<ApprovalPoll> {
+        self.poll(id, Some(session_id), ApprovalKind::Source)
+    }
+
+    /// Internal build-manager observation, never exposed without console auth.
+    pub fn poll_internal(&self, id: &str) -> Result<ApprovalPoll> {
+        let now = now_ms();
+        let mut inner = self.inner.lock().unwrap();
+        cleanup(&mut inner, now);
+        let approval = inner
+            .by_id
+            .get(id)
+            .ok_or_else(|| anyhow::anyhow!("approval not found or expired"))?;
+        Ok(poll_value(approval))
+    }
+
+    /// An authenticated console may observe unscoped webhook approvals, or
+    /// approvals created by its own session.
+    pub fn poll_console(&self, id: &str, session_id: [u8; 32]) -> Result<ApprovalPoll> {
+        let now = now_ms();
+        let mut inner = self.inner.lock().unwrap();
+        cleanup(&mut inner, now);
+        let approval = inner
+            .by_id
+            .get(id)
+            .ok_or_else(|| anyhow::anyhow!("approval not found or expired"))?;
+        if approval.kind == ApprovalKind::Login
+            || (approval.session_id.is_some() && approval.session_id != Some(session_id))
+        {
+            bail!("approval does not belong to this session");
+        }
+        Ok(poll_value(approval))
+    }
+
     fn poll(
         &self,
         id: &str,
@@ -350,21 +431,25 @@ impl Management {
             .get(id)
             .ok_or_else(|| anyhow::anyhow!("approval not found or expired"))?;
         if approval.kind != expected_kind
-            || (expected_kind == ApprovalKind::Manifest && approval.session_id != session_id)
+            || (expected_kind != ApprovalKind::Login && approval.session_id != session_id)
         {
             bail!("approval does not belong to this session");
         }
-        let (state, envelope, error) = match &approval.status {
-            Status::Pending | Status::Approved(_) => (ApprovalState::Pending, None, None),
-            Status::Completed(envelope) => (ApprovalState::Completed, Some(envelope.clone()), None),
-            Status::Failed(error) => (ApprovalState::Failed, None, Some(error.clone())),
-        };
-        Ok(ApprovalPoll {
-            state,
-            envelope,
-            error,
-            summary: approval.summary.clone(),
-        })
+        Ok(poll_value(approval))
+    }
+}
+
+fn poll_value(approval: &PendingApproval) -> ApprovalPoll {
+    let (state, envelope, error) = match &approval.status {
+        Status::Pending | Status::Approved(_) => (ApprovalState::Pending, None, None),
+        Status::Completed(envelope) => (ApprovalState::Completed, Some(envelope.clone()), None),
+        Status::Failed(error) => (ApprovalState::Failed, None, Some(error.clone())),
+    };
+    ApprovalPoll {
+        state,
+        envelope,
+        error,
+        summary: approval.summary.clone(),
     }
 }
 

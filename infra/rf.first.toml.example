@@ -26,6 +26,15 @@ workerd = "/usr/local/bin/workerd"
 port_base = 30100
 allow_local_durable_objects = false
 
+[build]
+# Repository definitions replicate, while credentials and build processes stay
+# on the node receiving the build request. Custom commands require bubblewrap.
+enabled = true
+git = "/usr/bin/git"
+sandbox = "/usr/bin/bwrap"
+github_token_env = "RF_GITHUB_TOKEN"
+timeout_seconds = 1200
+
 [d1]
 compact_threshold = 4096
 keep_tail = 256
