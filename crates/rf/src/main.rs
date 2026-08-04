@@ -156,6 +156,23 @@ enum Cmd {
         #[command(subcommand)]
         cmd: EmailCmd,
     },
+    /// 聚合所有存活节点上的 Worker 请求日志。
+    Requests {
+        worker: String,
+        #[arg(long)]
+        hostname: Option<String>,
+        /// 状态码类别：2、3、4 或 5。
+        #[arg(long)]
+        status_class: Option<u16>,
+        #[arg(long, default_value_t = 200)]
+        limit: usize,
+        #[arg(long)]
+        json: bool,
+        #[arg(long, env = "RF_NODE")]
+        node: String,
+        #[arg(long, env = "RF_CLUSTER_SECRET")]
+        secret: String,
+    },
     /// Fetch and verify a worker's transparency log (hash chain).
     Log {
         worker: String,
@@ -2651,6 +2668,112 @@ async fn async_main(cli: Cli) -> Result<()> {
                 Ok(())
             }
         },
+        Cmd::Requests {
+            worker,
+            hostname,
+            status_class,
+            limit,
+            json,
+            node,
+            secret,
+        } => {
+            if !rf_core::manifest::valid_name(&worker) {
+                anyhow::bail!("Worker 名称无效");
+            }
+            if status_class.is_some_and(|class| !(2..=5).contains(&class)) {
+                anyhow::bail!("--status-class 必须是 2、3、4 或 5");
+            }
+            let client = PeerClient::new(secret_bytes(&secret)?);
+            let candidates = client.live_api_candidates(&node).await?;
+            let results = futures_util::future::join_all(candidates.iter().map(|base| {
+                let client = client.clone();
+                let base = base.clone();
+                let worker = worker.clone();
+                let hostname = hostname.clone();
+                async move {
+                    (
+                        base.clone(),
+                        client
+                            .worker_request_logs(
+                                &base,
+                                &worker,
+                                hostname.as_deref(),
+                                status_class,
+                                limit,
+                            )
+                            .await,
+                    )
+                }
+            }))
+            .await;
+            let mut snapshots = Vec::new();
+            let mut unavailable = Vec::new();
+            for (base, result) in results {
+                match result {
+                    Ok(snapshot) => snapshots.push(snapshot),
+                    Err(_) => unavailable.push(base),
+                }
+            }
+            if snapshots.is_empty() {
+                anyhow::bail!("所有存活节点的请求日志均暂时不可用");
+            }
+            let merged = rf::observability::merge_snapshots(&snapshots, limit);
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::json!({
+                        "worker": worker,
+                        "nodes": snapshots.iter().map(|snapshot| serde_json::json!({
+                            "id": snapshot.node,
+                            "label": snapshot.label,
+                        })).collect::<Vec<_>>(),
+                        "unavailable_nodes": unavailable,
+                        "hostnames": merged.hostnames,
+                        "hours": merged.hours,
+                        "entries": merged.entries,
+                        "privacy": "不记录查询参数、请求头、请求体、Cookie、IP 或 User-Agent",
+                    }))?
+                );
+                return Ok(());
+            }
+            let total: u64 = merged
+                .hours
+                .iter()
+                .map(|hour| {
+                    hour.status_2xx
+                        + hour.status_3xx
+                        + hour.status_4xx
+                        + hour.status_5xx
+                        + hour.other
+                })
+                .sum();
+            println!(
+                "{worker}：{} 个节点可用，{} 个节点暂不可用，24 小时 {total} 次请求",
+                snapshots.len(),
+                unavailable.len()
+            );
+            let labels: std::collections::BTreeMap<&str, &str> = snapshots
+                .iter()
+                .map(|snapshot| (snapshot.node.as_str(), snapshot.label.as_str()))
+                .collect();
+            for entry in merged.entries {
+                println!(
+                    "{}  {:<4} {:<3} {:>6}ms  {:<16}  {}{}  v{}",
+                    format_request_time(entry.called_at_ms),
+                    entry.status_code,
+                    entry.method,
+                    entry.duration_ms,
+                    labels
+                        .get(entry.node.as_str())
+                        .copied()
+                        .unwrap_or(entry.node.as_str()),
+                    entry.hostname,
+                    entry.path,
+                    entry.version,
+                );
+            }
+            Ok(())
+        }
         Cmd::Log {
             worker,
             node,
@@ -2682,6 +2805,18 @@ async fn async_main(cli: Cli) -> Result<()> {
             Ok(())
         }
     }
+}
+
+fn format_request_time(timestamp_ms: u64) -> String {
+    let seconds = (timestamp_ms / 1_000).min(i64::MAX as u64) as i64;
+    time::OffsetDateTime::from_unix_timestamp(seconds)
+        .ok()
+        .and_then(|value| {
+            value
+                .format(&time::format_description::well_known::Rfc3339)
+                .ok()
+        })
+        .unwrap_or_else(|| timestamp_ms.to_string())
 }
 
 fn describe_approval(
@@ -3169,6 +3304,7 @@ async fn run(config_path: PathBuf) -> Result<()> {
 
     rf::cron_driver::spawn(node.clone());
     rf::queue::spawn_dispatcher(node.clone());
+    rf::observability::spawn(node.clone());
 
     if let Some(dns_cfg) = node.cfg.dns.clone() {
         match std::env::var(&dns_cfg.api_token_env) {

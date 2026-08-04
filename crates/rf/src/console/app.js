@@ -24,6 +24,7 @@ const state = {
   workerFile: null,
   cronRuns: [],
   cronDlq: [],
+  requestLogs: null,
   projectTab: "overview",
   r2Buckets: [],
   r2Active: null,
@@ -449,7 +450,7 @@ function switchProjectTab(tab) {
   state.projectTab = tab;
   $$('[data-project-tab]').forEach((button) => button.classList.toggle("active", button.dataset.projectTab === tab));
   $$(".project-tab").forEach((panel) => panel.classList.toggle("active", panel.id === `project-tab-${tab}`));
-  if (tab === "logs") loadDetailLogs();
+  if (tab === "logs") Promise.all([loadRequestLogs(), loadDetailLogs()]);
   if (tab === "deployments") loadDetailHistory();
   if (tab === "triggers" && state.activeWorker) loadCronRuns();
   if (tab === "code" && state.workerDetail && !state.workerFile) {
@@ -794,7 +795,7 @@ async function openWorkerDetail(name, tab = "overview") {
     if (state.activeWorker !== name) return;
     state.workerDetail = data;
     renderWorkerDetail(data);
-    await Promise.all([loadDetailHistory(), tab === "logs" ? loadDetailLogs() : Promise.resolve()]);
+    await Promise.all([loadDetailHistory(), tab === "logs" ? Promise.all([loadRequestLogs(), loadDetailLogs()]) : Promise.resolve()]);
   } catch (error) {
     toast(error.message, true);
     switchView("workers");
@@ -821,10 +822,59 @@ async function loadDetailLogs() {
     const data = await api(`/api/workers/${encodeURIComponent(name)}/runtime-log?limit=500`);
     if (state.activeWorker !== name) return;
     const streams = { system: "系统", stdout: "标准输出", stderr: "标准错误" };
-    $("#detail-log-meta").textContent = `节点 ${shortId(data.node, 20)} · 最近 ${data.lines?.length || 0} 条`;
-    $("#detail-logs").textContent = (data.lines || []).map((line) => `${new Date(line.at_ms).toLocaleString("zh-CN")} [v${line.version}] [${streams[line.stream] || line.stream}] ${line.message}`).join("\n") || "当前节点尚未记录运行输出。";
+    const unavailable = data.unavailable_nodes?.length || 0;
+    $("#detail-log-meta").textContent = `${data.nodes?.length || 0} 个节点可用${unavailable ? ` · ${unavailable} 个节点暂不可用` : ""} · 最近 ${data.lines?.length || 0} 条`;
+    $("#detail-logs").textContent = (data.lines || []).map((line) => `${new Date(line.at_ms).toLocaleString("zh-CN")} [${line.node_label || shortId(line.node, 10)}] [v${line.version}] [${streams[line.stream] || line.stream}] ${line.message}`).join("\n") || "所有存活节点均尚未记录运行输出。";
   } catch (error) {
     $("#detail-logs").textContent = error.message;
+  }
+}
+
+function renderRequestTrend(hours = []) {
+  const totals = hours.map((hour) => (hour.status_2xx || 0) + (hour.status_3xx || 0) + (hour.status_4xx || 0) + (hour.status_5xx || 0) + (hour.other || 0));
+  const maximum = Math.max(1, ...totals);
+  const chart = hours.map((hour, index) => {
+    const when = new Date(hour.start_ms);
+    const total = totals[index];
+    const title = `${when.toLocaleString("zh-CN", { month: "2-digit", day: "2-digit", hour: "2-digit" })}：${total} 次（2xx ${hour.status_2xx || 0}，3xx ${hour.status_3xx || 0}，4xx ${hour.status_4xx || 0}，5xx ${hour.status_5xx || 0}）`;
+    // Height classes keep the chart compatible with the console's strict
+    // style-src CSP; inline styles are intentionally forbidden.
+    const height = (value) => `h${Math.round(Math.max(0, Number(value || 0)) / maximum * 10)}`;
+    const label = index % 6 === 0 || index === hours.length - 1 ? `${String(when.getHours()).padStart(2, "0")}:00` : "";
+    return `<div class="request-hour" title="${escapeHtml(title)}"><div class="request-hour-stack"><span class="s2 ${height(hour.status_2xx)}"></span><span class="s3 ${height(hour.status_3xx)}"></span><span class="s4 ${height(hour.status_4xx)}"></span><span class="s5 ${height(hour.status_5xx)}"></span><span class="so ${height(hour.other)}"></span></div><small>${label}</small></div>`;
+  }).join("");
+  $("#request-log-trend").innerHTML = `<div class="request-trend-grid">${chart || '<div class="empty-state">暂无趋势数据。</div>'}</div>`;
+  $("#request-log-trend").setAttribute("aria-label", `最近 24 小时共 ${totals.reduce((sum, value) => sum + value, 0)} 次请求`);
+}
+
+async function loadRequestLogs() {
+  const name = state.activeWorker;
+  if (!name) return;
+  const selectedHostname = $("#request-log-hostname")?.value || "";
+  const selectedStatus = $("#request-log-status")?.value || "";
+  $("#request-log-rows").innerHTML = '<tr><td colspan="7" class="empty-cell">正在聚合各节点请求日志…</td></tr>';
+  try {
+    const params = new URLSearchParams({ limit: "300" });
+    if (selectedHostname) params.set("hostname", selectedHostname);
+    if (selectedStatus) params.set("status", selectedStatus);
+    const data = await api(`/api/workers/${encodeURIComponent(name)}/request-log?${params}`);
+    if (state.activeWorker !== name) return;
+    state.requestLogs = data;
+    const hostnames = [...new Set([...(data.hostnames || []), selectedHostname].filter(Boolean))].sort();
+    $("#request-log-hostname").innerHTML = `<option value="">全部域名</option>${hostnames.map((hostname) => `<option value="${escapeHtml(hostname)}"${hostname === selectedHostname ? " selected" : ""}>${escapeHtml(hostname)}</option>`).join("")}`;
+    const unavailable = data.unavailable_nodes?.length || 0;
+    const count24h = (data.hours || []).reduce((sum, hour) => sum + (hour.status_2xx || 0) + (hour.status_3xx || 0) + (hour.status_4xx || 0) + (hour.status_5xx || 0) + (hour.other || 0), 0);
+    $("#request-log-meta").textContent = `${data.nodes?.length || 0} 个节点可用${unavailable ? ` · ${unavailable} 个节点暂不可用` : ""} · 24 小时 ${count24h} 次请求 · 当前显示 ${data.entries?.length || 0} 条`;
+    renderRequestTrend(data.hours || []);
+    const labels = new Map((data.nodes || []).map((node) => [node.id, node.label || shortId(node.id, 10)]));
+    $("#request-log-rows").innerHTML = (data.entries || []).map((entry) => {
+      const statusClass = `s${Math.floor(Number(entry.status_code) / 100)}`;
+      return `<tr><td>${escapeHtml(new Date(entry.called_at_ms).toLocaleString("zh-CN"))}</td><td title="${escapeHtml(entry.node)}">${escapeHtml(labels.get(entry.node) || shortId(entry.node, 10))}</td><td><div class="request-path" title="${escapeHtml(entry.path)}"><span class="request-method">${escapeHtml(entry.method)}</span>${escapeHtml(entry.path)}</div></td><td>${escapeHtml(entry.hostname)}</td><td><span class="request-status ${statusClass}">${escapeHtml(entry.status_code)}</span></td><td>${escapeHtml(entry.duration_ms)} ms</td><td>v${escapeHtml(entry.version)}</td></tr>`;
+    }).join("") || '<tr><td colspan="7" class="empty-cell">当前筛选条件下尚无请求记录。</td></tr>';
+  } catch (error) {
+    $("#request-log-meta").textContent = error.message;
+    $("#request-log-trend").innerHTML = "";
+    $("#request-log-rows").innerHTML = `<tr><td colspan="7" class="empty-cell">${escapeHtml(error.message)}</td></tr>`;
   }
 }
 
@@ -3312,6 +3362,11 @@ $("#project-source-form").addEventListener("submit", saveProjectSource);
 $("#project-source-disconnect").addEventListener("click", () => state.activeWorker && disconnectSource(state.activeWorker));
 $("#project-delete").addEventListener("click", () => state.activeWorker && deleteWorker(state.activeWorker));
 $("#detail-refresh-logs").addEventListener("click", loadDetailLogs);
+$("#detail-refresh-requests").addEventListener("click", loadRequestLogs);
+$("#request-log-filter").addEventListener("submit", (event) => {
+  event.preventDefault();
+  loadRequestLogs();
+});
 $("#refresh").addEventListener("click", async () => {
   await loadOverview();
   await loadR2({ quiet: true });

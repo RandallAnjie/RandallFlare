@@ -8,6 +8,7 @@
 //!   claims:     "task\0holder_hex"   → claim Envelope
 //!   kv:         "ns\0key"            → KvEntry (postcard)
 
+use crate::observability::{RequestAggregate, RequestLogEntry};
 use anyhow::{Context, Result};
 use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition};
 use rf_core::envelope::Envelope;
@@ -24,6 +25,8 @@ const D1LOG: TableDefinition<&str, &[u8]> = TableDefinition::new("d1_log");
 /// Transparency log: every manifest envelope ever accepted, keyed
 /// "name\0<version zero-padded>" so range scans return version order.
 const LOG: TableDefinition<&str, &[u8]> = TableDefinition::new("manifest_log");
+/// Node-local Worker request metadata. The key preserves worker/time ordering.
+const REQUEST_LOGS: TableDefinition<&str, &[u8]> = TableDefinition::new("request_logs");
 
 pub struct Store {
     db: Database,
@@ -50,6 +53,7 @@ impl Store {
             tx.open_table(LOG)?;
             tx.open_table(D1META)?;
             tx.open_table(D1LOG)?;
+            tx.open_table(REQUEST_LOGS)?;
         }
         tx.commit()?;
         Ok(Self { db })
@@ -294,6 +298,108 @@ impl Store {
         }
         Ok(out)
     }
+
+    // ---- node-local Worker request logs ----
+
+    fn request_log_key(entry: &RequestLogEntry) -> String {
+        format!("{}\0{:020}\0{}", entry.worker, entry.called_at_ms, entry.id)
+    }
+
+    pub fn put_request_logs(&self, entries: &[RequestLogEntry]) -> Result<()> {
+        if entries.is_empty() {
+            return Ok(());
+        }
+        let encoded = entries
+            .iter()
+            .map(|entry| Ok((Self::request_log_key(entry), postcard::to_stdvec(entry)?)))
+            .collect::<Result<Vec<(String, Vec<u8>)>>>()?;
+        let tx = self.db.begin_write()?;
+        {
+            let mut table = tx.open_table(REQUEST_LOGS)?;
+            for (key, value) in &encoded {
+                table.insert(key.as_str(), value.as_slice())?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn load_request_logs(
+        &self,
+        worker: &str,
+        hostname: Option<&str>,
+        status_class: Option<u16>,
+        limit: usize,
+    ) -> Result<Vec<RequestLogEntry>> {
+        let tx = self.db.begin_read()?;
+        let table = tx.open_table(REQUEST_LOGS)?;
+        let start = format!("{worker}\0");
+        let end = format!("{worker}\x01");
+        let mut entries = Vec::new();
+        for item in table.range::<&str>(start.as_str()..end.as_str())?.rev() {
+            let (_, value) = item?;
+            let entry: RequestLogEntry =
+                postcard::from_bytes(value.value()).context("corrupt request log entry")?;
+            if crate::observability::entry_matches(&entry, hostname, status_class) {
+                entries.push(entry);
+                if entries.len() >= limit {
+                    break;
+                }
+            }
+        }
+        Ok(entries)
+    }
+
+    pub fn request_log_aggregate(
+        &self,
+        worker: &str,
+        since_ms: u64,
+        hostname: Option<&str>,
+    ) -> Result<RequestAggregate> {
+        let tx = self.db.begin_read()?;
+        let table = tx.open_table(REQUEST_LOGS)?;
+        let start = format!("{worker}\0{:020}\0", since_ms);
+        let end = format!("{worker}\x01");
+        let mut hostnames = std::collections::BTreeSet::new();
+        let mut hours = std::collections::BTreeMap::new();
+        for item in table.range::<&str>(start.as_str()..end.as_str())? {
+            let (_, value) = item?;
+            let entry: RequestLogEntry =
+                postcard::from_bytes(value.value()).context("corrupt request log entry")?;
+            hostnames.insert(entry.hostname.clone());
+            if hostname.is_none_or(|selected| selected == entry.hostname) {
+                let hour = entry.called_at_ms / 3_600_000 * 3_600_000;
+                crate::observability::add_status(
+                    hours.entry(hour).or_insert([0u64; 5]),
+                    entry.status_code,
+                );
+            }
+        }
+        Ok((hostnames, hours))
+    }
+
+    pub fn delete_request_logs_before(&self, cutoff_ms: u64) -> Result<usize> {
+        let tx = self.db.begin_write()?;
+        let removed;
+        {
+            let mut table = tx.open_table(REQUEST_LOGS)?;
+            let mut stale = Vec::new();
+            for item in table.range::<&str>(..)? {
+                let (key, value) = item?;
+                let entry: RequestLogEntry =
+                    postcard::from_bytes(value.value()).context("corrupt request log entry")?;
+                if entry.called_at_ms < cutoff_ms {
+                    stale.push(key.value().to_string());
+                }
+            }
+            removed = stale.len();
+            for key in stale {
+                table.remove(key.as_str())?;
+            }
+        }
+        tx.commit()?;
+        Ok(removed)
+    }
 }
 
 #[cfg(test)]
@@ -355,6 +461,61 @@ mod tests {
         }
         let store = Store::open(&path).unwrap();
         assert_eq!(store.load_claims().unwrap().len(), 1);
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn request_logs_batch_filter_aggregate_and_expire() {
+        let path = tmp();
+        let store = Store::open(&path).unwrap();
+        let make =
+            |id: &str, hostname: &str, status_code: u16, called_at_ms: u64| RequestLogEntry {
+                id: id.into(),
+                worker: "observed-worker".into(),
+                version: 3,
+                node: "node-a".into(),
+                hostname: hostname.into(),
+                method: "GET".into(),
+                path: "/without-query".into(),
+                status_code,
+                duration_ms: 7,
+                called_at_ms,
+            };
+        store
+            .put_request_logs(&[
+                make("one", "a.test", 204, 3_600_001),
+                make("two", "b.test", 503, 7_200_001),
+            ])
+            .unwrap();
+        let filtered = store
+            .load_request_logs("observed-worker", Some("b.test"), Some(5), 10)
+            .unwrap();
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].id, "two");
+        let (hostnames, hours) = store
+            .request_log_aggregate("observed-worker", 0, None)
+            .unwrap();
+        assert_eq!(hostnames.len(), 2);
+        assert_eq!(hours[&3_600_000], [1, 0, 0, 0, 0]);
+        assert_eq!(hours[&7_200_000], [0, 0, 0, 1, 0]);
+        assert_eq!(store.delete_request_logs_before(7_000_000).unwrap(), 1);
+        assert_eq!(
+            store
+                .load_request_logs("observed-worker", None, None, 10)
+                .unwrap()
+                .len(),
+            1
+        );
+        drop(store);
+        let store = Store::open(&path).unwrap();
+        assert_eq!(
+            store
+                .load_request_logs("observed-worker", None, None, 10)
+                .unwrap()[0]
+                .id,
+            "two"
+        );
+        drop(store);
         std::fs::remove_file(&path).ok();
     }
 }

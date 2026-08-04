@@ -190,7 +190,7 @@ async fn default_ingress_console_uses_operator_approved_cluster_session() {
         .unwrap();
     assert_eq!(committed["state"], "completed");
     let worker = http
-        .get(&ingress)
+        .get(format!("{ingress}/?access_token=must-not-be-recorded"))
         .header("host", "admin-worker.test")
         .send()
         .await
@@ -282,6 +282,42 @@ async fn default_ingress_console_uses_operator_approved_cluster_session() {
     let log = client.worker_log(&node.api, "admin-worker").await.unwrap();
     assert!(rf_core::manifest::verify_chain(&log, &operator_any.signer_id()).is_ok());
     assert_eq!(log.len(), 2);
+
+    // Request observability traverses the encrypted peer API, but its data
+    // model intentionally cannot contain query strings, headers or bodies.
+    let requests = client
+        .worker_request_logs(
+            &node.api,
+            "admin-worker",
+            Some("admin-worker.test"),
+            Some(2),
+            20,
+        )
+        .await
+        .unwrap();
+    assert!(!requests.entries.is_empty());
+    assert!(requests
+        .entries
+        .iter()
+        .all(|entry| entry.path == "/" && !entry.path.contains("access_token")));
+    assert_eq!(requests.hours.len(), 24);
+    let console_requests: serde_json::Value = http
+        .get(format!(
+            "{ingress}/api/workers/admin-worker/request-log?status=2xx&limit=20"
+        ))
+        .header("cookie", &cookie)
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(console_requests["nodes"].as_array().unwrap().len(), 1);
+    assert!(!console_requests["entries"].as_array().unwrap().is_empty());
+    let encoded = serde_json::to_string(&console_requests).unwrap();
+    assert!(!encoded.contains("must-not-be-recorded"));
 }
 
 fn free_port() -> u16 {

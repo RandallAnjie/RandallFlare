@@ -375,6 +375,41 @@ button.build-row:hover { border-color: #444; background: #0e0e0e; }
 .result-head { display: flex; justify-content: space-between; align-items: center; margin-top: 22px; }
 .result { min-height: 170px; max-height: 420px; overflow: auto; background: #030303; border: 1px solid var(--line-soft); border-radius: 7px; padding: 14px; color: #d4d4d4; font-size: 11px; line-height: 1.55; white-space: pre-wrap; }
 .log-output { min-height: 380px; max-height: 58vh; margin-top: 14px; white-space: pre-wrap; overflow-wrap: anywhere; }
+.runtime-log-panel { margin-top: 16px; }
+.request-log-filter { display: grid; grid-template-columns: minmax(170px, .9fr) minmax(170px, .7fr) auto; gap: 10px; align-items: end; margin-bottom: 15px; }
+.request-trend { margin: 15px 0 18px; overflow-x: auto; border: 1px solid var(--line-soft); border-radius: 7px; background: #050505; }
+.request-trend:focus-visible, .request-table-wrap:focus-visible { outline: 2px solid #777; outline-offset: 2px; }
+.request-trend-grid { display: grid; grid-template-columns: repeat(24, minmax(18px, 1fr)); gap: 5px; align-items: end; min-width: 640px; height: 154px; padding: 18px 14px 10px; }
+.request-hour { min-width: 0; display: grid; grid-template-rows: 110px 14px; gap: 5px; align-items: end; text-align: center; }
+.request-hour-stack { height: 110px; display: flex; flex-direction: column-reverse; justify-content: flex-start; overflow: hidden; border-radius: 2px 2px 0 0; background: #151515; }
+.request-hour-stack span { display: block; min-height: 0; }
+.request-hour-stack .s2 { background: #3cad6c; }
+.request-hour-stack .s3 { background: #4b8fdf; }
+.request-hour-stack .s4 { background: #d29a3e; }
+.request-hour-stack .s5 { background: #d85c5c; }
+.request-hour-stack .so { background: #777; }
+.request-hour-stack .h0 { height: 0; }
+.request-hour-stack .h1 { height: 10%; }
+.request-hour-stack .h2 { height: 20%; }
+.request-hour-stack .h3 { height: 30%; }
+.request-hour-stack .h4 { height: 40%; }
+.request-hour-stack .h5 { height: 50%; }
+.request-hour-stack .h6 { height: 60%; }
+.request-hour-stack .h7 { height: 70%; }
+.request-hour-stack .h8 { height: 80%; }
+.request-hour-stack .h9 { height: 90%; }
+.request-hour-stack .h10 { height: 100%; }
+.request-hour small { color: var(--muted); font: 9px "Geist Mono", monospace; white-space: nowrap; }
+.request-table-wrap { overflow-x: auto; }
+.request-table-wrap table { min-width: 860px; }
+.request-path { max-width: 300px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font: 11px "Geist Mono", monospace; }
+.request-method { display: inline-block; min-width: 38px; margin-right: 7px; color: var(--muted); font: 600 10px "Geist Mono", monospace; }
+.request-status { display: inline-flex; min-width: 38px; justify-content: center; padding: 3px 6px; border: 1px solid var(--line); border-radius: 999px; font: 600 10px "Geist Mono", monospace; }
+.request-status.s2 { color: var(--success); border-color: #245f3d; background: #0b1b12; }
+.request-status.s3 { color: #78b7ff; border-color: #294d73; background: #0b1520; }
+.request-status.s4 { color: #f4bd5a; border-color: #694d1e; background: #211807; }
+.request-status.s5 { color: #ff8e8e; border-color: #713838; background: #230d0d; }
+.empty-cell { color: var(--muted); text-align: center; padding: 28px 12px; }
 
 dialog { width: min(720px, calc(100vw - 32px)); max-height: 80vh; color: var(--text); background: var(--surface); border: 1px solid #383838; border-radius: 10px; padding: 21px; box-shadow: 0 30px 100px #000; }
 dialog::backdrop { background: #000c; backdrop-filter: blur(3px); }
@@ -417,6 +452,10 @@ dialog::backdrop { background: #000c; backdrop-filter: blur(3px); }
   .metric strong { font-size: 26px; }
   .inline-form, .form-grid { grid-template-columns: 1fr; }
   .r2-upload-form { grid-template-columns: 1fr; }
+  .request-log-filter { grid-template-columns: 1fr; }
+  .request-log-filter button { width: 100%; }
+  .request-observability .panel-head, .runtime-log-panel .panel-head { align-items: stretch; flex-direction: column; }
+  .request-observability .panel-head button, .runtime-log-panel .panel-head button { width: 100%; }
   .node-row { grid-template-columns: 10px 1fr auto; }
   .node-address { grid-column: 2; }
   .loading-line { left: 0; }

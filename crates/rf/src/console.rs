@@ -228,6 +228,7 @@ pub fn router(state: ConsoleState) -> Router {
         )
         .route("/api/workers/{name}/log", get(worker_log))
         .route("/api/workers/{name}/runtime-log", get(worker_runtime_log))
+        .route("/api/workers/{name}/request-log", get(worker_request_log))
         .route("/api/workers/{name}/build", post(worker_build))
         .route("/api/workers/{name}/files", post(worker_files_update))
         .route("/api/workers/{name}/files/{*path}", get(worker_file_get))
@@ -841,9 +842,7 @@ async fn current_manifest(
         return Err(ApiError::bad_request("Worker 名称无效"));
     }
     let envelopes = state.client.worker_log(&state.node, name).await?;
-    let operator = state
-        .operator_id()
-        .ok_or_else(|| ApiError::upstream("无法确定部署清单的签名者"))?;
+    let operator = configured_operator(state).await?;
     let chain = rf_core::manifest::verify_chain(&envelopes, &operator)
         .map_err(|error| ApiError::upstream(manifest_error_zh(error)))?;
     let manifest = chain
@@ -856,6 +855,21 @@ async fn current_manifest(
         .map(rf_core::envelope::Envelope::digest)
         .ok_or_else(|| ApiError::not_found("未找到 Worker 部署清单"))?;
     Ok((manifest, digest))
+}
+
+async fn configured_operator(state: &ConsoleState) -> ApiResult<rf_core::identity::SignerId> {
+    if let Some(operator) = state.operator_id() {
+        return Ok(operator);
+    }
+    state
+        .client
+        .status(&state.node)
+        .await?
+        .get("operator")
+        .and_then(Value::as_str)
+        .ok_or_else(|| ApiError::upstream("节点状态缺少管理员公钥身份"))?
+        .parse()
+        .map_err(|error| ApiError::upstream(format!("节点返回的管理员身份无效：{error}")))
 }
 
 async fn worker_get(
@@ -2314,9 +2328,7 @@ async fn worker_log(
     let signer = if envelopes.is_empty() {
         None
     } else {
-        state
-            .operator_id()
-            .or_else(|| envelopes.first().map(|envelope| envelope.signer))
+        Some(configured_operator(&state).await?)
     };
     let chain = match signer {
         Some(signer) => rf_core::manifest::verify_chain(&envelopes, &signer)
@@ -2346,6 +2358,10 @@ fn default_log_limit() -> usize {
     300
 }
 
+async fn cluster_api_candidates(state: &ConsoleState) -> ApiResult<Vec<String>> {
+    Ok(state.client.live_api_candidates(&state.node).await?)
+}
+
 async fn worker_runtime_log(
     State(state): State<ConsoleState>,
     Path(name): Path<String>,
@@ -2354,11 +2370,140 @@ async fn worker_runtime_log(
     if !valid_name(&name) {
         return Err(ApiError::bad_request("Worker 名称无效"));
     }
-    let node = state.public_node()?;
+    let limit = query.limit.clamp(1, 1_000);
+    let candidates = cluster_api_candidates(&state).await?;
+    let results = futures_util::future::join_all(candidates.iter().map(|base| {
+        let client = state.client.clone();
+        let base = base.clone();
+        let name = name.clone();
+        async move {
+            (
+                base.clone(),
+                client.worker_runtime_logs(&base, &name, limit).await,
+            )
+        }
+    }))
+    .await;
+    let mut lines = Vec::new();
+    let mut nodes = Vec::new();
+    let mut unavailable = Vec::new();
+    for (base, result) in results {
+        match result {
+            Ok(snapshot) => {
+                nodes.push(json!({
+                    "id": snapshot.node.clone(),
+                    "label": snapshot.label.clone(),
+                    "api": base,
+                }));
+                lines.extend(snapshot.lines.into_iter().map(|line| {
+                    json!({
+                        "at_ms": line.at_ms,
+                        "version": line.version,
+                        "stream": line.stream,
+                        "message": line.message,
+                        "node": snapshot.node,
+                        "node_label": snapshot.label,
+                    })
+                }));
+            }
+            Err(_) => unavailable.push(base),
+        }
+    }
+    if nodes.is_empty() {
+        return Err(ApiError::upstream("所有存活节点的运行日志均暂时不可用"));
+    }
+    lines.sort_by_key(|line| line.get("at_ms").and_then(Value::as_u64).unwrap_or(0));
+    if lines.len() > limit {
+        lines.drain(..lines.len() - limit);
+    }
     Ok(Json(json!({
         "worker": name,
-        "node": node.id_hex(),
-        "lines": node.runtime_logs(&name, query.limit),
+        "nodes": nodes,
+        "unavailable_nodes": unavailable,
+        "lines": lines,
+    })))
+}
+
+#[derive(Deserialize)]
+struct WorkerRequestLogQuery {
+    #[serde(default)]
+    hostname: String,
+    #[serde(default)]
+    status: String,
+    #[serde(default = "default_request_log_limit")]
+    limit: usize,
+}
+
+fn default_request_log_limit() -> usize {
+    200
+}
+
+async fn worker_request_log(
+    State(state): State<ConsoleState>,
+    Path(name): Path<String>,
+    Query(query): Query<WorkerRequestLogQuery>,
+) -> ApiResult<Json<Value>> {
+    if !valid_name(&name) {
+        return Err(ApiError::bad_request("Worker 名称无效"));
+    }
+    if query.hostname.len() > 253 {
+        return Err(ApiError::bad_request("域名筛选条件过长"));
+    }
+    let status_class = match query.status.trim().trim_end_matches("xx") {
+        "" | "all" => None,
+        "2" => Some(2),
+        "3" => Some(3),
+        "4" => Some(4),
+        "5" => Some(5),
+        _ => return Err(ApiError::bad_request("状态筛选必须是 2xx、3xx、4xx 或 5xx")),
+    };
+    let hostname = (!query.hostname.is_empty()).then_some(query.hostname.as_str());
+    let limit = query.limit.clamp(1, 1_000);
+    let candidates = cluster_api_candidates(&state).await?;
+    let results = futures_util::future::join_all(candidates.iter().map(|base| {
+        let client = state.client.clone();
+        let base = base.clone();
+        let name = name.clone();
+        let hostname = hostname.map(str::to_string);
+        async move {
+            (
+                base.clone(),
+                client
+                    .worker_request_logs(&base, &name, hostname.as_deref(), status_class, limit)
+                    .await,
+            )
+        }
+    }))
+    .await;
+
+    let mut snapshots = Vec::new();
+    let mut nodes = Vec::new();
+    let mut unavailable = Vec::new();
+    for (base, result) in results {
+        match result {
+            Ok(snapshot) => {
+                nodes.push(json!({
+                    "id": snapshot.node,
+                    "label": snapshot.label,
+                    "api": base,
+                }));
+                snapshots.push(snapshot);
+            }
+            Err(_) => unavailable.push(base),
+        }
+    }
+    if nodes.is_empty() {
+        return Err(ApiError::upstream("所有存活节点的请求日志均暂时不可用"));
+    }
+    let merged = crate::observability::merge_snapshots(&snapshots, limit);
+    Ok(Json(json!({
+        "worker": name,
+        "nodes": nodes,
+        "unavailable_nodes": unavailable,
+        "hostnames": merged.hostnames,
+        "hours": merged.hours,
+        "entries": merged.entries,
+        "privacy": "仅记录方法、无查询参数的路径、状态码与耗时；不记录请求体、请求头、Cookie、IP 或 User-Agent。",
     })))
 }
 

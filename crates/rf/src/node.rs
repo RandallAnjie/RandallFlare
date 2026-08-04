@@ -49,7 +49,7 @@ pub struct DeploymentStatus {
     pub updated_at_ms: u64,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RuntimeLogLine {
     pub at_ms: u64,
     pub version: u64,
@@ -81,6 +81,8 @@ pub struct Inner {
     pub worker_ports: HashMap<String, u16>,
     pub runtime_status: HashMap<String, DeploymentStatus>,
     pub runtime_logs: HashMap<String, VecDeque<RuntimeLogLine>>,
+    /// Request metadata waiting for the next one-second redb batch.
+    pub pending_request_logs: VecDeque<crate::observability::RequestLogEntry>,
     /// Loopback port of the kvbind server (set at daemon start).
     pub kvbind_port: u16,
     /// Loopback port of the native workerd R2 binding adapter.
@@ -150,6 +152,7 @@ impl Node {
             worker_ports: HashMap::new(),
             runtime_status: HashMap::new(),
             runtime_logs: HashMap::new(),
+            pending_request_logs: VecDeque::new(),
             kvbind_port: 0,
             r2bind_port: 0,
             d1bind_port: 0,
@@ -802,6 +805,49 @@ impl Node {
                     .collect()
             })
             .unwrap_or_default()
+    }
+
+    pub(crate) fn enqueue_request_log(&self, entry: crate::observability::RequestLogEntry) {
+        const MAX_PENDING: usize = 50_000;
+        let mut inner = self.inner.lock().unwrap();
+        inner.pending_request_logs.push_back(entry);
+        while inner.pending_request_logs.len() > MAX_PENDING {
+            inner.pending_request_logs.pop_front();
+        }
+    }
+
+    pub(crate) fn take_pending_request_logs(&self) -> Vec<crate::observability::RequestLogEntry> {
+        self.inner
+            .lock()
+            .unwrap()
+            .pending_request_logs
+            .drain(..)
+            .collect()
+    }
+
+    pub(crate) fn requeue_request_logs(&self, entries: Vec<crate::observability::RequestLogEntry>) {
+        const MAX_PENDING: usize = 50_000;
+        let mut inner = self.inner.lock().unwrap();
+        for entry in entries.into_iter().rev() {
+            inner.pending_request_logs.push_front(entry);
+        }
+        while inner.pending_request_logs.len() > MAX_PENDING {
+            inner.pending_request_logs.pop_front();
+        }
+    }
+
+    pub(crate) fn pending_request_logs(
+        &self,
+        worker: &str,
+    ) -> Vec<crate::observability::RequestLogEntry> {
+        self.inner
+            .lock()
+            .unwrap()
+            .pending_request_logs
+            .iter()
+            .filter(|entry| entry.worker == worker)
+            .cloned()
+            .collect()
     }
 
     /// Local, per-Worker materialization state advertised through gossip.

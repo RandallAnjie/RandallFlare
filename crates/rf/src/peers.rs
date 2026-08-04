@@ -300,6 +300,12 @@ impl PeerClient {
         Ok(serde_json::from_slice(&raw)?)
     }
 
+    /// Peer API addresses currently visible from `base`, including `base`.
+    pub async fn live_api_candidates(&self, base: &str) -> Result<Vec<String>> {
+        let status = self.status(base).await?;
+        Ok(peer_api_candidates(base, &status))
+    }
+
     pub async fn authorization(
         &self,
         base: &str,
@@ -362,6 +368,45 @@ impl PeerClient {
     pub async fn worker_log(&self, base: &str, name: &str) -> Result<Vec<Envelope>> {
         let raw = self.get(base, &format!("/v1/log/{name}")).await?;
         decode_envelopes(&raw)
+    }
+
+    pub async fn worker_request_logs(
+        &self,
+        base: &str,
+        worker: &str,
+        hostname: Option<&str>,
+        status_class: Option<u16>,
+        limit: usize,
+    ) -> Result<crate::observability::RequestLogSnapshot> {
+        let mut path = format!(
+            "/v1/observability/{}/requests?limit={}",
+            component(worker),
+            limit.clamp(1, 1_000)
+        );
+        if let Some(hostname) = hostname.filter(|value| !value.is_empty()) {
+            path.push_str("&hostname=");
+            path.push_str(&component(hostname));
+        }
+        if let Some(status_class) = status_class {
+            path.push_str(&format!("&status={status_class}"));
+        }
+        let raw = self.get(base, &path).await?;
+        Ok(serde_json::from_slice(&raw)?)
+    }
+
+    pub async fn worker_runtime_logs(
+        &self,
+        base: &str,
+        worker: &str,
+        limit: usize,
+    ) -> Result<crate::observability::RuntimeLogSnapshot> {
+        let path = format!(
+            "/v1/observability/{}/runtime?limit={}",
+            component(worker),
+            limit.clamp(1, 1_000)
+        );
+        let raw = self.get(base, &path).await?;
+        Ok(serde_json::from_slice(&raw)?)
     }
 
     pub async fn kv_get(&self, base: &str, ns: &str, key: &str) -> Result<Option<Vec<u8>>> {

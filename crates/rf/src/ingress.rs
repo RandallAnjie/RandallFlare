@@ -157,24 +157,49 @@ async fn handle(State(ingress): State<Ingress>, req: Request) -> Response {
         return (StatusCode::NOT_FOUND, "worker vanished\n").into_response();
     };
 
+    let method = req.method().as_str().to_string();
+    // Deliberately discard the query string. Observability stores only the
+    // matched path and never inspects headers or bodies.
     let path = req.uri().path().to_string();
+    let started = std::time::Instant::now();
+    let response = serve_worker(&ingress, req, &manifest, &path).await;
+    crate::observability::record(
+        &ingress.node,
+        &crate::observability::RequestObservation {
+            worker: &manifest.name,
+            version: manifest.version,
+            hostname: &host,
+            method: &method,
+            path: &path,
+            status_code: response.status().as_u16(),
+            duration_ms: started.elapsed().as_millis().min(u64::MAX as u128) as u64,
+        },
+    );
+    response
+}
 
+async fn serve_worker(
+    ingress: &Ingress,
+    req: Request,
+    manifest: &WorkerManifest,
+    path: &str,
+) -> Response {
     // Asset tree first (assets-only workers and hybrid fallthrough).
     if !manifest.assets.is_empty() {
-        if let Some(resp) = serve_asset(&ingress.node, &manifest, &path) {
+        if let Some(resp) = serve_asset(&ingress.node, manifest, path) {
             return resp;
         }
         if manifest.main.is_empty() {
             // Pure static site: custom 404 page or plain 404.
-            return not_found_page(&ingress.node, &manifest);
+            return not_found_page(&ingress.node, manifest);
         }
     }
 
     if manifest.main.is_empty() {
-        return not_found_page(&ingress.node, &manifest);
+        return not_found_page(&ingress.node, manifest);
     }
 
-    if !crate::deploy::durable_objects(&manifest).is_empty() {
+    if !crate::deploy::durable_objects(manifest).is_empty() {
         let wire = match request_to_wire(req).await {
             Ok(wire) => wire,
             Err(response) => return response,

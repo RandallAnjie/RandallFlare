@@ -92,6 +92,14 @@ pub fn router(api: Api) -> Router {
         )
         .route("/v1/worker/{name}", get(worker_get))
         .route("/v1/log/{name}", get(log_get))
+        .route(
+            "/v1/observability/{worker}/requests",
+            get(worker_request_logs),
+        )
+        .route(
+            "/v1/observability/{worker}/runtime",
+            get(worker_runtime_logs),
+        )
         .route("/v1/kv/{ns}", get(kv_list))
         .route(
             "/v1/kv/{ns}/{*key}",
@@ -1187,6 +1195,82 @@ async fn queue_redrive(
         Ok(false) => (StatusCode::NOT_FOUND, "dead letter not found").into_response(),
         Err(error) => (StatusCode::UNPROCESSABLE_ENTITY, error.to_string()).into_response(),
     }
+}
+
+#[derive(serde::Deserialize)]
+struct WorkerRequestLogsQuery {
+    #[serde(default)]
+    hostname: Option<String>,
+    #[serde(default)]
+    status: Option<u16>,
+    limit: Option<usize>,
+}
+
+async fn worker_request_logs(
+    State(api): State<Api>,
+    ConnectInfo(remote): ConnectInfo<SocketAddr>,
+    Path(worker): Path<String>,
+    Query(query): Query<WorkerRequestLogsQuery>,
+    method: Method,
+    uri: Uri,
+    headers: HeaderMap,
+) -> Response {
+    if let Err(response) = check(&api, &remote, &headers, &method, &uri, b"") {
+        return response.into_response();
+    }
+    if !rf_core::manifest::valid_name(&worker) {
+        return (StatusCode::BAD_REQUEST, "invalid worker name").into_response();
+    }
+    if query
+        .status
+        .is_some_and(|status| !(2..=5).contains(&status))
+    {
+        return (
+            StatusCode::BAD_REQUEST,
+            "status must be a class from 2 to 5",
+        )
+            .into_response();
+    }
+    match crate::observability::snapshot(
+        &api.node,
+        &worker,
+        query.hostname.as_deref().filter(|value| !value.is_empty()),
+        query.status,
+        query.limit.unwrap_or(200),
+    ) {
+        Ok(snapshot) => axum::Json(snapshot).into_response(),
+        Err(error) => (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()).into_response(),
+    }
+}
+
+#[derive(serde::Deserialize)]
+struct WorkerRuntimeLogsQuery {
+    limit: Option<usize>,
+}
+
+async fn worker_runtime_logs(
+    State(api): State<Api>,
+    ConnectInfo(remote): ConnectInfo<SocketAddr>,
+    Path(worker): Path<String>,
+    Query(query): Query<WorkerRuntimeLogsQuery>,
+    method: Method,
+    uri: Uri,
+    headers: HeaderMap,
+) -> Response {
+    if let Err(response) = check(&api, &remote, &headers, &method, &uri, b"") {
+        return response.into_response();
+    }
+    if !rf_core::manifest::valid_name(&worker) {
+        return (StatusCode::BAD_REQUEST, "invalid worker name").into_response();
+    }
+    axum::Json(crate::observability::RuntimeLogSnapshot {
+        node: api.node.id_hex(),
+        label: api.node.cfg.label.clone(),
+        lines: api
+            .node
+            .runtime_logs(&worker, query.limit.unwrap_or(300).clamp(1, 1_000)),
+    })
+    .into_response()
 }
 
 #[derive(serde::Deserialize)]

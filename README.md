@@ -52,6 +52,13 @@ Working today, verified by multi-process fault-injection e2e tests:
   rollout on every node. Push webhooks, immutable build history, runtime logs,
   and signed rollback are built in. Repository settings are operator-signed and
   replicated; tokens and build processes stay node-local.
+- **Privacy-bounded request observability**: each ingress node batches Worker
+  method, path, hostname, status and duration into its own redb state, retains
+  seven days, and exposes only encrypted peer snapshots. The Chinese console
+  merges all live nodes, labels runtime output by node, filters requests by
+  hostname/status and renders a 24-hour status trend. Query strings, headers,
+  bodies, cookies, client IPs and User-Agent values are never collected. See
+  [the observability guide](./docs/OBSERVABILITY.md).
 - **R2-compatible object storage**: operator-signed buckets, per-bucket D1
   metadata quorums, content-addressed local replicas or node-local rclone
   remotes, quotas, metadata, ranges, conditions, delimiter listing,
@@ -342,6 +349,7 @@ rf cron list site
 rf cron fire site --expression '*/5 * * * *'
 rf cron list site --dlq
 rf cron replay site <run-id>
+rf requests site --hostname site.example.com --status-class 5
 rf worker-delete site
 ```
 

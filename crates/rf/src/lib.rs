@@ -25,6 +25,7 @@ pub mod kvbind;
 pub mod management;
 pub mod node;
 pub mod objectstore;
+pub mod observability;
 pub mod pbind;
 pub mod peerapi;
 pub mod peers;

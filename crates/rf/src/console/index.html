@@ -269,7 +269,18 @@
           </div>
 
           <div id="project-tab-logs" class="project-tab">
-            <article class="panel"><div class="panel-head"><div><p class="eyebrow">本节点实时输出</p><h2>运行日志</h2></div><button id="detail-refresh-logs" class="secondary compact" type="button">刷新日志</button></div><div id="detail-log-meta" class="muted"></div><pre id="detail-logs" class="result log-output">正在等待日志数据…</pre></article>
+            <article class="panel request-observability">
+              <div class="panel-head"><div><p class="eyebrow">集群可观测性</p><h2>请求日志</h2><p class="muted compact-copy">从所有存活节点聚合，按节点保存 7 天。为保护访客隐私，不记录查询参数、请求头、请求体、Cookie、IP 或 User-Agent。</p></div><button id="detail-refresh-requests" class="secondary compact" type="button">刷新请求</button></div>
+              <form id="request-log-filter" class="request-log-filter">
+                <label><span>访问域名</span><select id="request-log-hostname"><option value="">全部域名</option></select></label>
+                <label><span>响应状态</span><select id="request-log-status"><option value="">全部状态</option><option value="2xx">2xx 成功</option><option value="3xx">3xx 重定向</option><option value="4xx">4xx 客户端错误</option><option value="5xx">5xx 服务端错误</option></select></label>
+                <button class="primary compact" type="submit">应用筛选</button>
+              </form>
+              <div id="request-log-meta" class="muted"></div>
+              <div id="request-log-trend" class="request-trend" role="img" tabindex="0" aria-label="最近 24 小时请求状态趋势"></div>
+              <div class="data-table-wrap request-table-wrap" role="region" tabindex="0" aria-label="请求日志表格，可横向滚动"><table class="data-table"><thead><tr><th>时间</th><th>节点</th><th>请求</th><th>域名</th><th>状态</th><th>耗时</th><th>版本</th></tr></thead><tbody id="request-log-rows"><tr><td colspan="7" class="empty-cell">正在读取请求日志…</td></tr></tbody></table></div>
+            </article>
+            <article class="panel runtime-log-panel"><div class="panel-head"><div><p class="eyebrow">集群实时输出</p><h2>运行日志</h2><p class="muted compact-copy">合并所有存活节点上的 Worker 标准输出、标准错误与运行时消息。</p></div><button id="detail-refresh-logs" class="secondary compact" type="button">刷新输出</button></div><div id="detail-log-meta" class="muted"></div><pre id="detail-logs" class="result log-output">正在等待日志数据…</pre></article>
           </div>
 
           <div id="project-tab-domains" class="project-tab">

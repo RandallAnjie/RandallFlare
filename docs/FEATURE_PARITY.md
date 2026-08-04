@@ -43,7 +43,7 @@ surface yet.
 | decentralized browser authentication | done | hardware-wallet browser approval UX |
 | signed audit/transparency history | partial | include every platform resource and mutation |
 | node tags, placement requirements, drain/suspend | planned | signed capability declarations and routing fallback |
-| topology, quotas, request metrics, DLQ | planned | replicated counters and retention policies |
+| topology, quotas, request metrics, DLQ | partial | privacy-bounded per-node request history, encrypted live-node aggregation, 24-hour status trends and Cron/Queue DLQ are done; placement topology and enforceable quotas remain |
 | access tokens and scoped API credentials | planned | signed grants, revocation and least-privilege scopes |
 | device/exit networking | planned | capability-tagged exits and encrypted tunnel enrolment |
 
@@ -58,7 +58,7 @@ surface yet.
 | default/custom domains and wildcard TLS | done | custom-domain DNS ownership workflow |
 | environment, encrypted Secrets, KV bindings, Cron | done | write-only XChaCha20-Poly1305 Secrets, names-only API/console, KV metadata + bulk get, and real scheduled-event Cron with D1 history/retry/DLQ/replay are verified |
 | compatibility date and flags | done | compatibility date plus validated, signed workerd compatibility flags are done; the supported-flag catalogue must track the pinned workerd release |
-| runtime/build logs and cluster distribution | done | request logs, analytics and retention |
+| runtime/build/request logs and cluster distribution | done | runtime output and 7-day request history aggregate across live nodes; longer archival/export is optional future work |
 | previews and pull-request deployments | planned | deterministic preview hostnames and cleanup |
 | service bindings and placement tags | partial | signed node-local dynamic Service router and native `env.SERVICE.fetch()` are done; placement-aware mesh fallback and cycle diagnostics remain |
 | R2, D1, Queue, Analytics, Pipeline, Workflow, Email, Binary bindings | partial | native R2, CF-shaped D1, Queue producer/consumer, Analytics Engine, Pipeline, Workflow and Email bindings + console editors done; Binary Deliver remains |
