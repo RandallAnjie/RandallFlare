@@ -42,22 +42,22 @@ pub struct ConsoleGrant {
 impl ConsoleGrant {
     pub fn validate(&self, cluster_id: &str, at_ms: u64) -> Result<()> {
         if self.version != CONSOLE_GRANT_VERSION {
-            bail!("unsupported console grant version");
+            bail!("不支持此版本的控制台授权凭证");
         }
         if self.cluster_id != cluster_id {
-            bail!("console grant belongs to a different cluster");
+            bail!("控制台授权凭证属于其他集群");
         }
         if self.expires_at_ms <= self.issued_at_ms
             || self.expires_at_ms - self.issued_at_ms > MAX_CONSOLE_SESSION_TTL_MS
         {
-            bail!("invalid console grant lifetime");
+            bail!("控制台授权凭证的有效期无效");
         }
         // Tolerate a small wall-clock skew between the approving CLI and node.
         if self.issued_at_ms > at_ms.saturating_add(30_000) {
-            bail!("console grant is not active yet");
+            bail!("控制台授权凭证尚未生效");
         }
         if self.expires_at_ms <= at_ms {
-            bail!("console grant expired");
+            bail!("控制台授权凭证已过期");
         }
         Ok(())
     }
@@ -172,7 +172,7 @@ impl Management {
         let payload = postcard::to_stdvec(&grant)?;
         self.create(
             ApprovalKind::Login,
-            format!("Sign in to RandallFlare cluster {cluster_id} via {label}"),
+            format!("通过节点 {label} 登录 RandallFlare 集群 {cluster_id}"),
             payload,
             Some(grant.session_id),
             LOGIN_APPROVAL_TTL_MS,
@@ -187,7 +187,7 @@ impl Management {
     ) -> Result<CreatedApproval> {
         manifest
             .validate()
-            .map_err(|error| anyhow::anyhow!("invalid manifest: {error}"))?;
+            .map_err(|error| anyhow::anyhow!("部署清单无效：{error}"))?;
         let payload = postcard::to_stdvec(manifest)?;
         self.create(
             ApprovalKind::Manifest,
@@ -209,7 +209,7 @@ impl Management {
     ) -> Result<CreatedApproval> {
         manifest
             .validate()
-            .map_err(|error| anyhow::anyhow!("invalid manifest: {error}"))?;
+            .map_err(|error| anyhow::anyhow!("部署清单无效：{error}"))?;
         let payload = postcard::to_stdvec(manifest)?;
         self.create(
             ApprovalKind::Manifest,
@@ -248,7 +248,7 @@ impl Management {
         let mut inner = self.inner.lock().unwrap();
         cleanup(&mut inner, now);
         if inner.by_id.len() >= MAX_PENDING {
-            bail!("too many pending management approvals");
+            bail!("待处理的管理审批过多");
         }
         let id = unique_token(&inner.by_id);
         let code = unique_code(&inner.by_code);
@@ -282,10 +282,10 @@ impl Management {
         let id = inner
             .by_code
             .get(&normalized)
-            .ok_or_else(|| anyhow::anyhow!("approval code not found or expired"))?;
+            .ok_or_else(|| anyhow::anyhow!("审批码不存在或已过期"))?;
         let approval = inner.by_id.get(id).expect("code index points at approval");
         if !matches!(approval.status, Status::Pending) {
-            bail!("approval code has already been used");
+            bail!("审批码已使用");
         }
         Ok(ApprovalView {
             id: approval.id.clone(),
@@ -312,16 +312,16 @@ impl Management {
             .by_code
             .get(&normalized)
             .cloned()
-            .ok_or_else(|| anyhow::anyhow!("approval code not found or expired"))?;
+            .ok_or_else(|| anyhow::anyhow!("审批码不存在或已过期"))?;
         let approval = inner
             .by_id
             .get_mut(&id)
             .expect("code index points at approval");
         if !matches!(approval.status, Status::Pending) {
-            bail!("approval code has already been used");
+            bail!("审批码已使用");
         }
         if signer != *operator || !signer.verify(&approval.payload, &signature) {
-            bail!("approval signature is not from the configured operator");
+            bail!("审批签名并非来自已配置的管理员");
         }
         let envelope = Envelope {
             payload: approval.payload.clone(),
@@ -332,23 +332,23 @@ impl Management {
             ApprovalKind::Login => {
                 let grant: ConsoleGrant = envelope
                     .open(Some(operator))
-                    .map_err(|error| anyhow::anyhow!("invalid console grant: {error}"))?;
+                    .map_err(|error| anyhow::anyhow!("控制台授权凭证无效：{error}"))?;
                 grant.validate(&grant.cluster_id, now)?;
                 approval.status = Status::Completed(envelope.clone());
             }
             ApprovalKind::Manifest => {
                 let manifest: WorkerManifest = envelope
                     .open(Some(operator))
-                    .map_err(|error| anyhow::anyhow!("invalid manifest approval: {error}"))?;
+                    .map_err(|error| anyhow::anyhow!("部署清单审批无效：{error}"))?;
                 manifest
                     .validate()
-                    .map_err(|error| anyhow::anyhow!("invalid manifest: {error}"))?;
+                    .map_err(|error| anyhow::anyhow!("部署清单无效：{error}"))?;
                 approval.status = Status::Approved(envelope.clone());
             }
             ApprovalKind::Source => {
                 let source: crate::build::WorkerSource = envelope
                     .open(Some(operator))
-                    .map_err(|error| anyhow::anyhow!("invalid source approval: {error}"))?;
+                    .map_err(|error| anyhow::anyhow!("源码配置审批无效：{error}"))?;
                 source.validate()?;
                 approval.status = Status::Approved(envelope.clone());
             }
@@ -395,7 +395,7 @@ impl Management {
         let approval = inner
             .by_id
             .get(id)
-            .ok_or_else(|| anyhow::anyhow!("approval not found or expired"))?;
+            .ok_or_else(|| anyhow::anyhow!("审批记录不存在或已过期"))?;
         Ok(poll_value(approval))
     }
 
@@ -408,11 +408,11 @@ impl Management {
         let approval = inner
             .by_id
             .get(id)
-            .ok_or_else(|| anyhow::anyhow!("approval not found or expired"))?;
+            .ok_or_else(|| anyhow::anyhow!("审批记录不存在或已过期"))?;
         if approval.kind == ApprovalKind::Login
             || (approval.session_id.is_some() && approval.session_id != Some(session_id))
         {
-            bail!("approval does not belong to this session");
+            bail!("该审批不属于当前会话");
         }
         Ok(poll_value(approval))
     }
@@ -429,11 +429,11 @@ impl Management {
         let approval = inner
             .by_id
             .get(id)
-            .ok_or_else(|| anyhow::anyhow!("approval not found or expired"))?;
+            .ok_or_else(|| anyhow::anyhow!("审批记录不存在或已过期"))?;
         if approval.kind != expected_kind
             || (expected_kind != ApprovalKind::Login && approval.session_id != session_id)
         {
-            bail!("approval does not belong to this session");
+            bail!("该审批不属于当前会话");
         }
         Ok(poll_value(approval))
     }

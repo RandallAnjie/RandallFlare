@@ -93,10 +93,10 @@ impl ConsoleState {
                 ..
             } => Ok(operator),
             ConsoleMode::Local { operator: None, .. } => Err(ApiError::forbidden(
-                "operator key is not configured; console is read-only",
+                "尚未配置管理员密钥；控制台当前为只读模式",
             )),
             ConsoleMode::Public { .. } => Err(ApiError::forbidden(
-                "public console manifests require operator approval",
+                "公共控制台提交的部署清单需要管理员批准",
             )),
         }
     }
@@ -104,7 +104,7 @@ impl ConsoleState {
     fn require_mutation(&self) -> ApiResult<()> {
         match &self.mode {
             ConsoleMode::Local { operator, .. } if operator.is_none() => Err(ApiError::forbidden(
-                "operator key is not configured; console is read-only",
+                "尚未配置管理员密钥；控制台当前为只读模式",
             )),
             _ => Ok(()),
         }
@@ -124,9 +124,7 @@ impl ConsoleState {
     fn public_node(&self) -> ApiResult<&Arc<Node>> {
         match &self.mode {
             ConsoleMode::Public { node, .. } => Ok(node),
-            ConsoleMode::Local { .. } => Err(ApiError::bad_request(
-                "this endpoint is available only on a public node console",
-            )),
+            ConsoleMode::Local { .. } => Err(ApiError::bad_request("此接口仅供公共节点控制台使用")),
         }
     }
 
@@ -163,15 +161,15 @@ pub async fn serve(
     let state = ConsoleState::new(node, secret, operator);
     let listener = tokio::net::TcpListener::bind(listen)
         .await
-        .with_context(|| format!("binding console at {listen}"))?;
+        .with_context(|| format!("在 {listen} 监听控制台"))?;
     let addr = listener.local_addr()?;
-    println!("RandallFlare Console: http://{addr}");
+    println!("RandallFlare 管理控制台：http://{addr}");
     println!(
-        "mode: {}",
+        "模式：{}",
         if !state.is_read_only() {
-            "operator"
+            "管理员"
         } else {
-            "read-only (no operator key)"
+            "只读（未配置管理员密钥）"
         }
     );
     axum::serve(listener, router(state))
@@ -184,7 +182,7 @@ pub async fn serve(
 
 fn validate_listen(listen: SocketAddr) -> Result<()> {
     if !listen.ip().is_loopback() {
-        bail!("console must listen on a loopback address; use an SSH tunnel for remote access");
+        bail!("控制台只能监听回环地址；如需远程访问，请使用 SSH 隧道");
     }
     Ok(())
 }
@@ -242,8 +240,7 @@ async fn require_console_auth(
                 .get(TOKEN_HEADER)
                 .and_then(|value| value.to_str().ok());
             if supplied != Some(token.as_ref()) {
-                return ApiError::unauthorized("missing or invalid console session token")
-                    .into_response();
+                return ApiError::unauthorized("控制台会话令牌缺失或无效").into_response();
             }
             ConsolePrincipal {
                 session_id: [0; 32],
@@ -252,7 +249,7 @@ async fn require_console_auth(
         }
         ConsoleMode::Public { node, .. } => {
             let Some(encoded) = cookie_value(request.headers(), SESSION_COOKIE) else {
-                return ApiError::unauthorized("operator authorization required").into_response();
+                return ApiError::unauthorized("需要操作员授权").into_response();
             };
             let grant = match decode_grant(encoded, &node.cfg.operator, &node.cfg.cluster_id) {
                 Ok(grant) => grant,
@@ -264,11 +261,10 @@ async fn require_console_auth(
                     .get(CSRF_HEADER)
                     .and_then(|value| value.to_str().ok());
                 if csrf != Some(grant.csrf_hex().as_str()) {
-                    return ApiError::forbidden("missing or invalid CSRF token").into_response();
+                    return ApiError::forbidden("CSRF 令牌缺失或无效").into_response();
                 }
                 if !same_origin(request.headers()) {
-                    return ApiError::forbidden("cross-origin management request rejected")
-                        .into_response();
+                    return ApiError::forbidden("已拒绝跨源管理请求").into_response();
                 }
             }
             ConsolePrincipal {
@@ -338,7 +334,7 @@ async fn styles_css() -> impl IntoResponse {
 }
 
 async fn not_found() -> ApiError {
-    ApiError::not_found("console route not found")
+    ApiError::not_found("未找到对应的控制台路由")
 }
 
 fn is_mutating(method: &Method) -> bool {
@@ -388,12 +384,12 @@ fn decode_grant(
     use base64::Engine as _;
     let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
         .decode(encoded)
-        .context("malformed console session")?;
+        .context("控制台会话格式有误")?;
     let envelope = rf_core::envelope::Envelope::from_bytes(&bytes)
-        .map_err(|error| anyhow::anyhow!("malformed console session: {error}"))?;
+        .map_err(|error| anyhow::anyhow!("控制台会话格式有误：{error}"))?;
     let grant: ConsoleGrant = envelope
         .open(Some(operator))
-        .map_err(|error| anyhow::anyhow!("invalid console session: {error}"))?;
+        .map_err(|error| anyhow::anyhow!("控制台会话无效：{error}"))?;
     grant.validate(cluster_id, now_ms())?;
     Ok(grant)
 }
@@ -417,9 +413,7 @@ async fn auth_challenge(
     headers: axum::http::HeaderMap,
 ) -> ApiResult<Json<Value>> {
     if !same_origin(&headers) {
-        return Err(ApiError::forbidden(
-            "cross-origin authentication request rejected",
-        ));
+        return Err(ApiError::forbidden("已拒绝跨源身份验证请求"));
     }
     let node = state.public_node()?;
     let approval = node
@@ -444,12 +438,12 @@ async fn auth_poll(
     match poll.state {
         ApprovalState::Pending => Ok(Json(json!({ "state": "pending" })).into_response()),
         ApprovalState::Failed => Err(ApiError::forbidden(
-            poll.error.unwrap_or_else(|| "authorization failed".into()),
+            poll.error.unwrap_or_else(|| "授权失败".into()),
         )),
         ApprovalState::Completed => {
             let envelope = poll
                 .envelope
-                .ok_or_else(|| ApiError::upstream("approved login is missing its envelope"))?;
+                .ok_or_else(|| ApiError::upstream("已批准的登录缺少签名信封"))?;
             let grant: ConsoleGrant = envelope
                 .open(Some(&node.cfg.operator))
                 .map_err(|error| ApiError::forbidden(error.to_string()))?;
@@ -471,7 +465,7 @@ async fn auth_poll(
             response.headers_mut().insert(
                 header::SET_COOKIE,
                 HeaderValue::from_str(&session_cookie(&envelope, secure))
-                    .map_err(|_| ApiError::upstream("could not create console cookie"))?,
+                    .map_err(|_| ApiError::upstream("无法创建控制台会话 Cookie"))?,
             );
             Ok(response)
         }
@@ -490,7 +484,7 @@ async fn logout(State(state): State<ConsoleState>) -> ApiResult<Response> {
     response.headers_mut().insert(
         header::SET_COOKIE,
         HeaderValue::from_str(&expired_session_cookie(secure))
-            .map_err(|_| ApiError::upstream("could not clear console cookie"))?,
+            .map_err(|_| ApiError::upstream("无法清除控制台会话 Cookie"))?,
     );
     Ok(response)
 }
@@ -531,7 +525,7 @@ async fn overview(State(state): State<ConsoleState>) -> ApiResult<Json<Value>> {
     let mut value = state.client.status(&state.node).await?;
     let object = value
         .as_object_mut()
-        .ok_or_else(|| ApiError::upstream("node returned a non-object status"))?;
+        .ok_or_else(|| ApiError::upstream("节点返回了无效的状态数据"))?;
     object.insert(
         "console".into(),
         json!({
@@ -569,17 +563,17 @@ async fn worker_deploy(
     match &state.mode {
         ConsoleMode::Local { .. } => {
             let operator = state.operator()?.clone();
-            let requested = request.path.ok_or_else(|| {
-                ApiError::bad_request("local console deploy requires a worker path")
-            })?;
+            let requested = request
+                .path
+                .ok_or_else(|| ApiError::bad_request("从本地控制台部署时必须提供 Worker 路径"))?;
             let path = requested.canonicalize().map_err(|error| {
                 ApiError::bad_request(format!(
-                    "cannot resolve worker directory {}: {error}",
+                    "无法解析 Worker 目录 {}：{error}",
                     requested.display()
                 ))
             })?;
             if !path.is_dir() {
-                return Err(ApiError::bad_request("worker path is not a directory"));
+                return Err(ApiError::bad_request("Worker 路径不是目录"));
             }
             let bundle = deploy::read_bundle(&path)?;
             let name = bundle.spec.name.clone();
@@ -591,7 +585,7 @@ async fn worker_deploy(
         ConsoleMode::Public { node, .. } => {
             if request.files.is_empty() || request.files.len() > MAX_CONSOLE_FILES {
                 return Err(ApiError::bad_request(format!(
-                    "upload must contain 1-{MAX_CONSOLE_FILES} files"
+                    "上传内容必须包含 1 至 {MAX_CONSOLE_FILES} 个文件"
                 )));
             }
             use base64::Engine as _;
@@ -600,10 +594,10 @@ async fn worker_deploy(
             for file in request.files {
                 let bytes = base64::engine::general_purpose::STANDARD
                     .decode(&file.data_base64)
-                    .map_err(|_| ApiError::bad_request("uploaded file is not valid base64"))?;
+                    .map_err(|_| ApiError::bad_request("上传文件不是有效的 Base64 数据"))?;
                 total = total.saturating_add(bytes.len());
                 if total > MAX_CONSOLE_UPLOAD {
-                    return Err(ApiError::bad_request("Worker upload exceeds 64 MiB"));
+                    return Err(ApiError::bad_request("Worker 上传内容超过 64 MiB"));
                 }
                 files.push((file.path, bytes));
             }
@@ -613,7 +607,7 @@ async fn worker_deploy(
                 principal.session_id,
                 &manifest,
                 format!(
-                    "Deploy Worker {} v{} ({} modules, {} assets)",
+                    "部署 Worker {} v{}（{} 个模块，{} 项静态资源）",
                     manifest.name,
                     manifest.version,
                     manifest.modules.len(),
@@ -638,7 +632,7 @@ async fn worker_delete(
     Path(name): Path<String>,
 ) -> ApiResult<Json<Value>> {
     if !valid_name(&name) {
-        return Err(ApiError::bad_request("invalid worker name"));
+        return Err(ApiError::bad_request("Worker 名称无效"));
     }
     match &state.mode {
         ConsoleMode::Local { .. } => {
@@ -653,7 +647,10 @@ async fn worker_delete(
             let approval = node.management.create_manifest(
                 principal.session_id,
                 &manifest,
-                format!("Delete Worker {} at v{}", manifest.name, manifest.version),
+                format!(
+                    "删除 Worker {}（生成版本 v{}）",
+                    manifest.name, manifest.version
+                ),
             )?;
             Ok(Json(json!({
                 "ok": true,
@@ -734,7 +731,7 @@ async fn source_connect(
         principal.session_id,
         &source,
         format!(
-            "Connect Worker {} to {} branch {}",
+            "将 Worker {} 连接至 {} 的 {} 分支",
             source.worker, source.repository, source.branch
         ),
     )?;
@@ -759,7 +756,7 @@ async fn source_disconnect(
     let approval = node.management.create_source(
         principal.session_id,
         &source,
-        format!("Disconnect GitHub repository from Worker {name}"),
+        format!("断开 Worker {name} 与 GitHub 仓库的连接"),
     )?;
     Ok(Json(json!({
         "ok": true,
@@ -778,7 +775,7 @@ async fn worker_build(
 ) -> ApiResult<Json<Value>> {
     state.require_mutation()?;
     if !valid_name(&name) {
-        return Err(ApiError::bad_request("invalid worker name"));
+        return Err(ApiError::bad_request("Worker 名称无效"));
     }
     let node = state.public_node()?.clone();
     let job = crate::build::start_build(node, &name, "manual", Some(principal.session_id), None)?;
@@ -792,7 +789,7 @@ async fn build_list(
     let node = state.public_node()?;
     if let Some(worker) = query.worker.as_deref() {
         if !valid_name(worker) {
-            return Err(ApiError::bad_request("invalid worker name"));
+            return Err(ApiError::bad_request("Worker 名称无效"));
         }
     }
     Ok(Json(json!({
@@ -806,8 +803,8 @@ async fn build_get(
     Path(id): Path<String>,
 ) -> ApiResult<Json<Value>> {
     let node = state.public_node()?;
-    let job = crate::build::build_job(node, &id)
-        .ok_or_else(|| ApiError::not_found("build job not found"))?;
+    let job =
+        crate::build::build_job(node, &id).ok_or_else(|| ApiError::not_found("未找到构建任务"))?;
     Ok(Json(json!({
         "job": job,
         "approve_node": node.cfg.peer_api_advertise().to_string(),
@@ -821,7 +818,7 @@ async fn worker_rollback(
 ) -> ApiResult<Json<Value>> {
     state.require_mutation()?;
     if !valid_name(&name) {
-        return Err(ApiError::bad_request("invalid worker name"));
+        return Err(ApiError::bad_request("Worker 名称无效"));
     }
     let node = state.public_node()?;
     let envelopes = node.manifest_log(&name)?;
@@ -830,13 +827,13 @@ async fn worker_rollback(
     let historical = chain
         .into_iter()
         .find(|manifest| manifest.version == version && !manifest.deleted)
-        .ok_or_else(|| ApiError::not_found("deployable historical version not found"))?;
+        .ok_or_else(|| ApiError::not_found("未找到可部署的历史版本"))?;
     let manifest = crate::build::rollback_manifest(node, &historical)?;
     let approval = node.management.create_manifest(
         principal.session_id,
         &manifest,
         format!(
-            "Rollback Worker {name} to the content of v{version} as v{}",
+            "将 Worker {name} 回滚至 v{version} 的内容，并发布为 v{}",
             manifest.version
         ),
     )?;
@@ -857,19 +854,19 @@ async fn github_webhook(
     body: Bytes,
 ) -> ApiResult<Json<Value>> {
     if !valid_name(&name) || body.len() > 2 * 1024 * 1024 {
-        return Err(ApiError::bad_request("invalid webhook request"));
+        return Err(ApiError::bad_request("Webhook 请求无效"));
     }
     let node = state.public_node()?.clone();
     let source = crate::build::source_head(&node, &name)
         .filter(|record| !record.source.deleted && record.source.webhook)
-        .ok_or_else(|| ApiError::not_found("GitHub webhook is not enabled for this Worker"))?;
+        .ok_or_else(|| ApiError::not_found("此 Worker 尚未启用 GitHub Webhook"))?;
     let signature = headers
         .get("x-hub-signature-256")
         .and_then(|value| value.to_str().ok())
         .unwrap_or_default();
     let secret = crate::build::webhook_secret(&node, &name)?;
     if !crate::build::verify_webhook(&secret, signature, &body) {
-        return Err(ApiError::unauthorized("invalid GitHub webhook signature"));
+        return Err(ApiError::unauthorized("GitHub Webhook 签名无效"));
     }
     let event = headers
         .get("x-github-event")
@@ -879,12 +876,10 @@ async fn github_webhook(
         return Ok(Json(json!({ "ok": true, "pong": true })));
     }
     if event != "push" {
-        return Err(ApiError::bad_request(
-            "only GitHub push webhooks are supported",
-        ));
+        return Err(ApiError::bad_request("目前仅支持 GitHub 推送事件 Webhook"));
     }
     let payload: Value = serde_json::from_slice(&body)
-        .map_err(|_| ApiError::bad_request("invalid GitHub webhook JSON"))?;
+        .map_err(|_| ApiError::bad_request("GitHub Webhook 的 JSON 数据无效"))?;
     let git_ref = payload
         .get("ref")
         .and_then(Value::as_str)
@@ -905,7 +900,7 @@ async fn github_webhook(
         .get("after")
         .and_then(Value::as_str)
         .filter(|value| value.len() == 40 && value.chars().all(|c| c.is_ascii_hexdigit()))
-        .ok_or_else(|| ApiError::bad_request("GitHub push omitted a valid after commit"))?
+        .ok_or_else(|| ApiError::bad_request("GitHub 推送事件缺少有效的 after 提交值"))?
         .to_string();
     if let Some(job) = crate::build::build_jobs(&node, Some(&name))
         .into_iter()
@@ -922,7 +917,7 @@ async fn worker_log(
     Path(name): Path<String>,
 ) -> ApiResult<Json<Value>> {
     if !valid_name(&name) {
-        return Err(ApiError::bad_request("invalid worker name"));
+        return Err(ApiError::bad_request("Worker 名称无效"));
     }
     let envelopes = state.client.worker_log(&state.node, &name).await?;
     let signer = if envelopes.is_empty() {
@@ -966,7 +961,7 @@ async fn worker_runtime_log(
     Query(query): Query<RuntimeLogQuery>,
 ) -> ApiResult<Json<Value>> {
     if !valid_name(&name) {
-        return Err(ApiError::bad_request("invalid worker name"));
+        return Err(ApiError::bad_request("Worker 名称无效"));
     }
     let node = state.public_node()?;
     Ok(Json(json!({
@@ -1011,16 +1006,14 @@ struct KvWriteRequest {
 
 fn validate_kv(namespace: &str, key: Option<&str>, writing: bool) -> ApiResult<()> {
     if namespace.trim().is_empty() || namespace.len() > 256 {
-        return Err(ApiError::bad_request("namespace must be 1-256 characters"));
+        return Err(ApiError::bad_request("命名空间长度必须为 1 至 256 个字符"));
     }
     if writing && namespace.starts_with("__rf") {
-        return Err(ApiError::forbidden(
-            "internal __rf namespaces are read-only in the console",
-        ));
+        return Err(ApiError::forbidden("内部 __rf 命名空间在控制台中为只读"));
     }
     if let Some(key) = key {
         if key.is_empty() || key.len() > 1024 {
-            return Err(ApiError::bad_request("key must be 1-1024 characters"));
+            return Err(ApiError::bad_request("键名长度必须为 1 至 1024 个字符"));
         }
     }
     Ok(())
@@ -1051,7 +1044,7 @@ async fn kv_get(
         .client
         .kv_get(&state.node, &query.namespace, &query.key)
         .await?
-        .ok_or_else(|| ApiError::not_found("KV key not found"))?;
+        .ok_or_else(|| ApiError::not_found("未找到该 KV 键"))?;
     let utf8 = String::from_utf8(value.clone()).ok();
     use base64::Engine as _;
     Ok(Json(json!({
@@ -1069,9 +1062,7 @@ async fn kv_put(
     state.require_mutation()?;
     validate_kv(&request.namespace, Some(&request.key), true)?;
     if request.value.len() > MAX_CONSOLE_VALUE {
-        return Err(ApiError::bad_request(
-            "console KV values are limited to 1 MiB",
-        ));
+        return Err(ApiError::bad_request("控制台写入的 KV 值最大为 1 MiB"));
     }
     state
         .client
@@ -1124,7 +1115,7 @@ async fn d1_create(
     state.require_mutation()?;
     if !valid_name(&request.name) {
         return Err(ApiError::bad_request(
-            "database name must be [a-z0-9-]{1,63}",
+            "数据库名称须由 1 至 63 个小写字母、数字或连字符组成",
         ));
     }
     let raw = state
@@ -1144,13 +1135,15 @@ async fn d1_exec(
 ) -> ApiResult<Json<Value>> {
     state.require_mutation()?;
     if !valid_name(&request.name) {
-        return Err(ApiError::bad_request("invalid database name"));
+        return Err(ApiError::bad_request("数据库名称无效"));
     }
     if request.sql.trim().is_empty() || request.sql.len() > MAX_CONSOLE_VALUE {
-        return Err(ApiError::bad_request("SQL must be 1 byte to 1 MiB"));
+        return Err(ApiError::bad_request(
+            "SQL 长度必须介于 1 字节与 1 MiB 之间",
+        ));
     }
     if !request.params.is_array() {
-        return Err(ApiError::bad_request("params must be a JSON array"));
+        return Err(ApiError::bad_request("参数必须是 JSON 数组"));
     }
     let result = state
         .client
@@ -1280,7 +1273,11 @@ mod tests {
         );
         let body = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
         let body = String::from_utf8(body.to_vec()).unwrap();
-        assert!(body.contains("RandallFlare Console"));
+        assert!(body.contains("RandallFlare 管理控制台"));
+        assert!(body.contains(r#"<html lang="zh-CN">"#));
+        assert!(body.contains("一次构建，一次验证，处处运行。"));
+        assert!(!body.contains(">Overview<"));
+        assert!(!body.contains(">Sign out<"));
         assert!(body.contains(state.local_token()));
         assert!(!body.contains("__RF_TOKEN__"));
     }

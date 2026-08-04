@@ -30,8 +30,8 @@ async fn default_ingress_console_uses_operator_approved_cluster_session() {
     let page = http.get(&ingress).send().await.unwrap();
     assert_eq!(page.status(), 200);
     let page = page.text().await.unwrap();
-    assert!(page.contains("RandallFlare Console"));
-    assert!(page.contains("Decentralized authorization"));
+    assert!(page.contains("RandallFlare 管理控制台"));
+    assert!(page.contains("去中心化身份验证"));
     assert!(!page.contains(&hex::encode(SECRET)));
 
     let denied = http

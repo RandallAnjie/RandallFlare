@@ -56,23 +56,23 @@ pub struct WorkerSource {
 impl WorkerSource {
     pub fn validate(&self) -> Result<()> {
         if self.schema != SOURCE_SCHEMA {
-            bail!("unsupported Worker source schema");
+            bail!("不支持此版本的 Worker 源码配置格式");
         }
         if !valid_name(&self.worker) {
-            bail!("worker name must be [a-z0-9-]{{1,63}}");
+            bail!("Worker 名称须由 1 至 63 个小写字母、数字或连字符组成");
         }
         if self.version == 0 || (self.version == 1) != self.prev.is_none() {
-            bail!("invalid Worker source version chain");
+            bail!("Worker 源码配置的版本链无效");
         }
         if self.deleted {
             return Ok(());
         }
         normalize_github_repository(&self.repository)?;
         validate_branch(&self.branch)?;
-        validate_relative(&self.root, true, "repository root")?;
-        validate_relative(&self.output_dir, true, "output directory")?;
+        validate_relative(&self.root, true, "仓库根目录")?;
+        validate_relative(&self.output_dir, true, "输出目录")?;
         if self.build_command.len() > 8 * 1024 || self.build_command.as_bytes().contains(&0) {
-            bail!("build command is too long or contains NUL");
+            bail!("构建命令过长或含有 NUL 字符");
         }
         Ok(())
     }
@@ -184,7 +184,7 @@ pub fn prepare_source(node: &Node, input: SourceInput) -> Result<WorkerSource> {
 }
 
 pub fn prepare_source_delete(node: &Node, worker: &str) -> Result<WorkerSource> {
-    let head = source_head(node, worker).ok_or_else(|| anyhow::anyhow!("source not found"))?;
+    let head = source_head(node, worker).ok_or_else(|| anyhow::anyhow!("未找到源码配置"))?;
     Ok(WorkerSource {
         schema: SOURCE_SCHEMA,
         worker: worker.to_string(),
@@ -206,7 +206,7 @@ pub fn prepare_source_delete(node: &Node, worker: &str) -> Result<WorkerSource> 
 pub fn ingest_source(node: &Node, envelope: &Envelope) -> Result<WorkerSource> {
     let source: WorkerSource = envelope
         .open(Some(&node.cfg.operator))
-        .map_err(|error| anyhow::anyhow!("invalid Worker source signature: {error}"))?;
+        .map_err(|error| anyhow::anyhow!("Worker 源码配置签名无效：{error}"))?;
     source.validate()?;
     let digest = hex::encode(envelope.digest());
     let key = format!("{}/{:020}/{}", source.worker, source.version, digest);
@@ -221,7 +221,7 @@ pub fn ingest_source(node: &Node, envelope: &Envelope) -> Result<WorkerSource> {
         .map(|record| record.digest.as_str())
         != Some(digest.as_str())
     {
-        tracing::debug!(worker = %source.worker, version = source.version, "stored non-head Worker source record");
+        tracing::debug!(worker = %source.worker, version = source.version, "已保存非最新的 Worker 源码配置记录");
     }
     Ok(source)
 }
@@ -340,14 +340,14 @@ pub fn start_build(
     requested_commit: Option<String>,
 ) -> Result<BuildJob> {
     if !node.cfg.build.enabled {
-        bail!("Git builds are disabled on this node");
+        bail!("此节点尚未启用 Git 构建");
     }
     let source = source_head(&node, worker)
         .filter(|record| !record.source.deleted)
-        .ok_or_else(|| anyhow::anyhow!("Worker has no connected repository"))?;
+        .ok_or_else(|| anyhow::anyhow!("Worker 尚未连接代码仓库"))?;
     if let Some(commit) = requested_commit.as_deref() {
         if commit.len() != 40 || !commit.chars().all(|value| value.is_ascii_hexdigit()) {
-            bail!("requested Git commit must be a 40-character SHA-1");
+            bail!("指定的 Git 提交必须是 40 位 SHA-1");
         }
     }
     let id = random_id();
@@ -368,7 +368,7 @@ pub fn start_build(
         version: None,
         approval: None,
         error: None,
-        log: vec!["Build queued on this node".into()],
+        log: vec!["构建任务已进入此节点的队列".into()],
     };
     persist_job(&node, &job)?;
     let shared = Arc::new(Mutex::new(job.clone()));
@@ -391,9 +391,9 @@ pub fn recover_interrupted(node: &Node) {
     for mut job in build_jobs(node, None) {
         if job.node_id == node.id_hex() && !job.state.terminal() {
             job.state = BuildState::Failed;
-            job.error = Some("node restarted while this build was running; retry the build".into());
+            job.error = Some("构建期间节点发生重启，请重新发起构建".into());
             job.updated_at_ms = now_ms();
-            append_log(&mut job, "Build interrupted by node restart");
+            append_log(&mut job, "构建因节点重启而中断");
             let _ = persist_job(node, &job);
         }
         if job.node_id == node.id_hex()
@@ -411,25 +411,19 @@ async fn run_build(
     job: Arc<Mutex<BuildJob>>,
     session_id: Option<[u8; 32]>,
 ) -> Result<()> {
-    let git = configured_binary(node.cfg.build.git.as_deref(), "git")
-        .context("git is not available on this node")?;
+    let git =
+        configured_binary(node.cfg.build.git.as_deref(), "git").context("此节点无法使用 Git")?;
     let builds_root = node.cfg.data_dir.join("builds");
     std::fs::create_dir_all(&builds_root)?;
     let job_id = job.lock().await.id.clone();
     let workspace = builds_root.join(&job_id);
     if workspace.exists() {
-        bail!("build workspace already exists; refusing to reuse it");
+        bail!("构建工作区已存在；为确保隔离安全，不会重复使用");
     }
     std::fs::create_dir(&workspace)?;
     let checkout = workspace.join("repo");
 
-    set_state(
-        &node,
-        &job,
-        BuildState::Cloning,
-        "Cloning GitHub repository",
-    )
-    .await?;
+    set_state(&node, &job, BuildState::Cloning, "正在克隆 GitHub 仓库").await?;
     let mut clone = Command::new(&git);
     clone
         .arg("clone")
@@ -449,7 +443,7 @@ async fn run_build(
         Duration::from_secs(node.cfg.build.timeout_seconds.min(300)),
     )
     .await
-    .context("git clone failed")?;
+    .context("Git 克隆失败")?;
 
     let mut commit = git_revision(&git, &checkout, &workspace).await?;
     let requested = job.lock().await.requested_commit.clone();
@@ -458,7 +452,7 @@ async fn run_build(
             let mut current = job.lock().await;
             append_log(
                 &mut current,
-                &format!("Fetching exact webhook commit {}", short_commit(&requested)),
+                &format!("正在获取 Webhook 指定的提交 {}", short_commit(&requested)),
             );
             current.updated_at_ms = now_ms();
             persist_job(&node, &current)?;
@@ -480,7 +474,7 @@ async fn run_build(
             Duration::from_secs(node.cfg.build.timeout_seconds.min(300)),
         )
         .await
-        .context("fetching webhook commit failed")?;
+        .context("获取 Webhook 指定的提交失败")?;
 
         let mut checkout_commit = Command::new(&git);
         checkout_commit
@@ -492,10 +486,10 @@ async fn run_build(
         sanitized_env(&mut checkout_commit, &workspace);
         run_logged(&node, &job, checkout_commit, Duration::from_secs(60))
             .await
-            .context("checking out webhook commit failed")?;
+            .context("检出 Webhook 指定的提交失败")?;
         commit = git_revision(&git, &checkout, &workspace).await?;
         if commit != requested {
-            bail!("Git checkout did not resolve to the webhook commit");
+            bail!("Git 检出的结果与 Webhook 指定的提交不一致");
         }
     }
     {
@@ -503,7 +497,7 @@ async fn run_build(
         current.commit = Some(commit.clone());
         append_log(
             &mut current,
-            &format!("Checked out {}", short_commit(&commit)),
+            &format!("已检出提交 {}", short_commit(&commit)),
         );
         current.updated_at_ms = now_ms();
         persist_job(&node, &current)?;
@@ -511,18 +505,12 @@ async fn run_build(
 
     let project_root = join_relative(&checkout, &source.root)?;
     if !project_root.is_dir() {
-        bail!("repository root does not exist: {}", source.root);
+        bail!("仓库根目录不存在：{}", source.root);
     }
     if !source.build_command.trim().is_empty() {
-        set_state(
-            &node,
-            &job,
-            BuildState::Building,
-            "Running sandboxed build command",
-        )
-        .await?;
+        set_state(&node, &job, BuildState::Building, "正在沙箱中执行构建命令").await?;
         let sandbox = configured_binary(node.cfg.build.sandbox.as_deref(), "bwrap")
-            .context("custom build command requires bubblewrap (bwrap) on this node")?;
+            .context("自定义构建命令要求此节点安装 bubblewrap（bwrap）")?;
         let command = sandbox_command(&sandbox, &checkout, &source.root, &source.build_command)?;
         run_logged(
             &node,
@@ -531,13 +519,13 @@ async fn run_build(
             Duration::from_secs(node.cfg.build.timeout_seconds),
         )
         .await
-        .context("sandboxed build failed")?;
+        .context("沙箱构建失败")?;
     } else {
         set_state(
             &node,
             &job,
             BuildState::Building,
-            "Zero-config build; using repository files",
+            "零配置构建：直接使用仓库文件",
         )
         .await?;
     }
@@ -546,15 +534,12 @@ async fn run_build(
         &node,
         &job,
         BuildState::Packaging,
-        "Validating rf.json and packaging immutable blobs",
+        "正在验证 rf.json 并封装不可变内容块",
     )
     .await?;
     let output_root = join_relative(&project_root, &source.output_dir)?;
     if !output_root.is_dir() {
-        bail!(
-            "build output directory does not exist: {}",
-            source.output_dir
-        );
+        bail!("构建输出目录不存在：{}", source.output_dir);
     }
     let bundle: Bundle = deploy::read_bundle(&output_root)?;
     let file_count = bundle.modules.len().saturating_add(bundle.assets.len());
@@ -565,11 +550,11 @@ async fn run_build(
         .chain(bundle.assets.iter().map(|(_, bytes)| bytes.len()))
         .sum();
     if file_count > 2_048 || bundle_bytes > 64 * 1024 * 1024 {
-        bail!("build output exceeds 2,048 files or 64 MiB");
+        bail!("构建产物超过 2,048 个文件或 64 MiB");
     }
     if bundle.spec.name != source.worker {
         bail!(
-            "rf.json names Worker {:?}, but repository is connected to {:?}",
+            "rf.json 中的 Worker 名称为 {:?}，但该仓库连接的是 {:?}",
             bundle.spec.name,
             source.worker
         );
@@ -579,7 +564,7 @@ async fn run_build(
         session_id,
         &manifest,
         format!(
-            "Deploy Git build {} v{} from {}@{}",
+            "部署 Git 构建 {} v{}（来源：{}@{}）",
             manifest.name,
             manifest.version,
             github_slug(&source.repository),
@@ -594,7 +579,7 @@ async fn run_build(
         current.updated_at_ms = now_ms();
         append_log(
             &mut current,
-            &format!("Artifact ready; operator approval code {}", approval.code),
+            &format!("构建产物已就绪；管理员审批码为 {}", approval.code),
         );
         persist_job(&node, &current)?;
     }
@@ -607,18 +592,15 @@ async fn run_build(
                     &node,
                     &job,
                     BuildState::Deployed,
-                    "Signed manifest committed; cluster distribution started",
+                    "已提交签名部署清单；集群分发已经开始",
                 )
                 .await?;
                 break;
             }
             poll if poll.state == ApprovalState::Failed => {
-                bail!(
-                    "manifest approval failed: {}",
-                    poll.error.unwrap_or_default()
-                );
+                bail!("部署清单审批失败：{}", poll.error.unwrap_or_default());
             }
-            _ if now_ms() >= approval.expires_at_ms => bail!("manifest approval expired"),
+            _ if now_ms() >= approval.expires_at_ms => bail!("部署清单审批已过期"),
             _ => {}
         }
     }
@@ -633,9 +615,9 @@ async fn git_revision(git: &Path, checkout: &Path, workspace: &Path) -> Result<S
         .arg("rev-parse")
         .arg("HEAD");
     sanitized_env(&mut revision, workspace);
-    let output = revision.output().await.context("reading Git commit")?;
+    let output = revision.output().await.context("读取 Git 提交")?;
     if !output.status.success() {
-        bail!("could not resolve checked out Git commit");
+        bail!("无法解析当前检出的 Git 提交");
     }
     Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
 }
@@ -646,12 +628,12 @@ fn apply_git_auth(command: &mut Command, node: &Node, source: &WorkerSource) -> 
     }
     let token = std::env::var(&node.cfg.build.github_token_env).with_context(|| {
         format!(
-            "source requires a GitHub token but {} is not set on this node",
+            "此源码配置需要 GitHub 令牌，但节点尚未设置环境变量 {}",
             node.cfg.build.github_token_env
         )
     })?;
     if token.is_empty() || token.as_bytes().contains(&b'\n') {
-        bail!("node-local GitHub token is empty or malformed");
+        bail!("节点本地的 GitHub 令牌为空或格式有误");
     }
     let basic = base64::engine::general_purpose::STANDARD.encode(format!("x-access-token:{token}"));
     command
@@ -682,9 +664,9 @@ async fn fail_job(node: &Node, job: &Arc<Mutex<BuildJob>>, error: String) {
     current.state = BuildState::Failed;
     current.error = Some(error.clone());
     current.updated_at_ms = now_ms();
-    append_log(&mut current, &format!("ERROR: {error}"));
+    append_log(&mut current, &format!("错误：{error}"));
     if let Err(persist_error) = persist_job(node, &current) {
-        tracing::error!(job = %current.id, "could not persist failed build: {persist_error}");
+        tracing::error!(job = %current.id, "无法保存失败构建的状态：{persist_error}");
     }
 }
 
@@ -717,9 +699,9 @@ async fn run_logged(
     timeout: Duration,
 ) -> Result<()> {
     command.stdout(Stdio::piped()).stderr(Stdio::piped());
-    let mut child = command.spawn().context("starting process")?;
-    let stdout = child.stdout.take().context("capturing stdout")?;
-    let stderr = child.stderr.take().context("capturing stderr")?;
+    let mut child = command.spawn().context("启动构建进程")?;
+    let stdout = child.stdout.take().context("读取标准输出")?;
+    let stderr = child.stderr.take().context("读取标准错误")?;
     let (tx, mut rx) = mpsc::channel::<String>(64);
     spawn_log_reader("out", stdout, tx.clone());
     spawn_log_reader("err", stderr, tx.clone());
@@ -736,10 +718,10 @@ async fn run_logged(
                     persist_job(node, &current)?;
                 }
             }
-            status = child.wait() => break status.context("waiting for process")?,
+            status = child.wait() => break status.context("等待构建进程结束")?,
             _ = &mut deadline => {
                 let _ = child.kill().await;
-                bail!("process exceeded {} second timeout", timeout.as_secs());
+                bail!("构建进程超过 {} 秒时限", timeout.as_secs());
             }
         }
     };
@@ -750,7 +732,7 @@ async fn run_logged(
         persist_job(node, &current)?;
     }
     if !status.success() {
-        bail!("process exited with {status}");
+        bail!("构建进程异常退出：{status}");
     }
     Ok(())
 }
@@ -901,7 +883,7 @@ pub fn configured_binary(configured: Option<&Path>, name: &str) -> Option<PathBu
 
 fn validate_relative(value: &str, allow_dot: bool, label: &str) -> Result<()> {
     if value.is_empty() || value.len() > 1024 || value.contains('\\') {
-        bail!("{label} must be a safe relative path");
+        bail!("{label}必须是安全的相对路径");
     }
     if value == "." && allow_dot {
         return Ok(());
@@ -912,13 +894,13 @@ fn validate_relative(value: &str, allow_dot: bool, label: &str) -> Result<()> {
             .components()
             .any(|part| !matches!(part, Component::Normal(_)))
     {
-        bail!("{label} must be a safe relative path");
+        bail!("{label}必须是安全的相对路径");
     }
     Ok(())
 }
 
 fn join_relative(base: &Path, relative: &str) -> Result<PathBuf> {
-    validate_relative(relative, true, "path")?;
+    validate_relative(relative, true, "路径")?;
     Ok(if relative == "." {
         base.to_path_buf()
     } else {
@@ -938,7 +920,7 @@ fn validate_branch(branch: &str) -> Result<()> {
             .chars()
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | '/'))
     {
-        bail!("invalid Git branch name");
+        bail!("Git 分支名称无效");
     }
     Ok(())
 }
@@ -947,7 +929,7 @@ pub fn normalize_github_repository(repository: &str) -> Result<String> {
     let value = repository.trim().trim_end_matches('/');
     let path = value
         .strip_prefix("https://github.com/")
-        .ok_or_else(|| anyhow::anyhow!("repository must be an https://github.com URL"))?
+        .ok_or_else(|| anyhow::anyhow!("仓库地址必须是 https://github.com URL"))?
         .trim_end_matches(".git");
     let mut parts = path.split('/');
     let owner = parts.next().unwrap_or_default();
@@ -962,7 +944,7 @@ pub fn normalize_github_repository(repository: &str) -> Result<String> {
             .chars()
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
     {
-        bail!("repository must identify one GitHub owner/repository");
+        bail!("仓库地址必须明确指定一个 GitHub 所有者与仓库名");
     }
     Ok(format!("https://github.com/{owner}/{repo}.git"))
 }
@@ -977,7 +959,7 @@ fn github_slug(repository: &str) -> &str {
 fn decode_digest(value: &str) -> Result<[u8; 32]> {
     hex::decode(value)?
         .try_into()
-        .map_err(|_| anyhow::anyhow!("invalid source digest"))
+        .map_err(|_| anyhow::anyhow!("源码摘要无效"))
 }
 
 fn random_id() -> String {
@@ -1004,14 +986,14 @@ fn short_commit(commit: &str) -> &str {
 fn cleanup_workspace(root: &Path, workspace: &Path) {
     if workspace.parent() == Some(root) && workspace.file_name().is_some() && workspace.exists() {
         if let Err(error) = std::fs::remove_dir_all(workspace) {
-            tracing::warn!(path = %workspace.display(), "could not remove build workspace: {error}");
+            tracing::warn!(path = %workspace.display(), "无法清理构建工作区：{error}");
         }
     }
 }
 
 pub fn webhook_secret(node: &Node, worker: &str) -> Result<String> {
     let mut mac = Hmac::<Sha256>::new_from_slice(&node.cfg.cluster_secret_bytes()?)
-        .map_err(|_| anyhow::anyhow!("invalid cluster secret"))?;
+        .map_err(|_| anyhow::anyhow!("集群密钥无效"))?;
     mac.update(b"randallflare-github-webhook-v1\0");
     mac.update(worker.as_bytes());
     Ok(hex::encode(mac.finalize().into_bytes()))
@@ -1036,7 +1018,7 @@ pub fn verify_webhook(secret_hex: &str, signature: &str, body: &[u8]) -> bool {
 pub fn rollback_manifest(node: &Node, historical: &WorkerManifest) -> Result<WorkerManifest> {
     let (version, prev) = node
         .manifest_head(&historical.name)
-        .ok_or_else(|| anyhow::anyhow!("Worker does not exist"))?;
+        .ok_or_else(|| anyhow::anyhow!("Worker 不存在"))?;
     let mut rollback = historical.clone();
     rollback.version = version + 1;
     rollback.prev = Some(prev);

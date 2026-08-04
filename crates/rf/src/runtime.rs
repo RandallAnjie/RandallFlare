@@ -49,9 +49,7 @@ impl Runtime {
     pub fn new(node: Arc<Node>, durable: crate::durable::Coordinator) -> Self {
         let workerd = node.cfg.runtime.workerd.clone().or_else(find_workerd);
         if workerd.is_none() {
-            tracing::warn!(
-                "workerd binary not found — module workers disabled, assets still serve"
-            );
+            tracing::warn!("未找到 workerd 可执行文件——模块 Worker 已停用，静态资源仍可提供服务");
         }
         let port_base = node.cfg.runtime.port_base;
         Self {
@@ -90,18 +88,18 @@ impl Runtime {
         for (name, rw) in self.running.iter_mut() {
             if let Some(child) = &mut rw.child {
                 if let Ok(Some(status)) = child.try_wait() {
-                    tracing::warn!("workerd for {name} exited: {status}");
+                    tracing::warn!("Worker {name} 的 workerd 已退出：{status}");
                     self.node.set_runtime_status(
                         name,
                         rw.version,
                         "failed",
-                        format!("workerd exited: {status}"),
+                        format!("workerd 已退出：{status}"),
                     );
                     self.node.append_runtime_log(
                         name,
                         rw.version,
                         "system",
-                        &format!("workerd exited: {status}"),
+                        &format!("workerd 已退出：{status}"),
                     );
                     rw.child = None;
                 }
@@ -147,14 +145,14 @@ impl Runtime {
                 if let Some(child) = &mut rw.child {
                     let _ = child.start_kill();
                 }
-                tracing::info!("stopped worker {name}");
+                tracing::info!("已停止 Worker {name}");
             }
             if let Some(manifest) = self.node.manifest(&name) {
                 self.node.set_runtime_status(
                     &name,
                     manifest.version,
                     "standby",
-                    "runtime is not the active Durable Object owner on this node",
+                    "此节点不是该 Durable Object 当前的活动所有者",
                 );
             }
         }
@@ -171,12 +169,12 @@ impl Runtime {
                 .iter()
                 .any(|s| m.blob_refs().any(|r| r == *s))
             {
-                tracing::debug!("worker {} waiting for blobs", m.name);
+                tracing::debug!("Worker {} 正在等待内容块", m.name);
                 self.node.set_runtime_status(
                     &m.name,
                     m.version,
                     "waiting_blobs",
-                    "fetching immutable blobs from peers",
+                    "正在从对等节点获取不可变内容块",
                 );
                 continue;
             }
@@ -189,9 +187,9 @@ impl Runtime {
                         &m.name,
                         m.version,
                         "system",
-                        &format!("startup failed: {e:#}"),
+                        &format!("启动失败：{e:#}"),
                     );
-                    tracing::warn!("starting worker {}: {e:#}", m.name)
+                    tracing::warn!("启动 Worker {} 时出错：{e:#}", m.name)
                 }
             }
         }
@@ -225,12 +223,12 @@ impl Runtime {
                 &m.name,
                 m.version,
                 "runtime_unavailable",
-                "workerd binary is not installed",
+                "尚未安装 workerd 可执行文件",
             );
             return Ok(()); // no runtime on this node
         };
         self.node
-            .set_runtime_status(&m.name, m.version, "starting", "materializing Worker");
+            .set_runtime_status(&m.name, m.version, "starting", "正在准备 Worker 运行文件");
         let port = self
             .running
             .get(&m.name)
@@ -251,7 +249,11 @@ impl Runtime {
             if let Some(parent) = path.parent() {
                 std::fs::create_dir_all(parent)?;
             }
-            let bytes = self.node.blobs.get(&module.sha256).context("module blob")?;
+            let bytes = self
+                .node
+                .blobs
+                .get(&module.sha256)
+                .context("读取模块内容块")?;
             std::fs::write(&path, bytes)?;
         }
         let durable_dir = self.node.cfg.data_dir.join("durable").join(&m.name);
@@ -295,7 +297,7 @@ impl Runtime {
         }
         let mut child = cmd
             .spawn()
-            .with_context(|| format!("spawning workerd for {}", m.name))?;
+            .with_context(|| format!("为 Worker {} 启动 workerd", m.name))?;
         if let Some(stdout) = child.stdout.take() {
             spawn_log_reader(
                 self.node.clone(),
@@ -320,7 +322,7 @@ impl Runtime {
         let mut healthy = false;
         for _ in 0..50 {
             if let Ok(Some(status)) = child.try_wait() {
-                anyhow::bail!("workerd for {} exited during startup: {status}", m.name);
+                anyhow::bail!("Worker {} 的 workerd 在启动期间退出：{status}", m.name);
             }
             if tokio::net::TcpStream::connect(("127.0.0.1", port))
                 .await
@@ -333,21 +335,25 @@ impl Runtime {
         }
         if !healthy {
             let _ = child.start_kill();
-            anyhow::bail!("workerd for {} never bound 127.0.0.1:{port}", m.name);
+            anyhow::bail!("Worker {} 的 workerd 未能监听 127.0.0.1:{port}", m.name);
         }
 
-        tracing::info!("worker {} v{} on 127.0.0.1:{port}", m.name, m.version);
+        tracing::info!(
+            "Worker {} v{} 已在 127.0.0.1:{port} 运行",
+            m.name,
+            m.version
+        );
         self.node.set_runtime_status(
             &m.name,
             m.version,
             "running",
-            format!("workerd on 127.0.0.1:{port}"),
+            format!("workerd 正在 127.0.0.1:{port} 运行"),
         );
         self.node.append_runtime_log(
             &m.name,
             m.version,
             "system",
-            &format!("Worker started on 127.0.0.1:{port}"),
+            &format!("Worker 已在 127.0.0.1:{port} 启动"),
         );
         self.running.insert(
             m.name.clone(),

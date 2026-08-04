@@ -1,167 +1,167 @@
 <!doctype html>
-<html lang="en">
+<html lang="zh-CN">
   <head>
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <meta name="color-scheme" content="dark">
     <meta name="rf-console-token" content="__RF_TOKEN__">
     <meta name="rf-console-mode" content="__RF_MODE__">
-    <title>RandallFlare Console</title>
+    <title>RandallFlare 管理控制台</title>
     <link rel="stylesheet" href="/styles.css">
   </head>
   <body>
-    <a class="skip-link" href="#content">Skip to content</a>
+    <a class="skip-link" href="#content">跳到主要内容</a>
     <section id="auth-gate" class="auth-gate hidden" aria-labelledby="auth-title">
       <div class="auth-card">
         <div class="brand auth-brand">
           <div class="brand-mark" aria-hidden="true"><span>R</span></div>
-          <div><strong>RandallFlare</strong><small>Decentralized authorization</small></div>
+          <div><strong>RandallFlare</strong><small>去中心化身份验证</small></div>
         </div>
-        <p class="eyebrow">OPERATOR PROOF</p>
-        <h1 id="auth-title">Authorize this browser</h1>
-        <p class="muted">This node has no account database and never receives your private key. Approve the one-time challenge with the RandallFlare CLI.</p>
+        <p class="eyebrow">管理员身份验证</p>
+        <h1 id="auth-title">授权此浏览器</h1>
+        <p class="muted">此节点没有账户数据库，也绝不会接触你的私钥。请使用 RandallFlare CLI 批准本次一次性登录请求。</p>
         <div class="approval-code-wrap">
-          <span>ONE-TIME CODE</span>
-          <strong id="auth-code">Generating…</strong>
+          <span>一次性授权码</span>
+          <strong id="auth-code">正在生成…</strong>
         </div>
-        <label for="auth-command">Run on an operator machine</label>
+        <label for="auth-command">请在管理员设备上运行</label>
         <div class="command-row">
-          <code id="auth-command">Waiting for node…</code>
-          <button id="auth-copy" class="secondary" type="button">Copy</button>
+          <code id="auth-command">正在等待节点…</code>
+          <button id="auth-copy" class="secondary" type="button">复制</button>
         </div>
-        <div class="auth-state"><span id="auth-dot" class="dot pending"></span><span id="auth-status">Creating signed challenge</span></div>
-        <button id="auth-retry" class="secondary hidden" type="button">Create another challenge</button>
-        <p class="form-note">The signed session is short-lived and independently verifiable by every node in this cluster. Use HTTPS outside this first-node test.</p>
+        <div class="auth-state"><span id="auth-dot" class="dot pending"></span><span id="auth-status">正在创建签名请求</span></div>
+        <button id="auth-retry" class="secondary hidden" type="button">重新生成授权请求</button>
+        <p class="form-note">签名会话仅在短时间内有效，集群中的每个节点均可独立验证。除首节点测试外，请务必使用 HTTPS。</p>
       </div>
     </section>
     <div class="shell">
       <aside class="sidebar">
         <div class="brand">
           <div class="brand-mark" aria-hidden="true"><span>R</span></div>
-          <div><strong>RandallFlare</strong><small>Operator Console</small></div>
+          <div><strong>RandallFlare</strong><small>管理控制台</small></div>
         </div>
-        <nav aria-label="Console sections">
+        <nav aria-label="控制台栏目">
           <button class="nav-item active" data-view="overview">
-            <span class="nav-glyph">⌁</span><span>Overview</span>
+            <span class="nav-glyph">⌁</span><span>概览</span>
           </button>
           <button class="nav-item" data-view="workers">
-            <span class="nav-glyph">◇</span><span>Workers</span><span id="worker-nav-count" class="count">0</span>
+            <span class="nav-glyph">◇</span><span>Worker</span><span id="worker-nav-count" class="count">0</span>
           </button>
           <button class="nav-item" data-view="kv">
-            <span class="nav-glyph">≋</span><span>KV Store</span>
+            <span class="nav-glyph">≋</span><span>KV 存储</span>
           </button>
           <button class="nav-item" data-view="d1">
-            <span class="nav-glyph">◫</span><span>D1 Databases</span>
+            <span class="nav-glyph">◫</span><span>D1 数据库</span>
           </button>
         </nav>
         <div class="sidebar-foot">
-          <div class="security-note"><span>●</span> Operator verified</div>
-          <small id="security-copy">No private key is stored<br>on this node.</small>
+          <div class="security-note"><span>●</span> 管理员身份已验证</div>
+          <small id="security-copy">此节点不保存<br>任何私钥。</small>
         </div>
       </aside>
 
       <main id="content" class="main">
         <header class="topbar">
           <div>
-            <p class="eyebrow" id="section-eyebrow">CLUSTER CONTROL</p>
-            <h1 id="section-title">Overview</h1>
+            <p class="eyebrow" id="section-eyebrow">集群控制</p>
+            <h1 id="section-title">概览</h1>
           </div>
           <div class="topbar-actions">
-            <div class="connection"><span id="connection-dot" class="dot pending"></span><span id="connection-text">Connecting</span></div>
-            <button id="logout" class="secondary compact hidden" type="button">Sign out</button>
-            <button id="refresh" class="icon-button" type="button" aria-label="Refresh data">↻</button>
+            <div class="connection"><span id="connection-dot" class="dot pending"></span><span id="connection-text">正在连接</span></div>
+            <button id="logout" class="secondary compact hidden" type="button">退出登录</button>
+            <button id="refresh" class="icon-button" type="button" aria-label="刷新数据">↻</button>
           </div>
         </header>
 
         <div id="loading" class="loading-line" aria-hidden="true"></div>
         <div id="transport-warning" class="banner warning hidden" role="status">
-          HTTP test mode — this session cookie is not protected in transit. Enable HTTPS before using this node in production.
+          当前为 HTTP 测试模式，会话 Cookie 在传输途中不受保护。将此节点用于生产环境前，请先启用 HTTPS。
         </div>
         <div id="global-error" class="banner error hidden" role="alert"></div>
 
         <section id="view-overview" class="view active" aria-labelledby="section-title">
           <div class="metrics">
-            <article class="metric"><span>Live nodes</span><strong id="metric-nodes">—</strong><small id="metric-public">Awaiting cluster</small></article>
-            <article class="metric"><span>Workers</span><strong id="metric-workers">—</strong><small id="metric-routes">No routing data</small></article>
-            <article class="metric"><span>D1 databases</span><strong id="metric-databases">—</strong><small>Replicated quorums</small></article>
-            <article class="metric"><span>Blob health</span><strong id="metric-blobs">—</strong><small>Missing locally</small></article>
+            <article class="metric"><span>在线节点</span><strong id="metric-nodes">—</strong><small id="metric-public">正在等待集群数据</small></article>
+            <article class="metric"><span>Worker</span><strong id="metric-workers">—</strong><small id="metric-routes">暂无路由数据</small></article>
+            <article class="metric"><span>D1 数据库</span><strong id="metric-databases">—</strong><small>多数派复制保障一致性</small></article>
+            <article class="metric"><span>内容块状态</span><strong id="metric-blobs">—</strong><small>本地缺失数</small></article>
           </div>
 
           <div class="grid two-one">
             <article class="panel">
-              <div class="panel-head"><div><p class="eyebrow">TOPOLOGY</p><h2>Cluster nodes</h2></div><span id="cluster-version" class="badge">rf —</span></div>
-              <div id="node-list" class="node-list empty-state">Waiting for node status…</div>
+              <div class="panel-head"><div><p class="eyebrow">网络拓扑</p><h2>集群节点</h2></div><span id="cluster-version" class="badge">rf —</span></div>
+              <div id="node-list" class="node-list empty-state">正在获取节点状态…</div>
             </article>
             <article class="panel identity-panel">
-              <p class="eyebrow">CONNECTED NODE</p>
+              <p class="eyebrow">当前连接节点</p>
               <h2 id="node-label">—</h2>
               <dl>
-                <div><dt>Node ID</dt><dd id="node-id">—</dd></div>
-                <div><dt>Peer API</dt><dd id="node-api">—</dd></div>
-                <div><dt>Operator</dt><dd id="operator-id">—</dd></div>
-                <div><dt>Manifest digest</dt><dd id="manifest-digest">—</dd></div>
-                <div><dt>Console mode</dt><dd id="console-mode">—</dd></div>
+                <div><dt>节点 ID</dt><dd id="node-id">—</dd></div>
+                <div><dt>节点 API</dt><dd id="node-api">—</dd></div>
+                <div><dt>管理员</dt><dd id="operator-id">—</dd></div>
+                <div><dt>清单摘要</dt><dd id="manifest-digest">—</dd></div>
+                <div><dt>控制台模式</dt><dd id="console-mode">—</dd></div>
               </dl>
             </article>
           </div>
 
           <article class="panel">
-            <div class="panel-head"><div><p class="eyebrow">ROUTING SURFACE</p><h2>Active workers</h2></div><button class="text-button" data-go="workers">Manage workers →</button></div>
-            <div id="overview-workers" class="worker-strip empty-state">No active workers.</div>
+            <div class="panel-head"><div><p class="eyebrow">路由概况</p><h2>运行中的 Worker</h2></div><button class="text-button" data-go="workers">管理 Worker →</button></div>
+            <div id="overview-workers" class="worker-strip empty-state">暂无运行中的 Worker。</div>
           </article>
         </section>
 
         <section id="view-workers" class="view" aria-labelledby="section-title">
           <div class="worker-hero">
-            <div><p class="eyebrow">GIT-NATIVE EDGE DELIVERY</p><h2>Build once. Verify once. Run everywhere.</h2><p class="muted">Every repository configuration and release artifact is operator-signed. Builds happen on this node; immutable blobs and manifests fan out directly across the cluster.</p></div>
-            <div id="build-capabilities" class="capability-strip"><span class="dot pending"></span> Checking build host…</div>
+            <div><p class="eyebrow">Git 原生边缘交付</p><h2>一次构建，一次验证，处处运行。</h2><p class="muted">每项仓库配置与发布产物都须经管理员签名。构建在当前节点完成，不可变内容块与清单随后由集群点对点分发。</p></div>
+            <div id="build-capabilities" class="capability-strip"><span class="dot pending"></span> 正在检查构建节点…</div>
           </div>
 
           <div id="git-workspace" class="grid one-one">
             <article class="panel">
-              <div class="panel-head"><div><p class="eyebrow">SOURCE</p><h2>Connect a GitHub repository</h2></div><span class="badge">operator signed</span></div>
+              <div class="panel-head"><div><p class="eyebrow">代码源</p><h2>连接 GitHub 仓库</h2></div><span class="badge">须管理员签名</span></div>
               <form id="source-form" class="source-form">
-                <label><span>Worker name</span><input id="source-worker" pattern="[a-z0-9-]{1,63}" placeholder="api" required></label>
-                <label class="wide"><span>Repository URL</span><input id="source-repository" type="url" placeholder="https://github.com/owner/repository" required></label>
-                <label><span>Branch</span><input id="source-branch" value="main" required></label>
-                <label><span>Monorepo root</span><input id="source-root" value="." required></label>
-                <label class="wide"><span>Build command <em>optional · sandboxed</em></span><input id="source-command" class="code-input" placeholder="npm ci && npm run build"></label>
-                <label><span>Output directory</span><input id="source-output" value="." required></label>
-                <label class="check-label"><input id="source-private" type="checkbox"><span>Private repository token</span></label>
-                <label class="check-label"><input id="source-webhook" type="checkbox" checked><span>Build on GitHub push</span></label>
-                <button class="primary wide" type="submit">Review & sign repository connection</button>
+                <label><span>Worker 名称</span><input id="source-worker" pattern="[a-z0-9-]{1,63}" placeholder="api" required></label>
+                <label class="wide"><span>仓库地址</span><input id="source-repository" type="url" placeholder="https://github.com/owner/repository" required></label>
+                <label><span>分支</span><input id="source-branch" value="main" required></label>
+                <label><span>仓库内项目目录</span><input id="source-root" value="." required></label>
+                <label class="wide"><span>构建命令 <em>可选 · 沙箱运行</em></span><input id="source-command" class="code-input" placeholder="npm ci && npm run build"></label>
+                <label><span>产物目录</span><input id="source-output" value="." required></label>
+                <label class="check-label"><input id="source-private" type="checkbox"><span>使用私有仓库令牌</span></label>
+                <label class="check-label"><input id="source-webhook" type="checkbox" checked><span>GitHub 推送时自动构建</span></label>
+                <button class="primary wide" type="submit">提交仓库连接</button>
               </form>
-              <p class="form-note">Private repositories read <code>RF_GITHUB_TOKEN</code> from this node only. The token is never stored, replicated, or exposed to the build command.</p>
+              <p class="form-note">私有仓库只会从当前节点读取 <code>RF_GITHUB_TOKEN</code>。令牌不会被保存、复制，也不会暴露给构建命令。</p>
             </article>
 
             <article class="panel deploy-panel">
-              <div class="panel-head"><div><p class="eyebrow">DIRECT RELEASE</p><h2>Upload a ready bundle</h2></div><span class="badge">rf.json</span></div>
-              <p class="muted">Use this path for prebuilt or emergency releases. Git-backed releases below use the same signed Manifest and distribution protocol.</p>
+              <div class="panel-head"><div><p class="eyebrow">直接发布</p><h2>上传已构建的 Worker 包</h2></div><span class="badge">rf.json</span></div>
+              <p class="muted">此入口适用于预构建产物或紧急发布。Git 构建同样使用已签名的部署清单（Manifest）与相同的分发协议。</p>
               <form id="deploy-form">
-                <div id="deploy-local-fields"><label for="deploy-path">Local bundle path</label><input id="deploy-path" name="path" type="text" placeholder="/absolute/path/to/worker" autocomplete="off"></div>
-                <div id="deploy-public-fields" class="hidden"><label for="deploy-files">Worker bundle directory</label><input id="deploy-files" name="files" type="file" webkitdirectory multiple></div>
-                <button class="secondary" type="submit">Prepare direct release</button>
+                <div id="deploy-local-fields"><label for="deploy-path">本地 Worker 包路径</label><input id="deploy-path" name="path" type="text" placeholder="/absolute/path/to/worker" autocomplete="off"></div>
+                <div id="deploy-public-fields" class="hidden"><label for="deploy-files">Worker 包目录</label><input id="deploy-files" name="files" type="file" webkitdirectory multiple></div>
+                <button class="secondary" type="submit">准备直接发布</button>
               </form>
               <div id="deploy-mode" class="form-note"></div>
             </article>
           </div>
 
           <article class="panel">
-            <div class="panel-head"><div><p class="eyebrow">REPOSITORIES</p><h2>Connected sources</h2></div><span id="source-count" class="badge">0 connected</span></div>
-            <div id="source-list" class="source-list empty-state">No GitHub repositories connected.</div>
+            <div class="panel-head"><div><p class="eyebrow">代码仓库</p><h2>已连接的代码源</h2></div><span id="source-count" class="badge">已连接 0 个</span></div>
+            <div id="source-list" class="source-list empty-state">尚未连接 GitHub 仓库。</div>
           </article>
 
           <article class="panel">
-            <div class="panel-head"><div><p class="eyebrow">BUILD PIPELINE</p><h2>Build activity</h2></div><button id="build-refresh" class="text-button" type="button">Refresh builds ↻</button></div>
-            <div id="build-list" class="build-list empty-state">No builds yet.</div>
+            <div class="panel-head"><div><p class="eyebrow">构建流水线</p><h2>构建记录</h2></div><button id="build-refresh" class="text-button" type="button">刷新构建记录 ↻</button></div>
+            <div id="build-list" class="build-list empty-state">暂无构建记录。</div>
           </article>
 
           <article class="panel">
-            <div class="panel-head"><div><p class="eyebrow">GLOBAL DEPLOYMENTS</p><h2>Worker inventory</h2></div><span id="worker-count" class="badge">0 live</span></div>
+            <div class="panel-head"><div><p class="eyebrow">集群部署</p><h2>Worker 清单</h2></div><span id="worker-count" class="badge">运行中 0 个</span></div>
             <div class="table-wrap">
               <table>
-                <thead><tr><th>Worker</th><th>Release</th><th>Content</th><th>Routes</th><th>Distribution</th><th><span class="sr-only">Actions</span></th></tr></thead>
-                <tbody id="workers-table"><tr><td colspan="6" class="empty-state">No workers found.</td></tr></tbody>
+                <thead><tr><th>Worker</th><th>版本</th><th>内容</th><th>路由</th><th>分发状态</th><th><span class="sr-only">操作</span></th></tr></thead>
+                <tbody id="workers-table"><tr><td colspan="6" class="empty-state">暂无 Worker。</td></tr></tbody>
               </table>
             </div>
           </article>
@@ -170,29 +170,29 @@
         <section id="view-kv" class="view" aria-labelledby="section-title">
           <div class="grid kv-grid">
             <article class="panel">
-              <div class="panel-head"><div><p class="eyebrow">NAMESPACE BROWSER</p><h2>Keys</h2></div><span id="kv-count" class="badge">0 keys</span></div>
+              <div class="panel-head"><div><p class="eyebrow">命名空间浏览器</p><h2>键</h2></div><span id="kv-count" class="badge">0 个键</span></div>
               <form id="kv-search-form" class="inline-form">
-                <label><span>Namespace</span><input id="kv-namespace" value="rf-smoke" list="kv-namespaces" required><datalist id="kv-namespaces"></datalist></label>
-                <label><span>Prefix</span><input id="kv-prefix" placeholder="optional"></label>
-                <button class="secondary" type="submit">Load</button>
+                <label><span>命名空间</span><input id="kv-namespace" value="rf-smoke" list="kv-namespaces" required><datalist id="kv-namespaces"></datalist></label>
+                <label><span>前缀</span><input id="kv-prefix" placeholder="可选"></label>
+                <button class="secondary" type="submit">加载</button>
               </form>
-              <div id="kv-keys" class="key-list empty-state">Choose a namespace to inspect.</div>
+              <div id="kv-keys" class="key-list empty-state">请选择要查看的命名空间。</div>
             </article>
             <article class="panel editor-panel">
-              <p class="eyebrow">VALUE EDITOR</p>
-              <h2 id="kv-editor-title">New key</h2>
+              <p class="eyebrow">值编辑器</p>
+              <h2 id="kv-editor-title">新建键</h2>
               <form id="kv-editor-form">
-                <label for="kv-key">Key</label>
+                <label for="kv-key">键</label>
                 <input id="kv-key" required autocomplete="off">
-                <label for="kv-value">UTF-8 value</label>
+                <label for="kv-value">UTF-8 值</label>
                 <textarea id="kv-value" rows="12" required></textarea>
                 <div class="button-row">
-                  <button class="primary" type="submit">Save value</button>
-                  <button id="kv-new" class="secondary" type="button">Clear</button>
-                  <button id="kv-delete" class="danger ghost hidden" type="button">Delete</button>
+                  <button class="primary" type="submit">保存</button>
+                  <button id="kv-new" class="secondary" type="button">清空</button>
+                  <button id="kv-delete" class="danger ghost hidden" type="button">删除</button>
                 </div>
               </form>
-              <p class="form-note">System namespaces beginning with <code>__rf</code> are protected from writes.</p>
+              <p class="form-note">以 <code>__rf</code> 开头的系统命名空间受保护，不能在控制台中写入。</p>
             </article>
           </div>
         </section>
@@ -200,30 +200,30 @@
         <section id="view-d1" class="view" aria-labelledby="section-title">
           <div class="grid d1-grid">
             <article class="panel">
-              <p class="eyebrow">DATABASE CATALOG</p>
-              <h2>Create database</h2>
+              <p class="eyebrow">数据库目录</p>
+              <h2>创建数据库</h2>
               <form id="d1-create-form" class="stack-form">
-                <label for="d1-create-name">Database name</label>
+                <label for="d1-create-name">数据库名称</label>
                 <input id="d1-create-name" pattern="[a-z0-9-]{1,63}" placeholder="analytics" required>
-                <button class="primary" type="submit">Create quorum</button>
+                <button class="primary" type="submit">创建数据库</button>
               </form>
               <div class="divider"></div>
-              <h3>Known databases</h3>
-              <div id="database-list" class="database-list empty-state">No databases reported.</div>
+              <h3>已知数据库</h3>
+              <div id="database-list" class="database-list empty-state">暂无数据库。</div>
             </article>
             <article class="panel sql-panel">
-              <div class="panel-head"><div><p class="eyebrow">QUERY CONSOLE</p><h2>Execute SQL</h2></div><span class="badge">Leader-routed</span></div>
+              <div class="panel-head"><div><p class="eyebrow">查询控制台</p><h2>执行 SQL</h2></div><span class="badge">自动路由至主节点</span></div>
               <form id="d1-exec-form">
-                <label for="d1-name">Database</label>
+                <label for="d1-name">数据库</label>
                 <input id="d1-name" value="rf-smoke" required>
-                <label for="d1-sql">SQL statement</label>
+                <label for="d1-sql">SQL 语句</label>
                 <textarea id="d1-sql" class="code-input" rows="8">SELECT * FROM probes LIMIT 50</textarea>
-                <label for="d1-params">JSON parameters</label>
+                <label for="d1-params">JSON 参数</label>
                 <input id="d1-params" class="code-input" value="[]">
-                <button class="primary" type="submit">Run statement</button>
+                <button class="primary" type="submit">执行语句</button>
               </form>
-              <div class="result-head"><h3>Result</h3><span id="d1-result-meta" class="muted"></span></div>
-              <pre id="d1-result" class="result">Run a statement to inspect its result.</pre>
+              <div class="result-head"><h3>执行结果</h3><span id="d1-result-meta" class="muted"></span></div>
+              <pre id="d1-result" class="result">执行一条语句后，结果会显示在这里。</pre>
             </article>
           </div>
         </section>
@@ -231,21 +231,21 @@
     </div>
 
     <dialog id="history-dialog">
-      <div class="dialog-head"><div><p class="eyebrow">VERIFIABLE HISTORY</p><h2 id="history-title">Worker log</h2></div><button id="history-close" class="icon-button" aria-label="Close">×</button></div>
+      <div class="dialog-head"><div><p class="eyebrow">可验证历史</p><h2 id="history-title">Worker 历史记录</h2></div><button id="history-close" class="icon-button" aria-label="关闭">×</button></div>
       <div id="history-content"></div>
     </dialog>
     <dialog id="approval-dialog">
-      <div class="dialog-head"><div><p class="eyebrow">OPERATOR SIGNATURE</p><h2 id="approval-title">Approve cluster change</h2></div><button id="approval-close" class="icon-button" aria-label="Close">×</button></div>
+      <div class="dialog-head"><div><p class="eyebrow">管理员签名</p><h2 id="approval-title">批准集群变更</h2></div><button id="approval-close" class="icon-button" aria-label="关闭">×</button></div>
       <p id="approval-summary" class="muted"></p>
-      <div class="approval-code-wrap"><span>ONE-TIME CODE</span><strong id="approval-code">—</strong></div>
-      <label for="approval-command">Run on an operator machine</label>
-      <div class="command-row"><code id="approval-command">—</code><button id="approval-copy" class="secondary" type="button">Copy</button></div>
-      <div class="auth-state"><span id="approval-dot" class="dot pending"></span><span id="approval-status">Waiting for signature</span></div>
+      <div class="approval-code-wrap"><span>一次性授权码</span><strong id="approval-code">—</strong></div>
+      <label for="approval-command">请在管理员设备上运行</label>
+      <div class="command-row"><code id="approval-command">—</code><button id="approval-copy" class="secondary" type="button">复制</button></div>
+      <div class="auth-state"><span id="approval-dot" class="dot pending"></span><span id="approval-status">正在等待管理员签名</span></div>
     </dialog>
     <dialog id="log-dialog" class="log-dialog">
-      <div class="dialog-head"><div><p class="eyebrow" id="log-eyebrow">BUILD LOG</p><h2 id="log-title">Activity</h2></div><button id="log-close" class="icon-button" aria-label="Close">×</button></div>
+      <div class="dialog-head"><div><p class="eyebrow" id="log-eyebrow">构建日志</p><h2 id="log-title">活动记录</h2></div><button id="log-close" class="icon-button" aria-label="关闭">×</button></div>
       <div id="log-meta" class="muted"></div>
-      <pre id="log-content" class="result log-output">Waiting for log data…</pre>
+      <pre id="log-content" class="result log-output">正在等待日志数据…</pre>
     </dialog>
     <div id="toast" class="toast" role="status" aria-live="polite"></div>
     <script src="/app.js" defer></script>

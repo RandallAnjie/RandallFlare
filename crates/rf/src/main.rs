@@ -257,19 +257,19 @@ async fn async_main(cli: Cli) -> Result<()> {
             let cluster_id = status
                 .get("cluster_id")
                 .and_then(serde_json::Value::as_str)
-                .context("node status omitted cluster_id")?;
+                .context("节点状态中缺少 cluster_id")?;
             let configured_operator: rf_core::identity::SignerId = status
                 .get("operator")
                 .and_then(serde_json::Value::as_str)
-                .context("node status omitted operator")?
+                .context("节点状态中缺少 operator")?
                 .parse()
-                .map_err(|error| anyhow::anyhow!("node returned an invalid operator: {error}"))?;
+                .map_err(|error| anyhow::anyhow!("节点返回的管理员身份无效：{error}"))?;
             let payload = base64::engine::general_purpose::STANDARD
                 .decode(&approval.payload_base64)
-                .context("node returned an invalid approval payload")?;
+                .context("节点返回的审批载荷无效")?;
             let operator = operator_key(key)?;
             if operator.signer_id() != configured_operator {
-                anyhow::bail!("operator key does not match the operator configured on node {node}");
+                anyhow::bail!("管理员密钥与节点 {node} 配置的管理员身份不匹配");
             }
             let description = describe_approval(approval.kind, &payload, cluster_id, &node)?;
             println!("{description}");
@@ -279,7 +279,7 @@ async fn async_main(cli: Cli) -> Result<()> {
                     .encode(operator.sign(&payload)),
             };
             client.approve_authorization(&node, &code, &request).await?;
-            println!("approved {}", approval.code);
+            println!("已批准 {}", approval.code);
             Ok(())
         }
         Cmd::Deploy {
@@ -436,39 +436,39 @@ fn describe_approval(
     match kind {
         rf::management::ApprovalKind::Login => {
             let grant: rf::management::ConsoleGrant =
-                postcard::from_bytes(payload).context("node returned an invalid console grant")?;
+                postcard::from_bytes(payload).context("节点返回的控制台授权凭证无效")?;
             grant
                 .validate(expected_cluster_id, rf::node::now_ms())
-                .context("refusing invalid console grant")?;
+                .context("已拒绝无效的控制台授权凭证")?;
             Ok(format!(
-                "Sign in to RandallFlare cluster {} via {node}",
+                "通过节点 {node} 登录 RandallFlare 集群 {}",
                 grant.cluster_id
             ))
         }
         rf::management::ApprovalKind::Manifest => {
-            let manifest: rf_core::manifest::WorkerManifest = postcard::from_bytes(payload)
-                .context("node returned an invalid Worker manifest")?;
+            let manifest: rf_core::manifest::WorkerManifest =
+                postcard::from_bytes(payload).context("节点返回的 Worker 部署清单无效")?;
             manifest
                 .validate()
-                .map_err(|error| anyhow::anyhow!("refusing invalid manifest: {error}"))?;
+                .map_err(|error| anyhow::anyhow!("已拒绝无效的部署清单：{error}"))?;
             if manifest.deleted {
                 return Ok(format!(
-                    "Delete Worker {} at v{}",
+                    "删除 Worker {}（生成版本 v{}）",
                     manifest.name, manifest.version
                 ));
             }
             let routes = if manifest.hostnames.is_empty() {
-                "none".to_string()
+                "无".to_string()
             } else {
                 manifest.hostnames.join(", ")
             };
             let env_keys = if manifest.env.is_empty() {
-                "none".to_string()
+                "无".to_string()
             } else {
                 manifest.env.keys().cloned().collect::<Vec<_>>().join(", ")
             };
             Ok(format!(
-                "Deploy Worker {} v{} ({} modules, {} assets)\n  routes: {}\n  environment keys: {}\n  KV bindings: {}\n  cron triggers: {}",
+                "部署 Worker {} v{}（{} 个模块，{} 项静态资源）\n  路由：{}\n  环境变量键：{}\n  KV 绑定：{}\n  定时触发器：{}",
                 manifest.name,
                 manifest.version,
                 manifest.modules.len(),
@@ -481,27 +481,25 @@ fn describe_approval(
         }
         rf::management::ApprovalKind::Source => {
             let source: rf::build::WorkerSource =
-                postcard::from_bytes(payload).context("node returned an invalid Worker source")?;
-            source
-                .validate()
-                .context("refusing invalid Worker source")?;
+                postcard::from_bytes(payload).context("节点返回的 Worker 源码配置无效")?;
+            source.validate().context("已拒绝无效的 Worker 源码配置")?;
             if source.deleted {
                 Ok(format!(
-                    "Disconnect GitHub repository from Worker {} (source v{})",
+                    "断开 Worker {} 与 GitHub 仓库的连接（源码配置 v{}）",
                     source.worker, source.version
                 ))
             } else {
                 Ok(format!(
-                    "Connect Worker {} to {} branch {} (source v{})\n  root: {}\n  build: {}\n  output: {}\n  private token: {}\n  webhook: {}",
+                    "将 Worker {} 连接至 {} 的 {} 分支（源码配置 v{}）\n  项目目录：{}\n  构建命令：{}\n  产物目录：{}\n  使用私有令牌：{}\n  Webhook：{}",
                     source.worker,
                     source.repository,
                     source.branch,
                     source.version,
                     source.root,
-                    if source.build_command.is_empty() { "zero-config" } else { &source.build_command },
+                    if source.build_command.is_empty() { "零配置构建" } else { &source.build_command },
                     source.output_dir,
-                    source.use_github_token,
-                    source.webhook,
+                    if source.use_github_token { "是" } else { "否" },
+                    if source.webhook { "已启用" } else { "未启用" },
                 ))
             }
         }
@@ -876,7 +874,7 @@ mod cli_tests {
         assert!(describe_approval(ApprovalKind::Login, &payload, "cluster-b", "node-a").is_err());
         assert_eq!(
             describe_approval(ApprovalKind::Login, &payload, "cluster-a", "node-a").unwrap(),
-            "Sign in to RandallFlare cluster cluster-a via node-a"
+            "通过节点 node-a 登录 RandallFlare 集群 cluster-a"
         );
     }
 }
