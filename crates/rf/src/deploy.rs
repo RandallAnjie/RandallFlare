@@ -29,6 +29,7 @@ pub const EMAIL_METADATA_ENV: &str = "__RF_EMAIL_BINDINGS_V1";
 pub const SERVICE_METADATA_ENV: &str = "__RF_SERVICE_BINDINGS_V1";
 pub const SECRET_METADATA_ENV: &str = "__RF_SECRET_BINDINGS_V1";
 pub const COMPATIBILITY_FLAGS_METADATA_ENV: &str = "__RF_COMPATIBILITY_FLAGS_V1";
+pub const REQUIRED_TAGS_METADATA_ENV: &str = crate::placement::REQUIRED_TAGS_METADATA_ENV;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DurableObjectBinding {
@@ -109,6 +110,10 @@ pub fn compatibility_flags(m: &WorkerManifest) -> Vec<String> {
         .unwrap_or_default()
 }
 
+pub fn required_tags(m: &WorkerManifest) -> Vec<String> {
+    crate::placement::required_tags(m)
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct DeploySpec {
@@ -158,6 +163,9 @@ pub struct DeploySpec {
     pub compatibility_date: String,
     #[serde(default)]
     pub compatibility_flags: Vec<String>,
+    /// Node capability tags that must all be present before this Worker runs.
+    #[serde(default)]
+    pub required_tags: Vec<String>,
 }
 
 fn default_compat() -> String {
@@ -185,6 +193,7 @@ fn validate_spec(spec: &DeploySpec) -> Result<()> {
     if spec.env.keys().any(|key| key.starts_with("__RF_")) {
         bail!("env keys beginning with __RF_ are reserved by rf");
     }
+    crate::placement::normalize_tags(spec.required_tags.clone())?;
     let mut binding_names = std::collections::BTreeSet::new();
     for name in spec
         .env
@@ -678,6 +687,13 @@ fn manifest_from_bundle(
         env.insert(
             COMPATIBILITY_FLAGS_METADATA_ENV.into(),
             serde_json::to_string(&bundle.spec.compatibility_flags)?,
+        );
+    }
+    if !bundle.spec.required_tags.is_empty() {
+        let tags = crate::placement::normalize_tags(bundle.spec.required_tags.clone())?;
+        env.insert(
+            REQUIRED_TAGS_METADATA_ENV.into(),
+            serde_json::to_string(&tags)?,
         );
     }
     let manifest = WorkerManifest {

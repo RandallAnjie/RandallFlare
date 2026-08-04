@@ -221,6 +221,8 @@ pub fn router(state: ConsoleState) -> Router {
     let api = Router::new()
         .route("/api/session", get(session))
         .route("/api/overview", get(overview))
+        .route("/api/nodes", get(node_list))
+        .route("/api/nodes/{id}", axum::routing::patch(node_update))
         .route("/api/workers/deploy", post(worker_deploy))
         .route(
             "/api/workers/{name}",
@@ -708,6 +710,214 @@ async fn overview(State(state): State<ConsoleState>) -> ApiResult<Json<Value>> {
     Ok(Json(value))
 }
 
+async fn node_list(State(state): State<ConsoleState>) -> ApiResult<Json<Value>> {
+    let status = state.client.status(&state.node).await?;
+    let policies = state
+        .client
+        .resource_heads(&state.node, Some(crate::placement::NODE_POLICY_KIND))
+        .await?
+        .into_iter()
+        .filter(|view| !view.resource.deleted)
+        .filter_map(|view| {
+            crate::placement::policy_spec(&view.resource)
+                .ok()
+                .map(|policy| (policy.node_id.clone(), (view, policy)))
+        })
+        .collect::<BTreeMap<_, _>>();
+    let mut live = BTreeMap::<String, Value>::new();
+    if let Some(id) = status.get("node").and_then(Value::as_str) {
+        live.insert(
+            id.to_string(),
+            json!({
+                "id": id,
+                "label": status.get("label").cloned().unwrap_or(Value::Null),
+                "public": status.get("public").and_then(Value::as_bool).unwrap_or(false),
+                "api": status.pointer("/console/connected_to").cloned().unwrap_or_else(|| Value::String(state.node.to_string())),
+                "ip4": Value::Null,
+                "capabilities": status.get("capabilities").cloned().unwrap_or_else(|| json!([])),
+                "deployments": status.get("deployments").cloned().unwrap_or_else(|| json!({})),
+                "local": true,
+                "live": true,
+            }),
+        );
+    }
+    for peer in status
+        .get("peers")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        if let Some(id) = peer.get("id").and_then(Value::as_str) {
+            let mut peer = peer.clone();
+            if let Some(object) = peer.as_object_mut() {
+                object.insert("local".into(), Value::Bool(false));
+                object.insert("live".into(), Value::Bool(true));
+            }
+            live.insert(id.to_string(), peer);
+        }
+    }
+    let mut ids = live
+        .keys()
+        .cloned()
+        .collect::<std::collections::BTreeSet<_>>();
+    ids.extend(policies.keys().cloned());
+    let nodes = ids
+        .into_iter()
+        .map(|id| {
+            let mut node = live.remove(&id).unwrap_or_else(|| {
+                json!({
+                    "id": id,
+                    "label": "离线节点",
+                    "public": false,
+                    "api": null,
+                    "ip4": null,
+                    "capabilities": [],
+                    "deployments": {},
+                    "local": false,
+                    "live": false,
+                })
+            });
+            let (resource_version, region, tags, drain, suspended, reason) = policies
+                .get(&id)
+                .map(|(view, policy)| {
+                    (
+                        view.resource.version,
+                        policy.region.clone(),
+                        policy.tags.clone(),
+                        policy.drain,
+                        policy.suspended,
+                        policy.reason.clone(),
+                    )
+                })
+                .unwrap_or((0, String::new(), vec![], false, false, String::new()));
+            let mut effective = node
+                .get("capabilities")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(Value::as_str)
+                .map(str::to_string)
+                .collect::<std::collections::BTreeSet<_>>();
+            if node.get("public").and_then(Value::as_bool) == Some(true) {
+                effective.insert("public".into());
+            }
+            effective.extend(tags.iter().cloned());
+            if !region.is_empty() {
+                effective.insert(format!("region-{region}"));
+            }
+            if let Some(object) = node.as_object_mut() {
+                object.insert("resource_version".into(), resource_version.into());
+                object.insert("region".into(), region.into());
+                object.insert("tags".into(), json!(tags));
+                object.insert("effective_tags".into(), json!(effective));
+                object.insert("drain".into(), drain.into());
+                object.insert("suspended".into(), suspended.into());
+                object.insert("reason".into(), reason.into());
+            }
+            node
+        })
+        .collect::<Vec<_>>();
+    Ok(Json(json!({ "nodes": nodes })))
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct NodePolicyRequest {
+    #[serde(default)]
+    region: Option<String>,
+    #[serde(default)]
+    tags: Option<Vec<String>>,
+    #[serde(default)]
+    drain: Option<bool>,
+    #[serde(default)]
+    suspended: Option<bool>,
+    #[serde(default)]
+    reason: Option<String>,
+}
+
+async fn node_update(
+    State(state): State<ConsoleState>,
+    Extension(principal): Extension<ConsolePrincipal>,
+    Path(id): Path<String>,
+    Json(request): Json<NodePolicyRequest>,
+) -> ApiResult<Json<Value>> {
+    state.require_mutation()?;
+    if id.len() != 64 || !id.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err(ApiError::bad_request("节点身份必须是 64 位十六进制值"));
+    }
+    if request.region.is_none()
+        && request.tags.is_none()
+        && request.drain.is_none()
+        && request.suspended.is_none()
+        && request.reason.is_none()
+    {
+        return Err(ApiError::bad_request("没有需要更新的节点策略"));
+    }
+    let name = crate::placement::resource_name(&id)?;
+    let head = state
+        .client
+        .resource_head(&state.node, crate::placement::NODE_POLICY_KIND, &name)
+        .await?;
+    let current = head
+        .as_ref()
+        .filter(|head| !head.resource.deleted)
+        .map(|head| crate::placement::policy_spec(&head.resource))
+        .transpose()?
+        .unwrap_or(crate::placement::NodePolicy {
+            schema: crate::placement::NODE_POLICY_SCHEMA,
+            node_id: id.to_ascii_lowercase(),
+            region: String::new(),
+            tags: vec![],
+            drain: false,
+            suspended: false,
+            reason: String::new(),
+        });
+    let policy = crate::placement::NodePolicy {
+        schema: crate::placement::NODE_POLICY_SCHEMA,
+        node_id: id.to_ascii_lowercase(),
+        region: request.region.unwrap_or(current.region),
+        tags: request.tags.unwrap_or(current.tags),
+        drain: request.drain.unwrap_or(current.drain),
+        suspended: request.suspended.unwrap_or(current.suspended),
+        reason: request.reason.unwrap_or(current.reason),
+    };
+    let record = crate::placement::prepare_after(policy, head.as_ref())?;
+    match &state.mode {
+        ConsoleMode::Local { .. } => {
+            let envelope = rf_core::envelope::Envelope::seal_any(&record, state.operator()?);
+            state.client.post_resource(&state.node, &envelope).await?;
+            Ok(Json(json!({
+                "ok": true,
+                "node": id,
+                "version": record.version,
+            })))
+        }
+        ConsoleMode::Public { node, .. } => {
+            let approval = node.management.create_resource(
+                principal.session_id,
+                &record,
+                format!(
+                    "更新节点 {} 的调度策略 v{}",
+                    short_node_id(&id),
+                    record.version
+                ),
+            )?;
+            Ok(Json(json!({
+                "ok": true,
+                "pending_approval": true,
+                "node": id,
+                "version": record.version,
+                "approval": approval,
+                "approve_node": node.cfg.peer_api_advertise().to_string(),
+            })))
+        }
+    }
+}
+
+fn short_node_id(id: &str) -> &str {
+    id.get(..12).unwrap_or(id)
+}
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct DeployRequest {
@@ -826,6 +1036,8 @@ struct WorkerSettingsRequest {
     compatibility_date: Option<String>,
     #[serde(default)]
     compatibility_flags: Option<Vec<String>>,
+    #[serde(default)]
+    required_tags: Option<Vec<String>>,
 }
 
 fn manifest_error_zh(error: ManifestError) -> String {
@@ -958,6 +1170,7 @@ async fn worker_get(
             "crons": manifest.crons,
             "compatibility_date": manifest.compatibility_date,
             "compatibility_flags": deploy::compatibility_flags(&manifest),
+            "required_tags": crate::placement::required_tags_checked(&manifest)?,
             "durable_objects": durable_objects,
         },
         "source": source,
@@ -978,6 +1191,7 @@ fn worker_console_environment(manifest: &WorkerManifest) -> BTreeMap<String, Str
     env.remove(deploy::SERVICE_METADATA_ENV);
     env.remove(deploy::SECRET_METADATA_ENV);
     env.remove(deploy::COMPATIBILITY_FLAGS_METADATA_ENV);
+    env.remove(crate::placement::REQUIRED_TAGS_METADATA_ENV);
     env
 }
 
@@ -1534,6 +1748,7 @@ fn apply_worker_settings(
         crons,
         compatibility_date,
         compatibility_flags,
+        required_tags,
     } = request;
     if hostnames.is_none()
         && env.is_none()
@@ -1549,6 +1764,7 @@ fn apply_worker_settings(
         && crons.is_none()
         && compatibility_date.is_none()
         && compatibility_flags.is_none()
+        && required_tags.is_none()
     {
         return Err(ApiError::bad_request("没有需要更新的 Worker 配置"));
     }
@@ -1609,7 +1825,31 @@ fn apply_worker_settings(
         {
             env.insert(deploy::COMPATIBILITY_FLAGS_METADATA_ENV.into(), flags);
         }
+        if let Some(required_tags) = manifest
+            .env
+            .get(crate::placement::REQUIRED_TAGS_METADATA_ENV)
+            .cloned()
+        {
+            env.insert(
+                crate::placement::REQUIRED_TAGS_METADATA_ENV.into(),
+                required_tags,
+            );
+        }
         manifest.env = env;
+    }
+    if let Some(required_tags) = required_tags {
+        let required_tags = crate::placement::normalize_tags(required_tags)
+            .map_err(|error| ApiError::bad_request(error.to_string()))?;
+        if required_tags.is_empty() {
+            manifest
+                .env
+                .remove(crate::placement::REQUIRED_TAGS_METADATA_ENV);
+        } else {
+            manifest.env.insert(
+                crate::placement::REQUIRED_TAGS_METADATA_ENV.into(),
+                serde_json::to_string(&required_tags)?,
+            );
+        }
     }
     if let Some(kv_bindings) = kv_bindings {
         validate_settings_map(&kv_bindings, "KV 绑定")?;
@@ -5114,6 +5354,7 @@ mod tests {
                 crons: Some(vec!["*/5 * * * *".into()]),
                 compatibility_date: Some("2026-08-04".into()),
                 compatibility_flags: Some(vec!["nodejs_compat".into()]),
+                required_tags: Some(vec![" GPU ".into(), "region-eu".into(), "gpu".into()]),
             },
         )
         .unwrap();
@@ -5142,6 +5383,10 @@ mod tests {
         assert_eq!(updated.kv_bindings["CACHE"], "shared");
         assert_eq!(updated.crons, vec!["*/5 * * * *"]);
         assert_eq!(deploy::compatibility_flags(&updated), ["nodejs_compat"]);
+        assert_eq!(
+            crate::placement::required_tags(&updated),
+            ["gpu", "region-eu"]
+        );
         assert!(updated.env.contains_key(deploy::SECRET_METADATA_ENV));
         let exposed = worker_console_environment(&updated);
         let exposed_json = serde_json::to_string(&exposed).unwrap();

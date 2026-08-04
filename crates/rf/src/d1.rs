@@ -77,19 +77,33 @@ pub fn kv_key(name: &str) -> String {
 /// this after membership has converged; the group is immutable once
 /// published, exactly like user-created D1 databases.
 pub fn ensure_database(node: &Node, name: &str) -> Result<Vec<PublicId>> {
-    let key = kv_key(name);
-    if let Some(raw) = node.kv_get(acme_ns(), &key) {
-        let meta: DbMeta = serde_json::from_slice(&raw)?;
-        return Ok(meta.group);
-    }
     let mut universe = vec![node.id()];
     for (id_hex, _) in node.peers() {
         if let Ok(id) = id_hex.parse() {
             universe.push(id);
         }
     }
+    ensure_database_on(node, name, universe)
+}
+
+/// Create a database on an explicitly selected immutable replica universe.
+/// Durable Objects use this to keep their fenced owner inside the Worker's
+/// signed placement constraints from the first commit onward.
+pub fn ensure_database_on(
+    node: &Node,
+    name: &str,
+    mut universe: Vec<PublicId>,
+) -> Result<Vec<PublicId>> {
+    let key = kv_key(name);
+    if let Some(raw) = node.kv_get(acme_ns(), &key) {
+        let meta: DbMeta = serde_json::from_slice(&raw)?;
+        return Ok(meta.group);
+    }
     universe.sort();
     universe.dedup();
+    if universe.is_empty() {
+        anyhow::bail!("D1 replica universe cannot be empty");
+    }
     let group = rf_core::quorum::rendezvous_group(name, &universe, 3);
     let meta = DbMeta {
         group: group.clone(),

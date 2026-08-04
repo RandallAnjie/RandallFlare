@@ -42,8 +42,8 @@ surface yet.
 | public/inner nodes, DNS rotation, TLS/ACME | done | multi-provider DNS adapters |
 | decentralized browser authentication | done | hardware-wallet browser approval UX |
 | signed audit/transparency history | partial | include every platform resource and mutation |
-| node tags, placement requirements, drain/suspend | planned | signed capability declarations and routing fallback |
-| topology, quotas, request metrics, DLQ | partial | privacy-bounded per-node request history, encrypted live-node aggregation, 24-hour status trends and Cron/Queue DLQ are done; placement topology and enforceable quotas remain |
+| node tags, placement requirements, drain/suspend | partial | signed policies, system/custom/region tags, Worker constraints, encrypted exact-revision peer fallback, preview placement, DNS draining, capability-aware initial DO quorums and Chinese node UI are implemented and two-node tested; existing-DO owner migration and multi-VPS production soak remain |
+| topology, quotas, request metrics, DLQ | partial | placement topology, privacy-bounded per-node request history, encrypted live-node aggregation, 24-hour status trends and Cron/Queue DLQ are done; enforceable cross-resource quotas remain |
 | access tokens and scoped API credentials | planned | signed grants, revocation and least-privilege scopes |
 | device/exit networking | planned | capability-tagged exits and encrypted tunnel enrolment |
 
@@ -60,7 +60,7 @@ surface yet.
 | compatibility date and flags | done | compatibility date plus validated, signed workerd compatibility flags are done; the supported-flag catalogue must track the pinned workerd release |
 | runtime/build/request logs and cluster distribution | done | runtime output and 7-day request history aggregate across live nodes; longer archival/export is optional future work |
 | previews and pull-request deployments | partial | deterministic version/PR domains, isolated runtimes and DO disks, signed approval/tombstones, automatic expiry, ACME/blob repair, request observability and Chinese UI are implemented; GitHub check/comment reporting and multi-node fault soak remain |
-| service bindings and placement tags | partial | signed node-local dynamic Service router and native `env.SERVICE.fetch()` are done; placement-aware mesh fallback and cycle diagnostics remain |
+| service bindings and placement tags | partial | signed node-local dynamic Service router, native `env.SERVICE.fetch()`, placement requirements and encrypted mesh fallback are done; multi-service cycle diagnostics remain |
 | R2, D1, Queue, Analytics, Pipeline, Workflow, Email, Binary bindings | partial | native R2, CF-shaped D1, Queue producer/consumer, Analytics Engine, Pipeline, Workflow and Email bindings + console editors done; Binary Deliver remains |
 
 ### Data and storage

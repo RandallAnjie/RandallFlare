@@ -65,6 +65,14 @@ Working today, verified by multi-process fault-injection e2e tests:
   hostname/status and renders a 24-hour status trend. Query strings, headers,
   bodies, cookies, client IPs and User-Agent values are never collected. See
   [the observability guide](./docs/OBSERVABILITY.md).
+- **Signed node placement and draining**: authenticated system capabilities,
+  operator-signed region/custom tags, per-Worker required tags and live
+  deployment states form a decentralized scheduler. An ineligible public
+  ingress forwards the exact immutable revision through the encrypted peer
+  transport to an eligible ready node, where placement is verified again.
+  Drain/suspend policies also remove nodes from DNS rotation, while previews
+  and initial Durable Object quorum selection obey the same requirements. See
+  [the node placement guide](./docs/NODES.md).
 - **R2-compatible object storage**: operator-signed buckets, per-bucket D1
   metadata quorums, content-addressed local replicas or node-local rclone
   remotes, quotas, metadata, ranges, conditions, delimiter listing,

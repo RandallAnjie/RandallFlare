@@ -115,6 +115,14 @@ nav { display: grid; gap: 3px; }
 .node-row { display: grid; grid-template-columns: 10px minmax(120px, 1fr) minmax(150px, 1.2fr) auto; gap: 12px; align-items: center; padding: 11px 12px; background: #070707; border: 1px solid var(--line-soft); border-radius: 7px; }
 .node-row .node-name { font-weight: 600; font-size: 12px; }
 .node-row .node-address, .node-row .node-short { color: var(--muted); font: 11px "Geist Mono", monospace; overflow: hidden; text-overflow: ellipsis; }
+.node-policy-row { width: 100%; color: inherit; font: inherit; text-align: left; cursor: pointer; transition: border-color .15s ease, background .15s ease; }
+.node-policy-row:hover, .node-policy-row.selected { border-color: #686868; background: #101010; }
+.node-policy-row.selected { box-shadow: inset 2px 0 #fff; }
+.node-policy-row .tag-row { display: flex; flex-wrap: wrap; gap: 4px; margin-top: 7px; }
+.node-policy-row .tag-row .badge { font-size: 9px; padding: 2px 5px; }
+.settings-panel.node-policy-panel { display: block; min-width: 0; }
+.node-policy-panel .settings-form { min-width: 0; margin-top: 22px; }
+.node-policy-panel input, .node-policy-panel textarea { min-width: 0; }
 .identity-panel dl { margin: 18px 0 0; }
 .identity-panel dl div { padding: 10px 0; border-top: 1px solid var(--line-soft); }
 .identity-panel dt, .detail-list dt { color: var(--muted); font-size: 10px; letter-spacing: .05em; margin-bottom: 5px; }

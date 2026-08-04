@@ -9,6 +9,7 @@
 //!   rf:kdig:<ns>    KV namespace digest (hex)
 //!   rf:claim:<task> base64 claim envelope (our own live claims)
 //!   rf:deploy:<worker> compact JSON local deployment/runtime state
+//!   rf:capabilities  JSON list of authenticated self-declared capabilities
 //!
 //! Digest mismatch against a peer triggers an HTTP anti-entropy pull;
 //! claim keys are ingested directly off the gossip state. Claims and
@@ -36,6 +37,7 @@ pub const K_MDIG: &str = "rf:mdig";
 pub const K_KDIG_PREFIX: &str = "rf:kdig:";
 pub const K_CLAIM_PREFIX: &str = "rf:claim:";
 pub const K_DEPLOY_PREFIX: &str = "rf:deploy:";
+pub const K_CAPABILITIES: &str = "rf:capabilities";
 
 fn b64() -> base64::engine::GeneralPurpose {
     base64::engine::general_purpose::STANDARD
@@ -121,6 +123,14 @@ pub async fn start(node: Arc<Node>) -> Result<Gossip> {
         ),
         (K_LABEL.into(), node.cfg.label.clone()),
         (K_MDIG.into(), node.manifest_digest_hex()),
+        (
+            K_CAPABILITIES.into(),
+            serde_json::to_string(
+                &crate::placement::system_tags(&node, &node.id_hex())
+                    .into_iter()
+                    .collect::<Vec<_>>(),
+            )?,
+        ),
     ];
     if let Some(dns) = &node.cfg.dns {
         if let Some(ip) = &dns.my_ipv4 {
@@ -276,6 +286,13 @@ async fn observer(node: Arc<Node>, chitchat: Arc<tokio::sync::Mutex<chitchat::Ch
                 view.label = state.get(K_LABEL).unwrap_or_default().to_string();
                 view.ipv4 = state.get(K_IP4).map(|s| s.to_string());
                 view.manifest_digest = state.get(K_MDIG).unwrap_or_default().to_string();
+                view.capabilities = state
+                    .get(K_CAPABILITIES)
+                    .and_then(|value| serde_json::from_str::<Vec<String>>(value).ok())
+                    .and_then(|tags| crate::placement::normalize_tags(tags).ok())
+                    .unwrap_or_default()
+                    .into_iter()
+                    .collect();
                 for (k, v) in state.key_values() {
                     if let Some(ns) = k.strip_prefix(K_KDIG_PREFIX) {
                         view.kv_digests.insert(ns.to_string(), v.to_string());

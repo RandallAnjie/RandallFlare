@@ -30,6 +30,7 @@ pub mod pbind;
 pub mod peerapi;
 pub mod peers;
 pub mod pipeline;
+pub mod placement;
 pub mod preview;
 pub mod qbind;
 pub mod queue;

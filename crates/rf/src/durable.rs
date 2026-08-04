@@ -23,7 +23,7 @@ use std::sync::{Arc, Mutex};
 
 const MAX_PROXY_BODY: usize = 64 * 1024 * 1024;
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProxyRequest {
     pub method: String,
     pub path_and_query: String,
@@ -31,7 +31,7 @@ pub struct ProxyRequest {
     pub body: Vec<u8>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProxyResponse {
     pub status: u16,
     pub headers: Vec<(String, Vec<u8>)>,
@@ -83,7 +83,27 @@ impl Coordinator {
     }
 
     pub fn ensure_worker(&self, worker: &str) -> Result<Vec<PublicId>> {
-        d1::ensure_database(&self.node, &Self::db_name(worker))
+        let manifest = self
+            .node
+            .manifest(worker)
+            .with_context(|| format!("Worker {worker} manifest is not available"))?;
+        let mut universe = Vec::new();
+        if crate::placement::eligible(&self.node, &self.node.id_hex(), &manifest) {
+            universe.push(self.node.id());
+        }
+        for id in self.node.peers().keys() {
+            if crate::placement::eligible(&self.node, id, &manifest) {
+                if let Ok(id) = id.parse() {
+                    universe.push(id);
+                }
+            }
+        }
+        if universe.is_empty() {
+            anyhow::bail!(
+                "no live node satisfies Durable Object Worker {worker} placement constraints"
+            );
+        }
+        d1::ensure_database_on(&self.node, &Self::db_name(worker), universe)
     }
 
     /// Upgrade path for DO manifests deployed before quorum ownership
@@ -240,27 +260,54 @@ impl Coordinator {
 
     pub async fn dispatch(&self, worker: &str, request: ProxyRequest) -> Result<ProxyResponse> {
         for _ in 0..30 {
-            let leader = self
-                .leader(worker)
-                .context("DO owner election in progress")?;
-            if leader == self.node.id() {
-                return self.proxy_on_owner(worker, request).await;
-            }
-            let addr = self
-                .node
-                .peers()
-                .get(&leader.to_string())
-                .and_then(|p| p.api_addr)
-                .context("DO owner is not reachable")?;
             let path = format!("/v1/do/{worker}/proxy");
-            match self
-                .client
-                .post(&addr.to_string(), &path, postcard::to_stdvec(&request)?)
-                .await
-            {
-                Ok(raw) => return Ok(postcard::from_bytes(&raw)?),
-                Err(_) => tokio::time::sleep(std::time::Duration::from_millis(300)).await,
+            let mut candidates = Vec::new();
+            if let Some(leader) = self.leader(worker) {
+                candidates.push(leader);
             }
+            if let Some(raw) = self
+                .node
+                .kv_get(crate::acme::NS, &d1::kv_key(&Self::db_name(worker)))
+            {
+                if let Ok(meta) = serde_json::from_slice::<d1::DbMeta>(&raw) {
+                    candidates.extend(meta.group);
+                }
+            }
+            candidates.sort();
+            candidates.dedup();
+            // Prefer a locally observed leader, while still probing the fixed
+            // replica group when this ingress node is not itself a member.
+            if let Some(leader) = self.leader(worker) {
+                if let Some(index) = candidates.iter().position(|id| *id == leader) {
+                    candidates.swap(0, index);
+                }
+            }
+            for candidate in candidates {
+                if candidate == self.node.id() {
+                    if self.is_owner(worker) {
+                        if let Ok(response) = self.proxy_on_owner(worker, request.clone()).await {
+                            return Ok(response);
+                        }
+                    }
+                    continue;
+                }
+                let Some(addr) = self
+                    .node
+                    .peers()
+                    .get(&candidate.to_string())
+                    .and_then(|peer| peer.api_addr)
+                else {
+                    continue;
+                };
+                if let Ok(raw) = self
+                    .client
+                    .post(&addr.to_string(), &path, postcard::to_stdvec(&request)?)
+                    .await
+                {
+                    return Ok(postcard::from_bytes(&raw)?);
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
         }
         anyhow::bail!("no reachable Durable Object owner for {worker}")
     }

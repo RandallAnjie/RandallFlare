@@ -11,6 +11,7 @@
 //!   certbot-fed, hot-reloaded).
 
 use crate::node::Node;
+use crate::peers::PeerClient;
 use anyhow::Result;
 use axum::body::Body;
 use axum::extract::{Request, State};
@@ -21,11 +22,17 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use tower::ServiceExt;
 
+const MAX_FORWARDED_BODY: usize = 63 * 1024 * 1024;
+const MAX_FORWARDED_HEADERS: usize = 256;
+const MAX_FORWARDED_HEADER_BYTES: usize = 256 * 1024;
+const MAX_FORWARDED_TARGET_BYTES: usize = 16 * 1024;
+
 #[derive(Clone)]
 pub struct Ingress {
     node: Arc<Node>,
     http: reqwest::Client,
     durable: crate::durable::Coordinator,
+    peers: PeerClient,
     console: axum::Router,
 }
 
@@ -39,6 +46,7 @@ fn app(
         secure_console,
     )?);
     let ingress = Ingress {
+        peers: PeerClient::new(node.cfg.cluster_secret_bytes()?),
         node,
         durable,
         http: reqwest::Client::builder()
@@ -220,21 +228,8 @@ async fn serve_worker(
     runtime_id: &str,
     durable_coordinator: bool,
 ) -> Response {
-    // Asset tree first (assets-only workers and hybrid fallthrough).
-    if !manifest.assets.is_empty() {
-        if let Some(resp) = serve_asset(&ingress.node, manifest, path) {
-            return resp;
-        }
-        if manifest.main.is_empty() {
-            // Pure static site: custom 404 page or plain 404.
-            return not_found_page(&ingress.node, manifest);
-        }
-    }
-
-    if manifest.main.is_empty() {
-        return not_found_page(&ingress.node, manifest);
-    }
-
+    // Durable Objects already have a fenced owner and their own encrypted
+    // forwarding path. Do not send them through the stateless placement path.
     if durable_coordinator && !crate::deploy::durable_objects(manifest).is_empty() {
         let wire = match request_to_wire(req).await {
             Ok(wire) => wire,
@@ -250,15 +245,156 @@ async fn serve_worker(
         };
     }
 
+    let revision = if runtime_id == manifest.name {
+        manifest.version
+    } else {
+        crate::resource::head(&ingress.node, crate::preview::PREVIEW_KIND, runtime_id)
+            .map(|view| view.resource.version)
+            .unwrap_or(0)
+    };
+    let local_eligible =
+        crate::placement::eligible(&ingress.node, &ingress.node.id_hex(), manifest);
+    if !local_eligible || !local_worker_ready(&ingress.node, manifest, runtime_id) {
+        let wire = match request_to_wire(req).await {
+            Ok(wire) => wire,
+            Err(response) => return response,
+        };
+        return dispatch_placed_worker(
+            ingress,
+            manifest,
+            runtime_id,
+            revision,
+            runtime_id != manifest.name,
+            wire,
+        )
+        .await;
+    }
+
+    serve_direct_worker(
+        &ingress.node,
+        &ingress.http,
+        req,
+        manifest,
+        path,
+        runtime_id,
+    )
+    .await
+}
+
+fn local_worker_ready(node: &Node, manifest: &WorkerManifest, runtime_id: &str) -> bool {
+    let blobs_ready = manifest.blob_refs().all(|sha| node.blobs.has(&sha));
+    blobs_ready && (manifest.main.is_empty() || node.worker_port(runtime_id).is_some())
+}
+
+async fn dispatch_placed_worker(
+    ingress: &Ingress,
+    manifest: &WorkerManifest,
+    runtime_id: &str,
+    revision: u64,
+    preview: bool,
+    request: crate::durable::ProxyRequest,
+) -> Response {
+    let payload = WorkerDispatchRequest {
+        worker: manifest.name.clone(),
+        runtime_id: runtime_id.to_string(),
+        manifest_version: manifest.version,
+        revision,
+        preview,
+        request,
+    };
+    let Ok(body) = postcard::to_stdvec(&payload) else {
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    };
+    let peers = ingress.node.peers();
+    let mut candidates = peers
+        .iter()
+        .filter(|(id, peer)| {
+            crate::placement::eligible(&ingress.node, id, manifest)
+                && peer.api_addr.is_some()
+                && peer.deployments.get(runtime_id).is_some_and(|status| {
+                    status.version == revision
+                        && matches!(status.state.as_str(), "ready" | "running")
+                })
+        })
+        .map(|(id, peer)| (placement_score(runtime_id, id), id, peer))
+        .collect::<Vec<_>>();
+    candidates.sort_by_key(|candidate| std::cmp::Reverse(candidate.0));
+    let mut last_error = None;
+    for (_, id, peer) in candidates {
+        let Some(api) = peer.api_addr else { continue };
+        match ingress
+            .peers
+            .post(&api.to_string(), "/v1/worker-dispatch", body.clone())
+            .await
+        {
+            Ok(raw) => match postcard::from_bytes::<crate::durable::ProxyResponse>(&raw) {
+                Ok(response) => return wire_to_response(response),
+                Err(error) => last_error = Some(format!("节点 {id} 返回了无效响应：{error}")),
+            },
+            Err(error) => last_error = Some(format!("节点 {id} 不可用：{error}")),
+        }
+    }
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        format!(
+            "没有可用的合格 Worker 节点{}\n",
+            last_error
+                .map(|error| format!("：{error}"))
+                .unwrap_or_default()
+        ),
+    )
+        .into_response()
+}
+
+fn placement_score(runtime_id: &str, node_id: &str) -> [u8; 32] {
+    use sha2::{Digest, Sha256};
+    Sha256::digest(format!("{runtime_id}\0{node_id}").as_bytes()).into()
+}
+
+/// A complete request forwarded over the encrypted peer transport. The target
+/// independently resolves and verifies the immutable revision before serving.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub(crate) struct WorkerDispatchRequest {
+    pub worker: String,
+    pub runtime_id: String,
+    pub manifest_version: u64,
+    pub revision: u64,
+    pub preview: bool,
+    pub request: crate::durable::ProxyRequest,
+}
+
+pub(crate) async fn serve_direct_worker(
+    node: &Node,
+    http: &reqwest::Client,
+    req: Request,
+    manifest: &WorkerManifest,
+    path: &str,
+    runtime_id: &str,
+) -> Response {
+    // Asset tree first (assets-only workers and hybrid fallthrough).
+    if !manifest.assets.is_empty() {
+        if let Some(resp) = serve_asset(node, manifest, path) {
+            return resp;
+        }
+        if manifest.main.is_empty() {
+            // Pure static site: custom 404 page or plain 404.
+            return not_found_page(node, manifest);
+        }
+    }
+
+    if manifest.main.is_empty() {
+        return not_found_page(node, manifest);
+    }
+
     // Module worker: proxy to local workerd.
-    let Some(port) = ingress.node.worker_port(runtime_id) else {
+    let Some(port) = node.worker_port(runtime_id) else {
         return (
             StatusCode::SERVICE_UNAVAILABLE,
             "worker not running on this node\n",
         )
             .into_response();
     };
-    proxy(&ingress.http, req, port).await
+    proxy(http, req, port).await
 }
 
 async fn serve_flow_ingress(
@@ -678,7 +814,7 @@ fn request_hostname(req: &Request) -> String {
         .unwrap_or_default()
 }
 
-async fn request_to_wire(
+pub(crate) async fn request_to_wire(
     req: Request,
 ) -> std::result::Result<crate::durable::ProxyRequest, Response> {
     let authority = request_authority(&req)
@@ -690,7 +826,7 @@ async fn request_to_wire(
         .map(|pq| pq.as_str().to_string())
         .unwrap_or_else(|| "/".into());
     let (parts, body) = req.into_parts();
-    let body = axum::body::to_bytes(body, 64 * 1024 * 1024)
+    let body = axum::body::to_bytes(body, MAX_FORWARDED_BODY)
         .await
         .map_err(|e| (StatusCode::PAYLOAD_TOO_LARGE, e.to_string()).into_response())?;
     let mut headers: Vec<(String, Vec<u8>)> = parts
@@ -703,6 +839,18 @@ async fn request_to_wire(
             headers.push(("host".to_string(), authority));
         }
     }
+    if path_and_query.len() > MAX_FORWARDED_TARGET_BYTES
+        || headers.len() > MAX_FORWARDED_HEADERS
+        || headers.iter().fold(0usize, |total, (name, value)| {
+            total.saturating_add(name.len()).saturating_add(value.len())
+        }) > MAX_FORWARDED_HEADER_BYTES
+    {
+        return Err((
+            StatusCode::REQUEST_HEADER_FIELDS_TOO_LARGE,
+            "Worker 请求头或请求目标过大",
+        )
+            .into_response());
+    }
     Ok(crate::durable::ProxyRequest {
         method: parts.method.to_string(),
         path_and_query,
@@ -711,7 +859,7 @@ async fn request_to_wire(
     })
 }
 
-fn wire_to_response(response: crate::durable::ProxyResponse) -> Response {
+pub(crate) fn wire_to_response(response: crate::durable::ProxyResponse) -> Response {
     let mut builder = Response::builder().status(response.status);
     for (name, value) in response.headers {
         builder = builder.header(name, value);
@@ -719,6 +867,69 @@ fn wire_to_response(response: crate::durable::ProxyResponse) -> Response {
     builder
         .body(Body::from(response.body))
         .unwrap_or_else(|_| StatusCode::BAD_GATEWAY.into_response())
+}
+
+pub(crate) fn wire_to_request(
+    request: crate::durable::ProxyRequest,
+) -> std::result::Result<Request, &'static str> {
+    let header_bytes = request.headers.iter().fold(0usize, |total, (name, value)| {
+        total.saturating_add(name.len()).saturating_add(value.len())
+    });
+    if request.body.len() > MAX_FORWARDED_BODY
+        || request.headers.len() > MAX_FORWARDED_HEADERS
+        || header_bytes > MAX_FORWARDED_HEADER_BYTES
+        || request.path_and_query.len() > MAX_FORWARDED_TARGET_BYTES
+    {
+        return Err("forwarded Worker request is too large");
+    }
+    let method = Method::from_bytes(request.method.as_bytes()).map_err(|_| "invalid method")?;
+    let uri = request
+        .path_and_query
+        .parse::<Uri>()
+        .map_err(|_| "invalid request target")?;
+    if uri.scheme().is_some() || uri.authority().is_some() || !uri.path().starts_with('/') {
+        return Err("invalid request target");
+    }
+    let mut builder = Request::builder().method(method).uri(uri);
+    for (name, value) in request.headers {
+        if is_hop_header(&name) {
+            continue;
+        }
+        let name = axum::http::HeaderName::from_bytes(name.as_bytes())
+            .map_err(|_| "invalid request header")?;
+        let value = HeaderValue::from_bytes(&value).map_err(|_| "invalid request header")?;
+        builder = builder.header(name, value);
+    }
+    builder
+        .body(Body::from(request.body))
+        .map_err(|_| "invalid forwarded request")
+}
+
+pub(crate) async fn response_to_wire(
+    response: Response,
+) -> std::result::Result<crate::durable::ProxyResponse, &'static str> {
+    let status = response.status().as_u16();
+    let headers: Vec<(String, Vec<u8>)> = response
+        .headers()
+        .iter()
+        .filter(|(name, _)| !is_hop_header(name.as_str()))
+        .map(|(name, value)| (name.to_string(), value.as_bytes().to_vec()))
+        .collect();
+    if headers.len() > MAX_FORWARDED_HEADERS
+        || headers.iter().fold(0usize, |total, (name, value)| {
+            total.saturating_add(name.len()).saturating_add(value.len())
+        }) > MAX_FORWARDED_HEADER_BYTES
+    {
+        return Err("Worker response headers are too large");
+    }
+    let body = axum::body::to_bytes(response.into_body(), MAX_FORWARDED_BODY)
+        .await
+        .map_err(|_| "Worker response exceeds 64 MiB")?;
+    Ok(crate::durable::ProxyResponse {
+        status,
+        headers,
+        body: body.to_vec(),
+    })
 }
 
 fn serve_asset(node: &Node, m: &WorkerManifest, path: &str) -> Option<Response> {
@@ -856,5 +1067,38 @@ mod tests {
         assert_eq!(public_byte_range("bytes=-99", 10), Ok((0, 9)));
         assert_eq!(public_byte_range("bytes=11-", 10), Err(()));
         assert_eq!(public_byte_range("bytes=1-2,4-5", 10), Err(()));
+    }
+
+    #[test]
+    fn encrypted_worker_forwarding_accepts_only_bounded_origin_form_requests() {
+        let request = crate::durable::ProxyRequest {
+            method: "POST".into(),
+            path_and_query: "/v1/items?limit=2".into(),
+            headers: vec![("content-type".into(), b"application/json".to_vec())],
+            body: br#"{"ok":true}"#.to_vec(),
+        };
+        let rebuilt = wire_to_request(request).unwrap();
+        assert_eq!(rebuilt.method(), Method::POST);
+        assert_eq!(
+            rebuilt.uri().path_and_query().unwrap().as_str(),
+            "/v1/items?limit=2"
+        );
+
+        let absolute = crate::durable::ProxyRequest {
+            method: "GET".into(),
+            path_and_query: "http://metadata.invalid/latest".into(),
+            headers: vec![],
+            body: vec![],
+        };
+        assert!(wire_to_request(absolute).is_err());
+        let excessive_headers = crate::durable::ProxyRequest {
+            method: "GET".into(),
+            path_and_query: "/".into(),
+            headers: (0..=MAX_FORWARDED_HEADERS)
+                .map(|index| (format!("x-test-{index}"), vec![b'x']))
+                .collect(),
+            body: vec![],
+        };
+        assert!(wire_to_request(excessive_headers).is_err());
     }
 }

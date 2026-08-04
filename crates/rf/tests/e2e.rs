@@ -2645,3 +2645,113 @@ async fn two_node_deploy_kv_and_static_stability() {
     b2.kill().unwrap();
     b2.wait().unwrap();
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn tag_placement_forwards_public_ingress_to_an_eligible_peer() {
+    let _scenario = E2E_LOCK.lock().await;
+    let operator = Keypair::from_seed([47u8; 32]);
+    let operator_any = AnyKeypair::Ed(operator.clone());
+    let client = PeerClient::new(SECRET);
+    let http = reqwest::Client::new();
+    let a = start("placement-a", &operator, &[]);
+    wait_ping(&a.api, Duration::from_secs(15)).await;
+    let b = start("placement-b", &operator, &[a.gossip]);
+    wait_ping(&b.api, Duration::from_secs(15)).await;
+    wait_full_membership(&client, &[&a, &b], Duration::from_secs(20)).await;
+
+    let b_id = client.status(&b.api).await.unwrap()["node"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let policy = rf::placement::prepare_after(
+        rf::placement::NodePolicy {
+            schema: rf::placement::NODE_POLICY_SCHEMA,
+            node_id: b_id.clone(),
+            region: "eu-west".into(),
+            tags: vec!["gpu".into()],
+            drain: false,
+            suspended: false,
+            reason: String::new(),
+        },
+        None,
+    )
+    .unwrap();
+    client
+        .post_resource(
+            &a.api,
+            &rf_core::envelope::Envelope::seal_any(&policy, &operator_any),
+        )
+        .await
+        .unwrap();
+    let policy_name = rf::placement::resource_name(&b_id).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        if client
+            .resource_head(&b.api, rf::placement::NODE_POLICY_KIND, &policy_name)
+            .await
+            .unwrap()
+            .is_some()
+        {
+            break;
+        }
+        assert!(Instant::now() < deadline, "node policy did not replicate");
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+
+    let bundle_dir =
+        std::env::temp_dir().join(format!("rf-placement-bundle-{}", rand::random::<u32>()));
+    std::fs::create_dir_all(bundle_dir.join("public")).unwrap();
+    std::fs::write(
+        bundle_dir.join("rf.json"),
+        r#"{"name":"placed-site","assets":"public","hostnames":["placed.test"],"required_tags":["gpu","region-eu-west"]}"#,
+    )
+    .unwrap();
+    std::fs::write(
+        bundle_dir.join("public/index.html"),
+        "<h1>served by the eligible node</h1>",
+    )
+    .unwrap();
+    let bundle = rf::deploy::read_bundle(&bundle_dir).unwrap();
+    rf::deploy::deploy(&bundle, &client, &a.api, &operator_any)
+        .await
+        .unwrap();
+
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let a_status = client.status(&a.api).await.unwrap_or_default();
+        let b_status = client.status(&b.api).await.unwrap_or_default();
+        let a_state = a_status["deployments"]["placed-site"]["state"].as_str();
+        let b_state = b_status["deployments"]["placed-site"]["state"].as_str();
+        let peer_state = a_status["peers"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .find(|peer| peer["id"] == b_id)
+            .and_then(|peer| peer["deployments"]["placed-site"]["state"].as_str());
+        if a_state == Some("not_placed") && b_state == Some("ready") && peer_state == Some("ready")
+        {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "placement status did not converge: A={a_state:?}, B={b_state:?}, peer={peer_state:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+
+    // The request enters A, which is deliberately ineligible. A must not
+    // serve its local blob copy; it forwards the request over the encrypted
+    // peer API, where B verifies the exact revision and placement again.
+    let response = http
+        .get(format!("http://127.0.0.1:{}/", a.ingress))
+        .header("host", "placed.test")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    assert_eq!(
+        response.text().await.unwrap(),
+        "<h1>served by the eligible node</h1>"
+    );
+    std::fs::remove_dir_all(bundle_dir).ok();
+}

@@ -133,6 +133,11 @@ impl Runtime {
             .into_iter()
             .filter(|m| !m.main.is_empty())
             .filter(|m| {
+                crate::placement::eligible(&self.node, &self.node.id_hex(), m)
+                    || (!crate::deploy::durable_objects(m).is_empty()
+                        && self.durable.is_owner(&m.name))
+            })
+            .filter(|m| {
                 let has_do = !crate::deploy::durable_objects(m).is_empty();
                 !has_do
                     || self.node.cfg.runtime.allow_local_durable_objects
@@ -149,6 +154,9 @@ impl Runtime {
             crate::preview::active_previews(&self.node)
                 .into_iter()
                 .filter(|(_, spec)| !spec.manifest.main.is_empty())
+                .filter(|(_, spec)| {
+                    crate::placement::eligible(&self.node, &self.node.id_hex(), &spec.manifest)
+                })
                 .map(|(view, spec)| DesiredWorker {
                     id: view.resource.name,
                     revision: view.resource.version,
@@ -1204,6 +1212,7 @@ pub fn generate_config(
             || k == crate::deploy::SERVICE_METADATA_ENV
             || k == crate::deploy::SECRET_METADATA_ENV
             || k == crate::deploy::COMPATIBILITY_FLAGS_METADATA_ENV
+            || k == crate::deploy::REQUIRED_TAGS_METADATA_ENV
         {
             continue;
         }

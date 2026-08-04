@@ -28,6 +28,7 @@ pub struct Api {
     pub node: Arc<Node>,
     pub d1: crate::d1::Registry,
     pub durable: crate::durable::Coordinator,
+    worker_http: reqwest::Client,
     secret: [u8; 32],
     seen_nonces: Arc<Mutex<HashMap<String, u64>>>,
 }
@@ -53,6 +54,9 @@ pub async fn serve_managed(
         node: node.clone(),
         d1,
         durable,
+        worker_http: reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(120))
+            .build()?,
         secret,
         seen_nonces: Arc::new(Mutex::new(HashMap::new())),
     };
@@ -91,6 +95,7 @@ pub fn router(api: Api) -> Router {
             get(authorization_get).post(authorization_post),
         )
         .route("/v1/worker/{name}", get(worker_get))
+        .route("/v1/worker-dispatch", post(worker_dispatch))
         .route("/v1/log/{name}", get(log_get))
         .route(
             "/v1/observability/{worker}/requests",
@@ -388,6 +393,7 @@ async fn status(
                 "public": v.public,
                 "api": v.api_addr.map(|a| a.to_string()),
                 "ip4": v.ipv4,
+                "capabilities": v.capabilities,
                 "deployments": v.deployments,
             })
         })
@@ -400,10 +406,23 @@ async fn status(
             let effective_hostnames = node.effective_worker_hostnames(&m);
             let has_do = !crate::deploy::durable_objects(&m).is_empty();
             let do_owner = if has_do {
-                api.durable.leader(&m.name).map(|id| id.to_string())
+                api.durable
+                    .leader(&m.name)
+                    .map(|id| id.to_string())
+                    .or_else(|| {
+                        peer_views.iter().find_map(|(id, peer)| {
+                            peer.deployments
+                                .get(&m.name)
+                                .filter(|status| {
+                                    status.version == m.version && status.state == "running"
+                                })
+                                .map(|_| id.clone())
+                        })
+                    })
             } else {
                 None
             };
+            let durable_owned_here = has_do && do_owner.as_deref() == Some(&node.id_hex());
             let mut deployments = vec![serde_json::json!({
                 "node": node.id_hex(),
                 "label": node.cfg.label,
@@ -440,7 +459,7 @@ async fn status(
                 "crons": m.crons,
                 "durable_objects": has_do,
                 "durable_owner": do_owner,
-                "durable_owned_here": has_do && api.durable.is_owner(&m.name),
+                "durable_owned_here": durable_owned_here,
                 "distribution": {
                     "ready": ready_nodes,
                     "total": deployments.len(),
@@ -555,6 +574,8 @@ async fn status(
         "cluster_id": node.cfg.cluster_id,
         "operator": node.cfg.operator.to_string(),
         "public": node.cfg.public,
+        "capabilities": crate::placement::system_tags(node, &node.id_hex()),
+        "deployments": local_deployments,
         "default_worker_domain": node.cfg.default_worker_domain(),
         "version": env!("CARGO_PKG_VERSION"),
         "peers": peers,
@@ -1005,6 +1026,87 @@ async fn d1_create(
         "group": group.iter().map(|g| g.to_string()).collect::<Vec<_>>(),
     }))
     .into_response()
+}
+
+async fn worker_dispatch(
+    State(api): State<Api>,
+    ConnectInfo(remote): ConnectInfo<SocketAddr>,
+    method: Method,
+    uri: Uri,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    if let Err(response) = check(&api, &remote, &headers, &method, &uri, &body) {
+        return response.into_response();
+    }
+    let Ok(dispatch) = postcard::from_bytes::<crate::ingress::WorkerDispatchRequest>(&body) else {
+        return (StatusCode::BAD_REQUEST, "bad Worker dispatch request").into_response();
+    };
+    let manifest = if dispatch.preview {
+        crate::preview::active_previews(&api.node)
+            .into_iter()
+            .find(|(view, spec)| {
+                view.resource.name == dispatch.runtime_id
+                    && view.resource.version == dispatch.revision
+                    && spec.worker == dispatch.worker
+                    && spec.manifest.version == dispatch.manifest_version
+            })
+            .map(|(_, spec)| spec.manifest)
+    } else {
+        api.node.manifest(&dispatch.worker).filter(|manifest| {
+            dispatch.runtime_id == dispatch.worker
+                && dispatch.revision == manifest.version
+                && dispatch.manifest_version == manifest.version
+        })
+    };
+    let Some(manifest) = manifest else {
+        return (StatusCode::CONFLICT, "Worker revision changed").into_response();
+    };
+    if !crate::placement::eligible(&api.node, &api.node.id_hex(), &manifest) {
+        return (
+            StatusCode::MISDIRECTED_REQUEST,
+            "Worker is not placed on this node",
+        )
+            .into_response();
+    }
+    if !crate::deploy::durable_objects(&manifest).is_empty() {
+        return (
+            StatusCode::MISDIRECTED_REQUEST,
+            "Durable Object Workers require their fenced owner route",
+        )
+            .into_response();
+    }
+    if manifest.blob_refs().any(|sha| !api.node.blobs.has(&sha))
+        || (!manifest.main.is_empty() && api.node.worker_port(&dispatch.runtime_id).is_none())
+    {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Worker runtime is not ready",
+        )
+            .into_response();
+    }
+    let request = match crate::ingress::wire_to_request(dispatch.request) {
+        Ok(request) => request,
+        Err(error) => return (StatusCode::BAD_REQUEST, error).into_response(),
+    };
+    let path = request.uri().path().to_string();
+    let response = crate::ingress::serve_direct_worker(
+        &api.node,
+        &api.worker_http,
+        request,
+        &manifest,
+        &path,
+        &dispatch.runtime_id,
+    )
+    .await;
+    match crate::ingress::response_to_wire(response).await {
+        Ok(response) => postcard::to_stdvec(&response)
+            .map(|raw| raw.into_response())
+            .unwrap_or_else(|error| {
+                (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()).into_response()
+            }),
+        Err(error) => (StatusCode::BAD_GATEWAY, error).into_response(),
+    }
 }
 
 async fn do_proxy(

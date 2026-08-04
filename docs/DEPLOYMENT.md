@@ -187,6 +187,11 @@ For a private repository, add a read-only `RF_GITHUB_TOKEN` to
 sandbox. Repository configuration and every produced Manifest still require a
 one-time operator signature.
 
+多 VPS 集群可在“节点与调度”中为成员签名区域与能力标签，并在 Worker 设置中填写
+所需标签。排空节点会先退出轮转 DNS；如果请求仍抵达该节点，入口会通过加密 Peer
+API 转发到满足约束且运行相同签名版本的节点。维护步骤、标签语义与 Durable Object
+注意事项见 [节点调度指南](./NODES.md)。
+
 邮件节点是可选角色，首台功能测试 VPS 默认不启用，也不应开放 TCP 25。需要测试
 邮件时，先按 [邮件指南](./EMAIL.md) 准备 MX/PTR、STARTTLS 证书、R2 bucket 和
 节点本地 DKIM 私钥变量，再在 `[email]` 中显式启用。邮件私钥与 rclone 凭据一样

@@ -7,6 +7,9 @@ if (consoleMode === "public") document.body.classList.add("auth-required");
 
 const state = {
   overview: null,
+  nodes: [],
+  nodeActive: null,
+  nodePolicyDirty: false,
   session: null,
   view: "overview",
   busy: 0,
@@ -61,6 +64,7 @@ const state = {
 
 const titles = {
   overview: ["集群控制", "概览"],
+  nodes: ["集群控制", "节点与调度"],
   workers: ["签名清单", "Worker"],
   "worker-new": ["Worker 项目", "新建项目"],
   "worker-detail": ["Worker 项目", "项目详情"],
@@ -760,6 +764,7 @@ function renderWorkerDetail(data) {
     .join("");
   $("#project-compatibility-date").value = worker.compatibility_date;
   $("#project-compatibility-flags").value = (worker.compatibility_flags || []).join("\n");
+  $("#project-required-tags").value = (worker.required_tags || []).join("\n");
   $("#project-source-repository").value = source?.repository?.replace(/\.git$/, "") || "";
   $("#project-source-branch").value = source?.branch || "main";
   $("#project-source-root").value = source?.root || ".";
@@ -1151,6 +1156,7 @@ async function saveProjectSettings(event) {
     {
       compatibility_date: $("#project-compatibility-date").value,
       compatibility_flags: $("#project-compatibility-flags").value.split(/\s+/).map((value) => value.trim()).filter(Boolean),
+      required_tags: $("#project-required-tags").value.split(/\s+/).map((value) => value.trim()).filter(Boolean),
     },
     `更新 ${state.activeWorker} 的兼容日期与标志。`,
   );
@@ -3069,6 +3075,81 @@ async function loadOverview({ quiet = false } = {}) {
   }
 }
 
+function renderNodes() {
+  const nodes = state.nodes;
+  $("#node-nav-count").textContent = String(nodes.length);
+  $("#nodes-live-count").textContent = `${nodes.filter((node) => node.live).length}/${nodes.length} 在线`;
+  const list = $("#cluster-node-list");
+  list.classList.toggle("empty-state", nodes.length === 0);
+  list.innerHTML = nodes.length ? nodes.map((node) => {
+    const tags = node.effective_tags || [];
+    const deployments = Object.values(node.deployments || {});
+    const running = deployments.filter((item) => ["ready", "running", "standby"].includes(item?.state)).length;
+    const lifecycle = node.suspended ? "已停用" : node.drain ? "排空中" : node.live ? "可调度" : "离线";
+    const dot = node.live ? (node.suspended ? "offline" : node.drain ? "pending" : "online") : "offline";
+    return `<button class="node-row node-policy-row${state.nodeActive === node.id ? " selected" : ""}" type="button" data-cluster-node="${escapeHtml(node.id)}">
+      <span class="dot ${dot}" title="${escapeHtml(lifecycle)}"></span>
+      <div><div class="node-name">${escapeHtml(node.label || "未命名节点")}${node.local ? " · 当前节点" : ""}</div><div class="node-short">${escapeHtml(shortId(node.id, 18))} · ${escapeHtml(node.region || "未设区域")}</div><div class="tag-row">${tags.slice(0, 8).map((tag) => `<span class="badge">${escapeHtml(tag)}</span>`).join("") || '<span class="muted">无能力标签</span>'}</div></div>
+      <div class="node-address">${running}/${deployments.length} 个实例</div><span class="badge${node.suspended ? " danger" : node.drain ? " pending" : " active"}">${escapeHtml(lifecycle)}</span>
+    </button>`;
+  }).join("") : "尚未发现集群节点。";
+  if (state.nodeActive && !nodes.some((node) => node.id === state.nodeActive)) state.nodeActive = null;
+  if (state.nodeActive && !state.nodePolicyDirty) selectNode(state.nodeActive, false);
+}
+
+function selectNode(id, rerender = true) {
+  const node = state.nodes.find((item) => item.id === id);
+  if (!node) return;
+  if (state.nodeActive !== id) state.nodePolicyDirty = false;
+  state.nodeActive = id;
+  if (rerender) renderNodes();
+  $("#node-policy-title").textContent = node.label || shortId(node.id, 18);
+  $("#node-policy-summary").textContent = `${node.live ? "在线" : "离线"} · 策略 v${node.resource_version || "尚未创建"} · ${node.effective_tags?.length || 0} 个有效标签`;
+  $("#node-policy-form").classList.remove("hidden");
+  $("#node-policy-id").value = node.id;
+  $("#node-policy-region").value = node.region || "";
+  $("#node-policy-tags").value = (node.tags || []).join("\n");
+  $("#node-policy-drain").checked = Boolean(node.drain);
+  $("#node-policy-suspended").checked = Boolean(node.suspended);
+  $("#node-policy-reason").value = node.reason || "";
+}
+
+async function loadNodes({ quiet = false } = {}) {
+  try {
+    const data = await api("/api/nodes");
+    state.nodes = data.nodes || [];
+    renderNodes();
+    if (!quiet) toast("节点与调度策略已刷新");
+  } catch (error) {
+    $("#cluster-node-list").innerHTML = `<div class="empty-state">${escapeHtml(error.message)}</div>`;
+    if (!quiet) toast(error.message, true);
+  }
+}
+
+async function saveNodePolicy(event) {
+  event.preventDefault();
+  const id = state.nodeActive;
+  if (!id) return;
+  const payload = {
+    region: $("#node-policy-region").value.trim(),
+    tags: $("#node-policy-tags").value.split(/\s+/).map((tag) => tag.trim()).filter(Boolean),
+    drain: $("#node-policy-drain").checked,
+    suspended: $("#node-policy-suspended").checked,
+    reason: $("#node-policy-reason").value.trim(),
+  };
+  try {
+    const result = await api(`/api/nodes/${encodeURIComponent(id)}`, { method: "PATCH", body: JSON.stringify(payload) });
+    const complete = async () => {
+      state.nodePolicyDirty = false;
+      await Promise.all([loadNodes({ quiet: true }), loadOverview({ quiet: true })]);
+    };
+    if (result.pending_approval) showApproval(result, `更新节点 ${shortId(id, 18)} 的签名调度策略。`, complete);
+    else { toast(`节点策略 v${result.version} 已发布`); await complete(); }
+  } catch (error) {
+    toast(error.message, true);
+  }
+}
+
 async function loadHistory(name) {
   try {
     const data = await api(`/api/workers/${encodeURIComponent(name)}/log`);
@@ -3366,7 +3447,9 @@ async function boot() {
       : "密钥仅保留在本地<br>控制台进程中。";
     $$("#deploy-form button, #source-form button, #kv-editor-form button, #d1-create-form button, #d1-exec-form button, #r2-bucket-form button, #r2-upload-form button, #r2-delete-bucket, #queue-form button, #queue-send-form button, #queue-delete, #analytics-form button, #analytics-write-form button, #analytics-delete, #pipeline-form button, #pipeline-token-form button, #pipeline-ingest-form button, #pipeline-flush, #pipeline-delete, #workflow-form button, #workflow-trigger-form button, #workflow-signal-form button, #workflow-delete, #flow-form button, #flow-token-form button, #flow-trigger-form button, #flow-delete, #email-domain-form button, #email-route-form button, #email-send-form button, #email-delete, #email-verify, #project-domain-add-form button, #project-bindings-form button, #project-secret-form button, #project-file-form button, #project-file-new, #project-triggers-form button, #project-cron-fire-form button, #project-cron-dlq button, #project-settings-form button, #project-preview-form button, #project-preview-list button, #project-source-form button, #project-redeploy, #project-delete")
       .forEach((button) => { button.disabled = state.session.read_only; });
+    $("#node-policy-form button").disabled = state.session.read_only;
     await loadOverview({ quiet: true });
+    await loadNodes({ quiet: true });
     await loadWorkerOps();
     await loadKeys();
     await loadR2({ quiet: true });
@@ -3387,12 +3470,23 @@ async function boot() {
   }
 }
 
-$$(".nav-item").forEach((button) => button.addEventListener("click", () => switchView(button.dataset.view)));
+$$(".nav-item").forEach((button) => button.addEventListener("click", () => {
+  switchView(button.dataset.view);
+  if (button.dataset.view === "nodes") loadNodes({ quiet: true });
+}));
 $$('[data-go]').forEach((button) => button.addEventListener("click", () => switchView(button.dataset.go)));
 $("#overview-workers").addEventListener("click", (event) => {
   const button = event.target.closest("[data-open-worker]");
   if (button) openWorkerDetail(button.dataset.openWorker);
 });
+$("#cluster-node-list").addEventListener("click", (event) => {
+  const button = event.target.closest("[data-cluster-node]");
+  if (button) selectNode(button.dataset.clusterNode);
+});
+$("#node-policy-form").addEventListener("submit", saveNodePolicy);
+$("#node-policy-form").addEventListener("input", () => { state.nodePolicyDirty = true; });
+$("#node-policy-form").addEventListener("change", () => { state.nodePolicyDirty = true; });
+$("#nodes-refresh").addEventListener("click", () => loadNodes());
 $("#new-project").addEventListener("click", () => {
   state.activeWorker = null;
   state.workerDetail = null;
@@ -3459,6 +3553,7 @@ $("#request-log-filter").addEventListener("submit", (event) => {
 });
 $("#refresh").addEventListener("click", async () => {
   await loadOverview();
+  await loadNodes({ quiet: true });
   await loadR2({ quiet: true });
   await loadQueues({ quiet: true });
   await loadAnalytics({ quiet: true });
@@ -3666,6 +3761,7 @@ setInterval(() => {
   if (state.session) {
     loadOverview({ quiet: true });
     loadWorkerOps();
+    if (state.view === "nodes") loadNodes({ quiet: true });
     if (state.view === "r2") loadR2({ quiet: true });
     if (state.view === "queues") loadQueues({ quiet: true });
     if (state.view === "analytics") loadAnalytics({ quiet: true }).then(() => {

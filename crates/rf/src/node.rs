@@ -15,7 +15,7 @@ use rf_core::identity::{Keypair, PublicId};
 use rf_core::kv::{KvEntry, Merge, Namespace};
 use rf_core::manifest::{ManifestIngest, ManifestSet, WorkerManifest};
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::net::SocketAddr;
 use std::sync::Mutex;
 use tokio::sync::broadcast;
@@ -67,6 +67,9 @@ pub struct PeerView {
     pub manifest_digest: String,
     pub kv_digests: BTreeMap<String, String>,
     pub deployments: BTreeMap<String, DeploymentStatus>,
+    /// Self-declared hardware/service capabilities carried by authenticated
+    /// cluster gossip (for example `build`, `email`, and `rclone`).
+    pub capabilities: BTreeSet<String>,
     pub generation: u64,
 }
 
@@ -287,6 +290,10 @@ impl Node {
     }
 
     pub fn notify_blobs_changed(&self) {
+        self.emit(NodeEvent::Runtime);
+    }
+
+    pub(crate) fn notify_runtime_changed(&self) {
         self.emit(NodeEvent::Runtime);
     }
 
@@ -877,11 +884,21 @@ impl Node {
                 inner.runtime_status.clone(),
             )
         };
-        manifests
+        let mut statuses = manifests
             .into_iter()
             .map(|manifest| {
                 let missing = manifest.blob_refs().any(|sha| !self.blobs.has(&sha));
-                let status = if missing {
+                let eligible = crate::placement::eligible(self, &self.id_hex(), &manifest);
+                let fenced_owner = !crate::deploy::durable_objects(&manifest).is_empty()
+                    && ports.contains_key(&manifest.name);
+                let status = if !eligible && !fenced_owner {
+                    DeploymentStatus {
+                        version: manifest.version,
+                        state: "not_placed".into(),
+                        detail: "node capability tags do not satisfy this Worker".into(),
+                        updated_at_ms: now_ms(),
+                    }
+                } else if missing {
                     DeploymentStatus {
                         version: manifest.version,
                         state: "waiting_blobs".into(),
@@ -899,7 +916,13 @@ impl Node {
                     DeploymentStatus {
                         version: manifest.version,
                         state: "running".into(),
-                        detail: format!("workerd on 127.0.0.1:{port}"),
+                        detail: if eligible {
+                            format!("workerd on 127.0.0.1:{port}")
+                        } else {
+                            format!(
+                                "fenced Durable Object owner on 127.0.0.1:{port}; retained for state safety"
+                            )
+                        },
                         updated_at_ms: explicit
                             .get(&manifest.name)
                             .map(|status| status.updated_at_ms)
@@ -919,7 +942,57 @@ impl Node {
                 };
                 (manifest.name, status)
             })
-            .collect()
+            .collect::<BTreeMap<_, _>>();
+        for (view, preview) in crate::preview::active_previews(self) {
+            let manifest = preview.manifest;
+            let runtime_id = view.resource.name;
+            let missing = manifest.blob_refs().any(|sha| !self.blobs.has(&sha));
+            let status = if !crate::placement::eligible(self, &self.id_hex(), &manifest) {
+                DeploymentStatus {
+                    version: view.resource.version,
+                    state: "not_placed".into(),
+                    detail: "node capability tags do not satisfy this Worker preview".into(),
+                    updated_at_ms: now_ms(),
+                }
+            } else if missing {
+                DeploymentStatus {
+                    version: view.resource.version,
+                    state: "waiting_blobs".into(),
+                    detail: "fetching immutable preview blobs from peers".into(),
+                    updated_at_ms: now_ms(),
+                }
+            } else if manifest.main.is_empty() {
+                DeploymentStatus {
+                    version: view.resource.version,
+                    state: "ready".into(),
+                    detail: "static preview assets ready".into(),
+                    updated_at_ms: now_ms(),
+                }
+            } else if let Some(port) = ports.get(&runtime_id) {
+                DeploymentStatus {
+                    version: view.resource.version,
+                    state: "running".into(),
+                    detail: format!("preview workerd on 127.0.0.1:{port}"),
+                    updated_at_ms: explicit
+                        .get(&runtime_id)
+                        .map(|status| status.updated_at_ms)
+                        .unwrap_or_else(now_ms),
+                }
+            } else {
+                explicit
+                    .get(&runtime_id)
+                    .cloned()
+                    .filter(|status| status.version == view.resource.version)
+                    .unwrap_or(DeploymentStatus {
+                        version: view.resource.version,
+                        state: "starting".into(),
+                        detail: "waiting for local preview runtime".into(),
+                        updated_at_ms: now_ms(),
+                    })
+            };
+            statuses.insert(runtime_id, status);
+        }
+        statuses
     }
 
     pub fn set_kvbind_port(&self, port: u16) {

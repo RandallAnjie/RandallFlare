@@ -44,6 +44,9 @@
           <button class="nav-item active" data-view="overview">
             <span class="nav-glyph" aria-hidden="true">⌁</span><span>概览</span>
           </button>
+          <button class="nav-item" data-view="nodes">
+            <span class="nav-glyph" aria-hidden="true">◎</span><span>节点与调度</span><span id="node-nav-count" class="count">0</span>
+          </button>
           <button class="nav-item" data-view="workers">
             <span class="nav-glyph" aria-hidden="true">◇</span><span>Worker</span><span id="worker-nav-count" class="count">0</span>
           </button>
@@ -138,6 +141,31 @@
             <div class="panel-head"><div><p class="eyebrow">路由概况</p><h2>运行中的 Worker</h2></div><button class="text-button" data-go="workers">管理 Worker →</button></div>
             <div id="overview-workers" class="worker-strip empty-state">暂无运行中的 Worker。</div>
           </article>
+        </section>
+
+        <section id="view-nodes" class="view" aria-labelledby="section-title">
+          <div class="projects-header">
+            <div><p class="eyebrow">去中心化调度</p><h2>节点与部署约束</h2><p class="muted">节点策略由管理员签名并传播到整个集群。Worker 只在满足全部标签的节点运行；公网入口会通过集群加密通道转发到合格实例。</p></div>
+            <button id="nodes-refresh" class="secondary" type="button">刷新节点</button>
+          </div>
+          <div class="grid one-one">
+            <article class="panel">
+              <div class="panel-head"><div><p class="eyebrow">成员目录</p><h2>集群节点</h2></div><span id="nodes-live-count" class="badge">—</span></div>
+              <div id="cluster-node-list" class="node-list empty-state">正在读取节点策略…</div>
+            </article>
+            <article class="panel settings-panel node-policy-panel">
+              <div class="settings-copy"><p class="eyebrow">签名策略</p><h2 id="node-policy-title">选择节点</h2><p id="node-policy-summary" class="muted">选择左侧节点后，可编辑区域、能力标签与生命周期状态。</p></div>
+              <form id="node-policy-form" class="settings-form hidden">
+                <label><span>节点身份</span><input id="node-policy-id" class="code-input" readonly></label>
+                <label><span>区域</span><input id="node-policy-region" class="code-input" placeholder="eu-west"><small>会自动形成 <code>region-eu-west</code> 调度标签。</small></label>
+                <label><span>自定义能力标签 <em>每行一个</em></span><textarea id="node-policy-tags" class="code-input" rows="7" placeholder="gpu&#10;high-memory"></textarea><small>只允许小写字母、数字与连字符；系统能力会自动识别。</small></label>
+                <label class="check-label"><input id="node-policy-drain" type="checkbox"><span>排空公网流量（停止加入 DNS，新请求转发到其他节点）</span></label>
+                <label class="check-label"><input id="node-policy-suspended" type="checkbox"><span>停用调度（不再承载普通 Worker）</span></label>
+                <label><span>操作原因</span><textarea id="node-policy-reason" rows="4" maxlength="500" placeholder="例如：计划维护至 2026-08-05"></textarea></label>
+                <button class="primary" type="submit">提交签名节点策略</button>
+              </form>
+            </article>
+          </div>
         </section>
 
         <section id="view-workers" class="view" aria-labelledby="section-title">
@@ -336,7 +364,7 @@
           </div>
 
           <div id="project-tab-settings" class="project-tab">
-            <article class="panel settings-panel"><div class="settings-copy"><p class="eyebrow">运行时</p><h2>兼容性</h2><p class="muted">兼容日期决定 Worker API 的行为基线；兼容性标志用于显式启用或禁用 workerd 行为。升级前建议先在测试 Worker 上验证。</p></div><form id="project-settings-form" class="settings-form"><label><span>兼容日期</span><input id="project-compatibility-date" class="code-input" type="date" required></label><label><span>兼容性标志 <em>每行一个</em></span><textarea id="project-compatibility-flags" class="code-input" rows="6" placeholder="nodejs_compat"></textarea></label><button class="primary" type="submit">保存兼容性配置</button></form></article>
+            <article class="panel settings-panel"><div class="settings-copy"><p class="eyebrow">运行时与调度</p><h2>兼容性及部署约束</h2><p class="muted">兼容日期决定 Worker API 的行为基线；所需标签决定哪些节点可以承载此 Worker，入口节点会自动转发到合格实例。</p></div><form id="project-settings-form" class="settings-form"><label><span>兼容日期</span><input id="project-compatibility-date" class="code-input" type="date" required></label><label><span>兼容性标志 <em>每行一个</em></span><textarea id="project-compatibility-flags" class="code-input" rows="6" placeholder="nodejs_compat"></textarea></label><label><span>节点所需标签 <em>每行一个</em></span><textarea id="project-required-tags" class="code-input" rows="6" placeholder="region-eu-west&#10;gpu"></textarea><small>留空表示可部署到任意未停用节点。标签必须在同一个节点上全部满足。</small></label><button class="primary" type="submit">保存运行时与调度配置</button></form></article>
             <article class="panel settings-panel"><div class="settings-copy"><p class="eyebrow">项目标识</p><h2>只读信息</h2><p class="muted">这些标识用于审计、节点收敛与内容校验。</p></div><dl id="project-identifiers" class="detail-list settings-identifiers"></dl></article>
             <article class="panel danger-zone"><div><p class="eyebrow">危险操作</p><h2>删除项目</h2><p class="muted">写入可验证的墓碑版本；历史记录仍会保留。</p></div><button id="project-delete" class="danger" type="button">删除 Worker</button></article>
           </div>
