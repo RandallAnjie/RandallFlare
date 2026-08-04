@@ -5,6 +5,7 @@ pub mod anchor;
 pub mod auth;
 pub mod blob;
 pub mod config;
+pub mod console;
 pub mod cron_driver;
 pub mod d1;
 pub mod deploy;

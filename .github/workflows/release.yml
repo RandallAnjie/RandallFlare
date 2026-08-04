@@ -11,7 +11,7 @@ jobs:
   linux-x86_64:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: x86_64-unknown-linux-musl
@@ -25,7 +25,9 @@ jobs:
       - name: Install musl toolchain
         run: sudo apt-get update && sudo apt-get install -y musl-tools
       - name: Validate deployment scripts
-        run: bash -n infra/*.sh
+        run: |
+          bash -n infra/*.sh
+          infra/install-release.sh --help >/dev/null
       - name: Install pinned workerd for real-runtime tests
         run: |
           infra/fetch-workerd.sh --output "$RUNNER_TEMP/workerd-bin/workerd"

@@ -28,16 +28,20 @@ RandallFlare only accepts operator-signed deployments, but `workerd` itself is
 Run code controlled by the trusted operator only. The supplied service runs
 both `rf` and its children as an unprivileged `rf` user.
 
-## 2. Build and create credentials locally
+## 2. Download the release and create credentials locally
 
-From the repository root:
+Use the binary produced by GitHub Actions. Verify the published checksum before
+using it to create or validate credentials:
 
 ```bash
-rustup target add x86_64-unknown-linux-musl
-cargo build --release --target x86_64-unknown-linux-musl
+RF_VERSION=v0.4.0
+curl -fLO "https://github.com/RandallAnjie/RandallFlare/releases/download/$RF_VERSION/rf-linux-x86_64"
+curl -fLO "https://github.com/RandallAnjie/RandallFlare/releases/download/$RF_VERSION/rf-linux-x86_64.sha256"
+sha256sum --check --strict rf-linux-x86_64.sha256
+chmod 0755 rf-linux-x86_64
 
 mkdir -m 0700 first-vps
-target/x86_64-unknown-linux-musl/release/rf keygen --dir first-vps
+./rf-linux-x86_64 keygen --dir first-vps
 cp infra/rf.first.toml.example first-vps/rf.toml
 chmod 0600 first-vps/operator.key first-vps/rf.toml
 ```
@@ -53,7 +57,7 @@ operator identity identical when adding later nodes.
 Validate the finished config before connecting to the VPS:
 
 ```bash
-target/x86_64-unknown-linux-musl/release/rf doctor \
+./rf-linux-x86_64 doctor \
   --config first-vps/rf.toml
 ```
 
@@ -65,32 +69,31 @@ cp infra/rf.env.example first-vps/rf.env
 chmod 0600 first-vps/rf.env
 ```
 
-## 3. Install over SSH
+## 3. Install the GitHub release on the VPS
 
-Root SSH:
+Copy only configuration and optional environment secrets, then let the VPS
+download and verify the GitHub-built artifact itself:
 
 ```bash
-infra/deploy-vps.sh \
-  --host root@203.0.113.7 \
-  --config first-vps/rf.toml
+scp first-vps/rf.toml root@203.0.113.7:/root/rf.toml
+scp first-vps/rf.env root@203.0.113.7:/root/rf.env  # only when used
+ssh root@203.0.113.7
+curl -fLo /tmp/install-randallflare-release.sh \
+  https://raw.githubusercontent.com/RandallAnjie/RandallFlare/v0.4.0/infra/install-release.sh
+bash /tmp/install-randallflare-release.sh \
+  --version v0.4.0 --config /root/rf.toml --env /root/rf.env
 ```
 
-For a non-root SSH account with passwordless sudo, add `--sudo`. Add
-`--port PORT` for a nonstandard SSH port and `--env first-vps/rf.env` when the
-optional environment file is needed.
+Omit both `scp` of `rf.env` and `--env` when no environment file is needed.
+For a non-root account, run the installer with `sudo`. Remove the temporary
+configuration copies after installation; `/etc/rf.toml` and `/etc/rf.env` are
+installed as `root:rf` mode `0640`.
 
 The VPS downloads `@cloudflare/workerd-linux-64` version `1.20260804.1` from
 the official npm registry and verifies pinned package and binary SHA-256 sums.
-This exact build passed the repository's complete real-runtime e2e suite. To
-avoid downloading on the server, first run:
-
-```bash
-infra/fetch-workerd.sh --output first-vps/workerd
-infra/deploy-vps.sh \
-  --host root@203.0.113.7 \
-  --config first-vps/rf.toml \
-  --workerd first-vps/workerd
-```
+This exact build passed the repository's complete real-runtime e2e suite.
+`workerd` is RandallFlare's local JavaScript runtime dependency; installing it
+does not use an external account, tunnel, or control plane.
 
 The installer validates both executables and the config, installs secrets as
 `root:rf` mode `0640`, enables `rf.service`, restarts it, and waits up to 30
@@ -104,7 +107,7 @@ Run this from the administrator machine after allowing its IP to reach TCP
 record is needed:
 
 ```bash
-export RF_BIN="$PWD/target/x86_64-unknown-linux-musl/release/rf"
+export RF_BIN="$PWD/rf-linux-x86_64"
 export RF_NODE="203.0.113.7:7382"
 export RF_INGRESS="http://203.0.113.7"
 export RF_CLUSTER_SECRET="<the cluster secret>"
@@ -129,14 +132,34 @@ journalctl -u rf -n 200 --no-pager
 /usr/local/bin/rf health --node 127.0.0.1:7382
 ```
 
-## 5. Upgrade
+## 5. Management console
 
-Rebuild the static binary and run the deploy command without `--config`; the
-installer preserves `/etc/rf.toml` and `/etc/rf.env` and atomically replaces the
-binary before restarting the service:
+Keep the operator private key on the administrator machine and start the
+loopback-only Console there:
 
 ```bash
-infra/deploy-vps.sh --host root@203.0.113.7
+export RF_NODE="203.0.113.7:7382"
+export RF_CLUSTER_SECRET="<the cluster secret>"
+export RF_OPERATOR_KEY="$PWD/first-vps/operator.key"
+./rf-linux-x86_64 console
+```
+
+Open `http://127.0.0.1:7390`. Worker deploys, hash-chain history, KV, and D1
+operations go through the same encrypted peer protocol as the CLI. If the
+operator key is omitted, the backend enforces observer mode. Use an SSH local
+forward to `127.0.0.1:7382` when the peer API is firewalled.
+
+## 6. Upgrade
+
+Run the release installer on the VPS without `--config`. It downloads the exact
+tag from GitHub, verifies the checksum and embedded version, preserves
+`/etc/rf.toml` and `/etc/rf.env`, and atomically replaces the binary before
+restarting the service:
+
+```bash
+curl -fLo /tmp/install-randallflare-release.sh \
+  https://raw.githubusercontent.com/RandallAnjie/RandallFlare/v0.4.0/infra/install-release.sh
+sudo bash /tmp/install-randallflare-release.sh --version v0.4.0
 ```
 
 The default hardened unit deliberately prevents the unprivileged daemon from

@@ -14,7 +14,7 @@ See [DESIGN.md](./DESIGN.md) for the architecture and consistency
 model. For a repeatable first-server rollout, use the
 [VPS deployment runbook](./docs/DEPLOYMENT.md).
 
-## Status: v0.3 (pre-release)
+## Status: v0.4 (pre-release)
 
 Working today, verified by multi-process fault-injection e2e tests:
 
@@ -37,6 +37,9 @@ Working today, verified by multi-process fault-injection e2e tests:
   claimed task (webhook-pluggable to any on-chain relayer), and
   operators can be an **Ethereum wallet** (`rf keygen --eth`,
   `operator = "0x…"`, EIP-191 signatures)
+- **Local operator console**: a responsive overview plus Worker deploy/history,
+  KV browsing/editing, and D1 creation/querying. Cluster credentials remain in
+  the loopback-only `rf console` process instead of entering browser storage.
 
 Also in: HTTPS ingress (SNI cert store, hot-reload, wildcard files,
 self-signed fallback) and **native workerd kvNamespace bindings** —
@@ -124,7 +127,10 @@ enabled = false                      # hardened service uses external upgrades
 rf run --config rf.toml
 ```
 
-For a systemd deployment, use `infra/deploy-vps.sh` or `infra/install.sh`.
+For a systemd deployment, prefer `infra/install-release.sh`; it downloads the
+GitHub Actions artifact directly on the VPS and verifies its checksum. The
+lower-level `infra/install.sh` and local-development `infra/deploy-vps.sh` are
+also available.
 The supplied unit runs as an unprivileged `rf` user; config and environment
 files are `root:rf` mode `0640`. See the
 [deployment runbook](./docs/DEPLOYMENT.md) for firewall, credentials,
@@ -137,7 +143,30 @@ installation, smoke testing, and upgrades.
 > networks. Only the public `/v1/ping` health check remains plaintext.
 > Transport v2 binds captured requests to the intended node identity;
 > upgrade all nodes together because older plaintext/v1 peers are not
-> accepted by a v0.3 node.
+> accepted by current nodes.
+
+## Management console
+
+Run the console on an administrator machine using the same GitHub Release
+binary as the nodes:
+
+```bash
+export RF_NODE=203.0.113.7:7382
+export RF_CLUSTER_SECRET="<cluster secret>"
+export RF_OPERATOR_KEY="$PWD/first-vps/operator.key"
+rf console                         # http://127.0.0.1:7390
+```
+
+The HTTP listener refuses non-loopback addresses. The page receives only a
+random, process-local session token; the cluster secret and operator private
+key stay in the `rf` process. Without an operator key, the console enforces
+observer mode and rejects every mutation. If TCP 7382 is restricted, tunnel it
+instead of exposing the console:
+
+```bash
+ssh -N -L 7382:127.0.0.1:7382 root@203.0.113.7
+RF_NODE=127.0.0.1:7382 rf console
+```
 
 ## Deploy a worker
 

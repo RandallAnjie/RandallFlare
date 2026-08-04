@@ -5,6 +5,7 @@ use clap::{Parser, Subcommand};
 use rf::config::NodeConfig;
 use rf::node::Node;
 use rf::peers::PeerClient;
+use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -48,6 +49,18 @@ enum Cmd {
     Health {
         #[arg(long, env = "RF_NODE")]
         node: String,
+    },
+    /// Run the local, credential-isolating management console.
+    Console {
+        #[arg(long, env = "RF_NODE")]
+        node: String,
+        #[arg(long, env = "RF_CLUSTER_SECRET")]
+        secret: String,
+        #[arg(long, env = "RF_OPERATOR_KEY")]
+        key: Option<PathBuf>,
+        /// Loopback address for the browser UI.
+        #[arg(long, default_value = "127.0.0.1:7390")]
+        listen: SocketAddr,
     },
     /// Deploy a worker directory (rf.json + modules + assets).
     Deploy {
@@ -172,13 +185,15 @@ fn secret_bytes(s: &str) -> Result<[u8; 32]> {
 }
 
 fn operator_key(path: Option<PathBuf>) -> Result<rf_core::identity::AnyKeypair> {
-    let path = path.unwrap_or_else(|| {
-        let home = std::env::var_os("HOME")
-            .map(PathBuf::from)
-            .unwrap_or_default();
-        home.join(".rf").join("operator.key")
-    });
+    let path = path.unwrap_or_else(default_operator_key_path);
     rf::keys::load_any(&path)
+}
+
+fn default_operator_key_path() -> PathBuf {
+    let home = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_default();
+    home.join(".rf").join("operator.key")
 }
 
 fn main() -> Result<()> {
@@ -198,6 +213,25 @@ async fn async_main(cli: Cli) -> Result<()> {
         Cmd::Run { config } => run(config).await,
         Cmd::Doctor { config, json } => doctor(config, json),
         Cmd::Health { node } => health(&node).await,
+        Cmd::Console {
+            node,
+            secret,
+            key,
+            listen,
+        } => {
+            let operator = match key {
+                Some(path) => Some(operator_key(Some(path))?),
+                None => {
+                    let path = default_operator_key_path();
+                    if path.is_file() {
+                        Some(operator_key(Some(path))?)
+                    } else {
+                        None
+                    }
+                }
+            };
+            rf::console::serve(listen, node, secret_bytes(&secret)?, operator).await
+        }
         Cmd::Deploy {
             dir,
             node,
