@@ -13,7 +13,7 @@ use crate::peers::PeerClient;
 use anyhow::{bail, Context, Result};
 use axum::body::Bytes;
 use axum::extract::{DefaultBodyLimit, Extension, Path, Query, State};
-use axum::http::{header, HeaderMap, HeaderValue, Method, Request, StatusCode};
+use axum::http::{header, HeaderMap, HeaderValue, Method, Request, StatusCode, Uri};
 use axum::middleware::{self, Next};
 use axum::response::{Html, IntoResponse, Response};
 use axum::routing::{delete, get, post};
@@ -135,6 +135,16 @@ impl ConsoleState {
 
     fn is_read_only(&self) -> bool {
         matches!(self.mode, ConsoleMode::Local { operator: None, .. })
+    }
+
+    fn origin_scheme(&self) -> &'static str {
+        match &self.mode {
+            ConsoleMode::Public {
+                secure_cookies: true,
+                ..
+            } => "https",
+            ConsoleMode::Local { .. } | ConsoleMode::Public { .. } => "http",
+        }
     }
 
     #[cfg(test)]
@@ -267,7 +277,8 @@ async fn require_console_auth(
                 if csrf != Some(grant.csrf_hex().as_str()) {
                     return ApiError::forbidden("CSRF 令牌缺失或无效").into_response();
                 }
-                if !same_origin(request.headers()) {
+                if !same_origin(&request, state.origin_scheme()) {
+                    log_origin_rejection(&request, state.origin_scheme(), "management");
                     return ApiError::forbidden("已拒绝跨源管理请求").into_response();
                 }
             }
@@ -355,24 +366,59 @@ fn cookie_value<'a>(headers: &'a axum::http::HeaderMap, name: &str) -> Option<&'
         .find_map(|(key, value)| (key == name).then_some(value))
 }
 
-fn same_origin(headers: &axum::http::HeaderMap) -> bool {
-    let Some(host) = headers
-        .get(header::HOST)
-        .and_then(|value| value.to_str().ok())
-    else {
+fn request_authority(request: &Request<axum::body::Body>) -> Option<&str> {
+    request
+        .uri()
+        .authority()
+        .map(|authority| authority.as_str())
+        .or_else(|| {
+            request
+                .headers()
+                .get(header::HOST)
+                .and_then(|value| value.to_str().ok())
+        })
+}
+
+fn same_origin(request: &Request<axum::body::Body>, expected_scheme: &str) -> bool {
+    let Some(authority) = request_authority(request) else {
         return false;
     };
-    let Some(origin) = headers
+    let Some(origin) = request
+        .headers()
         .get(header::ORIGIN)
         .and_then(|value| value.to_str().ok())
     else {
         return false;
     };
-    let authority = origin
-        .strip_prefix("https://")
-        .or_else(|| origin.strip_prefix("http://"))
-        .and_then(|value| value.split('/').next());
-    authority == Some(host)
+    let Ok(origin) = origin.parse::<Uri>() else {
+        return false;
+    };
+    origin.scheme_str() == Some(expected_scheme)
+        && origin
+            .authority()
+            .is_some_and(|origin| origin.as_str().eq_ignore_ascii_case(authority))
+        && origin.path() == "/"
+        && origin.query().is_none()
+}
+
+fn log_origin_rejection(
+    request: &Request<axum::body::Body>,
+    expected_scheme: &str,
+    endpoint: &str,
+) {
+    let authority = request_authority(request).unwrap_or("<missing>");
+    let origin = request
+        .headers()
+        .get(header::ORIGIN)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("<missing>");
+    tracing::warn!(
+        endpoint,
+        authority,
+        origin,
+        expected_scheme,
+        "console: rejected cross-origin request"
+    );
 }
 
 fn encode_grant(envelope: &rf_core::envelope::Envelope) -> String {
@@ -414,9 +460,10 @@ fn expired_session_cookie(secure: bool) -> String {
 
 async fn auth_challenge(
     State(state): State<ConsoleState>,
-    headers: axum::http::HeaderMap,
+    request: Request<axum::body::Body>,
 ) -> ApiResult<Json<Value>> {
-    if !same_origin(&headers) {
+    if !same_origin(&request, state.origin_scheme()) {
+        log_origin_rejection(&request, state.origin_scheme(), "auth_challenge");
         return Err(ApiError::forbidden("已拒绝跨源身份验证请求"));
     }
     let node = state.public_node()?;
@@ -1668,6 +1715,45 @@ mod tests {
     use std::sync::Arc;
     use tower::ServiceExt;
 
+    #[test]
+    fn same_origin_supports_http2_authority_and_rejects_cross_origin() {
+        let http2 = Request::builder()
+            .uri("https://Console.Example/api/auth/challenge")
+            .header(header::ORIGIN, "https://console.example")
+            .body(Body::empty())
+            .unwrap();
+        assert!(same_origin(&http2, "https"));
+
+        let http1 = Request::builder()
+            .uri("/api/auth/challenge")
+            .header(header::HOST, "127.0.0.1:18080")
+            .header(header::ORIGIN, "http://127.0.0.1:18080")
+            .body(Body::empty())
+            .unwrap();
+        assert!(same_origin(&http1, "http"));
+
+        let wrong_host = Request::builder()
+            .uri("https://console.example/api/auth/challenge")
+            .header(header::ORIGIN, "https://attacker.example")
+            .body(Body::empty())
+            .unwrap();
+        assert!(!same_origin(&wrong_host, "https"));
+
+        let wrong_scheme = Request::builder()
+            .uri("https://console.example/api/auth/challenge")
+            .header(header::ORIGIN, "http://console.example")
+            .body(Body::empty())
+            .unwrap();
+        assert!(!same_origin(&wrong_scheme, "https"));
+
+        let origin_with_path = Request::builder()
+            .uri("https://console.example/api/auth/challenge")
+            .header(header::ORIGIN, "https://console.example/not-an-origin")
+            .body(Body::empty())
+            .unwrap();
+        assert!(!same_origin(&origin_with_path, "https"));
+    }
+
     fn state() -> ConsoleState {
         ConsoleState::new("127.0.0.1:9".into(), [7u8; 32], None)
     }
@@ -1726,7 +1812,7 @@ mod tests {
         assert_eq!(updated.crons, vec!["*/5 * * * *"]);
     }
 
-    fn public_state() -> (ConsoleState, Arc<Node>, AnyKeypair) {
+    fn public_state(secure: bool) -> (ConsoleState, Arc<Node>, AnyKeypair) {
         let operator = AnyKeypair::Ed(Keypair::from_seed([19u8; 32]));
         let data_dir = std::env::temp_dir().join(format!(
             "rf-console-public-{}-{}",
@@ -1761,13 +1847,13 @@ mod tests {
         ))
         .unwrap();
         let node = Arc::new(Node::open(config, Keypair::from_seed([20u8; 32])).unwrap());
-        let state = ConsoleState::public(node.clone(), false).unwrap();
+        let state = ConsoleState::public(node.clone(), secure).unwrap();
         (state, node, operator)
     }
 
     #[test]
     fn worker_tls_view_reports_certificate_without_exposing_key_material() {
-        let (_, node, _) = public_state();
+        let (_, node, _) = public_state(false);
         let now = now_ms();
         let record = crate::acme::CertRecord {
             hostname: "*.example.com".into(),
@@ -1910,7 +1996,7 @@ mod tests {
     async fn public_console_requires_operator_signed_stateless_session() {
         use base64::Engine as _;
 
-        let (state, node, operator) = public_state();
+        let (state, node, operator) = public_state(true);
         let app = router(state.clone());
         let page = app
             .clone()
@@ -1941,14 +2027,28 @@ mod tests {
             .unwrap();
         assert_eq!(denied.status(), StatusCode::UNAUTHORIZED);
 
+        let cross_origin = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("https://console.test/api/auth/challenge")
+                    .header(header::ORIGIN, "https://attacker.test")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from("{}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(cross_origin.status(), StatusCode::FORBIDDEN);
+
         let challenge = app
             .clone()
             .oneshot(
                 Request::builder()
                     .method(Method::POST)
-                    .uri("/api/auth/challenge")
-                    .header(header::HOST, "console.test")
-                    .header(header::ORIGIN, "http://console.test")
+                    .uri("https://console.test/api/auth/challenge")
+                    .header(header::ORIGIN, "https://console.test")
                     .header(header::CONTENT_TYPE, "application/json")
                     .body(Body::from("{}"))
                     .unwrap(),
@@ -1991,6 +2091,7 @@ mod tests {
             .to_string();
         assert!(set_cookie.contains("HttpOnly"));
         assert!(set_cookie.contains("SameSite=Strict"));
+        assert!(set_cookie.contains("Secure"));
         let cookie = set_cookie.split(';').next().unwrap();
 
         let session = app
@@ -2018,7 +2119,7 @@ mod tests {
                     .method(Method::POST)
                     .uri("/api/auth/logout")
                     .header(header::HOST, "console.test")
-                    .header(header::ORIGIN, "http://console.test")
+                    .header(header::ORIGIN, "https://console.test")
                     .header(header::COOKIE, cookie)
                     .body(Body::from("{}"))
                     .unwrap(),
@@ -2033,7 +2134,7 @@ mod tests {
                     .method(Method::POST)
                     .uri("/api/auth/logout")
                     .header(header::HOST, "console.test")
-                    .header(header::ORIGIN, "http://console.test")
+                    .header(header::ORIGIN, "https://console.test")
                     .header(header::COOKIE, cookie)
                     .header(CSRF_HEADER, csrf)
                     .body(Body::from("{}"))

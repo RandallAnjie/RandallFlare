@@ -137,6 +137,8 @@ async function beginAuthorization() {
   } catch (error) {
     $("#auth-dot").className = "dot offline";
     $("#auth-status").textContent = error.message;
+    $("#auth-code").textContent = "生成失败";
+    $("#auth-command").textContent = "请检查连接后重新生成授权请求";
     $("#auth-retry").classList.remove("hidden");
   }
 }
