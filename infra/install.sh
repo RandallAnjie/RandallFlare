@@ -188,9 +188,15 @@ if [[ -z "$destdir" ]]; then
   chmod 0700 "$state_dir"
 
   if command -v runuser >/dev/null; then
-    runuser -u rf -- "$rf_bin" doctor --config "$config_target"
+    (
+      cd "$state_dir"
+      runuser -u rf -- "$rf_bin" doctor --config "$config_target"
+    )
   else
-    sudo -u rf -- "$rf_bin" doctor --config "$config_target"
+    (
+      cd "$state_dir"
+      sudo -u rf -- "$rf_bin" doctor --config "$config_target"
+    )
   fi
 
   systemctl daemon-reload
