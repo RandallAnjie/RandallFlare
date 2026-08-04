@@ -155,7 +155,7 @@ td { padding: 13px 10px; border-bottom: 1px solid var(--line-soft); vertical-ali
 td strong, td small { display: block; }
 td small { color: var(--muted); margin-top: 4px; max-width: 220px; overflow: hidden; text-overflow: ellipsis; }
 .table-actions { display: flex; justify-content: flex-end; gap: 5px; }
-.mini-button { border: 1px solid var(--line); background: var(--surface-2); border-radius: 6px; padding: 6px 8px; cursor: pointer; color: #d4d4d4; font-size: 11px; }
+.mini-button { border: 1px solid var(--line); background: var(--surface-2); border-radius: 6px; padding: 6px 8px; cursor: pointer; color: #d4d4d4; font-size: 11px; text-decoration: none; white-space: nowrap; }
 .mini-button:hover { background: var(--surface-3); border-color: #444; }
 .mini-button.danger { color: #ff9b9b; }
 .state-ok { color: var(--success); }
@@ -232,6 +232,8 @@ button.build-row:hover { border-color: #444; background: #0e0e0e; }
 .build-row.failed { border-color: #552c2c; }
 .build-row strong, .build-row small, .build-stage span, .build-stage small { display: block; }
 .build-row small { margin-top: 5px; color: var(--muted); font-size: 10px; }
+.build-row > div { min-width: 0; }
+.build-row > div > code { display: block; margin-top: 5px; overflow-wrap: anywhere; color: var(--muted); font-size: 10px; }
 .pipeline-state { width: 7px; height: 7px; border-radius: 50%; background: var(--faint); }
 .pipeline-state.active { background: var(--warning); animation: pulse 1s infinite alternate; }
 .pipeline-state.deployed { background: var(--success); }

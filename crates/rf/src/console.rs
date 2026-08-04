@@ -229,6 +229,14 @@ pub fn router(state: ConsoleState) -> Router {
         .route("/api/workers/{name}/log", get(worker_log))
         .route("/api/workers/{name}/runtime-log", get(worker_runtime_log))
         .route("/api/workers/{name}/request-log", get(worker_request_log))
+        .route(
+            "/api/workers/{name}/previews",
+            get(worker_preview_list).post(worker_preview_create),
+        )
+        .route(
+            "/api/workers/{name}/previews/{alias}",
+            delete(worker_preview_delete),
+        )
         .route("/api/workers/{name}/build", post(worker_build))
         .route("/api/workers/{name}/files", post(worker_files_update))
         .route("/api/workers/{name}/files/{*path}", get(worker_file_get))
@@ -2106,6 +2114,7 @@ async fn source_list(State(state): State<ConsoleState>) -> ApiResult<Json<Value>
                 "output_dir": record.source.output_dir,
                 "use_github_token": record.source.use_github_token,
                 "webhook": record.source.webhook,
+                "preview_pull_requests": record.source.preview_pull_requests,
                 "webhook_path": format!("/api/webhooks/github/{}", record.source.worker),
                 "webhook_secret": secret,
             })
@@ -2252,6 +2261,139 @@ async fn worker_rollback(
     })))
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WorkerPreviewRequest {
+    version: u64,
+    #[serde(default = "default_preview_ttl_days")]
+    ttl_days: u16,
+}
+
+fn default_preview_ttl_days() -> u16 {
+    crate::preview::DEFAULT_VERSION_TTL_DAYS
+}
+
+async fn worker_preview_list(
+    State(state): State<ConsoleState>,
+    Path(name): Path<String>,
+) -> ApiResult<Json<Value>> {
+    if !valid_name(&name) {
+        return Err(ApiError::bad_request("Worker 名称无效"));
+    }
+    let node = state.public_node()?;
+    let envelopes = node.manifest_log(&name)?;
+    let versions = rf_core::manifest::verify_chain(&envelopes, &node.cfg.operator)
+        .map_err(|error| ApiError::upstream(manifest_error_zh(error)))?
+        .into_iter()
+        .filter(|manifest| !manifest.deleted)
+        .map(|manifest| manifest.version)
+        .collect::<Vec<_>>();
+    let now = now_ms();
+    let scheme = state.origin_scheme();
+    let previews = crate::preview::preview_records(node, Some(&name))
+        .into_iter()
+        .map(|(view, spec)| {
+            let alias = view.resource.name;
+            json!({
+                "alias": alias,
+                "resource_version": view.resource.version,
+                "digest": view.digest,
+                "worker": spec.worker,
+                "hostname": spec.hostname,
+                "url": format!("{scheme}://{}", spec.hostname),
+                "manifest_version": spec.manifest.version,
+                "source": spec.source,
+                "created_at_ms": spec.created_at_ms,
+                "expires_at_ms": spec.expires_at_ms,
+                "active": spec.active(now),
+                "running_on_this_node": node.worker_port(&alias).is_some(),
+            })
+        })
+        .collect::<Vec<_>>();
+    Ok(Json(json!({
+        "worker": name,
+        "versions": versions,
+        "previews": previews,
+        "default_ttl_days": crate::preview::DEFAULT_VERSION_TTL_DAYS,
+        "max_ttl_days": 90,
+    })))
+}
+
+async fn worker_preview_create(
+    State(state): State<ConsoleState>,
+    Extension(principal): Extension<ConsolePrincipal>,
+    Path(name): Path<String>,
+    Json(request): Json<WorkerPreviewRequest>,
+) -> ApiResult<Json<Value>> {
+    state.require_mutation()?;
+    if !valid_name(&name) {
+        return Err(ApiError::bad_request("Worker 名称无效"));
+    }
+    let node = state.public_node()?;
+    let envelopes = node.manifest_log(&name)?;
+    let historical = rf_core::manifest::verify_chain(&envelopes, &node.cfg.operator)
+        .map_err(|error| ApiError::upstream(manifest_error_zh(error)))?
+        .into_iter()
+        .find(|manifest| manifest.version == request.version && !manifest.deleted)
+        .ok_or_else(|| ApiError::not_found("未找到可预览的历史版本"))?;
+    let record = crate::preview::prepare(
+        node,
+        historical,
+        crate::preview::PreviewSource::Version {
+            version: request.version,
+        },
+        request.ttl_days,
+    )?;
+    let spec = crate::preview::preview_spec(&record)?;
+    let approval = node.management.create_resource(
+        principal.session_id,
+        &record,
+        format!("发布 Worker {name} v{} 的隔离预览", request.version),
+    )?;
+    Ok(Json(json!({
+        "ok": true,
+        "pending_approval": true,
+        "name": record.name,
+        "version": record.version,
+        "url": format!("{}://{}", state.origin_scheme(), spec.hostname),
+        "approval": approval,
+        "approve_node": node.cfg.peer_api_advertise().to_string(),
+    })))
+}
+
+async fn worker_preview_delete(
+    State(state): State<ConsoleState>,
+    Extension(principal): Extension<ConsolePrincipal>,
+    Path((name, alias)): Path<(String, String)>,
+) -> ApiResult<Json<Value>> {
+    state.require_mutation()?;
+    if !valid_name(&name) || !valid_name(&alias) {
+        return Err(ApiError::bad_request("Worker 或预览名称无效"));
+    }
+    let node = state.public_node()?;
+    let current = crate::resource::head(node, crate::preview::PREVIEW_KIND, &alias)
+        .filter(|view| !view.resource.deleted)
+        .ok_or_else(|| ApiError::not_found("Worker 预览不存在"))?;
+    let spec = crate::preview::preview_spec(&current.resource)?;
+    if spec.worker != name {
+        return Err(ApiError::not_found("此 Worker 不包含该预览"));
+    }
+    let record = crate::preview::prepare_delete(node, &alias)?;
+    let approval = node.management.create_resource(
+        principal.session_id,
+        &record,
+        format!("停止并删除 Worker {name} 的预览 {alias}"),
+    )?;
+    Ok(Json(json!({
+        "ok": true,
+        "pending_approval": true,
+        "name": alias,
+        "version": record.version,
+        "approval": approval,
+        "approve_node": node.cfg.peer_api_advertise().to_string(),
+    })))
+}
+
 async fn github_webhook(
     State(state): State<ConsoleState>,
     Path(name): Path<String>,
@@ -2280,41 +2422,126 @@ async fn github_webhook(
     if event == "ping" {
         return Ok(Json(json!({ "ok": true, "pong": true })));
     }
-    if event != "push" {
-        return Err(ApiError::bad_request("目前仅支持 GitHub 推送事件 Webhook"));
-    }
     let payload: Value = serde_json::from_slice(&body)
         .map_err(|_| ApiError::bad_request("GitHub Webhook 的 JSON 数据无效"))?;
-    let git_ref = payload
-        .get("ref")
-        .and_then(Value::as_str)
-        .unwrap_or_default();
-    if git_ref != format!("refs/heads/{}", source.source.branch) {
-        return Ok(Json(json!({ "ok": true, "ignored": "branch" })));
-    }
-    if payload.get("deleted").and_then(Value::as_bool) == Some(true) {
-        return Ok(Json(json!({ "ok": true, "ignored": "deleted branch" })));
-    }
     let delivery = headers
         .get("x-github-delivery")
         .and_then(|value| value.to_str().ok())
         .filter(|value| !value.is_empty() && value.len() <= 128)
         .unwrap_or("unknown");
-    let trigger = format!("github:{delivery}");
-    let commit = payload
-        .get("after")
+    let repository = payload
+        .pointer("/repository/clone_url")
         .and_then(Value::as_str)
-        .filter(|value| value.len() == 40 && value.chars().all(|c| c.is_ascii_hexdigit()))
-        .ok_or_else(|| ApiError::bad_request("GitHub 推送事件缺少有效的 after 提交值"))?
-        .to_string();
+        .and_then(|value| crate::build::normalize_github_repository(value).ok())
+        .ok_or_else(|| ApiError::bad_request("GitHub Webhook 缺少有效的仓库身份"))?;
+    if repository != source.source.repository {
+        return Err(ApiError::bad_request("Webhook 仓库与 Worker 代码源不一致"));
+    }
+
+    let (trigger, commit, requested_ref, preview_source, ttl_days) = match event {
+        "push" => {
+            let git_ref = payload
+                .get("ref")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            if git_ref != format!("refs/heads/{}", source.source.branch) {
+                return Ok(Json(json!({ "ok": true, "ignored": "branch" })));
+            }
+            if payload.get("deleted").and_then(Value::as_bool) == Some(true) {
+                return Ok(Json(json!({ "ok": true, "ignored": "deleted branch" })));
+            }
+            let commit =
+                webhook_commit(&payload, "/after", "GitHub 推送事件缺少有效的 after 提交值")?;
+            (format!("github:{delivery}"), commit, None, None, 0)
+        }
+        "pull_request" => {
+            if !source.source.preview_pull_requests {
+                return Ok(Json(
+                    json!({ "ok": true, "ignored": "pull request previews disabled" }),
+                ));
+            }
+            let action = payload
+                .get("action")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            if !matches!(action, "opened" | "reopened" | "synchronize") {
+                return Ok(Json(
+                    json!({ "ok": true, "ignored": "pull request action" }),
+                ));
+            }
+            if payload
+                .pointer("/pull_request/base/ref")
+                .and_then(Value::as_str)
+                != Some(source.source.branch.as_str())
+            {
+                return Ok(Json(json!({ "ok": true, "ignored": "base branch" })));
+            }
+            let number = payload
+                .get("number")
+                .and_then(Value::as_u64)
+                .filter(|number| *number > 0 && *number <= 1_000_000_000)
+                .ok_or_else(|| ApiError::bad_request("Pull Request 编号无效"))?;
+            let commit = webhook_commit(
+                &payload,
+                "/pull_request/head/sha",
+                "Pull Request 缺少有效的 head 提交值",
+            )?;
+            let branch = payload
+                .pointer("/pull_request/head/ref")
+                .and_then(Value::as_str)
+                .filter(|branch| !branch.is_empty() && branch.len() <= 255)
+                .ok_or_else(|| ApiError::bad_request("Pull Request 分支名称无效"))?
+                .to_string();
+            (
+                format!("github-pr:{delivery}"),
+                commit.clone(),
+                Some(format!("refs/pull/{number}/head")),
+                Some(crate::preview::PreviewSource::PullRequest {
+                    number,
+                    commit,
+                    branch,
+                }),
+                crate::preview::DEFAULT_PULL_REQUEST_TTL_DAYS,
+            )
+        }
+        _ => {
+            return Err(ApiError::bad_request(
+                "仅支持 GitHub 推送与 Pull Request Webhook",
+            ))
+        }
+    };
     if let Some(job) = crate::build::build_jobs(&node, Some(&name))
         .into_iter()
         .find(|job| job.trigger == trigger)
     {
         return Ok(Json(json!({ "ok": true, "duplicate": true, "job": job })));
     }
-    let job = crate::build::start_build(node, &name, trigger, None, Some(commit))?;
+    let job = if let (Some(reference), Some(preview_source)) = (requested_ref, preview_source) {
+        crate::build::start_preview_build(
+            node,
+            &name,
+            trigger,
+            None,
+            crate::build::PreviewBuildRequest {
+                commit,
+                git_ref: reference,
+                source: preview_source,
+                ttl_days,
+            },
+        )?
+    } else {
+        crate::build::start_build(node, &name, trigger, None, Some(commit))?
+    };
     Ok(Json(json!({ "ok": true, "job": job })))
+}
+
+fn webhook_commit(payload: &Value, pointer: &str, message: &'static str) -> ApiResult<String> {
+    payload
+        .pointer(pointer)
+        .and_then(Value::as_str)
+        .filter(|value| value.len() == 40 && value.chars().all(|c| c.is_ascii_hexdigit()))
+        .map(str::to_string)
+        .ok_or_else(|| ApiError::bad_request(message))
 }
 
 async fn worker_log(

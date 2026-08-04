@@ -51,6 +51,51 @@ pub struct WorkerSource {
     pub use_github_token: bool,
     #[serde(default)]
     pub webhook: bool,
+    #[serde(default)]
+    pub preview_pull_requests: bool,
+}
+
+// Postcard encodes structs positionally, so serde(default) alone cannot read
+// source envelopes signed before Pull Request previews existed. Preserve the
+// exact old wire shape and upgrade it only after its original bytes verify.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct LegacyWorkerSource {
+    schema: u8,
+    worker: String,
+    version: u64,
+    prev: Option<[u8; 32]>,
+    #[serde(default)]
+    deleted: bool,
+    repository: String,
+    branch: String,
+    root: String,
+    #[serde(default)]
+    build_command: String,
+    output_dir: String,
+    #[serde(default)]
+    use_github_token: bool,
+    #[serde(default)]
+    webhook: bool,
+}
+
+impl From<LegacyWorkerSource> for WorkerSource {
+    fn from(source: LegacyWorkerSource) -> Self {
+        Self {
+            schema: source.schema,
+            worker: source.worker,
+            version: source.version,
+            prev: source.prev,
+            deleted: source.deleted,
+            repository: source.repository,
+            branch: source.branch,
+            root: source.root,
+            build_command: source.build_command,
+            output_dir: source.output_dir,
+            use_github_token: source.use_github_token,
+            webhook: source.webhook,
+            preview_pull_requests: false,
+        }
+    }
 }
 
 impl WorkerSource {
@@ -73,6 +118,9 @@ impl WorkerSource {
         validate_relative(&self.output_dir, true, "输出目录")?;
         if self.build_command.len() > 8 * 1024 || self.build_command.as_bytes().contains(&0) {
             bail!("构建命令过长或含有 NUL 字符");
+        }
+        if self.preview_pull_requests && !self.webhook {
+            bail!("启用 Pull Request 预览前必须先启用 GitHub Webhook");
         }
         Ok(())
     }
@@ -121,13 +169,34 @@ pub struct BuildJob {
     #[serde(default)]
     pub requested_commit: Option<String>,
     #[serde(default)]
+    pub requested_ref: Option<String>,
+    #[serde(default)]
     pub version: Option<u64>,
+    #[serde(default)]
+    pub preview: Option<PreviewBuildTarget>,
+    #[serde(default)]
+    pub preview_url: Option<String>,
     #[serde(default)]
     pub approval: Option<CreatedApproval>,
     #[serde(default)]
     pub error: Option<String>,
     #[serde(default)]
     pub log: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PreviewBuildTarget {
+    pub source: crate::preview::PreviewSource,
+    pub ttl_days: u16,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PreviewBuildRequest {
+    pub commit: String,
+    pub git_ref: String,
+    pub source: crate::preview::PreviewSource,
+    pub ttl_days: u16,
 }
 
 #[derive(Debug, Deserialize)]
@@ -147,6 +216,8 @@ pub struct SourceInput {
     pub use_github_token: bool,
     #[serde(default)]
     pub webhook: bool,
+    #[serde(default)]
+    pub preview_pull_requests: bool,
 }
 
 fn default_branch() -> String {
@@ -178,6 +249,7 @@ pub fn prepare_source(node: &Node, input: SourceInput) -> Result<WorkerSource> {
         output_dir: input.output_dir,
         use_github_token: input.use_github_token,
         webhook: input.webhook,
+        preview_pull_requests: input.preview_pull_requests,
     };
     source.validate()?;
     Ok(source)
@@ -198,15 +270,14 @@ pub fn prepare_source_delete(node: &Node, worker: &str) -> Result<WorkerSource> 
         output_dir: head.source.output_dir,
         use_github_token: false,
         webhook: false,
+        preview_pull_requests: false,
     })
 }
 
 /// Persist one verified immutable source envelope. Replication is provided by
 /// the normal internal-KV gossip loop.
 pub fn ingest_source(node: &Node, envelope: &Envelope) -> Result<WorkerSource> {
-    let source: WorkerSource = envelope
-        .open(Some(&node.cfg.operator))
-        .map_err(|error| anyhow::anyhow!("Worker 源码配置签名无效：{error}"))?;
+    let source = open_source(envelope, &node.cfg.operator)?;
     source.validate()?;
     let digest = hex::encode(envelope.digest());
     let key = format!("{}/{:020}/{}", source.worker, source.version, digest);
@@ -246,7 +317,7 @@ pub fn source_records(node: &Node, worker: Option<&str>) -> Vec<SourceRecord> {
         let Ok(envelope) = Envelope::from_bytes(bytes) else {
             continue;
         };
-        let Ok(source) = envelope.open::<WorkerSource>(Some(&node.cfg.operator)) else {
+        let Ok(source) = open_source(&envelope, &node.cfg.operator) else {
             continue;
         };
         if source.validate().is_err() || !key.starts_with(&format!("{}/", source.worker)) {
@@ -291,6 +362,19 @@ pub fn source_records(node: &Node, worker: Option<&str>) -> Vec<SourceRecord> {
         ))
     });
     out
+}
+
+fn open_source(
+    envelope: &Envelope,
+    operator: &rf_core::identity::SignerId,
+) -> Result<WorkerSource> {
+    if let Ok(source) = envelope.open::<WorkerSource>(Some(operator)) {
+        return Ok(source);
+    }
+    envelope
+        .open::<LegacyWorkerSource>(Some(operator))
+        .map(WorkerSource::from)
+        .map_err(|error| anyhow::anyhow!("Worker 源码配置签名无效：{error}"))
 }
 
 pub fn live_sources(node: &Node) -> Vec<SourceRecord> {
@@ -339,6 +423,48 @@ pub fn start_build(
     session_id: Option<[u8; 32]>,
     requested_commit: Option<String>,
 ) -> Result<BuildJob> {
+    start_build_target(
+        node,
+        worker,
+        trigger.into(),
+        session_id,
+        requested_commit,
+        None,
+        None,
+    )
+}
+
+pub fn start_preview_build(
+    node: Arc<Node>,
+    worker: &str,
+    trigger: impl Into<String>,
+    session_id: Option<[u8; 32]>,
+    request: PreviewBuildRequest,
+) -> Result<BuildJob> {
+    let target = PreviewBuildTarget {
+        source: request.source,
+        ttl_days: request.ttl_days,
+    };
+    start_build_target(
+        node,
+        worker,
+        trigger.into(),
+        session_id,
+        Some(request.commit),
+        Some(request.git_ref),
+        Some(target),
+    )
+}
+
+fn start_build_target(
+    node: Arc<Node>,
+    worker: &str,
+    trigger: String,
+    session_id: Option<[u8; 32]>,
+    requested_commit: Option<String>,
+    requested_ref: Option<String>,
+    preview: Option<PreviewBuildTarget>,
+) -> Result<BuildJob> {
     if !node.cfg.build.enabled {
         bail!("此节点尚未启用 Git 构建");
     }
@@ -350,6 +476,17 @@ pub fn start_build(
             bail!("指定的 Git 提交必须是 40 位 SHA-1");
         }
     }
+    if let Some(reference) = requested_ref.as_deref() {
+        validate_fetch_ref(reference)?;
+        if requested_commit.is_none() {
+            bail!("指定 Git 引用时必须同时固定提交哈希");
+        }
+    }
+    if let Some(target) = preview.as_ref() {
+        if target.ttl_days == 0 || target.ttl_days > 90 {
+            bail!("预览保留天数必须在 1 至 90 之间");
+        }
+    }
     let id = random_id();
     let now = now_ms();
     let job = BuildJob {
@@ -359,13 +496,16 @@ pub fn start_build(
         branch: source.source.branch.clone(),
         node_id: node.id_hex(),
         approve_node: node.cfg.peer_api_advertise().to_string(),
-        trigger: trigger.into(),
+        trigger,
         state: BuildState::Queued,
         created_at_ms: now,
         updated_at_ms: now,
         commit: None,
         requested_commit,
+        requested_ref,
         version: None,
+        preview,
+        preview_url: None,
         approval: None,
         error: None,
         log: vec!["构建任务已进入此节点的队列".into()],
@@ -381,6 +521,23 @@ pub fn start_build(
         }
     });
     Ok(job)
+}
+
+fn validate_fetch_ref(reference: &str) -> Result<()> {
+    if reference.len() > 255
+        || !reference.starts_with("refs/")
+        || reference.contains("..")
+        || reference.ends_with('.')
+        || reference.ends_with('/')
+        || reference.contains("@{")
+        || reference.bytes().any(|byte| {
+            byte.is_ascii_control()
+                || matches!(byte, b' ' | b'~' | b'^' | b':' | b'?' | b'*' | b'[' | b'\\')
+        })
+    {
+        bail!("Git 引用格式无效");
+    }
+    Ok(())
 }
 
 /// On restart, in-flight child processes are gone. Mark their records failed
@@ -446,7 +603,13 @@ async fn run_build(
     .context("Git 克隆失败")?;
 
     let mut commit = git_revision(&git, &checkout, &workspace).await?;
-    let requested = job.lock().await.requested_commit.clone();
+    let (requested, requested_ref) = {
+        let current = job.lock().await;
+        (
+            current.requested_commit.clone(),
+            current.requested_ref.clone(),
+        )
+    };
     if let Some(requested) = requested.filter(|requested| *requested != commit) {
         {
             let mut current = job.lock().await;
@@ -464,7 +627,7 @@ async fn run_build(
             .arg("fetch")
             .arg("--depth=1")
             .arg("origin")
-            .arg(&requested);
+            .arg(requested_ref.as_deref().unwrap_or(&requested));
         sanitized_env(&mut fetch, &workspace);
         apply_git_auth(&mut fetch, &node, &source)?;
         run_logged(
@@ -560,22 +723,47 @@ async fn run_build(
         );
     }
     let manifest = deploy::prepare_manifest_local(&bundle, &node)?;
-    let approval = node.management.create_manifest_scoped(
-        session_id,
-        &manifest,
-        format!(
-            "部署 Git 构建 {} v{}（来源：{}@{}）",
-            manifest.name,
-            manifest.version,
-            github_slug(&source.repository),
-            short_commit(&commit)
-        ),
-    )?;
+    let preview_target = job.lock().await.preview.clone();
+    let (approval, preview_url) = if let Some(target) = preview_target {
+        let record =
+            crate::preview::prepare(&node, manifest.clone(), target.source, target.ttl_days)?;
+        let spec = crate::preview::preview_spec(&record)?;
+        let approval = node.management.create_resource_scoped(
+            session_id,
+            &record,
+            format!(
+                "发布 Git 预览 {}（来源：{}@{}）",
+                record.name,
+                github_slug(&source.repository),
+                short_commit(&commit)
+            ),
+        )?;
+        let scheme = if node.cfg.ingress.https.is_some() {
+            "https"
+        } else {
+            "http"
+        };
+        (approval, Some(format!("{scheme}://{}", spec.hostname)))
+    } else {
+        let approval = node.management.create_manifest_scoped(
+            session_id,
+            &manifest,
+            format!(
+                "部署 Git 构建 {} v{}（来源：{}@{}）",
+                manifest.name,
+                manifest.version,
+                github_slug(&source.repository),
+                short_commit(&commit)
+            ),
+        )?;
+        (approval, None)
+    };
     {
         let mut current = job.lock().await;
         current.state = BuildState::AwaitingApproval;
         current.version = Some(manifest.version);
         current.approval = Some(approval.clone());
+        current.preview_url = preview_url;
         current.updated_at_ms = now_ms();
         append_log(
             &mut current,
@@ -588,13 +776,12 @@ async fn run_build(
         tokio::time::sleep(Duration::from_millis(900)).await;
         match node.management.poll_internal(&approval.id)? {
             poll if poll.state == ApprovalState::Completed => {
-                set_state(
-                    &node,
-                    &job,
-                    BuildState::Deployed,
-                    "已提交签名部署清单；集群分发已经开始",
-                )
-                .await?;
+                let message = if job.lock().await.preview.is_some() {
+                    "已提交签名预览资源；集群分发已经开始"
+                } else {
+                    "已提交签名部署清单；集群分发已经开始"
+                };
+                set_state(&node, &job, BuildState::Deployed, message).await?;
                 break;
             }
             poll if poll.state == ApprovalState::Failed => {
@@ -1077,6 +1264,10 @@ mod tests {
         assert!(validate_branch("feature/workers-v2").is_ok());
         assert!(validate_branch("--upload-pack=bad").is_err());
         assert!(validate_branch("refs//bad").is_err());
+        assert!(validate_fetch_ref("refs/pull/42/head").is_ok());
+        assert!(validate_fetch_ref("--upload-pack=bad").is_err());
+        assert!(validate_fetch_ref("refs/pull/../config").is_err());
+        assert!(validate_fetch_ref("refs/pull/1/head:evil").is_err());
     }
 
     #[test]
@@ -1103,6 +1294,7 @@ mod tests {
                 output_dir: ".".into(),
                 use_github_token: false,
                 webhook: true,
+                preview_pull_requests: true,
             },
         )
         .unwrap();
@@ -1120,6 +1312,7 @@ mod tests {
                 output_dir: "dist".into(),
                 use_github_token: true,
                 webhook: false,
+                preview_pull_requests: false,
             },
         )
         .unwrap();
@@ -1130,6 +1323,30 @@ mod tests {
 
         let attacker = AnyKeypair::Ed(Keypair::from_seed([43; 32]));
         assert!(ingest_source(&node, &Envelope::seal_any(&second, &attacker)).is_err());
+        std::fs::remove_dir_all(data_dir).ok();
+    }
+
+    #[test]
+    fn source_envelopes_from_before_pr_previews_remain_readable() {
+        let (node, operator, data_dir) = node();
+        let legacy = LegacyWorkerSource {
+            schema: SOURCE_SCHEMA,
+            worker: "legacy".into(),
+            version: 1,
+            prev: None,
+            deleted: false,
+            repository: "https://github.com/example/legacy.git".into(),
+            branch: "main".into(),
+            root: ".".into(),
+            build_command: String::new(),
+            output_dir: ".".into(),
+            use_github_token: false,
+            webhook: true,
+        };
+        ingest_source(&node, &Envelope::seal_any(&legacy, &operator)).unwrap();
+        let source = source_head(&node, "legacy").unwrap().source;
+        assert!(source.webhook);
+        assert!(!source.preview_pull_requests);
         std::fs::remove_dir_all(data_dir).ok();
     }
 

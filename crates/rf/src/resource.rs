@@ -17,7 +17,10 @@ use std::collections::{BTreeMap, HashMap};
 pub const RESOURCE_NAMESPACE: &str = "__rf_platform_resources_v1";
 pub const RESOURCE_SCHEMA: u8 = 1;
 const MAX_KIND_BYTES: usize = 48;
-const MAX_SPEC_BYTES: usize = 1024 * 1024;
+// Worker preview resources can carry a complete 5,000-file immutable
+// manifest. Keep a hard bound, but do not make legitimate large static sites
+// impossible to preview.
+const MAX_SPEC_BYTES: usize = 8 * 1024 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -60,7 +63,7 @@ impl ResourceRecord {
             bail!("平台资源配置必须是 JSON 对象");
         }
         if self.spec_json.len() > MAX_SPEC_BYTES {
-            bail!("平台资源配置不得超过 1 MiB");
+            bail!("平台资源配置不得超过 8 MiB");
         }
         Ok(())
     }

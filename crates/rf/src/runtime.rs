@@ -42,6 +42,13 @@ struct RunningWorker {
     child: Option<Child>,
 }
 
+struct DesiredWorker {
+    id: String,
+    revision: u64,
+    manifest: WorkerManifest,
+    preview: bool,
+}
+
 /// Where ingress should send traffic for a module worker.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct WorkerPort(pub u16);
@@ -120,7 +127,7 @@ impl Runtime {
     }
 
     async fn reconcile(&mut self) {
-        let desired: Vec<WorkerManifest> = self
+        let mut desired: Vec<DesiredWorker> = self
             .node
             .live_manifests()
             .into_iter()
@@ -131,11 +138,28 @@ impl Runtime {
                     || self.node.cfg.runtime.allow_local_durable_objects
                     || self.durable.is_owner(&m.name)
             })
+            .map(|manifest| DesiredWorker {
+                id: manifest.name.clone(),
+                revision: manifest.version,
+                manifest,
+                preview: false,
+            })
             .collect();
+        desired.extend(
+            crate::preview::active_previews(&self.node)
+                .into_iter()
+                .filter(|(_, spec)| !spec.manifest.main.is_empty())
+                .map(|(view, spec)| DesiredWorker {
+                    id: view.resource.name,
+                    revision: view.resource.version,
+                    manifest: spec.manifest,
+                    preview: true,
+                }),
+        );
 
         // Stop workers that disappeared.
         let names: std::collections::HashSet<&str> =
-            desired.iter().map(|m| m.name.as_str()).collect();
+            desired.iter().map(|worker| worker.id.as_str()).collect();
         let stale: Vec<String> = self
             .running
             .keys()
@@ -160,39 +184,39 @@ impl Runtime {
             }
         }
 
-        for m in desired {
-            let current = self.running.get(&m.name);
+        for worker in desired {
+            let m = &worker.manifest;
+            let current = self.running.get(&worker.id);
             let up = current.map(|rw| rw.child.is_some()).unwrap_or(false);
-            if current.map(|rw| rw.version) == Some(m.version) && up {
+            if current.map(|rw| rw.version) == Some(worker.revision) && up {
                 continue; // already running this version
             }
-            if self
-                .node
-                .missing_blobs()
-                .iter()
-                .any(|s| m.blob_refs().any(|r| r == *s))
-            {
-                tracing::debug!("Worker {} 正在等待内容块", m.name);
+            if m.blob_refs().any(|sha| !self.node.blobs.has(&sha)) {
+                tracing::debug!("Worker 运行实例 {} 正在等待内容块", worker.id);
                 self.node.set_runtime_status(
-                    &m.name,
-                    m.version,
+                    &worker.id,
+                    worker.revision,
                     "waiting_blobs",
                     "正在从对等节点获取不可变内容块",
                 );
                 continue;
             }
-            match self.start_worker(&m).await {
+            match self.start_worker(&worker).await {
                 Ok(()) => {}
                 Err(e) => {
-                    self.node
-                        .set_runtime_status(&m.name, m.version, "failed", format!("{e:#}"));
+                    self.node.set_runtime_status(
+                        &worker.id,
+                        worker.revision,
+                        "failed",
+                        format!("{e:#}"),
+                    );
                     self.node.append_runtime_log(
-                        &m.name,
-                        m.version,
+                        &worker.id,
+                        worker.revision,
                         "system",
                         &format!("启动失败：{e:#}"),
                     );
-                    tracing::warn!("启动 Worker {} 时出错：{e:#}", m.name)
+                    tracing::warn!("启动 Worker 运行实例 {} 时出错：{e:#}", worker.id)
                 }
             }
         }
@@ -220,31 +244,38 @@ impl Runtime {
         self.port_base // hopeless; spawn will fail loudly
     }
 
-    async fn start_worker(&mut self, m: &WorkerManifest) -> Result<()> {
+    async fn start_worker(&mut self, desired: &DesiredWorker) -> Result<()> {
+        let m = &desired.manifest;
+        let runtime_id = &desired.id;
+        let revision = desired.revision;
         let Some(workerd) = &self.workerd else {
             self.node.set_runtime_status(
-                &m.name,
-                m.version,
+                runtime_id,
+                revision,
                 "runtime_unavailable",
                 "尚未安装 workerd 可执行文件",
             );
             return Ok(()); // no runtime on this node
         };
         self.node
-            .set_runtime_status(&m.name, m.version, "starting", "正在准备 Worker 运行文件");
+            .set_runtime_status(runtime_id, revision, "starting", "正在准备 Worker 运行文件");
         let port = self
             .running
-            .get(&m.name)
+            .get(runtime_id)
             .map(|r| r.port)
-            .unwrap_or_else(|| self.alloc_port(&m.name));
+            .unwrap_or_else(|| self.alloc_port(runtime_id));
 
         let dir = self
             .node
             .cfg
             .data_dir
-            .join("workers")
-            .join(&m.name)
-            .join(m.version.to_string());
+            .join(if desired.preview {
+                "worker-previews"
+            } else {
+                "workers"
+            })
+            .join(runtime_id)
+            .join(revision.to_string());
         let src = dir.join("src");
         std::fs::create_dir_all(&src)?;
         #[cfg(unix)]
@@ -274,19 +305,29 @@ impl Runtime {
             rf_entry_source(m, &d1_bindings, &event_token),
         )?;
         std::fs::write(src.join("__rf_workflow.js"), WORKFLOW_SHIM_SOURCE)?;
-        let durable_dir = self.node.cfg.data_dir.join("durable").join(&m.name);
+        let durable_dir = self
+            .node
+            .cfg
+            .data_dir
+            .join(if desired.preview {
+                "durable-previews"
+            } else {
+                "durable"
+            })
+            .join(runtime_id);
         std::fs::create_dir_all(&durable_dir)?;
 
         // Stop the old version before replacing a DO SQLite snapshot.
         // workerd may keep WAL handles open even between requests.
-        if let Some(rw) = self.running.get_mut(&m.name) {
+        if let Some(rw) = self.running.get_mut(runtime_id) {
             if let Some(child) = &mut rw.child {
                 let _ = child.start_kill();
                 let _ = tokio::time::timeout(std::time::Duration::from_secs(5), child.wait()).await;
             }
             rw.child = None;
         }
-        if !crate::deploy::durable_objects(m).is_empty()
+        if !desired.preview
+            && !crate::deploy::durable_objects(m).is_empty()
             && !self.node.cfg.runtime.allow_local_durable_objects
         {
             self.durable.restore(&m.name).await?;
@@ -345,12 +386,12 @@ impl Runtime {
         }
         let mut child = cmd
             .spawn()
-            .with_context(|| format!("为 Worker {} 启动 workerd", m.name))?;
+            .with_context(|| format!("为 Worker 运行实例 {runtime_id} 启动 workerd"))?;
         if let Some(stdout) = child.stdout.take() {
             spawn_log_reader(
                 self.node.clone(),
-                m.name.clone(),
-                m.version,
+                runtime_id.clone(),
+                revision,
                 "stdout",
                 stdout,
             );
@@ -358,8 +399,8 @@ impl Runtime {
         if let Some(stderr) = child.stderr.take() {
             spawn_log_reader(
                 self.node.clone(),
-                m.name.clone(),
-                m.version,
+                runtime_id.clone(),
+                revision,
                 "stderr",
                 stderr,
             );
@@ -373,14 +414,13 @@ impl Runtime {
                 tokio::time::sleep(std::time::Duration::from_millis(50)).await;
                 let tail = self
                     .node
-                    .runtime_logs(&m.name, 20)
+                    .runtime_logs(runtime_id, 20)
                     .into_iter()
                     .map(|line| line.message)
                     .collect::<Vec<_>>()
                     .join(" | ");
                 anyhow::bail!(
-                    "Worker {} 的 workerd 在启动期间退出：{status}{}",
-                    m.name,
+                    "Worker 运行实例 {runtime_id} 的 workerd 在启动期间退出：{status}{}",
                     if tail.is_empty() {
                         String::new()
                     } else {
@@ -399,31 +439,31 @@ impl Runtime {
         }
         if !healthy {
             let _ = child.start_kill();
-            anyhow::bail!("Worker {} 的 workerd 未能监听 127.0.0.1:{port}", m.name);
+            anyhow::bail!("Worker 运行实例 {runtime_id} 的 workerd 未能监听 127.0.0.1:{port}");
         }
 
         tracing::info!(
-            "Worker {} v{} 已在 127.0.0.1:{port} 运行",
-            m.name,
-            m.version
+            "Worker 运行实例 {} 修订版 {} 已在 127.0.0.1:{port} 运行",
+            runtime_id,
+            revision
         );
         self.node.set_runtime_status(
-            &m.name,
-            m.version,
+            runtime_id,
+            revision,
             "running",
             format!("workerd 正在 127.0.0.1:{port} 运行"),
         );
         self.node.append_runtime_log(
-            &m.name,
-            m.version,
+            runtime_id,
+            revision,
             "system",
             &format!("Worker 已在 127.0.0.1:{port} 启动"),
         );
-        self.node.set_worker_event_token(&m.name, event_token);
+        self.node.set_worker_event_token(runtime_id, event_token);
         self.running.insert(
-            m.name.clone(),
+            runtime_id.clone(),
             RunningWorker {
-                version: m.version,
+                version: revision,
                 port,
                 child: Some(child),
             },

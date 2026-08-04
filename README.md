@@ -52,6 +52,12 @@ Working today, verified by multi-process fault-injection e2e tests:
   rollout on every node. Push webhooks, immutable build history, runtime logs,
   and signed rollback are built in. Repository settings are operator-signed and
   replicated; tokens and build processes stay node-local.
+- **Signed preview environments**: every immutable Worker history version can
+  run at `v<version>-<worker>.<default_domain>` without advancing production.
+  Verified GitHub Pull Request events build the exact head commit into
+  `pr<number>-<worker>.<default_domain>`. Previews require operator approval,
+  use isolated runtime/DO directories, expire independently on every node and
+  are removed with signed tombstones. See [the preview guide](./docs/PREVIEWS.md).
 - **Privacy-bounded request observability**: each ingress node batches Worker
   method, path, hostname, status and duration into its own redb state, retains
   seven days, and exposes only encrypted peer snapshots. The Chinese console
@@ -305,11 +311,13 @@ RF_GITHUB_TOKEN=github_pat_…
 ```
 
 The console shows a per-Worker webhook URL and derived HMAC secret. Configure a
-GitHub repository webhook for the push event with content type
-`application/json`. Any cluster node can receive a verified push and build;
-the result still waits for `rf authorize <code>` before deployment. After
-approval, content-addressed blobs and the Manifest distribute peer-to-peer and
-the UI reports ready nodes versus total live nodes.
+GitHub repository webhook for the push event and, when Pull Request previews
+are enabled, the pull request event, with content type `application/json`.
+Any cluster node can receive a verified event and build; the result still waits
+for `rf authorize <code>` before production deployment or preview publication.
+After approval, content-addressed blobs and the signed Manifest/resource
+distribute peer-to-peer. See [PREVIEWS.md](./docs/PREVIEWS.md) for deterministic
+domains, expiry and the preview data-access boundary.
 
 Use HTTPS before treating a public management session as production-safe. The
 first-VPS HTTP address is suitable for isolated testing, but HTTP cannot protect

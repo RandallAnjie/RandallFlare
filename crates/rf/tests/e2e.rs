@@ -283,6 +283,135 @@ async fn default_ingress_console_uses_operator_approved_cluster_session() {
     assert!(rf_core::manifest::verify_chain(&log, &operator_any.signer_id()).is_ok());
     assert_eq!(log.len(), 2);
 
+    // A historical preview is a separately signed resource: production stays
+    // on v2 while the deterministic preview host serves the immutable v1
+    // bytes. Deleting it writes a tombstone and immediately releases routing.
+    let preview: serde_json::Value = http
+        .post(format!("{ingress}/api/workers/admin-worker/previews"))
+        .header("cookie", &cookie)
+        .header("origin", &ingress)
+        .header("x-rf-csrf", csrf)
+        .json(&serde_json::json!({"version": 1, "ttl_days": 7}))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(preview["pending_approval"], true);
+    assert_eq!(preview["name"], "v1-admin-worker");
+    let preview_code = preview["approval"]["code"].as_str().unwrap();
+    let preview_id = preview["approval"]["id"].as_str().unwrap();
+    let preview_approval = client.authorization(&node.api, preview_code).await.unwrap();
+    assert_eq!(
+        preview_approval.kind,
+        rf::management::ApprovalKind::Resource
+    );
+    let preview_payload = base64::engine::general_purpose::STANDARD
+        .decode(preview_approval.payload_base64)
+        .unwrap();
+    client
+        .approve_authorization(
+            &node.api,
+            preview_code,
+            &rf::management::ApprovalSignature {
+                signer: operator_any.signer_id(),
+                signature_base64: base64::engine::general_purpose::STANDARD
+                    .encode(operator_any.sign(&preview_payload)),
+            },
+        )
+        .await
+        .unwrap();
+    let committed: serde_json::Value = http
+        .get(format!("{ingress}/api/approvals/{preview_id}"))
+        .header("cookie", &cookie)
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(committed["state"], "completed");
+    let historical = http
+        .get(&ingress)
+        .header("host", "v1-admin-worker.workers.test")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(historical.status(), 200);
+    assert!(historical
+        .text()
+        .await
+        .unwrap()
+        .contains("deployed through decentralized console"));
+    let production = http
+        .get(&ingress)
+        .header("host", "admin-worker.test")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(production.bytes().await.unwrap().as_ref(), edited_html);
+
+    let remove_preview: serde_json::Value = http
+        .delete(format!(
+            "{ingress}/api/workers/admin-worker/previews/v1-admin-worker"
+        ))
+        .header("cookie", &cookie)
+        .header("origin", &ingress)
+        .header("x-rf-csrf", csrf)
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let remove_code = remove_preview["approval"]["code"].as_str().unwrap();
+    let remove_id = remove_preview["approval"]["id"].as_str().unwrap();
+    let remove_approval = client.authorization(&node.api, remove_code).await.unwrap();
+    let remove_payload = base64::engine::general_purpose::STANDARD
+        .decode(remove_approval.payload_base64)
+        .unwrap();
+    client
+        .approve_authorization(
+            &node.api,
+            remove_code,
+            &rf::management::ApprovalSignature {
+                signer: operator_any.signer_id(),
+                signature_base64: base64::engine::general_purpose::STANDARD
+                    .encode(operator_any.sign(&remove_payload)),
+            },
+        )
+        .await
+        .unwrap();
+    let removed: serde_json::Value = http
+        .get(format!("{ingress}/api/approvals/{remove_id}"))
+        .header("cookie", &cookie)
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(removed["state"], "completed");
+    let released = http
+        .get(&ingress)
+        .header("host", "v1-admin-worker.workers.test")
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(released.contains("RandallFlare 管理控制台"));
+
     // Request observability traverses the encrypted peer API, but its data
     // model intentionally cannot contain query strings, headers or bodies.
     let requests = client
@@ -554,6 +683,7 @@ listen = "127.0.0.1:{api_port}"
 
 [ingress]
 http = "127.0.0.1:{ingress_port}"
+default_domain = "workers.test"
 "#,
         data = dir.join("data").display(),
         op = operator.public(),

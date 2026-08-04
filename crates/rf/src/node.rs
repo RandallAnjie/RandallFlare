@@ -261,10 +261,23 @@ impl Node {
 
     /// Blob hashes referenced by live manifests but absent on disk.
     pub fn missing_blobs(&self) -> Vec<[u8; 32]> {
-        let inner = self.inner.lock().unwrap();
+        let manifests = {
+            let inner = self.inner.lock().unwrap();
+            inner
+                .manifests
+                .live()
+                .map(|record| record.manifest.clone())
+                .collect::<Vec<_>>()
+        };
+        let mut manifests = manifests;
+        manifests.extend(
+            crate::preview::active_previews(self)
+                .into_iter()
+                .map(|(_, spec)| spec.manifest),
+        );
         let mut missing = Vec::new();
-        for rec in inner.manifests.live() {
-            for sha in rec.manifest.blob_refs() {
+        for manifest in manifests {
+            for sha in manifest.blob_refs() {
                 if !self.blobs.has(&sha) && !missing.contains(&sha) {
                     missing.push(sha);
                 }

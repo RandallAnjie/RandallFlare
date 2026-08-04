@@ -180,8 +180,9 @@ production use. The legacy `rf console` loopback command remains available for
 offline/emergency administration.
 
 The Workers page also provides GitHub repository connection, sandboxed builds,
-push webhooks, live build/runtime logs, cluster-wide rollout status, and signed
-rollback. For a private repository, add a read-only `RF_GITHUB_TOKEN` to
+push and Pull Request webhooks, signed preview environments, live
+build/runtime/request logs, cluster-wide rollout status, and signed rollback.
+For a private repository, add a read-only `RF_GITHUB_TOKEN` to
 `/etc/rf.env`; it remains local to this node and is stripped from the build
 sandbox. Repository configuration and every produced Manifest still require a
 one-time operator signature.

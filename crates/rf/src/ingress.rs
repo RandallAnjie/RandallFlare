@@ -102,6 +102,20 @@ async fn handle(State(ingress): State<Ingress>, req: Request) -> Response {
             .unwrap_or_else(|never| match never {});
     }
 
+    // Signed previews have their own deterministic host and runtime identity.
+    // They never advance or shadow the production manifest chain.
+    if let Some((view, preview)) = crate::preview::find_by_hostname(&ingress.node, &host) {
+        return serve_observed_worker(
+            &ingress,
+            req,
+            &preview.manifest,
+            &host,
+            &view.resource.name,
+            false,
+        )
+        .await;
+    }
+
     if let Some((flow, spec)) = crate::flow::flow_records(&ingress.node)
         .into_iter()
         .find_map(|(view, spec)| {
@@ -157,18 +171,38 @@ async fn handle(State(ingress): State<Ingress>, req: Request) -> Response {
         return (StatusCode::NOT_FOUND, "worker vanished\n").into_response();
     };
 
+    let runtime_id = manifest.name.clone();
+    serve_observed_worker(&ingress, req, &manifest, &host, &runtime_id, true).await
+}
+
+async fn serve_observed_worker(
+    ingress: &Ingress,
+    req: Request,
+    manifest: &WorkerManifest,
+    hostname: &str,
+    runtime_id: &str,
+    durable_coordinator: bool,
+) -> Response {
     let method = req.method().as_str().to_string();
     // Deliberately discard the query string. Observability stores only the
     // matched path and never inspects headers or bodies.
     let path = req.uri().path().to_string();
     let started = std::time::Instant::now();
-    let response = serve_worker(&ingress, req, &manifest, &path).await;
+    let response = serve_worker(
+        ingress,
+        req,
+        manifest,
+        &path,
+        runtime_id,
+        durable_coordinator,
+    )
+    .await;
     crate::observability::record(
         &ingress.node,
         &crate::observability::RequestObservation {
             worker: &manifest.name,
             version: manifest.version,
-            hostname: &host,
+            hostname,
             method: &method,
             path: &path,
             status_code: response.status().as_u16(),
@@ -183,6 +217,8 @@ async fn serve_worker(
     req: Request,
     manifest: &WorkerManifest,
     path: &str,
+    runtime_id: &str,
+    durable_coordinator: bool,
 ) -> Response {
     // Asset tree first (assets-only workers and hybrid fallthrough).
     if !manifest.assets.is_empty() {
@@ -199,7 +235,7 @@ async fn serve_worker(
         return not_found_page(&ingress.node, manifest);
     }
 
-    if !crate::deploy::durable_objects(manifest).is_empty() {
+    if durable_coordinator && !crate::deploy::durable_objects(manifest).is_empty() {
         let wire = match request_to_wire(req).await {
             Ok(wire) => wire,
             Err(response) => return response,
@@ -215,7 +251,7 @@ async fn serve_worker(
     }
 
     // Module worker: proxy to local workerd.
-    let Some(port) = ingress.node.worker_port(&manifest.name) else {
+    let Some(port) = ingress.node.worker_port(runtime_id) else {
         return (
             StatusCode::SERVICE_UNAVAILABLE,
             "worker not running on this node\n",

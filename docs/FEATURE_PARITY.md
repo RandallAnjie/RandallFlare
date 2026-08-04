@@ -53,13 +53,13 @@ surface yet.
 | --- | --- | --- |
 | modules + static assets in one deploy unit | done | — |
 | browser upload and CLI deploy | done | signed per-file create/edit/rename/delete and binary replacement are done; ZIP/TAR import and export remain |
-| GitHub source, sandboxed build, webhook deploy | done | GitHub App auth, PR checks/comments, SSH deploy keys |
-| versions, hash-chain audit and rollback | done | version-pinned preview aliases |
+| GitHub source, sandboxed build, webhook deploy | done | signed PR preview builds are done; GitHub App auth, PR checks/comments and SSH deploy keys remain |
+| versions, hash-chain audit and rollback | done | historical-version preview aliases, renewal and signed deletion are done |
 | default/custom domains and wildcard TLS | done | custom-domain DNS ownership workflow |
 | environment, encrypted Secrets, KV bindings, Cron | done | write-only XChaCha20-Poly1305 Secrets, names-only API/console, KV metadata + bulk get, and real scheduled-event Cron with D1 history/retry/DLQ/replay are verified |
 | compatibility date and flags | done | compatibility date plus validated, signed workerd compatibility flags are done; the supported-flag catalogue must track the pinned workerd release |
 | runtime/build/request logs and cluster distribution | done | runtime output and 7-day request history aggregate across live nodes; longer archival/export is optional future work |
-| previews and pull-request deployments | planned | deterministic preview hostnames and cleanup |
+| previews and pull-request deployments | partial | deterministic version/PR domains, isolated runtimes and DO disks, signed approval/tombstones, automatic expiry, ACME/blob repair, request observability and Chinese UI are implemented; GitHub check/comment reporting and multi-node fault soak remain |
 | service bindings and placement tags | partial | signed node-local dynamic Service router and native `env.SERVICE.fetch()` are done; placement-aware mesh fallback and cycle diagnostics remain |
 | R2, D1, Queue, Analytics, Pipeline, Workflow, Email, Binary bindings | partial | native R2, CF-shaped D1, Queue producer/consumer, Analytics Engine, Pipeline, Workflow and Email bindings + console editors done; Binary Deliver remains |
 

@@ -160,6 +160,22 @@ pub fn spawn_renewer(node: Arc<Node>, cfg: AcmeConfig, dns: DnsApi) {
                             }
                         }
                     }
+                    for (_, preview) in crate::preview::active_previews(&node) {
+                        let hostname = preview
+                            .hostname
+                            .trim()
+                            .trim_end_matches('.')
+                            .to_ascii_lowercase();
+                        if hostname == zone || hostname.ends_with(&format!(".{zone}")) {
+                            let covered_by_configured_wildcard = hostname
+                                .split_once('.')
+                                .map(|(_, suffix)| format!("*.{suffix}"))
+                                .is_some_and(|wildcard| configured.contains(&wildcard));
+                            if !covered_by_configured_wildcard {
+                                hostnames.insert(hostname);
+                            }
+                        }
+                    }
                     for (view, spec) in crate::r2::bucket_records(&node) {
                         if !spec.public_access {
                             continue;

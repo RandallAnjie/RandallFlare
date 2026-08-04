@@ -25,6 +25,7 @@ const state = {
   cronRuns: [],
   cronDlq: [],
   requestLogs: null,
+  previews: [],
   projectTab: "overview",
   r2Buckets: [],
   r2Active: null,
@@ -374,6 +375,7 @@ function buildStateLabel(stateName) {
 
 function buildTriggerLabel(trigger) {
   if (trigger === "manual") return "手动触发";
+  if (String(trigger || "").startsWith("github-pr:")) return "GitHub Pull Request 预览";
   if (String(trigger || "").startsWith("github:")) return "GitHub 推送";
   return trigger || "未知来源";
 }
@@ -396,12 +398,15 @@ function buildRowsHtml(jobs, approveNode) {
     const terminal = job.state === "deployed" || job.state === "failed";
     const short = job.commit ? job.commit.slice(0, 12) : "等待中";
     const approval = job.approval && job.state === "awaiting_approval"
-      ? `<button class="primary" data-build-action="approve" data-build="${escapeHtml(job.id)}" data-node="${escapeHtml(job.approve_node || approveNode || "")}">签署发布</button>` : "";
+      ? `<button class="primary" data-build-action="approve" data-build="${escapeHtml(job.id)}" data-node="${escapeHtml(job.approve_node || approveNode || "")}">签署${job.preview ? "预览" : "发布"}</button>` : "";
+    const preview = Boolean(job.preview);
+    const destination = preview ? "预览环境" : "生产环境";
+    const resultLink = job.preview_url && job.state === "deployed" ? `<a class="mini-button" href="${escapeHtml(job.preview_url)}" target="_blank" rel="noreferrer">访问预览 ↗</a>` : "";
     return `<article class="build-row ${job.state === "failed" ? "failed" : ""}">
       <span class="pipeline-state ${terminal ? job.state : "active"}"></span>
-      <div><strong>${escapeHtml(job.worker)}</strong><small>${escapeHtml(buildTriggerLabel(job.trigger))} · ${escapeHtml(job.branch)} · <code>${escapeHtml(short)}</code></small></div>
-      <div class="build-stage"><span class="badge ${job.state === "deployed" ? "active" : ""}">${escapeHtml(buildStateLabel(job.state))}</span><small>${job.version ? `发布 v${escapeHtml(job.version)}` : "产物尚未就绪"}</small></div>
-      <div class="table-actions">${approval}<button class="mini-button" data-build-action="log" data-build="${escapeHtml(job.id)}">查看日志</button></div>
+      <div><strong>${escapeHtml(job.worker)}</strong><small>${escapeHtml(buildTriggerLabel(job.trigger))} · ${escapeHtml(destination)} · <code>${escapeHtml(short)}</code></small></div>
+      <div class="build-stage"><span class="badge ${job.state === "deployed" ? "active" : ""}">${escapeHtml(buildStateLabel(job.state))}</span><small>${job.version ? `${preview ? "预览" : "发布"} v${escapeHtml(job.version)}` : "产物尚未就绪"}</small></div>
+      <div class="table-actions">${approval}${resultLink}<button class="mini-button" data-build-action="log" data-build="${escapeHtml(job.id)}">查看日志</button></div>
     </article>`;
   }).join("") : '<div class="empty-state">暂无构建记录。连接仓库后即可开始首次构建。</div>';
 }
@@ -452,6 +457,7 @@ function switchProjectTab(tab) {
   $$(".project-tab").forEach((panel) => panel.classList.toggle("active", panel.id === `project-tab-${tab}`));
   if (tab === "logs") Promise.all([loadRequestLogs(), loadDetailLogs()]);
   if (tab === "deployments") loadDetailHistory();
+  if (tab === "previews") loadWorkerPreviews();
   if (tab === "triggers" && state.activeWorker) loadCronRuns();
   if (tab === "code" && state.workerDetail && !state.workerFile) {
     const worker = state.workerDetail.worker;
@@ -761,14 +767,16 @@ function renderWorkerDetail(data) {
   $("#project-source-output").value = source?.output_dir || ".";
   $("#project-source-private").checked = Boolean(source?.use_github_token);
   $("#project-source-webhook").checked = source ? Boolean(source.webhook) : true;
+  $("#project-source-pr-previews").checked = source ? Boolean(source.preview_pull_requests) : true;
+  $("#project-source-pr-previews").disabled = !$("#project-source-webhook").checked;
   $("#project-source-panel .settings-copy .muted").textContent = source
     ? "编辑仓库、分支与构建命令。源码配置也由管理员签名并在集群内复制。"
     : "该项目尚未连接 GitHub；填写配置即可接入构建与推送部署。";
   $("#project-source-form button[type=submit]").textContent = source ? "保存 Git 配置" : "连接 GitHub 仓库";
   $("#project-source-disconnect").classList.toggle("hidden", !source);
   $("#project-source-status").innerHTML = source ? `
-    <div class="source-connection"><span class="dot online"></span><p><strong>已连接</strong><small>代码源 v${escapeHtml(source.version)} · ${source.webhook ? "推送自动构建已启用" : "仅手动构建"}</small></p></div>
-    ${source.webhook ? `<div class="webhook-grid"><span>回调地址</span><code>${escapeHtml(`${location.origin}${source.webhook_path}`)}</code><span>密钥</span><code>${escapeHtml(source.webhook_secret || "不可用")}</code><span>事件</span><code>仅推送事件</code></div>` : ""}` : '<div class="source-connection"><span class="dot pending"></span><p><strong>尚未连接</strong><small>填写右侧表单即可启用 GitHub 构建。</small></p></div>';
+    <div class="source-connection"><span class="dot online"></span><p><strong>已连接</strong><small>代码源 v${escapeHtml(source.version)} · ${source.webhook ? "自动构建已启用" : "仅手动构建"}${source.preview_pull_requests ? " · PR 预览已启用" : ""}</small></p></div>
+    ${source.webhook ? `<div class="webhook-grid"><span>回调地址</span><code>${escapeHtml(`${location.origin}${source.webhook_path}`)}</code><span>密钥</span><code>${escapeHtml(source.webhook_secret || "不可用")}</code><span>事件</span><code>${source.preview_pull_requests ? "推送与 Pull Request" : "仅推送"}</code></div>` : ""}` : '<div class="source-connection"><span class="dot pending"></span><p><strong>尚未连接</strong><small>填写右侧表单即可启用 GitHub 构建。</small></p></div>';
   $("#project-identifiers").innerHTML = `
     <div><dt>Worker 名称</dt><dd class="mono">${escapeHtml(worker.name)}</dd></div>
     <div><dt>当前版本</dt><dd class="mono">v${escapeHtml(worker.version)}</dd></div>
@@ -811,6 +819,72 @@ async function loadDetailHistory() {
     $("#detail-history").innerHTML = `<p class="muted"><span class="state-ok">✓ 哈希链验证通过</span> · ${data.entries.length} 个版本</p>${data.entries.slice().reverse().map((entry, index) => `<div class="history-entry"><div class="version">v${escapeHtml(entry.version)}</div><div>${escapeHtml(entry.hostnames?.join(", ") || "未配置域名")}<code>${escapeHtml(entry.digest)}</code></div>${!entry.deleted && index > 0 ? `<button class="mini-button" data-rollback-worker="${escapeHtml(name)}" data-rollback-version="${escapeHtml(entry.version)}">回滚</button>` : ""}</div>`).join("")}`;
   } catch (error) {
     $("#detail-history").innerHTML = `<div class="empty-state">${escapeHtml(error.message)}</div>`;
+  }
+}
+
+function previewSourceLabel(source) {
+  if (source?.type === "pull_request") return `Pull Request #${source.number} · ${source.branch}`;
+  if (source?.type === "commit") return `提交 ${String(source.commit || "").slice(0, 12)}`;
+  return `历史版本 v${source?.version ?? "—"}`;
+}
+
+function renderWorkerPreviews(data) {
+  state.previews = data.previews || [];
+  const select = $("#project-preview-version");
+  const selected = select.value;
+  select.innerHTML = (data.versions || []).slice().reverse().map((version) => `<option value="${escapeHtml(version)}">v${escapeHtml(version)}</option>`).join("");
+  if ([...select.options].some((option) => option.value === selected)) select.value = selected;
+  $("#project-preview-ttl").max = data.max_ttl_days || 90;
+  if (!$("#project-preview-ttl").value) $("#project-preview-ttl").value = data.default_ttl_days || 30;
+  $("#project-preview-list").innerHTML = state.previews.length ? state.previews.map((preview) => {
+    const active = Boolean(preview.active);
+    const expires = new Date(preview.expires_at_ms).toLocaleString("zh-CN");
+    return `<article class="build-row ${active ? "" : "failed"}">
+      <span class="pipeline-state ${active ? "deployed" : "failed"}"></span>
+      <div><strong>${escapeHtml(preview.alias)}</strong><small>${escapeHtml(previewSourceLabel(preview.source))} · ${active ? `到期于 ${expires}` : `已于 ${expires} 到期`}</small><code>${escapeHtml(preview.hostname)}</code></div>
+      <div class="build-stage"><span class="badge ${active ? "active" : ""}">${active ? (preview.running_on_this_node ? "本节点运行中" : "正在分发") : "已到期"}</span><small>清单 v${escapeHtml(preview.manifest_version)} · 资源 v${escapeHtml(preview.resource_version)}</small></div>
+      <div class="table-actions">${active ? `<a class="mini-button" href="${escapeHtml(preview.url)}" target="_blank" rel="noreferrer">访问 ↗</a>` : ""}<button class="mini-button danger" type="button" data-preview-delete="${escapeHtml(preview.alias)}">删除</button></div>
+    </article>`;
+  }).join("") : '<div class="empty-state">尚无预览。可以选择历史版本创建，也可以在代码源中启用 Pull Request 预览。</div>';
+}
+
+async function loadWorkerPreviews({ quiet = true } = {}) {
+  const worker = state.activeWorker;
+  if (!worker) return;
+  try {
+    const data = await api(`/api/workers/${encodeURIComponent(worker)}/previews`);
+    if (state.activeWorker === worker) renderWorkerPreviews(data);
+  } catch (error) {
+    $("#project-preview-list").innerHTML = `<div class="empty-state">${escapeHtml(error.message)}</div>`;
+    if (!quiet) toast(error.message, true);
+  }
+}
+
+async function createWorkerPreview(event) {
+  event.preventDefault();
+  const worker = state.activeWorker;
+  if (!worker) return;
+  const version = Number($("#project-preview-version").value);
+  const ttlDays = Number($("#project-preview-ttl").value);
+  try {
+    const result = await api(`/api/workers/${encodeURIComponent(worker)}/previews`, {
+      method: "POST",
+      body: JSON.stringify({ version, ttl_days: ttlDays }),
+    });
+    showApproval(result, `发布 ${worker} v${version} 的隔离预览。`, () => loadWorkerPreviews({ quiet: false }));
+  } catch (error) {
+    toast(error.message, true);
+  }
+}
+
+async function deleteWorkerPreview(alias) {
+  const worker = state.activeWorker;
+  if (!worker || !window.confirm(`要停止并删除预览“${alias}”吗？`)) return;
+  try {
+    const result = await api(`/api/workers/${encodeURIComponent(worker)}/previews/${encodeURIComponent(alias)}`, { method: "DELETE" });
+    showApproval(result, `停止 ${worker} 的预览 ${alias}。`, () => loadWorkerPreviews({ quiet: false }));
+  } catch (error) {
+    toast(error.message, true);
   }
 }
 
@@ -1093,6 +1167,7 @@ async function saveProjectSource(event) {
     output_dir: $("#project-source-output").value.trim(),
     use_github_token: $("#project-source-private").checked,
     webhook: $("#project-source-webhook").checked,
+    preview_pull_requests: $("#project-source-webhook").checked && $("#project-source-pr-previews").checked,
   };
   try {
     const result = await api("/api/sources", { method: "POST", body: JSON.stringify(payload) });
@@ -1124,6 +1199,7 @@ async function connectSource(event) {
     output_dir: $("#source-output").value.trim(),
     use_github_token: $("#source-private").checked,
     webhook: $("#source-webhook").checked,
+    preview_pull_requests: $("#source-webhook").checked && $("#source-pr-previews").checked,
   };
   try {
     const result = await api("/api/sources", { method: "POST", body: JSON.stringify(payload) });
@@ -1147,6 +1223,8 @@ function editSource(worker) {
   $("#source-output").value = source.output_dir;
   $("#source-private").checked = source.use_github_token;
   $("#source-webhook").checked = source.webhook;
+  $("#source-pr-previews").checked = Boolean(source.preview_pull_requests);
+  $("#source-pr-previews").disabled = !source.webhook;
   $("#source-form").scrollIntoView({ behavior: "smooth", block: "center" });
 }
 
@@ -1209,7 +1287,10 @@ function approveBuild(id, approveNode) {
     version: job.version,
     approval: job.approval,
     approve_node: approveNode,
-  }, `部署为 ${job.worker} 构建的不可变产物。`);
+  }, job.preview ? `发布 ${job.worker} 构建的隔离预览。` : `部署为 ${job.worker} 构建的不可变产物。`, async () => {
+    await loadWorkerOps();
+    if (job.preview && state.activeWorker === job.worker) await loadWorkerPreviews();
+  });
 }
 
 async function openRuntimeLog(worker) {
@@ -3283,7 +3364,7 @@ async function boot() {
     $("#security-copy").innerHTML = consoleMode === "public"
       ? "此节点不保存<br>任何私钥。"
       : "密钥仅保留在本地<br>控制台进程中。";
-    $$("#deploy-form button, #source-form button, #kv-editor-form button, #d1-create-form button, #d1-exec-form button, #r2-bucket-form button, #r2-upload-form button, #r2-delete-bucket, #queue-form button, #queue-send-form button, #queue-delete, #analytics-form button, #analytics-write-form button, #analytics-delete, #pipeline-form button, #pipeline-token-form button, #pipeline-ingest-form button, #pipeline-flush, #pipeline-delete, #workflow-form button, #workflow-trigger-form button, #workflow-signal-form button, #workflow-delete, #flow-form button, #flow-token-form button, #flow-trigger-form button, #flow-delete, #email-domain-form button, #email-route-form button, #email-send-form button, #email-delete, #email-verify, #project-domain-add-form button, #project-bindings-form button, #project-secret-form button, #project-file-form button, #project-file-new, #project-triggers-form button, #project-cron-fire-form button, #project-cron-dlq button, #project-settings-form button, #project-source-form button, #project-redeploy, #project-delete")
+    $$("#deploy-form button, #source-form button, #kv-editor-form button, #d1-create-form button, #d1-exec-form button, #r2-bucket-form button, #r2-upload-form button, #r2-delete-bucket, #queue-form button, #queue-send-form button, #queue-delete, #analytics-form button, #analytics-write-form button, #analytics-delete, #pipeline-form button, #pipeline-token-form button, #pipeline-ingest-form button, #pipeline-flush, #pipeline-delete, #workflow-form button, #workflow-trigger-form button, #workflow-signal-form button, #workflow-delete, #flow-form button, #flow-token-form button, #flow-trigger-form button, #flow-delete, #email-domain-form button, #email-route-form button, #email-send-form button, #email-delete, #email-verify, #project-domain-add-form button, #project-bindings-form button, #project-secret-form button, #project-file-form button, #project-file-new, #project-triggers-form button, #project-cron-fire-form button, #project-cron-dlq button, #project-settings-form button, #project-preview-form button, #project-preview-list button, #project-source-form button, #project-redeploy, #project-delete")
       .forEach((button) => { button.disabled = state.session.read_only; });
     await loadOverview({ quiet: true });
     await loadWorkerOps();
@@ -3358,7 +3439,16 @@ $("#project-cron-dlq").addEventListener("click", (event) => {
   if (remove) deleteProjectCronDlq(remove.dataset.cronDelete);
 });
 $("#project-settings-form").addEventListener("submit", saveProjectSettings);
+$("#project-preview-form").addEventListener("submit", createWorkerPreview);
+$("#project-preview-refresh").addEventListener("click", () => loadWorkerPreviews({ quiet: false }));
+$("#project-preview-list").addEventListener("click", (event) => {
+  const button = event.target.closest("button[data-preview-delete]");
+  if (button) deleteWorkerPreview(button.dataset.previewDelete);
+});
 $("#project-source-form").addEventListener("submit", saveProjectSource);
+$("#project-source-webhook").addEventListener("change", () => {
+  $("#project-source-pr-previews").disabled = !$("#project-source-webhook").checked;
+});
 $("#project-source-disconnect").addEventListener("click", () => state.activeWorker && disconnectSource(state.activeWorker));
 $("#project-delete").addEventListener("click", () => state.activeWorker && deleteWorker(state.activeWorker));
 $("#detail-refresh-logs").addEventListener("click", loadDetailLogs);
@@ -3381,6 +3471,9 @@ $("#deploy-form").addEventListener("submit", deployWorker);
 $("#deploy-file-picker").addEventListener("click", () => $("#deploy-files").click());
 $("#deploy-files").addEventListener("change", updateDeployFileStatus);
 $("#source-form").addEventListener("submit", connectSource);
+$("#source-webhook").addEventListener("change", () => {
+  $("#source-pr-previews").disabled = !$("#source-webhook").checked;
+});
 $("#source-worker").addEventListener("input", updateDefaultDomainPreview);
 $("#kv-search-form").addEventListener("submit", (event) => { event.preventDefault(); loadKeys(); });
 $("#kv-editor-form").addEventListener("submit", saveKey);
