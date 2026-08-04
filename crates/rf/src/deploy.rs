@@ -74,6 +74,46 @@ fn module_kind(path: &Path) -> ModuleKind {
     }
 }
 
+fn validate_spec(spec: &DeploySpec) -> Result<()> {
+    if spec.env.contains_key(DO_METADATA_ENV) {
+        bail!("env key {DO_METADATA_ENV} is reserved by rf");
+    }
+    if let Some(assets) = &spec.assets {
+        let path = Path::new(assets);
+        if assets.is_empty()
+            || assets.contains('\\')
+            || path
+                .components()
+                .any(|part| !matches!(part, std::path::Component::Normal(_)))
+        {
+            bail!("assets must be a safe relative directory");
+        }
+    }
+    Ok(())
+}
+
+fn validate_bundle(bundle: &Bundle) -> Result<()> {
+    if let Some(main) = &bundle.spec.main {
+        if !bundle.modules.iter().any(|(path, _, _)| path == main) {
+            bail!("main module {main:?} not found in bundle");
+        }
+    } else if bundle.assets.is_empty() {
+        bail!("worker has neither a main module nor assets");
+    }
+    Ok(())
+}
+
+fn safe_upload_path(path: &str) -> bool {
+    !path.is_empty()
+        && path.len() <= 1024
+        && !path.starts_with('/')
+        && !path.contains('\\')
+        && !path.as_bytes().iter().any(|byte| byte.is_ascii_control())
+        && path
+            .split('/')
+            .all(|part| !part.is_empty() && part != "." && part != "..")
+}
+
 fn walk(dir: &Path) -> Result<Vec<PathBuf>> {
     let mut out = Vec::new();
     let mut stack = vec![dir.to_path_buf()];
@@ -109,21 +149,7 @@ pub fn read_bundle(dir: &Path) -> Result<Bundle> {
     let raw = std::fs::read_to_string(&spec_path)
         .with_context(|| format!("reading {}", spec_path.display()))?;
     let spec: DeploySpec = serde_json::from_str(&raw).context("parsing rf.json")?;
-    if spec.env.contains_key(DO_METADATA_ENV) {
-        bail!("env key {DO_METADATA_ENV} is reserved by rf");
-    }
-
-    if let Some(assets) = &spec.assets {
-        let path = Path::new(assets);
-        if assets.is_empty()
-            || assets.contains('\\')
-            || path
-                .components()
-                .any(|part| !matches!(part, std::path::Component::Normal(_)))
-        {
-            bail!("assets must be a safe relative directory");
-        }
-    }
+    validate_spec(&spec)?;
 
     let assets_dir = spec.assets.as_ref().map(|a| dir.join(a));
     let mut modules = Vec::new();
@@ -147,18 +173,57 @@ pub fn read_bundle(dir: &Path) -> Result<Bundle> {
         modules.push((rel_str, bytes, kind));
     }
 
-    if let Some(main) = &spec.main {
-        if !modules.iter().any(|(p, _, _)| p == main) {
-            bail!("main module {main:?} not found in bundle");
-        }
-    } else if assets.is_empty() {
-        bail!("worker has neither a main module nor assets");
-    }
-    Ok(Bundle {
+    let bundle = Bundle {
         spec,
         modules,
         assets,
-    })
+    };
+    validate_bundle(&bundle)?;
+    Ok(bundle)
+}
+
+/// Build a bundle from browser-uploaded relative paths. The browser sends
+/// bytes only; filesystem paths are never interpreted on the node.
+pub fn read_bundle_files(files: Vec<(String, Vec<u8>)>) -> Result<Bundle> {
+    let mut files_by_path = BTreeMap::new();
+    for (path, bytes) in files {
+        if !safe_upload_path(&path) {
+            bail!("unsafe uploaded bundle path: {path:?}");
+        }
+        if files_by_path.insert(path.clone(), bytes).is_some() {
+            bail!("duplicate uploaded bundle path: {path:?}");
+        }
+    }
+    let spec_bytes = files_by_path
+        .remove("rf.json")
+        .ok_or_else(|| anyhow::anyhow!("uploaded bundle is missing rf.json"))?;
+    let spec_raw = std::str::from_utf8(&spec_bytes).context("rf.json is not UTF-8")?;
+    let spec: DeploySpec = serde_json::from_str(spec_raw).context("parsing rf.json")?;
+    validate_spec(&spec)?;
+
+    let asset_prefix = spec.assets.as_ref().map(|assets| format!("{assets}/"));
+    let mut modules = Vec::new();
+    let mut assets = Vec::new();
+    for (path, bytes) in files_by_path {
+        if let Some(prefix) = &asset_prefix {
+            if let Some(asset_path) = path.strip_prefix(prefix) {
+                if asset_path.is_empty() {
+                    bail!("uploaded asset path is empty");
+                }
+                assets.push((asset_path.to_string(), bytes));
+                continue;
+            }
+        }
+        let kind = module_kind(Path::new(&path));
+        modules.push((path, bytes, kind));
+    }
+    let bundle = Bundle {
+        spec,
+        modules,
+        assets,
+    };
+    validate_bundle(&bundle)?;
+    Ok(bundle)
 }
 
 /// Upload all blobs + submit the signed manifest. Returns the new
@@ -169,6 +234,21 @@ pub async fn deploy(
     node_addr: &str,
     operator: &AnyKeypair,
 ) -> Result<u64> {
+    let manifest = prepare_manifest(bundle, client, node_addr).await?;
+    let version = manifest.version;
+    let env = Envelope::seal_any(&manifest, operator);
+    client.post_manifest(node_addr, &env).await?;
+    Ok(version)
+}
+
+/// Upload bundle blobs and build the exact canonical manifest that the
+/// operator must sign. No cluster state changes until the signed envelope is
+/// submitted.
+pub async fn prepare_manifest(
+    bundle: &Bundle,
+    client: &PeerClient,
+    node_addr: &str,
+) -> Result<WorkerManifest> {
     let head = client.worker_head(node_addr, &bundle.spec.name).await?;
     let version = head.map(|(v, _)| v).unwrap_or(0) + 1;
     let prev = head.map(|(_, digest)| digest);
@@ -257,9 +337,7 @@ pub async fn deploy(
     manifest
         .validate()
         .map_err(|e| anyhow::anyhow!("invalid manifest: {e}"))?;
-    let env = Envelope::seal_any(&manifest, operator);
-    client.post_manifest(node_addr, &env).await?;
-    Ok(version)
+    Ok(manifest)
 }
 
 /// Tombstone a worker.
@@ -269,6 +347,18 @@ pub async fn delete_worker(
     node_addr: &str,
     operator: &AnyKeypair,
 ) -> Result<u64> {
+    let manifest = prepare_delete(name, client, node_addr).await?;
+    let version = manifest.version;
+    let env = Envelope::seal_any(&manifest, operator);
+    client.post_manifest(node_addr, &env).await?;
+    Ok(version)
+}
+
+pub async fn prepare_delete(
+    name: &str,
+    client: &PeerClient,
+    node_addr: &str,
+) -> Result<WorkerManifest> {
     let head = client.worker_head(node_addr, name).await?;
     let Some((prior, prev_digest)) = head else {
         bail!("no such worker: {name}")
@@ -287,9 +377,7 @@ pub async fn delete_worker(
         crons: vec![],
         compatibility_date: String::new(),
     };
-    let env = Envelope::seal_any(&manifest, operator);
-    client.post_manifest(node_addr, &env).await?;
-    Ok(prior + 1)
+    Ok(manifest)
 }
 
 fn decode_sha(hex_str: &str) -> Result<[u8; 32]> {
@@ -350,6 +438,37 @@ mod tests {
         write_bundle(&dir2, r#"{"name":"empty"}"#, &[]);
         assert!(read_bundle(&dir2).is_err());
         std::fs::remove_dir_all(&dir2).ok();
+    }
+
+    #[test]
+    fn browser_uploaded_bundle_uses_only_safe_relative_paths() {
+        let bundle = read_bundle_files(vec![
+            (
+                "rf.json".into(),
+                br#"{"name":"browser-site","assets":"public"}"#.to_vec(),
+            ),
+            ("public/index.html".into(), b"<h1>browser</h1>".to_vec()),
+        ])
+        .unwrap();
+        assert_eq!(bundle.spec.name, "browser-site");
+        assert_eq!(bundle.assets[0].0, "index.html");
+        assert!(read_bundle_files(vec![
+            (
+                "rf.json".into(),
+                br#"{"name":"bad","main":"index.js"}"#.to_vec(),
+            ),
+            ("../index.js".into(), b"export default {}".to_vec()),
+        ])
+        .is_err());
+        assert!(read_bundle_files(vec![
+            (
+                "rf.json".into(),
+                br#"{"name":"duplicate","main":"index.js"}"#.to_vec(),
+            ),
+            ("index.js".into(), b"one".to_vec()),
+            ("index.js".into(), b"two".to_vec()),
+        ])
+        .is_err());
     }
 
     #[cfg(unix)]

@@ -37,6 +37,11 @@ command -v curl >/dev/null || { echo "curl is required" >&2; exit 1; }
 echo "1/6 node health and authenticated status"
 "$RF_BIN" health --node "$RF_NODE"
 "$RF_BIN" status --node "$RF_NODE" >/dev/null
+console_body=$(curl --fail --silent --show-error --connect-timeout 3 --max-time 5 "$ingress/")
+[[ "$console_body" == *"RandallFlare Console"* ]] || {
+  echo "default ingress did not serve the RandallFlare management interface" >&2
+  exit 1
+}
 
 echo "2/6 static asset deployment and ingress"
 "$RF_BIN" deploy "$examples_dir/hello" --node "$RF_NODE" >/dev/null

@@ -19,21 +19,32 @@ use axum::response::{IntoResponse, Response};
 use rf_core::manifest::WorkerManifest;
 use std::net::SocketAddr;
 use std::sync::Arc;
+use tower::ServiceExt;
 
 #[derive(Clone)]
 pub struct Ingress {
     node: Arc<Node>,
     http: reqwest::Client,
     durable: crate::durable::Coordinator,
+    console: axum::Router,
 }
 
-fn app(node: Arc<Node>, durable: crate::durable::Coordinator) -> Result<axum::Router> {
+fn app(
+    node: Arc<Node>,
+    durable: crate::durable::Coordinator,
+    secure_console: bool,
+) -> Result<axum::Router> {
+    let console = crate::console::router(crate::console::ConsoleState::public(
+        node.clone(),
+        secure_console,
+    )?);
     let ingress = Ingress {
         node,
         durable,
         http: reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(120))
             .build()?,
+        console,
     };
     Ok(axum::Router::new().fallback(handle).with_state(ingress))
 }
@@ -43,7 +54,7 @@ pub async fn serve(
     durable: crate::durable::Coordinator,
     listen: SocketAddr,
 ) -> Result<SocketAddr> {
-    let app = app(node, durable)?;
+    let app = app(node, durable, false)?;
     let listener = tokio::net::TcpListener::bind(listen).await?;
     let addr = listener.local_addr()?;
     tokio::spawn(async move {
@@ -63,7 +74,7 @@ pub async fn serve_tls(
 ) -> Result<()> {
     let store = crate::tls::spawn_store(node.cfg.data_dir.join("certs"))?;
     let rustls_cfg = crate::tls::server_config(store);
-    let app = app(node, durable)?;
+    let app = app(node, durable, true)?;
     let config = axum_server::tls_rustls::RustlsConfig::from_config(rustls_cfg);
     tokio::spawn(async move {
         if let Err(e) = axum_server::bind_rustls(listen, config)
@@ -84,13 +95,26 @@ async fn handle(State(ingress): State<Ingress>, req: Request) -> Response {
         .map(|h| h.split(':').next().unwrap_or(h).to_ascii_lowercase())
         .unwrap_or_default();
 
+    // A node's literal IP is its stable bootstrap/admin address and cannot be
+    // shadowed by a Worker manifest. Named hosts remain Worker-first; an
+    // unclaimed name falls through to the same decentralized console.
+    if host.parse::<std::net::IpAddr>().is_ok() {
+        return ingress
+            .console
+            .clone()
+            .oneshot(req)
+            .await
+            .unwrap_or_else(|never| match never {});
+    }
+
     let routes = ingress.node.routes();
     let Some(worker_name) = routes.get(&host) else {
-        return (
-            StatusCode::NOT_FOUND,
-            format!("no worker bound to {host}\n"),
-        )
-            .into_response();
+        return ingress
+            .console
+            .clone()
+            .oneshot(req)
+            .await
+            .unwrap_or_else(|never| match never {});
     };
     let Some(manifest) = ingress.node.manifest(worker_name) else {
         return (StatusCode::NOT_FOUND, "worker vanished\n").into_response();

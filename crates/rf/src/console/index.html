@@ -5,11 +5,35 @@
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <meta name="color-scheme" content="dark">
     <meta name="rf-console-token" content="__RF_TOKEN__">
+    <meta name="rf-console-mode" content="__RF_MODE__">
     <title>RandallFlare Console</title>
     <link rel="stylesheet" href="/styles.css">
   </head>
   <body>
     <a class="skip-link" href="#content">Skip to content</a>
+    <section id="auth-gate" class="auth-gate hidden" aria-labelledby="auth-title">
+      <div class="auth-card">
+        <div class="brand auth-brand">
+          <div class="brand-mark" aria-hidden="true"><span>R</span></div>
+          <div><strong>RandallFlare</strong><small>Decentralized authorization</small></div>
+        </div>
+        <p class="eyebrow">OPERATOR PROOF</p>
+        <h1 id="auth-title">Authorize this browser</h1>
+        <p class="muted">This node has no account database and never receives your private key. Approve the one-time challenge with the RandallFlare CLI.</p>
+        <div class="approval-code-wrap">
+          <span>ONE-TIME CODE</span>
+          <strong id="auth-code">Generating…</strong>
+        </div>
+        <label for="auth-command">Run on an operator machine</label>
+        <div class="command-row">
+          <code id="auth-command">Waiting for node…</code>
+          <button id="auth-copy" class="secondary" type="button">Copy</button>
+        </div>
+        <div class="auth-state"><span id="auth-dot" class="dot pending"></span><span id="auth-status">Creating signed challenge</span></div>
+        <button id="auth-retry" class="secondary hidden" type="button">Create another challenge</button>
+        <p class="form-note">The signed session is short-lived and independently verifiable by every node in this cluster. Use HTTPS outside this first-node test.</p>
+      </div>
+    </section>
     <div class="shell">
       <aside class="sidebar">
         <div class="brand">
@@ -31,8 +55,8 @@
           </button>
         </nav>
         <div class="sidebar-foot">
-          <div class="security-note"><span>●</span> Credentials isolated</div>
-          <small>Secrets remain in the local<br>console process.</small>
+          <div class="security-note"><span>●</span> Operator verified</div>
+          <small id="security-copy">No private key is stored<br>on this node.</small>
         </div>
       </aside>
 
@@ -44,11 +68,15 @@
           </div>
           <div class="topbar-actions">
             <div class="connection"><span id="connection-dot" class="dot pending"></span><span id="connection-text">Connecting</span></div>
+            <button id="logout" class="secondary compact hidden" type="button">Sign out</button>
             <button id="refresh" class="icon-button" type="button" aria-label="Refresh data">↻</button>
           </div>
         </header>
 
         <div id="loading" class="loading-line" aria-hidden="true"></div>
+        <div id="transport-warning" class="banner warning hidden" role="status">
+          HTTP test mode — this session cookie is not protected in transit. Enable HTTPS before using this node in production.
+        </div>
         <div id="global-error" class="banner error hidden" role="alert"></div>
 
         <section id="view-overview" class="view active" aria-labelledby="section-title">
@@ -88,11 +116,17 @@
             <article class="panel deploy-panel">
               <p class="eyebrow">SIGNED RELEASE</p>
               <h2>Deploy a Worker</h2>
-              <p class="muted">Select a local bundle directory containing <code>rf.json</code>. The console signs the manifest without exposing your key to the browser.</p>
+              <p class="muted">Select a bundle containing <code>rf.json</code>. The node prepares its exact manifest; your operator CLI signs that payload before the cluster accepts it.</p>
               <form id="deploy-form">
-                <label for="deploy-path">Local bundle path</label>
-                <input id="deploy-path" name="path" type="text" placeholder="/absolute/path/to/worker" autocomplete="off" required>
-                <button class="primary" type="submit">Deploy signed version</button>
+                <div id="deploy-local-fields">
+                  <label for="deploy-path">Local bundle path</label>
+                  <input id="deploy-path" name="path" type="text" placeholder="/absolute/path/to/worker" autocomplete="off">
+                </div>
+                <div id="deploy-public-fields" class="hidden">
+                  <label for="deploy-files">Worker bundle directory</label>
+                  <input id="deploy-files" name="files" type="file" webkitdirectory multiple>
+                </div>
+                <button class="primary" type="submit">Prepare signed deployment</button>
               </form>
               <div id="deploy-mode" class="form-note"></div>
             </article>
@@ -174,6 +208,14 @@
     <dialog id="history-dialog">
       <div class="dialog-head"><div><p class="eyebrow">VERIFIABLE HISTORY</p><h2 id="history-title">Worker log</h2></div><button id="history-close" class="icon-button" aria-label="Close">×</button></div>
       <div id="history-content"></div>
+    </dialog>
+    <dialog id="approval-dialog">
+      <div class="dialog-head"><div><p class="eyebrow">OPERATOR SIGNATURE</p><h2 id="approval-title">Approve cluster change</h2></div><button id="approval-close" class="icon-button" aria-label="Close">×</button></div>
+      <p id="approval-summary" class="muted"></p>
+      <div class="approval-code-wrap"><span>ONE-TIME CODE</span><strong id="approval-code">—</strong></div>
+      <label for="approval-command">Run on an operator machine</label>
+      <div class="command-row"><code id="approval-command">—</code><button id="approval-copy" class="secondary" type="button">Copy</button></div>
+      <div class="auth-state"><span id="approval-dot" class="dot pending"></span><span id="approval-status">Waiting for signature</span></div>
     </dialog>
     <div id="toast" class="toast" role="status" aria-live="polite"></div>
     <script src="/app.js" defer></script>

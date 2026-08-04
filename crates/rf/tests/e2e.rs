@@ -14,6 +14,197 @@ use std::time::{Duration, Instant};
 use rf::peers::PeerClient;
 use rf_core::identity::{AnyKeypair, Keypair};
 
+#[tokio::test(flavor = "multi_thread")]
+async fn default_ingress_console_uses_operator_approved_cluster_session() {
+    use base64::Engine as _;
+
+    let _scenario = E2E_LOCK.lock().await;
+    let operator = Keypair::from_seed([31u8; 32]);
+    let operator_any = AnyKeypair::Ed(operator.clone());
+    let client = PeerClient::new(SECRET);
+    let http = reqwest::Client::new();
+    let node = start("admin", &operator, &[]);
+    wait_ping(&node.api, Duration::from_secs(15)).await;
+    let ingress = format!("http://127.0.0.1:{}", node.ingress);
+
+    let page = http.get(&ingress).send().await.unwrap();
+    assert_eq!(page.status(), 200);
+    let page = page.text().await.unwrap();
+    assert!(page.contains("RandallFlare Console"));
+    assert!(page.contains("Decentralized authorization"));
+    assert!(!page.contains(&hex::encode(SECRET)));
+
+    let denied = http
+        .get(format!("{ingress}/api/session"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(denied.status(), 401);
+
+    let challenge: serde_json::Value = http
+        .post(format!("{ingress}/api/auth/challenge"))
+        .header("origin", &ingress)
+        .json(&serde_json::json!({}))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let id = challenge["id"].as_str().unwrap();
+    let code = challenge["code"].as_str().unwrap();
+    let approval = client.authorization(&node.api, code).await.unwrap();
+    assert_eq!(approval.kind, rf::management::ApprovalKind::Login);
+    let payload = base64::engine::general_purpose::STANDARD
+        .decode(approval.payload_base64)
+        .unwrap();
+    client
+        .approve_authorization(
+            &node.api,
+            code,
+            &rf::management::ApprovalSignature {
+                signer: operator_any.signer_id(),
+                signature_base64: base64::engine::general_purpose::STANDARD
+                    .encode(operator_any.sign(&payload)),
+            },
+        )
+        .await
+        .unwrap();
+
+    let authorized = http
+        .get(format!("{ingress}/api/auth/challenge/{id}"))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
+    let set_cookie = authorized
+        .headers()
+        .get("set-cookie")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_string();
+    let cookie = set_cookie.split(';').next().unwrap().to_string();
+    let session: serde_json::Value = http
+        .get(format!("{ingress}/api/session"))
+        .header("cookie", &cookie)
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(session["auth_mode"], "operator_grant");
+    let csrf = session["csrf"].as_str().unwrap();
+
+    http.put(format!("{ingress}/api/kv/value"))
+        .header("cookie", &cookie)
+        .header("origin", &ingress)
+        .header("x-rf-csrf", csrf)
+        .json(&serde_json::json!({
+            "namespace": "admin-e2e",
+            "key": "verified",
+            "value": "yes"
+        }))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
+    assert_eq!(
+        client
+            .kv_get(&node.api, "admin-e2e", "verified")
+            .await
+            .unwrap()
+            .as_deref(),
+        Some(b"yes".as_slice())
+    );
+
+    let deploy: serde_json::Value = http
+        .post(format!("{ingress}/api/workers/deploy"))
+        .header("cookie", &cookie)
+        .header("origin", &ingress)
+        .header("x-rf-csrf", csrf)
+        .json(&serde_json::json!({
+            "files": [
+                {
+                    "path": "rf.json",
+                    "data_base64": base64::engine::general_purpose::STANDARD.encode(
+                        br#"{"name":"admin-worker","assets":"public","hostnames":["admin-worker.test"]}"#
+                    )
+                },
+                {
+                    "path": "public/index.html",
+                    "data_base64": base64::engine::general_purpose::STANDARD.encode(
+                        b"<h1>deployed through decentralized console</h1>"
+                    )
+                }
+            ]
+        }))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(deploy["pending_approval"], true);
+    let deploy_code = deploy["approval"]["code"].as_str().unwrap();
+    let deploy_id = deploy["approval"]["id"].as_str().unwrap();
+    let manifest_approval = client.authorization(&node.api, deploy_code).await.unwrap();
+    assert_eq!(
+        manifest_approval.kind,
+        rf::management::ApprovalKind::Manifest
+    );
+    let manifest_payload = base64::engine::general_purpose::STANDARD
+        .decode(manifest_approval.payload_base64)
+        .unwrap();
+    client
+        .approve_authorization(
+            &node.api,
+            deploy_code,
+            &rf::management::ApprovalSignature {
+                signer: operator_any.signer_id(),
+                signature_base64: base64::engine::general_purpose::STANDARD
+                    .encode(operator_any.sign(&manifest_payload)),
+            },
+        )
+        .await
+        .unwrap();
+    let committed: serde_json::Value = http
+        .get(format!("{ingress}/api/approvals/{deploy_id}"))
+        .header("cookie", &cookie)
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(committed["state"], "completed");
+    let worker = http
+        .get(&ingress)
+        .header("host", "admin-worker.test")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(worker.status(), 200);
+    assert!(worker
+        .text()
+        .await
+        .unwrap()
+        .contains("deployed through decentralized console"));
+    let log = client.worker_log(&node.api, "admin-worker").await.unwrap();
+    assert!(rf_core::manifest::verify_chain(&log, &operator_any.signer_id()).is_ok());
+}
+
 fn free_port() -> u16 {
     TcpListener::bind("127.0.0.1:0")
         .unwrap()

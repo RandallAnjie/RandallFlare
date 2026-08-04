@@ -4,6 +4,7 @@
 
 use crate::blob::BlobStore;
 use crate::config::NodeConfig;
+use crate::management::Management;
 use crate::store::Store;
 use anyhow::Result;
 use rf_core::claim::{ClaimSet, Ingest};
@@ -60,6 +61,7 @@ pub struct Node {
     pub keypair: Keypair,
     pub store: Store,
     pub blobs: BlobStore,
+    pub management: Management,
     pub inner: Mutex<Inner>,
     events: broadcast::Sender<NodeEvent>,
 }
@@ -111,6 +113,7 @@ impl Node {
             keypair,
             store,
             blobs,
+            management: Management::default(),
             inner: Mutex::new(inner),
             events,
         })

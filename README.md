@@ -14,7 +14,7 @@ See [DESIGN.md](./DESIGN.md) for the architecture and consistency
 model. For a repeatable first-server rollout, use the
 [VPS deployment runbook](./docs/DEPLOYMENT.md).
 
-## Status: v0.4 (pre-release)
+## Status: v0.5 (pre-release)
 
 Working today, verified by multi-process fault-injection e2e tests:
 
@@ -37,9 +37,11 @@ Working today, verified by multi-process fault-injection e2e tests:
   claimed task (webhook-pluggable to any on-chain relayer), and
   operators can be an **Ethereum wallet** (`rf keygen --eth`,
   `operator = "0x…"`, EIP-191 signatures)
-- **Local operator console**: a responsive overview plus Worker deploy/history,
-  KV browsing/editing, and D1 creation/querying. Cluster credentials remain in
-  the loopback-only `rf console` process instead of entering browser storage.
+- **Decentralized management console**: an unmatched/default ingress hostname
+  opens the responsive admin UI directly. Operator-signed, stateless sessions
+  are independently verified by every node; there is no account database or
+  central authentication service. Worker changes use one-time CLI approval so
+  operator private keys never live on nodes or in browsers.
 
 Also in: HTTPS ingress (SNI cert store, hot-reload, wildcard files,
 self-signed fallback) and **native workerd kvNamespace bindings** —
@@ -147,25 +149,39 @@ installation, smoke testing, and upgrades.
 
 ## Management console
 
-Run the console on an administrator machine using the same GitHub Release
-binary as the nodes:
+Open any public node directly; when no Worker owns the request hostname, ingress
+serves the RandallFlare management interface:
+
+```text
+http://203.0.113.7/
+```
+
+The page shows a one-time code. Approve it from an operator machine using the
+same GitHub Release binary:
 
 ```bash
 export RF_NODE=203.0.113.7:7382
 export RF_CLUSTER_SECRET="<cluster secret>"
 export RF_OPERATOR_KEY="$PWD/first-vps/operator.key"
-rf console                         # http://127.0.0.1:7390
+rf authorize ABC12-DEF34
 ```
 
-The HTTP listener refuses non-loopback addresses. The page receives only a
-random, process-local session token; the cluster secret and operator private
-key stay in the `rf` process. Without an operator key, the console enforces
-observer mode and rejects every mutation. If TCP 7382 is restricted, tunnel it
-instead of exposing the console:
+The CLI fetches the exact challenge through the encrypted peer API and signs it
+with the operator key. The resulting HttpOnly, SameSite session contains an
+operator-signed grant rather than a centrally stored session ID, so every node
+can validate it independently. KV and D1 operations use that grant directly.
+Worker deploy/delete requests prepare a canonical manifest and display another
+one-time code; `rf authorize <code>` signs that exact manifest before it can
+enter the transparency log.
+
+Use HTTPS before treating a public management session as production-safe. The
+first-VPS HTTP address is suitable for isolated testing, but HTTP cannot protect
+session cookies from an on-path observer.
+
+The loopback-only console remains available as an offline/emergency path:
 
 ```bash
-ssh -N -L 7382:127.0.0.1:7382 root@203.0.113.7
-RF_NODE=127.0.0.1:7382 rf console
+rf console                         # http://127.0.0.1:7390
 ```
 
 ## Deploy a worker

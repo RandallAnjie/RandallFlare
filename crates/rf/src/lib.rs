@@ -15,6 +15,7 @@ pub mod gossip;
 pub mod ingress;
 pub mod keys;
 pub mod kvbind;
+pub mod management;
 pub mod node;
 pub mod peerapi;
 pub mod peers;
