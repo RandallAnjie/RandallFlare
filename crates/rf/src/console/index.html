@@ -222,6 +222,7 @@
           </div>
           <nav class="project-tabs" aria-label="项目详情">
             <button class="active" data-project-tab="overview" type="button">概览</button>
+            <button data-project-tab="code" type="button">代码</button>
             <button data-project-tab="deployments" type="button">部署</button>
             <button data-project-tab="logs" type="button">日志</button>
             <button data-project-tab="domains" type="button">域名与证书</button>
@@ -239,6 +240,27 @@
             <div class="grid one-one">
               <article class="panel"><div class="panel-head"><div><p class="eyebrow">集群状态</p><h2>节点分发</h2></div><span id="detail-distribution-count" class="badge">—</span></div><div id="detail-distribution" class="node-list"></div></article>
               <article class="panel"><div class="panel-head"><div><p class="eyebrow">构建产物</p><h2>文件与绑定</h2></div></div><div id="detail-content" class="detail-stack"></div></article>
+            </div>
+          </div>
+
+          <div id="project-tab-code" class="project-tab">
+            <div class="code-workspace">
+              <article class="panel code-sidebar">
+                <div class="panel-head"><div><p class="eyebrow">当前签名版本</p><h2>文件</h2></div><button id="project-file-new" class="secondary compact" type="button">新建</button></div>
+                <p id="project-code-source-warning" class="form-note"></p>
+                <div id="project-file-list" class="code-file-list empty-state">当前版本没有文件。</div>
+              </article>
+              <article class="panel code-editor-panel">
+                <div class="panel-head"><div><p class="eyebrow">版本化编辑器</p><h2 id="project-file-title">选择文件</h2><p id="project-file-meta" class="muted compact-copy">每次保存都会生成新的签名版本，旧版本仍可回滚。</p></div><span id="project-file-state" class="badge">只读预览</span></div>
+                <form id="project-file-form" class="settings-form hidden">
+                  <div class="form-grid"><label><span>相对路径</span><input id="project-file-path" class="code-input" required></label><label><span>文件类型</span><select id="project-file-type"><option value="module">Worker 模块</option><option value="asset">静态资源</option></select></label></div>
+                  <label class="check-label"><input id="project-file-main" type="checkbox"><span>设为 Worker 入口模块</span></label>
+                  <label><span>UTF-8 文本内容</span><textarea id="project-file-content" class="code-input code-editor" rows="24" spellcheck="false"></textarea><small id="project-file-binary-note" class="input-note"></small></label>
+                  <label><span>用本地文件替换 <em>文本或二进制，最大 25 MiB</em></span><input id="project-file-upload" type="file"></label>
+                  <div class="button-row"><button class="primary" type="submit">发布文件修改</button><button id="project-file-delete" class="danger ghost hidden" type="button">删除文件</button></div>
+                </form>
+                <div id="project-file-empty" class="empty-state">从左侧选择文件，或新建一个模块/静态资源。</div>
+              </article>
             </div>
           </div>
 
@@ -286,7 +308,7 @@
           </div>
 
           <div id="project-tab-settings" class="project-tab">
-            <article class="panel settings-panel"><div class="settings-copy"><p class="eyebrow">运行时</p><h2>兼容性</h2><p class="muted">兼容日期决定 Worker API 的行为基线。升级前建议先在测试 Worker 上验证。</p></div><form id="project-settings-form" class="settings-form"><label><span>兼容日期</span><input id="project-compatibility-date" class="code-input" type="date" required></label><button class="primary" type="submit">保存兼容日期</button></form></article>
+            <article class="panel settings-panel"><div class="settings-copy"><p class="eyebrow">运行时</p><h2>兼容性</h2><p class="muted">兼容日期决定 Worker API 的行为基线；兼容性标志用于显式启用或禁用 workerd 行为。升级前建议先在测试 Worker 上验证。</p></div><form id="project-settings-form" class="settings-form"><label><span>兼容日期</span><input id="project-compatibility-date" class="code-input" type="date" required></label><label><span>兼容性标志 <em>每行一个</em></span><textarea id="project-compatibility-flags" class="code-input" rows="6" placeholder="nodejs_compat"></textarea></label><button class="primary" type="submit">保存兼容性配置</button></form></article>
             <article class="panel settings-panel"><div class="settings-copy"><p class="eyebrow">项目标识</p><h2>只读信息</h2><p class="muted">这些标识用于审计、节点收敛与内容校验。</p></div><dl id="project-identifiers" class="detail-list settings-identifiers"></dl></article>
             <article class="panel danger-zone"><div><p class="eyebrow">危险操作</p><h2>删除项目</h2><p class="muted">写入可验证的墓碑版本；历史记录仍会保留。</p></div><button id="project-delete" class="danger" type="button">删除 Worker</button></article>
           </div>

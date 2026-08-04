@@ -1138,6 +1138,7 @@ pub fn generate_config(
             || k == crate::deploy::EMAIL_METADATA_ENV
             || k == crate::deploy::SERVICE_METADATA_ENV
             || k == crate::deploy::SECRET_METADATA_ENV
+            || k == crate::deploy::COMPATIBILITY_FLAGS_METADATA_ENV
         {
             continue;
         }
@@ -1345,6 +1346,11 @@ pub fn generate_config(
             "      durableObjectNamespaces = [\n{durable_namespaces}      ],\n      durableObjectStorage = (localDisk = \"do-storage\"),\n"
         )
     };
+    let compatibility_flags = crate::deploy::compatibility_flags(m)
+        .iter()
+        .map(|flag| capnp_string(flag))
+        .collect::<Vec<_>>()
+        .join(", ");
     let durable_service = if durable_objects.is_empty() {
         String::new()
     } else {
@@ -1363,6 +1369,7 @@ const config :Workerd.Config = (
       modules = [
 {modules}      ],
       compatibilityDate = {compat},
+      compatibilityFlags = [{compatibility_flags}],
       bindings = [
 {bindings}      ],
 {durable_worker}    )),
@@ -1484,6 +1491,10 @@ mod tests {
             )]))
             .unwrap(),
         );
+        m.env.insert(
+            crate::deploy::COMPATIBILITY_FLAGS_METADATA_ENV.into(),
+            serde_json::to_string(&vec!["nodejs_compat", "global_navigator"]).unwrap(),
+        );
         let cfg = generate_config(
             &m,
             30111,
@@ -1539,6 +1550,7 @@ mod tests {
         assert!(cfg.contains("x-rf-service-target\", value = \"backend\""));
         assert!(cfg.contains("name = \"randallflare:workers\""));
         assert!(cfg.contains("compatibilityDate = \"2026-07-31\""));
+        assert!(cfg.contains("compatibilityFlags = [\"nodejs_compat\", \"global_navigator\"]"));
         assert!(cfg.contains("durableObjectNamespace = (className = \"Counter\")"));
         assert!(cfg.contains("uniqueKey = \"rf--w--Counter\", enableSql = true"));
         assert!(cfg.contains("durableObjectStorage = (localDisk = \"do-storage\")"));

@@ -28,6 +28,7 @@ pub const WORKFLOW_METADATA_ENV: &str = "__RF_WORKFLOW_BINDINGS_V1";
 pub const EMAIL_METADATA_ENV: &str = "__RF_EMAIL_BINDINGS_V1";
 pub const SERVICE_METADATA_ENV: &str = "__RF_SERVICE_BINDINGS_V1";
 pub const SECRET_METADATA_ENV: &str = "__RF_SECRET_BINDINGS_V1";
+pub const COMPATIBILITY_FLAGS_METADATA_ENV: &str = "__RF_COMPATIBILITY_FLAGS_V1";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DurableObjectBinding {
@@ -101,6 +102,13 @@ pub fn service_bindings(m: &WorkerManifest) -> BTreeMap<String, String> {
         .unwrap_or_default()
 }
 
+pub fn compatibility_flags(m: &WorkerManifest) -> Vec<String> {
+    m.env
+        .get(COMPATIBILITY_FLAGS_METADATA_ENV)
+        .and_then(|raw| serde_json::from_str(raw).ok())
+        .unwrap_or_default()
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct DeploySpec {
@@ -148,13 +156,15 @@ pub struct DeploySpec {
     pub assets: Option<String>,
     #[serde(default = "default_compat")]
     pub compatibility_date: String,
+    #[serde(default)]
+    pub compatibility_flags: Vec<String>,
 }
 
 fn default_compat() -> String {
     "2026-07-01".into()
 }
 
-fn module_kind(path: &Path) -> ModuleKind {
+pub(crate) fn module_kind(path: &Path) -> ModuleKind {
     match path.extension().and_then(|e| e.to_str()).unwrap_or("") {
         "js" | "mjs" => ModuleKind::EsModule,
         "cjs" => ModuleKind::CommonJs,
@@ -162,6 +172,13 @@ fn module_kind(path: &Path) -> ModuleKind {
         "txt" | "html" | "css" => ModuleKind::Text,
         _ => ModuleKind::Data,
     }
+}
+
+pub(crate) fn reserved_module_path(path: &str) -> bool {
+    matches!(
+        path,
+        "__rf_entry.js" | "__rf_d1_entry.js" | "__rf_workflow.js"
+    )
 }
 
 fn validate_spec(spec: &DeploySpec) -> Result<()> {
@@ -192,6 +209,7 @@ fn validate_spec(spec: &DeploySpec) -> Result<()> {
             bail!("invalid Worker Service binding target {target:?}");
         }
     }
+    validate_compatibility_flags(&spec.compatibility_flags)?;
     if let Some(assets) = &spec.assets {
         let path = Path::new(assets);
         if assets.is_empty()
@@ -206,13 +224,32 @@ fn validate_spec(spec: &DeploySpec) -> Result<()> {
     Ok(())
 }
 
+pub fn validate_compatibility_flags(flags: &[String]) -> Result<()> {
+    if flags.len() > 128 {
+        bail!("a Worker may have at most 128 compatibility flags");
+    }
+    let mut seen = std::collections::BTreeSet::new();
+    for flag in flags {
+        if flag.is_empty()
+            || flag.len() > 100
+            || !flag
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+            || !seen.insert(flag)
+        {
+            bail!("invalid or duplicate compatibility flag {flag:?}");
+        }
+    }
+    Ok(())
+}
+
 fn validate_bundle(bundle: &Bundle) -> Result<()> {
     if bundle
         .modules
         .iter()
-        .any(|(path, _, _)| path == "__rf_entry.js" || path == "__rf_d1_entry.js")
+        .any(|(path, _, _)| reserved_module_path(path))
     {
-        bail!("module paths beginning with __rf_ are reserved by rf");
+        bail!("generated __rf_ module path is reserved by rf");
     }
     if let Some(main) = &bundle.spec.main {
         if !bundle.modules.iter().any(|(path, _, _)| path == main) {
@@ -636,6 +673,13 @@ fn manifest_from_bundle(
             serde_json::to_string(&bundle.spec.services)?,
         );
     }
+    if !bundle.spec.compatibility_flags.is_empty() {
+        validate_compatibility_flags(&bundle.spec.compatibility_flags)?;
+        env.insert(
+            COMPATIBILITY_FLAGS_METADATA_ENV.into(),
+            serde_json::to_string(&bundle.spec.compatibility_flags)?,
+        );
+    }
     let manifest = WorkerManifest {
         name: bundle.spec.name.clone(),
         version,
@@ -727,7 +771,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("rf-bundle-{}", rand::random::<u32>()));
         write_bundle(
             &dir,
-            r#"{"name":"w","main":"index.js","assets":"public","hostnames":["a.example.com"],"services":{"BACKEND":"backend"}}"#,
+            r#"{"name":"w","main":"index.js","assets":"public","hostnames":["a.example.com"],"services":{"BACKEND":"backend"},"compatibility_flags":["nodejs_compat"]}"#,
             &[
                 ("index.js", "export default {}"),
                 ("lib/util.js", "export const x = 1"),
@@ -738,6 +782,7 @@ mod tests {
         let b = read_bundle(&dir).unwrap();
         assert_eq!(b.spec.name, "w");
         assert_eq!(b.spec.services["BACKEND"], "backend");
+        assert_eq!(b.spec.compatibility_flags, ["nodejs_compat"]);
         let mpaths: Vec<&str> = b.modules.iter().map(|(p, _, _)| p.as_str()).collect();
         assert_eq!(mpaths, vec!["index.js", "lib/util.js"]);
         let apaths: Vec<&str> = b.assets.iter().map(|(p, _)| p.as_str()).collect();
@@ -755,6 +800,28 @@ mod tests {
         );
         assert!(read_bundle(&dir).is_err());
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn compatibility_flags_reject_duplicates_and_unsafe_names() {
+        assert!(validate_compatibility_flags(
+            &["nodejs_compat".into(), "global-navigator".into(),]
+        )
+        .is_ok());
+        assert!(
+            validate_compatibility_flags(&["nodejs_compat".into(), "nodejs_compat".into(),])
+                .is_err()
+        );
+        assert!(validate_compatibility_flags(&["contains space".into()]).is_err());
+        assert!(validate_compatibility_flags(&["非ASCII".into()]).is_err());
+    }
+
+    #[test]
+    fn generated_runtime_modules_are_reserved() {
+        for path in ["__rf_entry.js", "__rf_d1_entry.js", "__rf_workflow.js"] {
+            assert!(reserved_module_path(path));
+        }
+        assert!(!reserved_module_path("src/__rf_helper.js"));
     }
 
     #[test]

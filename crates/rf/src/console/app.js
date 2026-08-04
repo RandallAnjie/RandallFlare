@@ -21,6 +21,7 @@ const state = {
   activeLog: null,
   activeWorker: null,
   workerDetail: null,
+  workerFile: null,
   projectTab: "overview",
   r2Buckets: [],
   r2Active: null,
@@ -448,6 +449,11 @@ function switchProjectTab(tab) {
   $$(".project-tab").forEach((panel) => panel.classList.toggle("active", panel.id === `project-tab-${tab}`));
   if (tab === "logs") loadDetailLogs();
   if (tab === "deployments") loadDetailHistory();
+  if (tab === "code" && state.workerDetail && !state.workerFile) {
+    const worker = state.workerDetail.worker;
+    const first = worker.main || worker.modules?.[0]?.path || worker.assets?.[0]?.path;
+    if (first) openWorkerFile(first);
+  }
 }
 
 function certificateStatusLabel(status) {
@@ -539,6 +545,147 @@ function renderWorkerSecrets(names = []) {
   $("#project-secret-value").disabled = !secure;
 }
 
+function workerFileRows(worker) {
+  return [
+    ...(worker.modules || []).map((file) => ({ ...file, file_type: "module" })),
+    ...(worker.assets || []).map((file) => ({ ...file, file_type: "asset" })),
+  ].sort((left, right) => left.path.localeCompare(right.path));
+}
+
+function workerFilePath(worker, path) {
+  return `/api/workers/${encodeURIComponent(worker)}/files/${path.split("/").map(encodeURIComponent).join("/")}`;
+}
+
+function renderProjectFiles(worker, source) {
+  const files = workerFileRows(worker);
+  const list = $("#project-file-list");
+  list.classList.toggle("empty-state", files.length === 0);
+  list.innerHTML = files.length ? files.map((file) => {
+    const active = state.workerFile?.path === file.path;
+    const entry = worker.main === file.path;
+    return `<button class="code-file-button ${active ? "active" : ""}" type="button" data-worker-file="${escapeHtml(file.path)}"><span>${file.file_type === "module" ? "◇" : "□"}</span><code>${escapeHtml(file.path)}</code><small>${entry ? "入口" : formatBytes(file.size)}</small></button>`;
+  }).join("") : "当前版本没有文件。";
+  $("#project-code-source-warning").textContent = source
+    ? "此项目已连接 GitHub。在线修改会成为一个独立签名版本；下一次 Git 构建可能覆盖它。"
+    : "直接编辑会创建新的签名版本，内容块随后由节点间自动分发。";
+}
+
+async function openWorkerFile(path) {
+  const worker = state.activeWorker;
+  if (!worker) return;
+  try {
+    const data = await api(workerFilePath(worker, path));
+    if (state.activeWorker !== worker) return;
+    state.workerFile = data;
+    renderProjectFiles(state.workerDetail.worker, state.workerDetail.source);
+    $("#project-file-form").classList.remove("hidden");
+    $("#project-file-empty").classList.add("hidden");
+    $("#project-file-title").textContent = data.path;
+    $("#project-file-meta").textContent = `${data.file_type === "module" ? data.module_kind || "Worker 模块" : "静态资源"} · ${formatBytes(data.size)} · ${shortId(data.sha256, 18)}`;
+    $("#project-file-state").textContent = data.editable ? (data.text == null ? "二进制" : "可编辑") : "超出在线编辑上限";
+    $("#project-file-path").value = data.path;
+    $("#project-file-type").value = data.file_type;
+    $("#project-file-main").checked = state.workerDetail.worker.main === data.path;
+    $("#project-file-main").disabled = data.file_type !== "module";
+    $("#project-file-content").value = data.text ?? "";
+    $("#project-file-content").disabled = data.text == null;
+    $("#project-file-binary-note").textContent = data.editable
+      ? data.text == null ? "这是二进制文件；可选择本地文件完整替换，路径重命名仍可直接发布。" : "文本按 UTF-8 保存；可使用下方文件选择器完整替换。"
+      : data.reason || "此文件不能在浏览器中读取。";
+    $("#project-file-upload").value = "";
+    $("#project-file-delete").classList.remove("hidden");
+  } catch (error) {
+    toast(error.message, true);
+  }
+}
+
+function newWorkerFile() {
+  state.workerFile = { path: "", file_type: "module", text: "", content_base64: "", editable: true, is_new: true };
+  renderProjectFiles(state.workerDetail?.worker || {}, state.workerDetail?.source);
+  $("#project-file-form").classList.remove("hidden");
+  $("#project-file-empty").classList.add("hidden");
+  $("#project-file-title").textContent = "新建文件";
+  $("#project-file-meta").textContent = "选择模块或静态资源；可以使用斜杠创建目录层级。";
+  $("#project-file-state").textContent = "尚未发布";
+  $("#project-file-path").value = "src/new-file.js";
+  $("#project-file-type").value = "module";
+  $("#project-file-main").checked = !(state.workerDetail?.worker?.main);
+  $("#project-file-main").disabled = false;
+  $("#project-file-content").disabled = false;
+  $("#project-file-content").value = "export default {\n  async fetch(request, env, ctx) {\n    return new Response(\"Hello from RandallFlare\");\n  }\n};\n";
+  $("#project-file-binary-note").textContent = "新文件将随下一份签名清单发布。";
+  $("#project-file-upload").value = "";
+  $("#project-file-delete").classList.add("hidden");
+  $("#project-file-path").focus();
+}
+
+async function saveWorkerFile(event) {
+  event.preventDefault();
+  const worker = state.activeWorker;
+  const current = state.workerFile;
+  if (!worker || !current) return;
+  const path = $("#project-file-path").value.trim();
+  const upload = $("#project-file-upload").files?.[0];
+  const changes = [];
+  if (!current.is_new && current.path !== path) {
+    changes.push({ operation: "rename", from: current.path, to: path });
+  }
+  let contentBase64 = null;
+  if (upload) {
+    if (upload.size > 25 * 1024 * 1024) {
+      toast("单个编辑文件不能超过 25 MiB", true);
+      return;
+    }
+    contentBase64 = bytesToBase64(new Uint8Array(await upload.arrayBuffer()));
+  } else if (!$("#project-file-content").disabled) {
+    contentBase64 = bytesToBase64(new TextEncoder().encode($("#project-file-content").value));
+  } else if (current.content_base64 && (current.path !== path || current.file_type !== $("#project-file-type").value)) {
+    contentBase64 = current.content_base64;
+  }
+  if (current.is_new && contentBase64 == null) contentBase64 = "";
+  const fileType = $("#project-file-type").value;
+  if (!current.is_new && fileType !== current.file_type && contentBase64 == null) {
+    toast("切换大文件类型时必须选择本地文件重新上传", true);
+    return;
+  }
+  if (contentBase64 != null && (current.is_new || contentBase64 !== current.content_base64 || fileType !== current.file_type)) {
+    changes.push({ operation: "put", path, content_base64: contentBase64, file_type: fileType });
+  }
+  const payload = { changes };
+  const wasMain = state.workerDetail.worker.main === current.path;
+  const wantsMain = $("#project-file-main").checked;
+  if (wantsMain && !wasMain) payload.main = path;
+  else if (!wantsMain && wasMain) payload.main = "";
+  if (!payload.changes.length && payload.main === undefined) {
+    toast("文件没有变化", true);
+    return;
+  }
+  try {
+    const result = await api(`/api/workers/${encodeURIComponent(worker)}/files`, { method: "POST", body: JSON.stringify(payload) });
+    const complete = async () => { state.workerFile = null; await loadOverview({ quiet: true }); await openWorkerDetail(worker, "code"); };
+    if (result.pending_approval) showApproval(result, `发布 ${worker} 的文件修改。`, complete);
+    else { toast(`${path} 已发布到 ${worker} v${result.version}`); await complete(); }
+  } catch (error) {
+    toast(error.message, true);
+  }
+}
+
+async function deleteWorkerFile() {
+  const worker = state.activeWorker;
+  const current = state.workerFile;
+  if (!worker || !current?.path || !window.confirm(`要从新版本中删除“${current.path}”吗？旧版本仍可回滚。`)) return;
+  try {
+    const result = await api(`/api/workers/${encodeURIComponent(worker)}/files`, {
+      method: "POST", body: JSON.stringify({ changes: [{ operation: "delete", path: current.path }] }),
+    });
+    const complete = async () => { state.workerFile = null; await loadOverview({ quiet: true }); await openWorkerDetail(worker, "code"); };
+    if (result.pending_approval) showApproval(result, `删除 ${worker} 的文件 ${current.path}。`, complete);
+    else { toast(`${current.path} 已从新版本删除`); await complete(); }
+  } catch (error) {
+    toast(error.message, true);
+  }
+}
+
 function renderWorkerDetail(data) {
   const worker = data.worker;
   const summary = (state.overview?.workers || []).find((item) => item.name === worker.name) || {};
@@ -548,6 +695,7 @@ function renderWorkerDetail(data) {
   const assets = worker.assets || [];
   const totalBytes = [...modules, ...assets].reduce((total, item) => total + Number(item.size || 0), 0);
   const openUrl = workerUrl(worker.hostnames?.[0], Boolean(data.tls?.enabled));
+  state.workerFile = state.workerFile && workerFileRows(worker).some((file) => file.path === state.workerFile.path) ? state.workerFile : null;
 
   $("#project-title").textContent = worker.name;
   $("#project-subtitle").textContent = source
@@ -598,6 +746,7 @@ function renderWorkerDetail(data) {
   renderWorkerSecrets(worker.secret_names || []);
   $("#project-crons").value = (worker.crons || []).join("\n");
   $("#project-compatibility-date").value = worker.compatibility_date;
+  $("#project-compatibility-flags").value = (worker.compatibility_flags || []).join("\n");
   $("#project-source-repository").value = source?.repository?.replace(/\.git$/, "") || "";
   $("#project-source-branch").value = source?.branch || "main";
   $("#project-source-root").value = source?.root || ".";
@@ -619,9 +768,15 @@ function renderWorkerDetail(data) {
     <div><dt>清单摘要</dt><dd class="mono">${escapeHtml(worker.digest)}</dd></div>
     <div><dt>入口模块</dt><dd class="mono">${escapeHtml(worker.main || "静态资源项目")}</dd></div>`;
   $("#detail-builds").innerHTML = buildRowsHtml(state.builds.filter((job) => job.worker === worker.name));
+  renderProjectFiles(worker, source);
+  if (state.projectTab === "code" && !state.workerFile) {
+    const first = worker.main || worker.modules?.[0]?.path || worker.assets?.[0]?.path;
+    if (first) openWorkerFile(first);
+  }
 }
 
 async function openWorkerDetail(name, tab = "overview") {
+  if (state.activeWorker !== name) state.workerFile = null;
   state.activeWorker = name;
   state.workerDetail = null;
   switchView("worker-detail");
@@ -787,8 +942,11 @@ async function saveProjectTriggers(event) {
 async function saveProjectSettings(event) {
   event.preventDefault();
   await updateWorkerSettings(
-    { compatibility_date: $("#project-compatibility-date").value },
-    `更新 ${state.activeWorker} 的兼容日期。`,
+    {
+      compatibility_date: $("#project-compatibility-date").value,
+      compatibility_flags: $("#project-compatibility-flags").value.split(/\s+/).map((value) => value.trim()).filter(Boolean),
+    },
+    `更新 ${state.activeWorker} 的兼容日期与标志。`,
   );
 }
 
@@ -2993,7 +3151,7 @@ async function boot() {
     $("#security-copy").innerHTML = consoleMode === "public"
       ? "此节点不保存<br>任何私钥。"
       : "密钥仅保留在本地<br>控制台进程中。";
-    $$("#deploy-form button, #source-form button, #kv-editor-form button, #d1-create-form button, #d1-exec-form button, #r2-bucket-form button, #r2-upload-form button, #r2-delete-bucket, #queue-form button, #queue-send-form button, #queue-delete, #analytics-form button, #analytics-write-form button, #analytics-delete, #pipeline-form button, #pipeline-token-form button, #pipeline-ingest-form button, #pipeline-flush, #pipeline-delete, #workflow-form button, #workflow-trigger-form button, #workflow-signal-form button, #workflow-delete, #flow-form button, #flow-token-form button, #flow-trigger-form button, #flow-delete, #email-domain-form button, #email-route-form button, #email-send-form button, #email-delete, #email-verify, #project-domain-add-form button, #project-bindings-form button, #project-secret-form button, #project-triggers-form button, #project-settings-form button, #project-source-form button, #project-redeploy, #project-delete")
+    $$("#deploy-form button, #source-form button, #kv-editor-form button, #d1-create-form button, #d1-exec-form button, #r2-bucket-form button, #r2-upload-form button, #r2-delete-bucket, #queue-form button, #queue-send-form button, #queue-delete, #analytics-form button, #analytics-write-form button, #analytics-delete, #pipeline-form button, #pipeline-token-form button, #pipeline-ingest-form button, #pipeline-flush, #pipeline-delete, #workflow-form button, #workflow-trigger-form button, #workflow-signal-form button, #workflow-delete, #flow-form button, #flow-token-form button, #flow-trigger-form button, #flow-delete, #email-domain-form button, #email-route-form button, #email-send-form button, #email-delete, #email-verify, #project-domain-add-form button, #project-bindings-form button, #project-secret-form button, #project-file-form button, #project-file-new, #project-triggers-form button, #project-settings-form button, #project-source-form button, #project-redeploy, #project-delete")
       .forEach((button) => { button.disabled = state.session.read_only; });
     await loadOverview({ quiet: true });
     await loadWorkerOps();
@@ -3025,6 +3183,7 @@ $("#overview-workers").addEventListener("click", (event) => {
 $("#new-project").addEventListener("click", () => {
   state.activeWorker = null;
   state.workerDetail = null;
+  state.workerFile = null;
   switchView("worker-new");
   window.scrollTo({ top: 0, behavior: "smooth" });
   setTimeout(() => $("#source-worker").focus(), 300);
@@ -3033,6 +3192,7 @@ $("#new-project-back").addEventListener("click", () => switchView("workers"));
 $("#project-back").addEventListener("click", () => {
   state.activeWorker = null;
   state.workerDetail = null;
+  state.workerFile = null;
   switchView("workers");
 });
 $$("[data-project-tab]").forEach((button) => button.addEventListener("click", () => switchProjectTab(button.dataset.projectTab)));
@@ -3048,6 +3208,14 @@ $("#project-redeploy").addEventListener("click", () => {
 $("#project-domain-add-form").addEventListener("submit", saveProjectDomains);
 $("#project-bindings-form").addEventListener("submit", saveProjectBindings);
 $("#project-secret-form").addEventListener("submit", saveWorkerSecret);
+$("#project-file-form").addEventListener("submit", saveWorkerFile);
+$("#project-file-new").addEventListener("click", newWorkerFile);
+$("#project-file-delete").addEventListener("click", deleteWorkerFile);
+$("#project-file-type").addEventListener("change", () => {
+  const module = $("#project-file-type").value === "module";
+  $("#project-file-main").disabled = !module;
+  if (!module) $("#project-file-main").checked = false;
+});
 $("#project-triggers-form").addEventListener("submit", saveProjectTriggers);
 $("#project-settings-form").addEventListener("submit", saveProjectSettings);
 $("#project-source-form").addEventListener("submit", saveProjectSource);
@@ -3161,6 +3329,10 @@ $("#project-domain-list").addEventListener("click", (event) => {
 $("#project-secret-list").addEventListener("click", (event) => {
   const button = event.target.closest("button[data-delete-secret]");
   if (button) deleteWorkerSecret(button.dataset.deleteSecret);
+});
+$("#project-file-list").addEventListener("click", (event) => {
+  const button = event.target.closest("button[data-worker-file]");
+  if (button) openWorkerFile(button.dataset.workerFile);
 });
 $("#detail-builds").addEventListener("click", (event) => {
   const button = event.target.closest("button[data-build-action]");

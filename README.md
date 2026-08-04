@@ -323,7 +323,8 @@ my-worker/
                    #  "pipelines":{"ARCHIVE":"event-archive"},
                    #  "workflows":{"ORDER_FLOW":"order-flow"},
                    #  "email":{"MAIL":"support-mail"},
-                   #  "services":{"BACKEND":"api-worker"}}
+                   #  "services":{"BACKEND":"api-worker"},
+                   #  "compatibility_flags":["nodejs_compat"]}
   index.js         # omit "main" entirely for a pure static site
   public/…
 
@@ -356,6 +357,12 @@ new manifest. Nodes decrypt it only into a mode-`0600` temporary workerd config
 and remove that plaintext file as soon as workerd is listening.
 Use HTTPS for the public console; the UI disables Secret writes on public HTTP.
 See [Worker bindings and encrypted Secrets](./docs/WORKERS.md).
+
+The project “Code” tab edits module and static files without mutating an old
+deployment. Every save verifies content hashes and creates a new signed,
+hash-chained manifest, so the change follows the same approval, distribution
+and rollback path as a CLI or GitHub deployment. Binary files can be replaced
+as whole files; large files remain metadata-only in the browser.
 
 Workflow classes import RandallFlare's built-in runtime module; no npm package
 or central orchestrator is required:

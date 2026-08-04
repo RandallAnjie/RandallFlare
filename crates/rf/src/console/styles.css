@@ -278,6 +278,14 @@ button.build-row:hover { border-color: #444; background: #0e0e0e; }
 .source-status { margin-top: 18px; }
 .source-status .webhook-grid { grid-template-columns: 70px minmax(0, 1fr); }
 .settings-identifiers { margin: 0; }
+.code-workspace { display: grid; grid-template-columns: minmax(220px, .48fr) minmax(0, 1.52fr); gap: 16px; align-items: start; }
+.code-sidebar, .code-editor-panel { min-width: 0; }
+.code-file-list { display: grid; gap: 5px; max-height: 720px; overflow: auto; }
+.code-file-button { display: grid; grid-template-columns: 20px minmax(0, 1fr) auto; gap: 8px; align-items: center; width: 100%; padding: 9px 10px; border: 1px solid transparent; border-radius: 6px; background: transparent; color: var(--text); cursor: pointer; text-align: left; }
+.code-file-button:hover, .code-file-button.active { border-color: var(--line); background: var(--surface-3); }
+.code-file-button code { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 10px; }
+.code-file-button small { color: var(--muted); font-size: 9px; }
+.code-editor { min-height: 430px; resize: vertical; tab-size: 2; white-space: pre; }
 .detail-stack { display: grid; gap: 15px; }
 .deployment-version { display: flex; align-items: center; gap: 12px; padding: 13px; border: 1px solid var(--line-soft); border-radius: 7px; background: #070707; }
 .deployment-version strong { font: 600 17px "Geist Mono", monospace; }
@@ -381,7 +389,7 @@ dialog::backdrop { background: #000c; backdrop-filter: blur(3px); }
 
 @media (max-width: 1120px) {
   .metrics { grid-template-columns: repeat(2, 1fr); }
-  .two-one, .one-two, .one-one, .kv-grid, .d1-grid, .r2-grid, .flow-layout { grid-template-columns: 1fr; }
+  .two-one, .one-two, .one-one, .kv-grid, .d1-grid, .r2-grid, .flow-layout, .code-workspace { grid-template-columns: 1fr; }
   .r2-upload-form { grid-template-columns: 1fr 1fr auto; }
   .build-row { grid-template-columns: 9px minmax(150px, 1fr) auto; }
   .build-stage { display: none; }

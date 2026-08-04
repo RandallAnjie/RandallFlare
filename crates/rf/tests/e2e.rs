@@ -201,8 +201,87 @@ async fn default_ingress_console_uses_operator_approved_cluster_session() {
         .await
         .unwrap()
         .contains("deployed through decentralized console"));
+    let file: serde_json::Value = http
+        .get(format!(
+            "{ingress}/api/workers/admin-worker/files/index.html"
+        ))
+        .header("cookie", &cookie)
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(
+        file["text"],
+        "<h1>deployed through decentralized console</h1>"
+    );
+    let edited_html = b"<h1>edited as a signed Worker version</h1>";
+    let edit: serde_json::Value = http
+        .post(format!("{ingress}/api/workers/admin-worker/files"))
+        .header("cookie", &cookie)
+        .header("origin", &ingress)
+        .header("x-rf-csrf", csrf)
+        .json(&serde_json::json!({
+            "changes": [{
+                "operation": "put",
+                "path": "index.html",
+                "content_base64": base64::engine::general_purpose::STANDARD.encode(edited_html),
+                "file_type": "asset"
+            }]
+        }))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(edit["pending_approval"], true);
+    let edit_code = edit["approval"]["code"].as_str().unwrap();
+    let edit_id = edit["approval"]["id"].as_str().unwrap();
+    let edit_approval = client.authorization(&node.api, edit_code).await.unwrap();
+    let edit_payload = base64::engine::general_purpose::STANDARD
+        .decode(edit_approval.payload_base64)
+        .unwrap();
+    client
+        .approve_authorization(
+            &node.api,
+            edit_code,
+            &rf::management::ApprovalSignature {
+                signer: operator_any.signer_id(),
+                signature_base64: base64::engine::general_purpose::STANDARD
+                    .encode(operator_any.sign(&edit_payload)),
+            },
+        )
+        .await
+        .unwrap();
+    let edited: serde_json::Value = http
+        .get(format!("{ingress}/api/approvals/{edit_id}"))
+        .header("cookie", &cookie)
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(edited["state"], "completed");
+    let worker = http
+        .get(&ingress)
+        .header("host", "admin-worker.test")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(worker.status(), 200);
+    assert_eq!(worker.bytes().await.unwrap().as_ref(), edited_html);
     let log = client.worker_log(&node.api, "admin-worker").await.unwrap();
     assert!(rf_core::manifest::verify_chain(&log, &operator_any.signer_id()).is_ok());
+    assert_eq!(log.len(), 2);
 }
 
 fn free_port() -> u16 {
@@ -616,7 +695,8 @@ async fn module_worker_on_real_workerd() {
             "analytics":{"METRICS":"web-metrics"},
             "pipelines":{"ARCHIVE":"events-pipe"},
             "workflows":{"ORDER_WORKFLOW":"order-flow"},
-            "services":{"BACKEND":"backend"}}"#,
+            "services":{"BACKEND":"backend"},
+            "compatibility_flags":["nodejs_compat"]}"#,
     )
     .unwrap();
     std::fs::write(

@@ -20,7 +20,7 @@ use axum::routing::{delete, get, post, put};
 use axum::{Json, Router};
 use rand::RngCore;
 use rf_core::identity::AnyKeypair;
-use rf_core::manifest::{valid_name, ManifestError, WorkerManifest};
+use rf_core::manifest::{valid_name, AssetFile, ManifestError, Module, WorkerManifest};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
@@ -39,6 +39,9 @@ const SESSION_COOKIE: &str = "rf_console_session";
 const MAX_CONSOLE_VALUE: usize = 1024 * 1024;
 const MAX_CONSOLE_UPLOAD: usize = 64 * 1024 * 1024;
 const MAX_CONSOLE_FILES: usize = 2048;
+const MAX_EDITOR_CHANGES: usize = 256;
+const MAX_EDITOR_FILE: usize = 25 * 1024 * 1024;
+const MAX_EDITOR_READ: usize = 5 * 1024 * 1024;
 
 #[derive(Clone)]
 enum ConsoleMode {
@@ -226,6 +229,8 @@ pub fn router(state: ConsoleState) -> Router {
         .route("/api/workers/{name}/log", get(worker_log))
         .route("/api/workers/{name}/runtime-log", get(worker_runtime_log))
         .route("/api/workers/{name}/build", post(worker_build))
+        .route("/api/workers/{name}/files", post(worker_files_update))
+        .route("/api/workers/{name}/files/{*path}", get(worker_file_get))
         .route("/api/workers/{name}/secrets", get(worker_secret_list))
         .route(
             "/api/workers/{name}/secrets/{binding}",
@@ -800,6 +805,8 @@ struct WorkerSettingsRequest {
     crons: Option<Vec<String>>,
     #[serde(default)]
     compatibility_date: Option<String>,
+    #[serde(default)]
+    compatibility_flags: Option<Vec<String>>,
 }
 
 fn manifest_error_zh(error: ManifestError) -> String {
@@ -918,6 +925,7 @@ async fn worker_get(
             "secret_names": secret_names,
             "crons": manifest.crons,
             "compatibility_date": manifest.compatibility_date,
+            "compatibility_flags": deploy::compatibility_flags(&manifest),
             "durable_objects": durable_objects,
         },
         "source": source,
@@ -937,7 +945,319 @@ fn worker_console_environment(manifest: &WorkerManifest) -> BTreeMap<String, Str
     env.remove(deploy::EMAIL_METADATA_ENV);
     env.remove(deploy::SERVICE_METADATA_ENV);
     env.remove(deploy::SECRET_METADATA_ENV);
+    env.remove(deploy::COMPATIBILITY_FLAGS_METADATA_ENV);
     env
+}
+
+#[derive(Debug, Clone, Copy, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum WorkerFileType {
+    Module,
+    Asset,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(tag = "operation", rename_all = "snake_case", deny_unknown_fields)]
+enum WorkerFileChange {
+    Put {
+        path: String,
+        content_base64: String,
+        #[serde(default)]
+        file_type: Option<WorkerFileType>,
+    },
+    Delete {
+        path: String,
+    },
+    Rename {
+        from: String,
+        to: String,
+    },
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WorkerFilesRequest {
+    changes: Vec<WorkerFileChange>,
+    #[serde(default)]
+    main: Option<String>,
+}
+
+#[derive(Clone)]
+enum EditableWorkerFile {
+    Module(Module),
+    Asset(AssetFile),
+}
+
+impl EditableWorkerFile {
+    fn set_path(&mut self, path: String) {
+        match self {
+            Self::Module(module) => {
+                module.kind = deploy::module_kind(std::path::Path::new(&path));
+                module.path = path;
+            }
+            Self::Asset(asset) => asset.path = path,
+        }
+    }
+}
+
+async fn worker_file_get(
+    State(state): State<ConsoleState>,
+    Path((name, path)): Path<(String, String)>,
+) -> ApiResult<Json<Value>> {
+    let (manifest, _) = current_manifest(&state, &name).await?;
+    let (sha256, size, file_type, module_kind) =
+        if let Some(module) = manifest.modules.iter().find(|module| module.path == path) {
+            (
+                module.sha256,
+                module.size,
+                "module",
+                Some(format!("{:?}", module.kind)),
+            )
+        } else if let Some(asset) = manifest.assets.iter().find(|asset| asset.path == path) {
+            (asset.sha256, asset.size, "asset", None)
+        } else {
+            return Err(ApiError::not_found("当前 Worker 版本中没有这个文件"));
+        };
+    if size > MAX_EDITOR_READ as u64 {
+        return Ok(Json(json!({
+            "path": path,
+            "file_type": file_type,
+            "module_kind": module_kind,
+            "size": size,
+            "sha256": hex::encode(sha256),
+            "editable": false,
+            "reason": "文件超过 5 MiB，请通过目录上传或 Git 构建替换",
+        })));
+    }
+    let bytes = state.client.fetch_blob(&state.node, &sha256).await?;
+    if crate::blob::sha256_hex(&bytes) != hex::encode(sha256) {
+        return Err(ApiError::upstream("节点返回的文件内容摘要不匹配"));
+    }
+    use base64::Engine as _;
+    let text = String::from_utf8(bytes.clone())
+        .ok()
+        .filter(|value| !value.contains('\0'));
+    Ok(Json(json!({
+        "path": path,
+        "file_type": file_type,
+        "module_kind": module_kind,
+        "size": size,
+        "sha256": hex::encode(sha256),
+        "editable": true,
+        "text": text,
+        "content_base64": base64::engine::general_purpose::STANDARD.encode(bytes),
+    })))
+}
+
+async fn worker_files_update(
+    State(state): State<ConsoleState>,
+    Extension(principal): Extension<ConsolePrincipal>,
+    Path(name): Path<String>,
+    Json(request): Json<WorkerFilesRequest>,
+) -> ApiResult<Json<Value>> {
+    state.require_mutation()?;
+    if request.changes.is_empty() && request.main.is_none() {
+        return Err(ApiError::bad_request("没有需要发布的文件或入口修改"));
+    }
+    if request.changes.len() > MAX_EDITOR_CHANGES {
+        return Err(ApiError::bad_request("一次最多修改 256 个文件"));
+    }
+    let (mut manifest, digest) = current_manifest(&state, &name).await?;
+    let mut files = BTreeMap::new();
+    for module in manifest.modules.drain(..) {
+        files.insert(module.path.clone(), EditableWorkerFile::Module(module));
+    }
+    for asset in manifest.assets.drain(..) {
+        if files
+            .insert(asset.path.clone(), EditableWorkerFile::Asset(asset))
+            .is_some()
+        {
+            return Err(ApiError::upstream("当前 Worker 清单包含重复文件路径"));
+        }
+    }
+
+    let mut uploaded_bytes = 0usize;
+    use base64::Engine as _;
+    for change in request.changes {
+        match change {
+            WorkerFileChange::Put {
+                path,
+                content_base64,
+                file_type,
+            } => {
+                validate_editor_path(&path)?;
+                let bytes = base64::engine::general_purpose::STANDARD
+                    .decode(content_base64)
+                    .map_err(|_| ApiError::bad_request("文件内容不是有效的 Base64"))?;
+                if bytes.len() > MAX_EDITOR_FILE {
+                    return Err(ApiError::bad_request("单个编辑文件不能超过 25 MiB"));
+                }
+                uploaded_bytes = uploaded_bytes.saturating_add(bytes.len());
+                if uploaded_bytes > MAX_CONSOLE_UPLOAD {
+                    return Err(ApiError::bad_request("单次文件修改不能超过 64 MiB"));
+                }
+                let resolved_type = file_type.or_else(|| {
+                    files.get(&path).map(|file| match file {
+                        EditableWorkerFile::Module(_) => WorkerFileType::Module,
+                        EditableWorkerFile::Asset(_) => WorkerFileType::Asset,
+                    })
+                });
+                let resolved_type = resolved_type.ok_or_else(|| {
+                    ApiError::bad_request("创建新文件时必须指定 module 或 asset 类型")
+                })?;
+                if matches!(resolved_type, WorkerFileType::Module)
+                    && deploy::reserved_module_path(&path)
+                {
+                    return Err(ApiError::bad_request("__rf_ 模块路径由 RandallFlare 保留"));
+                }
+                let sha_hex = state.client.put_blob(&state.node, bytes.clone()).await?;
+                let sha256 = decode_console_sha(&sha_hex)?;
+                if crate::blob::sha256_hex(&bytes) != sha_hex.trim().to_ascii_lowercase() {
+                    return Err(ApiError::upstream("节点返回的内容摘要与上传文件不匹配"));
+                }
+                let file = match resolved_type {
+                    WorkerFileType::Module => EditableWorkerFile::Module(Module {
+                        path: path.clone(),
+                        sha256,
+                        kind: deploy::module_kind(std::path::Path::new(&path)),
+                        size: bytes.len() as u64,
+                    }),
+                    WorkerFileType::Asset => EditableWorkerFile::Asset(AssetFile {
+                        path: path.clone(),
+                        sha256,
+                        size: bytes.len() as u64,
+                    }),
+                };
+                files.insert(path, file);
+            }
+            WorkerFileChange::Delete { path } => {
+                validate_editor_path(&path)?;
+                if files.remove(&path).is_none() {
+                    return Err(ApiError::not_found(format!("文件 {path} 不存在")));
+                }
+            }
+            WorkerFileChange::Rename { from, to } => {
+                validate_editor_path(&from)?;
+                validate_editor_path(&to)?;
+                if files.contains_key(&to) {
+                    return Err(ApiError::bad_request(format!("目标文件 {to} 已存在")));
+                }
+                let mut file = files
+                    .remove(&from)
+                    .ok_or_else(|| ApiError::not_found(format!("文件 {from} 不存在")))?;
+                file.set_path(to.clone());
+                if manifest.main == from {
+                    if !matches!(file, EditableWorkerFile::Module(_)) {
+                        return Err(ApiError::bad_request("入口模块不能重命名为静态资源"));
+                    }
+                    manifest.main = to.clone();
+                }
+                files.insert(to, file);
+            }
+        }
+    }
+    if files.len() > 5_000 {
+        return Err(ApiError::bad_request("一个 Worker 最多包含 5000 个文件"));
+    }
+    if let Some(main) = request.main {
+        manifest.main = main.trim().to_string();
+    }
+    manifest.modules = files
+        .values()
+        .filter_map(|file| match file {
+            EditableWorkerFile::Module(module) => Some(module.clone()),
+            EditableWorkerFile::Asset(_) => None,
+        })
+        .collect();
+    manifest.assets = files
+        .values()
+        .filter_map(|file| match file {
+            EditableWorkerFile::Module(_) => None,
+            EditableWorkerFile::Asset(asset) => Some(asset.clone()),
+        })
+        .collect();
+    if manifest
+        .modules
+        .iter()
+        .any(|module| deploy::reserved_module_path(&module.path))
+    {
+        return Err(ApiError::bad_request("__rf_ 模块路径由 RandallFlare 保留"));
+    }
+    if manifest.main.is_empty() && manifest.assets.is_empty() {
+        return Err(ApiError::bad_request(
+            "Worker 必须设置入口模块，或至少保留一个静态资源",
+        ));
+    }
+    manifest.version = manifest
+        .version
+        .checked_add(1)
+        .ok_or_else(|| ApiError::bad_request("Worker 版本号已耗尽"))?;
+    manifest.prev = Some(digest);
+    manifest.validate().map_err(|error| {
+        ApiError::bad_request(format!("Worker 文件无效：{}", manifest_error_zh(error)))
+    })?;
+    submit_file_manifest(&state, &principal, manifest, files.len()).await
+}
+
+async fn submit_file_manifest(
+    state: &ConsoleState,
+    principal: &ConsolePrincipal,
+    manifest: WorkerManifest,
+    file_count: usize,
+) -> ApiResult<Json<Value>> {
+    match &state.mode {
+        ConsoleMode::Local { .. } => {
+            let envelope = rf_core::envelope::Envelope::seal_any(&manifest, state.operator()?);
+            state.client.post_manifest(&state.node, &envelope).await?;
+            Ok(Json(json!({
+                "ok": true,
+                "name": manifest.name,
+                "version": manifest.version,
+                "files": file_count,
+            })))
+        }
+        ConsoleMode::Public { node, .. } => {
+            let approval = node.management.create_manifest(
+                principal.session_id,
+                &manifest,
+                format!(
+                    "发布 Worker {} 的文件修改为 v{}（{} 个文件）",
+                    manifest.name, manifest.version, file_count
+                ),
+            )?;
+            Ok(Json(json!({
+                "ok": true,
+                "pending_approval": true,
+                "name": manifest.name,
+                "version": manifest.version,
+                "files": file_count,
+                "approval": approval,
+                "approve_node": node.cfg.peer_api_advertise().to_string(),
+            })))
+        }
+    }
+}
+
+fn validate_editor_path(path: &str) -> ApiResult<()> {
+    if path.is_empty()
+        || path.len() > 1024
+        || path.starts_with('/')
+        || path.contains('\\')
+        || path.as_bytes().iter().any(|byte| byte.is_ascii_control())
+        || path
+            .split('/')
+            .any(|part| part.is_empty() || matches!(part, "." | ".."))
+    {
+        return Err(ApiError::bad_request("文件路径不是安全的相对路径"));
+    }
+    Ok(())
+}
+
+fn decode_console_sha(value: &str) -> ApiResult<[u8; 32]> {
+    hex::decode(value.trim())
+        .ok()
+        .and_then(|bytes| bytes.try_into().ok())
+        .ok_or_else(|| ApiError::upstream("节点返回了无效的内容摘要"))
 }
 
 fn worker_tls_view(node: &Node, hostnames: &[String]) -> Value {
@@ -1181,6 +1501,7 @@ fn apply_worker_settings(
         service_bindings,
         crons,
         compatibility_date,
+        compatibility_flags,
     } = request;
     if hostnames.is_none()
         && env.is_none()
@@ -1195,6 +1516,7 @@ fn apply_worker_settings(
         && service_bindings.is_none()
         && crons.is_none()
         && compatibility_date.is_none()
+        && compatibility_flags.is_none()
     {
         return Err(ApiError::bad_request("没有需要更新的 Worker 配置"));
     }
@@ -1247,6 +1569,13 @@ fn apply_worker_settings(
         }
         if let Some(secrets) = manifest.env.get(deploy::SECRET_METADATA_ENV).cloned() {
             env.insert(deploy::SECRET_METADATA_ENV.into(), secrets);
+        }
+        if let Some(flags) = manifest
+            .env
+            .get(deploy::COMPATIBILITY_FLAGS_METADATA_ENV)
+            .cloned()
+        {
+            env.insert(deploy::COMPATIBILITY_FLAGS_METADATA_ENV.into(), flags);
         }
         manifest.env = env;
     }
@@ -1484,6 +1813,20 @@ fn apply_worker_settings(
             return Err(ApiError::bad_request("兼容日期必须采用 YYYY-MM-DD 格式"));
         }
         manifest.compatibility_date = compatibility_date;
+    }
+    if let Some(compatibility_flags) = compatibility_flags {
+        deploy::validate_compatibility_flags(&compatibility_flags)
+            .map_err(|error| ApiError::bad_request(format!("兼容性标志无效：{error:#}")))?;
+        if compatibility_flags.is_empty() {
+            manifest
+                .env
+                .remove(deploy::COMPATIBILITY_FLAGS_METADATA_ENV);
+        } else {
+            manifest.env.insert(
+                deploy::COMPATIBILITY_FLAGS_METADATA_ENV.into(),
+                serde_json::to_string(&compatibility_flags)?,
+            );
+        }
     }
     let encrypted_secrets = crate::worker_secret::encrypted_secrets_checked(&manifest)?;
     let mut binding_names = std::collections::BTreeSet::new();
@@ -4200,6 +4543,25 @@ mod tests {
         assert!(!same_origin(&origin_with_path, "https"));
     }
 
+    #[test]
+    fn editor_paths_are_strict_relative_paths() {
+        for path in ["index.js", "src/worker.mjs", "public/中文.txt"] {
+            assert!(validate_editor_path(path).is_ok(), "{path}");
+        }
+        for path in [
+            "",
+            "/index.js",
+            "../secret",
+            "src/../secret",
+            "src//worker.js",
+            "src\\worker.js",
+            "./index.js",
+            "index.js\nignored",
+        ] {
+            assert!(validate_editor_path(path).is_err(), "{path:?}");
+        }
+    }
+
     fn state() -> ConsoleState {
         ConsoleState::new("127.0.0.1:9".into(), [7u8; 32], None)
     }
@@ -4294,6 +4656,7 @@ mod tests {
                 service_bindings: Some(BTreeMap::from([("BACKEND".into(), "backend".into())])),
                 crons: Some(vec!["*/5 * * * *".into()]),
                 compatibility_date: Some("2026-08-04".into()),
+                compatibility_flags: Some(vec!["nodejs_compat".into()]),
             },
         )
         .unwrap();
@@ -4321,6 +4684,7 @@ mod tests {
         assert_eq!(deploy::service_bindings(&updated)["BACKEND"], "backend");
         assert_eq!(updated.kv_bindings["CACHE"], "shared");
         assert_eq!(updated.crons, vec!["*/5 * * * *"]);
+        assert_eq!(deploy::compatibility_flags(&updated), ["nodejs_compat"]);
         assert!(updated.env.contains_key(deploy::SECRET_METADATA_ENV));
         let exposed = worker_console_environment(&updated);
         let exposed_json = serde_json::to_string(&exposed).unwrap();

@@ -52,12 +52,12 @@ surface yet.
 | Capability | State | Remaining acceptance work |
 | --- | --- | --- |
 | modules + static assets in one deploy unit | done | — |
-| browser upload and CLI deploy | done | archive editor and per-file editing |
+| browser upload and CLI deploy | done | signed per-file create/edit/rename/delete and binary replacement are done; ZIP/TAR import and export remain |
 | GitHub source, sandboxed build, webhook deploy | done | GitHub App auth, PR checks/comments, SSH deploy keys |
 | versions, hash-chain audit and rollback | done | version-pinned preview aliases |
 | default/custom domains and wildcard TLS | done | custom-domain DNS ownership workflow |
 | environment, encrypted Secrets, KV bindings, Cron | done | write-only XChaCha20-Poly1305 Secrets, names-only API/console and KV metadata + bulk get are verified; Cron replay/history remains |
-| compatibility date | done | compatibility flags |
+| compatibility date and flags | done | compatibility date plus validated, signed workerd compatibility flags are done; the supported-flag catalogue must track the pinned workerd release |
 | runtime/build logs and cluster distribution | done | request logs, analytics and retention |
 | previews and pull-request deployments | planned | deterministic preview hostnames and cleanup |
 | service bindings and placement tags | partial | signed node-local dynamic Service router and native `env.SERVICE.fetch()` are done; placement-aware mesh fallback and cycle diagnostics remain |
