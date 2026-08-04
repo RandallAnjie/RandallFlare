@@ -315,6 +315,8 @@ async fn status(
         .live_manifests()
         .into_iter()
         .map(|m| {
+            let default_hostname = node.default_worker_hostname(&m.name);
+            let effective_hostnames = node.effective_worker_hostnames(&m);
             let has_do = !crate::deploy::durable_objects(&m).is_empty();
             let do_owner = if has_do {
                 api.durable.leader(&m.name).map(|id| id.to_string())
@@ -349,7 +351,9 @@ async fn status(
             serde_json::json!({
                 "name": m.name,
                 "version": m.version,
-                "hostnames": m.hostnames,
+                "hostnames": effective_hostnames,
+                "custom_hostnames": m.hostnames,
+                "default_hostname": default_hostname,
                 "modules": m.modules.len(),
                 "assets": m.assets.len(),
                 "crons": m.crons,
@@ -380,6 +384,7 @@ async fn status(
         "cluster_id": node.cfg.cluster_id,
         "operator": node.cfg.operator.to_string(),
         "public": node.cfg.public,
+        "default_worker_domain": node.cfg.default_worker_domain(),
         "version": env!("CARGO_PKG_VERSION"),
         "peers": peers,
         "workers": workers,

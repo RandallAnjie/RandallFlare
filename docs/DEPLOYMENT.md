@@ -44,7 +44,7 @@ Use the binary produced by GitHub Actions. Verify the published checksum before
 using it to create or validate credentials:
 
 ```bash
-RF_VERSION=v0.8.3
+RF_VERSION=v0.9.0
 curl -fLO "https://github.com/RandallAnjie/RandallFlare/releases/download/$RF_VERSION/rf-linux-x86_64"
 curl -fLO "https://github.com/RandallAnjie/RandallFlare/releases/download/$RF_VERSION/rf-linux-x86_64.sha256"
 sha256sum --check --strict rf-linux-x86_64.sha256
@@ -89,9 +89,9 @@ scp first-vps/rf.toml root@203.0.113.7:/root/rf.toml
 scp first-vps/rf.env root@203.0.113.7:/root/rf.env  # only when used
 ssh root@203.0.113.7
 curl -fLo /tmp/install-randallflare-release.sh \
-  https://raw.githubusercontent.com/RandallAnjie/RandallFlare/v0.8.3/infra/install-release.sh
+  https://raw.githubusercontent.com/RandallAnjie/RandallFlare/v0.9.0/infra/install-release.sh
 bash /tmp/install-randallflare-release.sh \
-  --version v0.8.3 --config /root/rf.toml --env /root/rf.env
+  --version v0.9.0 --config /root/rf.toml --env /root/rf.env
 ```
 
 Omit both `scp` of `rf.env` and `--env` when no environment file is needed.
@@ -151,6 +151,12 @@ the raw IP address, serve the RandallFlare management interface:
 http://203.0.113.7/
 ```
 
+To give every Worker an immediately usable hostname, point wildcard DNS and TLS
+at the public nodes and set `default_domain` under `[ingress]`. A Worker named
+`api` then receives `api.workers.example.com` on every node without adding that
+route to its signed manifest. Explicit custom domains remain independently
+editable.
+
 The browser displays a one-time code. Keep the operator private key on the
 administrator machine and approve that code through the encrypted peer API:
 
@@ -188,8 +194,8 @@ restarting the service:
 
 ```bash
 curl -fLo /tmp/install-randallflare-release.sh \
-  https://raw.githubusercontent.com/RandallAnjie/RandallFlare/v0.8.3/infra/install-release.sh
-sudo bash /tmp/install-randallflare-release.sh --version v0.8.3
+  https://raw.githubusercontent.com/RandallAnjie/RandallFlare/v0.9.0/infra/install-release.sh
+sudo bash /tmp/install-randallflare-release.sh --version v0.9.0
 ```
 
 The default hardened unit deliberately prevents the unprivileged daemon from

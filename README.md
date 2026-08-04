@@ -14,7 +14,7 @@ See [DESIGN.md](./DESIGN.md) for the architecture and consistency
 model. For a repeatable first-server rollout, use the
 [VPS deployment runbook](./docs/DEPLOYMENT.md).
 
-## Status: v0.8.3 (pre-release)
+## Status: v0.9.0 (pre-release)
 
 Working today, verified by multi-process fault-injection e2e tests:
 
@@ -113,6 +113,8 @@ https = "0.0.0.0:443"   # SNI certs from <data_dir>/certs/<host>.crt/.key
                         # (certbot output works; hot-reloaded, wildcard
                         # via _wildcard.<domain>.crt; self-signed
                         # fallback until you drop certs in)
+default_domain = "workers.example.com" # every Worker gets
+                                       # <worker>.workers.example.com
 
 [dns]                                # optional, public nodes
 hostname = "edge.example.com"
@@ -143,6 +145,12 @@ timeout_seconds = 1200
 
 rf run --config rf.toml
 ```
+
+`ingress.default_domain` does not create central allocation state or modify a
+Worker's signed manifest. Every node derives the same hostname from the Worker
+name, and the deterministic default route is reserved for that Worker. Point a
+wildcard DNS record and certificate at the public nodes once; custom domains can
+still be attached through signed Worker settings.
 
 For a systemd deployment, prefer `infra/install-release.sh`; it downloads the
 GitHub Actions artifact directly on the VPS and verifies its checksum. The

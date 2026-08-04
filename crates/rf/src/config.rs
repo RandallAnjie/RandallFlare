@@ -2,6 +2,7 @@
 
 use anyhow::{Context, Result};
 use rf_core::identity::SignerId;
+use rf_core::manifest::valid_hostname;
 use serde::Deserialize;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
@@ -271,6 +272,12 @@ pub struct IngressConfig {
     /// fallback while no matching certificate exists.
     #[serde(default)]
     pub https: Option<SocketAddr>,
+    /// Optional suffix used to give every live Worker a deterministic
+    /// `<worker>.<domain>` route. The route is derived locally rather than
+    /// written into the signed manifest, so every node reaches the same
+    /// result without central allocation state.
+    #[serde(default)]
+    pub default_domain: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -363,6 +370,14 @@ impl NodeConfig {
         if self.runtime.port_base > u16::MAX - 999 {
             anyhow::bail!("runtime.port_base must be at most {}", u16::MAX - 999);
         }
+        if let Some(domain) = &self.ingress.default_domain {
+            if !valid_hostname(domain) || !valid_hostname(&format!("{}.{}", "a".repeat(63), domain))
+            {
+                anyhow::bail!(
+                    "ingress.default_domain must be a lowercase DNS name that can fit a Worker prefix"
+                );
+            }
+        }
         if self.d1.compact_threshold == 0 || self.d1.keep_tail >= self.d1.compact_threshold {
             anyhow::bail!("d1.keep_tail must be smaller than a non-zero d1.compact_threshold");
         }
@@ -405,6 +420,15 @@ impl NodeConfig {
 
     pub fn peer_api_advertise(&self) -> SocketAddr {
         self.peer_api.advertise.unwrap_or(self.peer_api.listen)
+    }
+
+    pub fn default_worker_domain(&self) -> Option<&str> {
+        self.ingress.default_domain.as_deref()
+    }
+
+    pub fn default_worker_hostname(&self, worker: &str) -> Option<String> {
+        self.default_worker_domain()
+            .map(|domain| format!("{worker}.{domain}"))
     }
 }
 
@@ -484,5 +508,30 @@ mod tests {
         )
         .unwrap();
         assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn default_worker_domain_is_validated_and_derived() {
+        let raw = r#"
+            data_dir = "/var/lib/rf"
+            operator = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+            cluster_secret = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+            [gossip]
+            listen = "127.0.0.1:7381"
+            [peer_api]
+            listen = "127.0.0.1:7382"
+            [ingress]
+            default_domain = "workers.example.com"
+        "#;
+        let cfg: NodeConfig = toml::from_str(raw).unwrap();
+        cfg.validate().unwrap();
+        assert_eq!(
+            cfg.default_worker_hostname("hello"),
+            Some("hello.workers.example.com".into())
+        );
+
+        let mut invalid = cfg.clone();
+        invalid.ingress.default_domain = Some("Workers.Example.com".into());
+        assert!(invalid.validate().is_err());
     }
 }

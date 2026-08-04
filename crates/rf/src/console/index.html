@@ -143,7 +143,7 @@
                 <div class="panel-head"><div><p class="eyebrow">推荐工作流</p><h2>从 GitHub 导入</h2></div><span class="badge active">持续部署</span></div>
                 <p class="muted">连接仓库后，RandallFlare 会在沙箱中构建，并将经过签名的内容全量分发到所有节点。</p>
                 <form id="source-form" class="source-form">
-                  <label><span>Worker 名称</span><input id="source-worker" pattern="[a-z0-9-]{1,63}" placeholder="api" required></label>
+                  <label><span>Worker 名称</span><input id="source-worker" pattern="[a-z0-9-]{1,63}" placeholder="api" required><small id="source-default-domain" class="input-note">填写名称后即可预览默认域名</small></label>
                   <label class="wide"><span>仓库地址</span><input id="source-repository" type="url" placeholder="https://github.com/owner/repository" required></label>
                   <label><span>生产分支</span><input id="source-branch" value="main" required></label>
                   <label><span>根目录</span><input id="source-root" value="." required></label>
@@ -160,7 +160,7 @@
 
               <article class="panel import-panel deploy-panel">
                 <div class="panel-head"><div><p class="eyebrow">手动部署</p><h2>上传 Worker 包</h2></div><span class="badge">rf.json</span></div>
-                <p class="muted">选择包含 <code>rf.json</code> 的完整产物目录。浏览器只会上传本次部署所需的文件。</p>
+                <p class="muted">选择包含 <code>rf.json</code> 的完整产物目录。浏览器只会上传本次部署所需的文件；发布后会按清单中的 Worker 名称自动分配默认域名。</p>
                 <form id="deploy-form">
                   <div id="deploy-local-fields"><label for="deploy-path">本地 Worker 包路径</label><input id="deploy-path" name="path" type="text" placeholder="/absolute/path/to/worker" autocomplete="off"></div>
                   <div id="deploy-public-fields" class="hidden">
@@ -225,7 +225,7 @@
           <div id="project-tab-domains" class="project-tab">
             <div id="domain-tls-summary" class="domain-overview"></div>
             <article class="panel domain-panel">
-              <div class="panel-head"><div><p class="eyebrow">生产路由</p><h2>访问域名</h2><p class="muted compact-copy">域名绑定写入签名清单；证书从集群 KV 同步到每个 HTTPS 节点。</p></div><span id="project-domain-count" class="badge">0 个域名</span></div>
+              <div class="panel-head"><div><p class="eyebrow">生产路由</p><h2>访问域名</h2><p class="muted compact-copy">默认域名由每个节点确定性生成；自定义域名写入签名清单。证书从集群 KV 同步到每个 HTTPS 节点。</p></div><span id="project-domain-count" class="badge">0 个域名</span></div>
               <div id="project-domain-list" class="domain-list empty-state">尚未绑定域名。</div>
               <form id="project-domain-add-form" class="domain-add-form">
                 <label><span>添加域名</span><input id="project-domain-input" inputmode="url" placeholder="api.example.com" required></label>

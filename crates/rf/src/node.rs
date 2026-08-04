@@ -451,7 +451,33 @@ impl Node {
 
     /// Routing table: hostname → worker.
     pub fn routes(&self) -> BTreeMap<String, String> {
-        self.inner.lock().unwrap().manifests.routes()
+        let inner = self.inner.lock().unwrap();
+        let mut routes = inner.manifests.routes();
+        for record in inner.manifests.live() {
+            if let Some(hostname) = self.cfg.default_worker_hostname(&record.manifest.name) {
+                // A Worker's deterministic default route is reserved for that
+                // Worker, even if another manifest lists it as a custom route.
+                routes.insert(hostname, record.manifest.name.clone());
+            }
+        }
+        routes
+    }
+
+    pub fn default_worker_hostname(&self, worker: &str) -> Option<String> {
+        self.cfg.default_worker_hostname(worker)
+    }
+
+    pub fn effective_worker_hostnames(&self, manifest: &WorkerManifest) -> Vec<String> {
+        let mut hostnames = Vec::with_capacity(manifest.hostnames.len() + 1);
+        if let Some(default) = self.default_worker_hostname(&manifest.name) {
+            hostnames.push(default);
+        }
+        for hostname in &manifest.hostnames {
+            if !hostnames.contains(hostname) {
+                hostnames.push(hostname.clone());
+            }
+        }
+        hostnames
     }
 
     pub fn manifest(&self, name: &str) -> Option<WorkerManifest> {
@@ -675,5 +701,88 @@ impl Node {
         for ns in inner.kv.values_mut() {
             ns.gc(now, HORIZON_MS);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rf_core::envelope::Envelope;
+    use std::collections::BTreeMap;
+
+    fn manifest(name: &str, hostnames: &[&str]) -> WorkerManifest {
+        WorkerManifest {
+            name: name.into(),
+            version: 1,
+            prev: None,
+            deleted: false,
+            main: String::new(),
+            modules: vec![],
+            assets: vec![],
+            hostnames: hostnames
+                .iter()
+                .map(|hostname| (*hostname).into())
+                .collect(),
+            env: BTreeMap::new(),
+            kv_bindings: BTreeMap::new(),
+            crons: vec![],
+            compatibility_date: "2026-08-04".into(),
+        }
+    }
+
+    #[test]
+    fn default_worker_routes_are_deterministic_and_reserved() {
+        let operator = Keypair::from_seed([41; 32]);
+        let data_dir = std::env::temp_dir().join(format!(
+            "rf-default-routes-{}-{}",
+            std::process::id(),
+            rand::random::<u32>()
+        ));
+        let cfg: NodeConfig = toml::from_str(&format!(
+            r#"
+            data_dir = {data_dir:?}
+            operator = "{operator}"
+            cluster_secret = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+            [gossip]
+            listen = "127.0.0.1:17381"
+            [peer_api]
+            listen = "127.0.0.1:17382"
+            [ingress]
+            default_domain = "workers.example"
+            "#,
+            data_dir = data_dir.display(),
+            operator = operator.public(),
+        ))
+        .unwrap();
+        let node = Node::open(cfg, Keypair::from_seed([42; 32])).unwrap();
+        let alpha = manifest(
+            "alpha",
+            &[
+                "alpha.workers.example",
+                "beta.workers.example",
+                "custom.example",
+            ],
+        );
+        let beta = manifest("beta", &[]);
+        node.ingest_manifest(&Envelope::seal(&alpha, &operator))
+            .unwrap();
+        node.ingest_manifest(&Envelope::seal(&beta, &operator))
+            .unwrap();
+
+        assert_eq!(
+            node.effective_worker_hostnames(&alpha),
+            vec![
+                "alpha.workers.example".to_string(),
+                "beta.workers.example".to_string(),
+                "custom.example".to_string(),
+            ]
+        );
+        let routes = node.routes();
+        assert_eq!(routes["alpha.workers.example"], "alpha");
+        assert_eq!(routes["beta.workers.example"], "beta");
+        assert_eq!(routes["custom.example"], "alpha");
+
+        drop(node);
+        std::fs::remove_dir_all(data_dir).unwrap();
     }
 }

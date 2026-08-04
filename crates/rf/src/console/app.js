@@ -177,6 +177,19 @@ function switchView(view) {
   $("#section-title").textContent = title[1];
 }
 
+function updateDefaultDomainPreview() {
+  const preview = $("#source-default-domain");
+  const domain = state.overview?.default_worker_domain;
+  const worker = $("#source-worker").value.trim().toLowerCase();
+  if (!domain) {
+    preview.textContent = "当前节点尚未启用 Worker 默认域名";
+  } else if (/^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/.test(worker)) {
+    preview.textContent = `默认域名：https://${worker}.${domain}`;
+  } else {
+    preview.textContent = `填写名称后自动获得 <Worker名称>.${domain}`;
+  }
+}
+
 function renderOverview(data) {
   state.overview = data;
   const peers = Array.isArray(data.peers) ? data.peers : [];
@@ -209,6 +222,7 @@ function renderOverview(data) {
   $("#console-mode").textContent = data.console?.read_only ? "只读" : "管理员模式";
   $("#worker-nav-count").textContent = String(workers.length);
   $("#worker-count").textContent = `运行中 ${workers.length} 个`;
+  updateDefaultDomainPreview();
 
   $("#node-list").classList.remove("empty-state");
   $("#node-list").innerHTML = allNodes
@@ -398,19 +412,21 @@ function certificateStateClass(status) {
 
 function renderProjectDomains(worker, tls = {}) {
   const hostnames = worker.hostnames || [];
+  const defaultHostname = worker.default_hostname || null;
   const certificates = new Map((tls.certificates || []).map((item) => [item.hostname, item]));
   const trusted = (tls.certificates || []).filter((item) => ["active", "installed", "renewing"].includes(item.status)).length;
   const automaticConfigured = Boolean(tls.acme_enabled && tls.include_worker_hostnames);
   const automatic = Boolean(automaticConfigured && tls.acme_ready);
   $("#project-domain-count").textContent = `${hostnames.length} 个域名`;
   $("#domain-tls-summary").innerHTML = `
-    <article class="domain-metric"><span>路由状态</span><strong>${hostnames.length ? "已发布" : "待配置"}</strong><small>${hostnames.length} 个域名写入当前清单</small></article>
+    <article class="domain-metric"><span>路由状态</span><strong>${hostnames.length ? "已发布" : "待配置"}</strong><small>${hostnames.length} 个生效域名${defaultHostname ? " · 含系统默认域名" : ""}</small></article>
     <article class="domain-metric"><span>HTTPS 入口</span><strong>${tls.enabled ? "已启用" : "未启用"}</strong><small>${tls.enabled ? "节点正在监听 HTTPS" : "请先在节点配置 ingress.https"}</small></article>
     <article class="domain-metric"><span>受信任证书</span><strong>${trusted}/${hostnames.length}</strong><small>${automatic ? "新增域名可由 ACME 自动签发" : automaticConfigured ? "ACME 缺少可用的 DNS 区域或令牌" : tls.acme_enabled ? "ACME 仅管理节点配置中的域名" : "当前节点未配置 ACME"}</small></article>`;
 
   const list = $("#project-domain-list");
   list.classList.toggle("empty-state", hostnames.length === 0);
   list.innerHTML = hostnames.length ? hostnames.map((hostname) => {
+    const isDefault = hostname === defaultHostname;
     const cert = certificates.get(hostname) || { status: "unknown", source: "unknown", coverage: "unknown" };
     const url = workerUrl(hostname, Boolean(tls.enabled));
     const source = cert.source === "acme" ? "ACME 自动管理" : cert.source === "manual" ? "手动证书" : "无证书";
@@ -422,14 +438,16 @@ function renderProjectDomains(worker, tls = {}) {
       : cert.status === "installed" ? "有效期由手动证书决定" : "尚无有效期信息";
     return `<div class="domain-row">
       <span class="domain-icon">↗</span>
-      <div class="domain-primary"><a href="${escapeHtml(url)}" target="_blank" rel="noreferrer">${escapeHtml(hostname)}</a><small>${escapeHtml(url)}</small></div>
-      <div class="domain-route"><span class="status-chip ok">路由已发布</span><small>Worker v${escapeHtml(worker.version)}</small></div>
+      <div class="domain-primary"><a href="${escapeHtml(url)}" target="_blank" rel="noreferrer">${escapeHtml(hostname)}</a><small>${isDefault ? "系统分配 · " : "自定义域名 · "}${escapeHtml(url)}</small></div>
+      <div class="domain-route"><span class="status-chip ok">${isDefault ? "默认域名" : "路由已发布"}</span><small>Worker v${escapeHtml(worker.version)}</small></div>
       <div class="domain-certificate"><span class="status-chip ${certificateStateClass(cert.status)}">${escapeHtml(certificateStatusLabel(cert.status))}</span><small>${escapeHtml(source)} · ${escapeHtml(coverage)}</small><small>${escapeHtml(expiry)}</small></div>
-      <button class="mini-button danger" type="button" data-remove-domain="${escapeHtml(hostname)}">移除</button>
+      ${isDefault ? '<span class="badge active">始终可用</span>' : `<button class="mini-button danger" type="button" data-remove-domain="${escapeHtml(hostname)}">移除</button>`}
     </div>`;
   }).join("") : "尚未绑定域名。添加域名后，所有节点会从同一份签名清单建立路由。";
 
-  const dnsInstruction = tls.dns_target
+  const dnsInstruction = defaultHostname
+    ? `默认域名 ${defaultHostname} 已由通配符 DNS 接入；仅添加自定义域名时需要配置 DNS。`
+    : tls.dns_target
     ? `将域名的 CNAME 指向 ${tls.dns_target}；RandallFlare 的 DNS 轮换会维护可用边缘节点。`
     : "将域名的 A/AAAA 或 CNAME 记录指向承担入口流量的 RandallFlare 公网节点。";
   const certificateInstruction = automatic
@@ -440,7 +458,7 @@ function renderProjectDomains(worker, tls = {}) {
       ? "如需自动签发新绑定的域名，请在节点的 [acme] 中启用 include_worker_hostnames，或预先配置覆盖它的通配符证书。"
       : "请在节点的 [acme] 中配置 DNS-01，或把 .crt/.key 证书放入 data_dir/certs；证书会热加载。";
   $("#project-domain-guidance").innerHTML = `
-    <div><span>1</span><p><strong>发布路由</strong><small>这里的添加或移除操作会生成新的签名 Worker 清单。</small></p></div>
+    <div><span>1</span><p><strong>默认域名</strong><small>${defaultHostname ? `每个节点都会独立推导 ${escapeHtml(defaultHostname)}，无需写入清单或申请分配。` : "当前节点尚未配置默认 Worker 域名。"}</small></p></div>
     <div><span>2</span><p><strong>配置 DNS</strong><small>${escapeHtml(dnsInstruction)}</small></p></div>
     <div><span>3</span><p><strong>启用 HTTPS</strong><small>${escapeHtml(certificateInstruction)}</small></p></div>`;
 }
@@ -575,8 +593,10 @@ async function updateWorkerSettings(payload, summary) {
 async function saveProjectDomains(event) {
   event.preventDefault();
   const hostname = $("#project-domain-input").value.trim().replace(/^https?:\/\//, "").split("/")[0].replace(/\.$/, "").toLowerCase();
-  const current = state.workerDetail?.worker?.hostnames || [];
-  if (current.includes(hostname)) {
+  const worker = state.workerDetail?.worker || {};
+  const effective = worker.hostnames || [];
+  const current = worker.custom_hostnames || effective.filter((item) => item !== worker.default_hostname);
+  if (effective.includes(hostname)) {
     toast(`${hostname} 已绑定到当前 Worker`, true);
     return;
   }
@@ -586,8 +606,13 @@ async function saveProjectDomains(event) {
 }
 
 async function removeProjectDomain(hostname) {
+  const worker = state.workerDetail?.worker || {};
+  if (hostname === worker.default_hostname) {
+    toast("默认域名由节点自动分配，不能移除", true);
+    return;
+  }
   if (!window.confirm(`要从 ${state.activeWorker} 移除域名“${hostname}”吗？`)) return;
-  const hostnames = (state.workerDetail?.worker?.hostnames || []).filter((item) => item !== hostname);
+  const hostnames = (worker.custom_hostnames || worker.hostnames || []).filter((item) => item !== hostname && item !== worker.default_hostname);
   await updateWorkerSettings({ hostnames }, `从 ${state.activeWorker} 移除域名 ${hostname}。`);
 }
 
@@ -1151,6 +1176,7 @@ $("#deploy-form").addEventListener("submit", deployWorker);
 $("#deploy-file-picker").addEventListener("click", () => $("#deploy-files").click());
 $("#deploy-files").addEventListener("change", updateDeployFileStatus);
 $("#source-form").addEventListener("submit", connectSource);
+$("#source-worker").addEventListener("input", updateDefaultDomainPreview);
 $("#kv-search-form").addEventListener("submit", (event) => { event.preventDefault(); loadKeys(); });
 $("#kv-editor-form").addEventListener("submit", saveKey);
 $("#kv-new").addEventListener("click", clearKey);
