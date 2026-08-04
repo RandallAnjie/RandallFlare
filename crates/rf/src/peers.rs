@@ -268,6 +268,32 @@ impl PeerClient {
         Ok(serde_json::from_slice(&raw)?)
     }
 
+    pub async fn authorization(
+        &self,
+        base: &str,
+        code: &str,
+    ) -> Result<crate::management::ApprovalView> {
+        let raw = self
+            .get(base, &format!("/v1/authorize/{}", component(code)))
+            .await?;
+        Ok(serde_json::from_slice(&raw)?)
+    }
+
+    pub async fn approve_authorization(
+        &self,
+        base: &str,
+        code: &str,
+        approval: &crate::management::ApprovalSignature,
+    ) -> Result<()> {
+        self.post(
+            base,
+            &format!("/v1/authorize/{}", component(code)),
+            serde_json::to_vec(approval)?,
+        )
+        .await?;
+        Ok(())
+    }
+
     pub async fn worker_version(&self, base: &str, name: &str) -> Result<Option<u64>> {
         Ok(self.worker_head(base, name).await?.map(|(v, _)| v))
     }

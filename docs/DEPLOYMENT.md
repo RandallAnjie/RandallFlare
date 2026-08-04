@@ -15,7 +15,7 @@ Open only the required ports:
 | Protocol | Port | Source | Purpose |
 | --- | ---: | --- | --- |
 | TCP | 22 | administrator IP | SSH |
-| TCP | 80, 443 | public | Worker ingress |
+| TCP | 80, 443 | public | Worker ingress + default management UI |
 | UDP | 7381 | future node IPs | encrypted gossip |
 | TCP | 7382 | administrator and future node IPs | encrypted peer/operator API |
 
@@ -34,7 +34,7 @@ Use the binary produced by GitHub Actions. Verify the published checksum before
 using it to create or validate credentials:
 
 ```bash
-RF_VERSION=v0.4.0
+RF_VERSION=v0.5.0
 curl -fLO "https://github.com/RandallAnjie/RandallFlare/releases/download/$RF_VERSION/rf-linux-x86_64"
 curl -fLO "https://github.com/RandallAnjie/RandallFlare/releases/download/$RF_VERSION/rf-linux-x86_64.sha256"
 sha256sum --check --strict rf-linux-x86_64.sha256
@@ -79,9 +79,9 @@ scp first-vps/rf.toml root@203.0.113.7:/root/rf.toml
 scp first-vps/rf.env root@203.0.113.7:/root/rf.env  # only when used
 ssh root@203.0.113.7
 curl -fLo /tmp/install-randallflare-release.sh \
-  https://raw.githubusercontent.com/RandallAnjie/RandallFlare/v0.4.0/infra/install-release.sh
+  https://raw.githubusercontent.com/RandallAnjie/RandallFlare/v0.5.0/infra/install-release.sh
 bash /tmp/install-randallflare-release.sh \
-  --version v0.4.0 --config /root/rf.toml --env /root/rf.env
+  --version v0.5.0 --config /root/rf.toml --env /root/rf.env
 ```
 
 Omit both `scp` of `rf.env` and `--env` when no environment file is needed.
@@ -134,20 +134,33 @@ journalctl -u rf -n 200 --no-pager
 
 ## 5. Management console
 
-Keep the operator private key on the administrator machine and start the
-loopback-only Console there:
+Open the public node's default address. Unknown/unclaimed hostnames, including
+the raw IP address, serve the RandallFlare management interface:
+
+```text
+http://203.0.113.7/
+```
+
+The browser displays a one-time code. Keep the operator private key on the
+administrator machine and approve that code through the encrypted peer API:
 
 ```bash
 export RF_NODE="203.0.113.7:7382"
 export RF_CLUSTER_SECRET="<the cluster secret>"
 export RF_OPERATOR_KEY="$PWD/first-vps/operator.key"
-./rf-linux-x86_64 console
+./rf-linux-x86_64 authorize ABC12-DEF34
 ```
 
-Open `http://127.0.0.1:7390`. Worker deploys, hash-chain history, KV, and D1
-operations go through the same encrypted peer protocol as the CLI. If the
-operator key is omitted, the backend enforces observer mode. Use an SSH local
-forward to `127.0.0.1:7382` when the peer API is firewalled.
+The resulting short-lived session is signed by the operator and can be checked
+by every cluster node without a central account or session database. Worker
+deploy/delete actions display their own one-time approval code because the
+operator signs the exact canonical manifest; nodes and browsers never receive
+the private key. KV and D1 changes still require the signed session plus same-
+origin CSRF proof.
+
+HTTP is acceptable only for an isolated first-node test. Configure HTTPS before
+production use. The legacy `rf console` loopback command remains available for
+offline/emergency administration.
 
 ## 6. Upgrade
 
@@ -158,8 +171,8 @@ restarting the service:
 
 ```bash
 curl -fLo /tmp/install-randallflare-release.sh \
-  https://raw.githubusercontent.com/RandallAnjie/RandallFlare/v0.4.0/infra/install-release.sh
-sudo bash /tmp/install-randallflare-release.sh --version v0.4.0
+  https://raw.githubusercontent.com/RandallAnjie/RandallFlare/v0.5.0/infra/install-release.sh
+sudo bash /tmp/install-randallflare-release.sh --version v0.5.0
 ```
 
 The default hardened unit deliberately prevents the unprivileged daemon from

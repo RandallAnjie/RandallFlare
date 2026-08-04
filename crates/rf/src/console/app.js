@@ -1,6 +1,9 @@
 const token = document.querySelector('meta[name="rf-console-token"]').content;
+const consoleMode = document.querySelector('meta[name="rf-console-mode"]').content;
 const $ = (selector) => document.querySelector(selector);
 const $$ = (selector) => Array.from(document.querySelectorAll(selector));
+
+if (consoleMode === "public") document.body.classList.add("auth-required");
 
 const state = {
   overview: null,
@@ -8,6 +11,9 @@ const state = {
   view: "overview",
   busy: 0,
   kvSelected: null,
+  authChallenge: null,
+  authTimer: null,
+  approvalTimer: null,
 };
 
 const titles = {
@@ -57,7 +63,10 @@ async function api(path, options = {}) {
   setBusy(true);
   try {
     const headers = new Headers(options.headers || {});
-    headers.set("x-rf-console-token", token);
+    if (consoleMode === "local") headers.set("x-rf-console-token", token);
+    if (consoleMode === "public" && state.session?.csrf && options.method && options.method !== "GET") {
+      headers.set("x-rf-csrf", state.session.csrf);
+    }
     if (options.body && !headers.has("content-type")) {
       headers.set("content-type", "application/json");
     }
@@ -67,11 +76,82 @@ async function api(path, options = {}) {
       ? await response.json()
       : await response.text();
     if (!response.ok) {
-      throw new Error(payload?.error || payload || `Request failed (${response.status})`);
+      const error = new Error(payload?.error || payload || `Request failed (${response.status})`);
+      error.status = response.status;
+      throw error;
     }
     return payload;
   } finally {
     setBusy(false);
+  }
+}
+
+function authorizationCommand(code, node) {
+  return `RF_NODE=${node} rf authorize ${code}`;
+}
+
+async function copyText(text, button) {
+  try {
+    await navigator.clipboard.writeText(text);
+    const previous = button.textContent;
+    button.textContent = "Copied";
+    setTimeout(() => { button.textContent = previous; }, 1200);
+  } catch {
+    toast("Copy failed; select the command manually", true);
+  }
+}
+
+async function beginAuthorization() {
+  clearTimeout(state.authTimer);
+  state.authChallenge = null;
+  document.body.classList.add("auth-required");
+  $("#auth-gate").classList.remove("hidden");
+  $("#auth-retry").classList.add("hidden");
+  $("#auth-dot").className = "dot pending";
+  $("#auth-status").textContent = "Creating signed challenge";
+  $("#auth-code").textContent = "Generating…";
+  try {
+    const response = await fetch("/api/auth/challenge", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: "{}",
+    });
+    const data = await response.json();
+    if (!response.ok) throw new Error(data.error || `Challenge failed (${response.status})`);
+    state.authChallenge = data;
+    const command = authorizationCommand(data.code, data.approve_node);
+    $("#auth-code").textContent = data.code;
+    $("#auth-command").textContent = command;
+    $("#auth-status").textContent = "Waiting for operator signature";
+    state.authTimer = setTimeout(pollAuthorization, 900);
+  } catch (error) {
+    $("#auth-dot").className = "dot offline";
+    $("#auth-status").textContent = error.message;
+    $("#auth-retry").classList.remove("hidden");
+  }
+}
+
+async function pollAuthorization() {
+  const challenge = state.authChallenge;
+  if (!challenge) return;
+  try {
+    const response = await fetch(`/api/auth/challenge/${encodeURIComponent(challenge.id)}`);
+    const data = await response.json();
+    if (!response.ok) throw new Error(data.error || `Authorization failed (${response.status})`);
+    if (data.state === "completed") {
+      $("#auth-dot").className = "dot online";
+      $("#auth-status").textContent = "Operator verified";
+      document.body.classList.remove("auth-required");
+      $("#auth-gate").classList.add("hidden");
+      state.authChallenge = null;
+      await boot();
+      return;
+    }
+    state.authTimer = setTimeout(pollAuthorization, 900);
+  } catch (error) {
+    $("#auth-dot").className = "dot offline";
+    $("#auth-status").textContent = error.message;
+    $("#auth-retry").classList.remove("hidden");
   }
 }
 
@@ -190,6 +270,12 @@ async function loadOverview({ quiet = false } = {}) {
     renderOverview(data);
     if (!quiet) toast("Cluster state refreshed");
   } catch (error) {
+    if (consoleMode === "public" && error.status === 401) {
+      state.session = null;
+      showError("");
+      if (!state.authChallenge) await beginAuthorization();
+      return;
+    }
     $("#connection-dot").className = "dot offline";
     $("#connection-text").textContent = "Disconnected";
     showError(error.message);
@@ -214,9 +300,79 @@ async function deleteWorker(name) {
   if (!window.confirm(`Tombstone Worker “${name}”? Existing history remains verifiable.`)) return;
   try {
     const result = await api(`/api/workers/${encodeURIComponent(name)}`, { method: "DELETE" });
-    toast(`${name} tombstoned at v${result.version}`);
-    await loadOverview({ quiet: true });
+    if (result.pending_approval) {
+      showApproval(result, `${name} will be tombstoned after operator approval.`);
+    } else {
+      toast(`${name} tombstoned at v${result.version}`);
+      await loadOverview({ quiet: true });
+    }
   } catch (error) {
+    toast(error.message, true);
+  }
+}
+
+function bytesToBase64(bytes) {
+  let binary = "";
+  const chunk = 0x8000;
+  for (let offset = 0; offset < bytes.length; offset += chunk) {
+    binary += String.fromCharCode(...bytes.subarray(offset, offset + chunk));
+  }
+  return btoa(binary);
+}
+
+async function browserBundleFiles() {
+  const selected = Array.from($("#deploy-files").files || []);
+  if (!selected.length) throw new Error("Select a Worker bundle directory");
+  const rawPaths = selected.map((file) => file.webkitRelativePath || file.name);
+  const firstRoot = rawPaths[0].split("/")[0];
+  const stripRoot = rawPaths.every((path) => path.startsWith(`${firstRoot}/`));
+  const files = [];
+  let total = 0;
+  for (let index = 0; index < selected.length; index += 1) {
+    const file = selected[index];
+    const bytes = new Uint8Array(await file.arrayBuffer());
+    total += bytes.length;
+    if (total > 64 * 1024 * 1024) throw new Error("Worker bundle exceeds 64 MiB");
+    const raw = rawPaths[index];
+    const path = stripRoot ? raw.slice(firstRoot.length + 1) : raw;
+    files.push({ path, data_base64: bytesToBase64(bytes) });
+  }
+  return files;
+}
+
+function showApproval(result, fallbackSummary) {
+  clearTimeout(state.approvalTimer);
+  const approval = result.approval;
+  const command = authorizationCommand(approval.code, result.approve_node);
+  $("#approval-title").textContent = result.name
+    ? `${result.name} v${result.version}`
+    : "Approve cluster change";
+  $("#approval-summary").textContent = approval.summary || fallbackSummary;
+  $("#approval-code").textContent = approval.code;
+  $("#approval-command").textContent = command;
+  $("#approval-dot").className = "dot pending";
+  $("#approval-status").textContent = "Waiting for operator signature";
+  $("#approval-dialog").showModal();
+  state.approvalTimer = setTimeout(() => pollApproval(approval.id), 900);
+}
+
+async function pollApproval(id) {
+  try {
+    const result = await api(`/api/approvals/${encodeURIComponent(id)}`);
+    if (result.state === "completed") {
+      $("#approval-dot").className = "dot online";
+      $("#approval-status").textContent = "Signed and committed across the cluster";
+      toast(result.summary || "Cluster change committed");
+      await loadOverview({ quiet: true });
+      return;
+    }
+    if (result.state === "failed") {
+      throw new Error(result.error || "Cluster change failed");
+    }
+    state.approvalTimer = setTimeout(() => pollApproval(id), 900);
+  } catch (error) {
+    $("#approval-dot").className = "dot offline";
+    $("#approval-status").textContent = error.message;
     toast(error.message, true);
   }
 }
@@ -298,14 +454,20 @@ async function removeKey() {
 
 async function deployWorker(event) {
   event.preventDefault();
-  const path = $("#deploy-path").value.trim();
   try {
+    const payload = consoleMode === "public"
+      ? { files: await browserBundleFiles() }
+      : { path: $("#deploy-path").value.trim() };
     const result = await api("/api/workers/deploy", {
       method: "POST",
-      body: JSON.stringify({ path }),
+      body: JSON.stringify(payload),
     });
-    toast(`Deployed ${result.name} v${result.version}`);
-    await loadOverview({ quiet: true });
+    if (result.pending_approval) {
+      showApproval(result, `${result.name} v${result.version} is ready for signing.`);
+    } else {
+      toast(`Deployed ${result.name} v${result.version}`);
+      await loadOverview({ quiet: true });
+    }
   } catch (error) {
     toast(error.message, true);
   }
@@ -357,14 +519,35 @@ async function executeSql(event) {
 async function boot() {
   try {
     state.session = await api("/api/session");
+    document.body.classList.remove("auth-required");
+    $("#auth-gate").classList.add("hidden");
+    $("#logout").classList.toggle("hidden", consoleMode !== "public");
+    $("#deploy-local-fields").classList.toggle("hidden", consoleMode === "public");
+    $("#deploy-public-fields").classList.toggle("hidden", consoleMode !== "public");
+    $("#deploy-path").required = consoleMode === "local";
+    $("#deploy-files").required = consoleMode === "public";
     $("#deploy-mode").textContent = state.session.read_only
       ? "No operator key loaded. All mutations are disabled."
-      : `Signing as ${shortId(state.session.operator, 22)}.`;
+      : consoleMode === "public"
+        ? `Authenticated as ${shortId(state.session.operator, 22)}. Worker manifests require one-time CLI approval.`
+        : `Signing as ${shortId(state.session.operator, 22)}.`;
+    $("#transport-warning").classList.toggle(
+      "hidden",
+      consoleMode !== "public" || state.session.secure_transport,
+    );
+    $("#security-copy").innerHTML = consoleMode === "public"
+      ? "No private key is stored<br>on this node."
+      : "Secrets remain in the local<br>console process.";
     $$("#deploy-form button, #kv-editor-form button, #d1-create-form button, #d1-exec-form button")
       .forEach((button) => { button.disabled = state.session.read_only; });
     await loadOverview({ quiet: true });
     await loadKeys();
   } catch (error) {
+    if (consoleMode === "public" && error.status === 401) {
+      state.session = null;
+      if (!state.authChallenge) await beginAuthorization();
+      return;
+    }
     showError(error.message);
     toast(error.message, true);
   }
@@ -381,6 +564,19 @@ $("#kv-delete").addEventListener("click", removeKey);
 $("#d1-create-form").addEventListener("submit", createDatabase);
 $("#d1-exec-form").addEventListener("submit", executeSql);
 $("#history-close").addEventListener("click", () => $("#history-dialog").close());
+$("#approval-close").addEventListener("click", () => $("#approval-dialog").close());
+$("#auth-retry").addEventListener("click", beginAuthorization);
+$("#auth-copy").addEventListener("click", () => copyText($("#auth-command").textContent, $("#auth-copy")));
+$("#approval-copy").addEventListener("click", () => copyText($("#approval-command").textContent, $("#approval-copy")));
+$("#logout").addEventListener("click", async () => {
+  try {
+    await api("/api/auth/logout", { method: "POST", body: "{}" });
+  } catch (error) {
+    toast(error.message, true);
+  }
+  state.session = null;
+  await beginAuthorization();
+});
 $("#workers-table").addEventListener("click", (event) => {
   const button = event.target.closest("button[data-action]");
   if (!button) return;
@@ -398,5 +594,7 @@ $("#database-list").addEventListener("click", (event) => {
   $("#d1-sql").focus();
 });
 
-setInterval(() => loadOverview({ quiet: true }), 10_000);
+setInterval(() => {
+  if (state.session) loadOverview({ quiet: true });
+}, 10_000);
 boot();

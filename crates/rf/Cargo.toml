@@ -14,6 +14,7 @@ path = "src/main.rs"
 rf-core = { path = "../rf-core" }
 tokio = { version = "1", features = ["full"] }
 tokio-stream = "0.1"
+tower = { version = "0.5", features = ["util"] }
 chitchat = "0.11"
 axum = "0.8"
 redb = "4"
@@ -46,4 +47,3 @@ rusqlite = { version = "0.40.1", features = ["bundled"] }
 zstd = "0.13"
 
 [dev-dependencies]
-tower = { version = "0.5", features = ["util"] }

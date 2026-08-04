@@ -62,6 +62,17 @@ enum Cmd {
         #[arg(long, default_value = "127.0.0.1:7390")]
         listen: SocketAddr,
     },
+    /// Approve a browser login or Worker change with the operator key.
+    Authorize {
+        /// One-time code displayed by the management interface.
+        code: String,
+        #[arg(long, env = "RF_NODE")]
+        node: String,
+        #[arg(long, env = "RF_OPERATOR_KEY")]
+        key: Option<PathBuf>,
+        #[arg(long, env = "RF_CLUSTER_SECRET")]
+        secret: String,
+    },
     /// Deploy a worker directory (rf.json + modules + assets).
     Deploy {
         dir: PathBuf,
@@ -232,6 +243,45 @@ async fn async_main(cli: Cli) -> Result<()> {
             };
             rf::console::serve(listen, node, secret_bytes(&secret)?, operator).await
         }
+        Cmd::Authorize {
+            code,
+            node,
+            key,
+            secret,
+        } => {
+            use base64::Engine as _;
+
+            let client = PeerClient::new(secret_bytes(&secret)?);
+            let approval = client.authorization(&node, &code).await?;
+            let status = client.status(&node).await?;
+            let cluster_id = status
+                .get("cluster_id")
+                .and_then(serde_json::Value::as_str)
+                .context("node status omitted cluster_id")?;
+            let configured_operator: rf_core::identity::SignerId = status
+                .get("operator")
+                .and_then(serde_json::Value::as_str)
+                .context("node status omitted operator")?
+                .parse()
+                .map_err(|error| anyhow::anyhow!("node returned an invalid operator: {error}"))?;
+            let payload = base64::engine::general_purpose::STANDARD
+                .decode(&approval.payload_base64)
+                .context("node returned an invalid approval payload")?;
+            let operator = operator_key(key)?;
+            if operator.signer_id() != configured_operator {
+                anyhow::bail!("operator key does not match the operator configured on node {node}");
+            }
+            let description = describe_approval(approval.kind, &payload, cluster_id, &node)?;
+            println!("{description}");
+            let request = rf::management::ApprovalSignature {
+                signer: operator.signer_id(),
+                signature_base64: base64::engine::general_purpose::STANDARD
+                    .encode(operator.sign(&payload)),
+            };
+            client.approve_authorization(&node, &code, &request).await?;
+            println!("approved {}", approval.code);
+            Ok(())
+        }
         Cmd::Deploy {
             dir,
             node,
@@ -373,6 +423,61 @@ async fn async_main(cli: Cli) -> Result<()> {
                 );
             }
             Ok(())
+        }
+    }
+}
+
+fn describe_approval(
+    kind: rf::management::ApprovalKind,
+    payload: &[u8],
+    expected_cluster_id: &str,
+    node: &str,
+) -> Result<String> {
+    match kind {
+        rf::management::ApprovalKind::Login => {
+            let grant: rf::management::ConsoleGrant =
+                postcard::from_bytes(payload).context("node returned an invalid console grant")?;
+            grant
+                .validate(expected_cluster_id, rf::node::now_ms())
+                .context("refusing invalid console grant")?;
+            Ok(format!(
+                "Sign in to RandallFlare cluster {} via {node}",
+                grant.cluster_id
+            ))
+        }
+        rf::management::ApprovalKind::Manifest => {
+            let manifest: rf_core::manifest::WorkerManifest = postcard::from_bytes(payload)
+                .context("node returned an invalid Worker manifest")?;
+            manifest
+                .validate()
+                .map_err(|error| anyhow::anyhow!("refusing invalid manifest: {error}"))?;
+            if manifest.deleted {
+                return Ok(format!(
+                    "Delete Worker {} at v{}",
+                    manifest.name, manifest.version
+                ));
+            }
+            let routes = if manifest.hostnames.is_empty() {
+                "none".to_string()
+            } else {
+                manifest.hostnames.join(", ")
+            };
+            let env_keys = if manifest.env.is_empty() {
+                "none".to_string()
+            } else {
+                manifest.env.keys().cloned().collect::<Vec<_>>().join(", ")
+            };
+            Ok(format!(
+                "Deploy Worker {} v{} ({} modules, {} assets)\n  routes: {}\n  environment keys: {}\n  KV bindings: {}\n  cron triggers: {}",
+                manifest.name,
+                manifest.version,
+                manifest.modules.len(),
+                manifest.assets.len(),
+                routes,
+                env_keys,
+                manifest.kv_bindings.len(),
+                manifest.crons.len(),
+            ))
         }
     }
 }
@@ -691,7 +796,8 @@ async fn run(config_path: PathBuf) -> Result<()> {
 
 #[cfg(test)]
 mod cli_tests {
-    use super::parse_ping;
+    use super::{describe_approval, parse_ping};
+    use rf::management::{ApprovalKind, ConsoleGrant, CONSOLE_GRANT_VERSION};
 
     #[test]
     fn parses_health_identity() {
@@ -703,5 +809,24 @@ mod cli_tests {
     fn rejects_invalid_health_response() {
         assert!(parse_ping("ok").is_err());
         assert!(parse_ping("rf not-an-id").is_err());
+    }
+
+    #[test]
+    fn login_approval_is_bound_to_reported_cluster() {
+        let now = rf::node::now_ms();
+        let grant = ConsoleGrant {
+            version: CONSOLE_GRANT_VERSION,
+            cluster_id: "cluster-a".into(),
+            session_id: [1; 32],
+            csrf: [2; 32],
+            issued_at_ms: now,
+            expires_at_ms: now + 60_000,
+        };
+        let payload = postcard::to_stdvec(&grant).unwrap();
+        assert!(describe_approval(ApprovalKind::Login, &payload, "cluster-b", "node-a").is_err());
+        assert_eq!(
+            describe_approval(ApprovalKind::Login, &payload, "cluster-a", "node-a").unwrap(),
+            "Sign in to RandallFlare cluster cluster-a via node-a"
+        );
     }
 }

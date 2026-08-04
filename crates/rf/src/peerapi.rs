@@ -71,6 +71,10 @@ pub fn router(api: Api) -> Router {
         .route("/v1/blob/{sha}", get(blob_get))
         .route("/v1/blob", post(blob_put))
         .route("/v1/manifest", post(manifest_post))
+        .route(
+            "/v1/authorize/{code}",
+            get(authorization_get).post(authorization_post),
+        )
         .route("/v1/worker/{name}", get(worker_get))
         .route("/v1/log/{name}", get(log_get))
         .route("/v1/kv/{ns}", get(kv_list))
@@ -340,6 +344,8 @@ async fn status(
     axum::Json(serde_json::json!({
         "node": node.id_hex(),
         "label": node.cfg.label,
+        "cluster_id": node.cfg.cluster_id,
+        "operator": node.cfg.operator.to_string(),
         "public": node.cfg.public,
         "version": env!("CARGO_PKG_VERSION"),
         "peers": peers,
@@ -476,6 +482,100 @@ async fn manifest_post(
         }
         Err(e) => (StatusCode::UNPROCESSABLE_ENTITY, e.to_string()).into_response(),
     }
+}
+
+async fn authorization_get(
+    State(api): State<Api>,
+    ConnectInfo(remote): ConnectInfo<SocketAddr>,
+    Path(code): Path<String>,
+    method: Method,
+    uri: Uri,
+    headers: HeaderMap,
+) -> Response {
+    if let Err(response) = check(&api, &remote, &headers, &method, &uri, b"") {
+        return response.into_response();
+    }
+    match api.node.management.view_by_code(&code) {
+        Ok(view) => axum::Json(view).into_response(),
+        Err(error) => (StatusCode::NOT_FOUND, error.to_string()).into_response(),
+    }
+}
+
+async fn authorization_post(
+    State(api): State<Api>,
+    ConnectInfo(remote): ConnectInfo<SocketAddr>,
+    Path(code): Path<String>,
+    method: Method,
+    uri: Uri,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    use base64::Engine as _;
+
+    if let Err(response) = check(&api, &remote, &headers, &method, &uri, &body) {
+        return response.into_response();
+    }
+    let request: crate::management::ApprovalSignature = match serde_json::from_slice(&body) {
+        Ok(request) => request,
+        Err(error) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                format!("invalid approval: {error}"),
+            )
+                .into_response();
+        }
+    };
+    let signature =
+        match base64::engine::general_purpose::STANDARD.decode(&request.signature_base64) {
+            Ok(signature) => signature,
+            Err(error) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    format!("invalid approval signature: {error}"),
+                )
+                    .into_response();
+            }
+        };
+    let approved =
+        match api
+            .node
+            .management
+            .approve(&code, request.signer, signature, &api.node.cfg.operator)
+        {
+            Ok(approved) => approved,
+            Err(error) => return (StatusCode::FORBIDDEN, error.to_string()).into_response(),
+        };
+
+    if approved.kind == crate::management::ApprovalKind::Manifest {
+        let result = ingest_manifest_envelope(&api, &approved.envelope);
+        match result {
+            Ok(()) => api.node.management.complete(&approved.id, Ok(())),
+            Err(error) => {
+                let message = error.to_string();
+                api.node
+                    .management
+                    .complete(&approved.id, Err(anyhow::anyhow!(message.clone())));
+                return (StatusCode::UNPROCESSABLE_ENTITY, message).into_response();
+            }
+        }
+    }
+    axum::Json(serde_json::json!({
+        "ok": true,
+        "kind": approved.kind,
+    }))
+    .into_response()
+}
+
+fn ingest_manifest_envelope(api: &Api, envelope: &Envelope) -> Result<()> {
+    api.node.ingest_manifest(envelope)?;
+    let manifest: rf_core::manifest::WorkerManifest =
+        envelope
+            .open(Some(&api.node.cfg.operator))
+            .map_err(|error| anyhow::anyhow!("approved manifest could not be decoded: {error}"))?;
+    if !crate::deploy::durable_objects(&manifest).is_empty() {
+        api.durable.ensure_worker(&manifest.name)?;
+    }
+    Ok(())
 }
 
 async fn worker_get(
