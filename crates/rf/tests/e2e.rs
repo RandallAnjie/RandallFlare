@@ -145,6 +145,41 @@ async fn wait_ping(api: &str, budget: Duration) {
     }
 }
 
+async fn wait_full_membership(client: &PeerClient, nodes: &[&TestNode], budget: Duration) {
+    let deadline = Instant::now() + budget;
+    loop {
+        let mut converged = true;
+        for node in nodes {
+            let status = client.status(&node.api).await.unwrap_or_default();
+            if status["peers"].as_array().map(Vec::len).unwrap_or(0) + 1 < nodes.len() {
+                converged = false;
+                break;
+            }
+        }
+        if converged {
+            return;
+        }
+        if Instant::now() >= deadline {
+            dump_node_logs(nodes);
+            panic!("cluster membership did not converge on every node");
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+}
+
+fn dump_node_logs(nodes: &[&TestNode]) {
+    for node in nodes {
+        let path = node._dir.join("node.log");
+        let text = std::fs::read_to_string(&path).unwrap_or_else(|error| error.to_string());
+        let mut tail: Vec<&str> = text.lines().rev().take(120).collect();
+        tail.reverse();
+        eprintln!("--- tail of {} ---", path.display());
+        for line in tail {
+            eprintln!("{line}");
+        }
+    }
+}
+
 fn start(label: &str, operator: &Keypair, seeds: &[u16]) -> TestNode {
     let dir = std::env::temp_dir().join(format!("rf-e2e-{label}-{}", rand::random::<u32>()));
     std::fs::create_dir_all(&dir).unwrap();
@@ -427,18 +462,7 @@ async fn durable_object_routes_and_survives_owner_loss() {
     let c = start("doc", &operator, &[a.gossip]);
     wait_ping(&b.api, Duration::from_secs(15)).await;
     wait_ping(&c.api, Duration::from_secs(15)).await;
-    let deadline = Instant::now() + Duration::from_secs(15);
-    loop {
-        let status = client.status(&a.api).await.unwrap_or_default();
-        if status["peers"].as_array().map(|p| p.len()).unwrap_or(0) >= 2 {
-            break;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "DO cluster membership never converged"
-        );
-        tokio::time::sleep(Duration::from_millis(200)).await;
-    }
+    wait_full_membership(&client, &[&a, &b, &c], Duration::from_secs(20)).await;
 
     let bundle_dir = std::env::temp_dir().join(format!(
         "rf-e2e-do-cluster-bundle-{}",
@@ -489,17 +513,17 @@ export default {
             .header("host", "global-counter.test")
             .send()
     };
-    let deadline = Instant::now() + Duration::from_secs(40);
+    let deadline = Instant::now() + Duration::from_secs(60);
     loop {
         if let Ok(resp) = call(b.ingress, "/value").await {
             if resp.status() == 200 && resp.text().await.unwrap() == "0" {
                 break;
             }
         }
-        assert!(
-            Instant::now() < deadline,
-            "distributed DO owner never became ready"
-        );
+        if Instant::now() >= deadline {
+            dump_node_logs(&[&a, &b, &c]);
+            panic!("distributed DO owner never became ready");
+        }
         tokio::time::sleep(Duration::from_millis(300)).await;
     }
 
