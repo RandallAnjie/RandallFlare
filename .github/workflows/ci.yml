@@ -23,7 +23,7 @@ jobs:
           infra/install-release.sh --help >/dev/null
           ! infra/install-release.sh --version latest >/dev/null 2>&1
           if command -v apparmor_parser >/dev/null; then
-            apparmor_parser -Q infra/rf-bwrap.apparmor
+            apparmor_parser -KQ infra/rf-bwrap.apparmor
           fi
       - name: Install pinned workerd for real-runtime tests
         run: |
