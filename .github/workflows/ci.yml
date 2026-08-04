@@ -17,6 +17,12 @@ jobs:
         with:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
+      - name: Validate deployment scripts
+        run: bash -n infra/*.sh
+      - name: Install pinned workerd for real-runtime tests
+        run: |
+          infra/fetch-workerd.sh --output "$RUNNER_TEMP/workerd-bin/workerd"
+          echo "$RUNNER_TEMP/workerd-bin" >> "$GITHUB_PATH"
       - run: cargo fmt --all --check
       - run: cargo clippy --workspace --all-targets --all-features -- -D warnings
       - run: cargo test --workspace --all-targets --locked

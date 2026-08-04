@@ -1,0 +1,5 @@
+{
+  "name": "rf-smoke-static",
+  "assets": "public",
+  "hostnames": ["static.smoke.rf.test"]
+}

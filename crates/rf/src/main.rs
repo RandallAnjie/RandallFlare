@@ -36,6 +36,19 @@ enum Cmd {
         #[arg(long, short)]
         config: PathBuf,
     },
+    /// Validate a node config and inspect runtime prerequisites.
+    Doctor {
+        #[arg(long, short)]
+        config: PathBuf,
+        /// Emit machine-readable JSON.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Check the public identity/health endpoint of a node.
+    Health {
+        #[arg(long, env = "RF_NODE")]
+        node: String,
+    },
     /// Deploy a worker directory (rf.json + modules + assets).
     Deploy {
         dir: PathBuf,
@@ -183,6 +196,8 @@ async fn async_main(cli: Cli) -> Result<()> {
     match cli.cmd {
         Cmd::Keygen { dir, eth } => keygen(dir, eth),
         Cmd::Run { config } => run(config).await,
+        Cmd::Doctor { config, json } => doctor(config, json),
+        Cmd::Health { node } => health(&node).await,
         Cmd::Deploy {
             dir,
             node,
@@ -326,6 +341,137 @@ async fn async_main(cli: Cli) -> Result<()> {
             Ok(())
         }
     }
+}
+
+fn doctor(config: PathBuf, json: bool) -> Result<()> {
+    let cfg = NodeConfig::load(&config)?;
+    let configured_workerd = cfg.runtime.workerd.clone();
+    let workerd = configured_workerd
+        .clone()
+        .or_else(rf::runtime::find_workerd);
+    if let Some(path) = configured_workerd.as_ref() {
+        if !path.is_file() {
+            anyhow::bail!("configured workerd does not exist: {}", path.display());
+        }
+    }
+    let workerd_version = workerd.as_ref().and_then(|path| {
+        std::process::Command::new(path)
+            .arg("--version")
+            .output()
+            .ok()
+            .filter(|out| out.status.success())
+            .map(|out| String::from_utf8_lossy(&out.stdout).trim().to_string())
+    });
+    if let (Some(path), None) = (&configured_workerd, &workerd_version) {
+        anyhow::bail!(
+            "configured workerd could not be executed successfully: {}",
+            path.display()
+        );
+    }
+    let mut warnings = Vec::new();
+    if workerd_version.is_none() {
+        warnings.push("workerd not found; module workers and Durable Objects will be unavailable");
+    }
+    if cfg.public && cfg.ingress.http.is_none() && cfg.ingress.https.is_none() {
+        warnings.push("public node has no HTTP or HTTPS ingress listener");
+    }
+    if !cfg.public && (cfg.ingress.http.is_some() || cfg.ingress.https.is_some()) {
+        warnings.push("ingress is configured but public=false disables it");
+    }
+    if let Some(dns) = &cfg.dns {
+        if std::env::var_os(&dns.api_token_env).is_none() {
+            warnings.push("DNS is configured but its API token environment variable is absent");
+        }
+    }
+    if let Some(acme) = &cfg.acme {
+        let token_env = acme
+            .api_token_env
+            .as_deref()
+            .or_else(|| cfg.dns.as_ref().map(|dns| dns.api_token_env.as_str()))
+            .unwrap_or("CF_API_TOKEN");
+        if std::env::var_os(token_env).is_none() {
+            warnings.push("ACME is configured but its API token environment variable is absent");
+        }
+        if acme.zone.is_none() && cfg.dns.is_none() {
+            warnings.push("ACME is configured but neither acme.zone nor dns.zone is set");
+        }
+    }
+    if cfg.update.enabled {
+        warnings.push(
+            "self-update is enabled; the hardened systemd service intentionally cannot replace /usr/local/bin/rf",
+        );
+    }
+    let report = serde_json::json!({
+        "ok": true,
+        "version": env!("CARGO_PKG_VERSION"),
+        "config": config,
+        "data_dir": cfg.data_dir,
+        "label": cfg.label,
+        "operator": cfg.operator.to_string(),
+        "public": cfg.public,
+        "gossip_listen": cfg.gossip.listen,
+        "gossip_advertise": cfg.gossip_advertise(),
+        "peer_api_listen": cfg.peer_api.listen,
+        "peer_api_advertise": cfg.peer_api_advertise(),
+        "ingress_http": cfg.ingress.http,
+        "ingress_https": cfg.ingress.https,
+        "workerd": workerd,
+        "workerd_version": workerd_version,
+        "warnings": warnings,
+    });
+    if json {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+    } else {
+        println!("configuration OK: {}", config.display());
+        println!(
+            "node: {} ({})",
+            report["label"].as_str().unwrap_or(""),
+            report["operator"].as_str().unwrap_or("unknown")
+        );
+        println!(
+            "gossip: {} -> {}",
+            report["gossip_listen"], report["gossip_advertise"]
+        );
+        println!(
+            "peer API: {} -> {}",
+            report["peer_api_listen"], report["peer_api_advertise"]
+        );
+        match report["workerd_version"].as_str() {
+            Some(version) => println!("runtime: {version}"),
+            None => println!("runtime: unavailable (assets-only mode)"),
+        }
+        for warning in report["warnings"].as_array().into_iter().flatten() {
+            println!("warning: {}", warning.as_str().unwrap_or("unknown warning"));
+        }
+    }
+    Ok(())
+}
+
+async fn health(node: &str) -> Result<()> {
+    let response = reqwest::Client::builder()
+        .connect_timeout(std::time::Duration::from_secs(3))
+        .timeout(std::time::Duration::from_secs(5))
+        .build()?
+        .get(format!("http://{node}/v1/ping"))
+        .send()
+        .await?
+        .error_for_status()?;
+    let body = response.text().await?;
+    let id = parse_ping(&body)?;
+    println!("healthy {node} node={id}");
+    Ok(())
+}
+
+fn parse_ping(body: &str) -> Result<rf_core::identity::PublicId> {
+    let mut parts = body.split_whitespace();
+    if parts.next() != Some("rf") {
+        anyhow::bail!("invalid health response");
+    }
+    parts
+        .next()
+        .ok_or_else(|| anyhow::anyhow!("health response omitted node identity"))?
+        .parse()
+        .map_err(|e| anyhow::anyhow!("invalid node identity in health response: {e}"))
 }
 
 async fn detect_public_ipv4() -> Result<String> {
@@ -507,4 +653,21 @@ async fn run(config_path: PathBuf) -> Result<()> {
     tokio::signal::ctrl_c().await?;
     tracing::info!("shutting down");
     Ok(())
+}
+
+#[cfg(test)]
+mod cli_tests {
+    use super::parse_ping;
+
+    #[test]
+    fn parses_health_identity() {
+        let id = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        assert_eq!(parse_ping(&format!("rf {id}\n")).unwrap().to_string(), id);
+    }
+
+    #[test]
+    fn rejects_invalid_health_response() {
+        assert!(parse_ping("ok").is_err());
+        assert!(parse_ping("rf not-an-id").is_err());
+    }
 }

@@ -15,7 +15,7 @@
 //! KV bindings are native workerd `kvNamespace` bindings: each one
 //! points at an external service → the node's loopback kvbind server,
 //! with the namespace id attached via injectRequestHeaders. Protocol
-//! verified against workerd 2026-07-31 (see kvbind.rs).
+//! verified against workerd 2026-08-04 (see kvbind.rs).
 
 use crate::node::{Node, NodeEvent};
 use anyhow::{Context, Result};
@@ -46,7 +46,7 @@ pub struct WorkerPort(pub u16);
 
 impl Runtime {
     pub fn new(node: Arc<Node>, durable: crate::durable::Coordinator) -> Self {
-        let workerd = node.cfg.runtime.workerd.clone().or_else(which_workerd);
+        let workerd = node.cfg.runtime.workerd.clone().or_else(find_workerd);
         if workerd.is_none() {
             tracing::warn!(
                 "workerd binary not found — module workers disabled, assets still serve"
@@ -288,7 +288,7 @@ impl Runtime {
 
 use sha2::Digest;
 
-fn which_workerd() -> Option<PathBuf> {
+pub fn find_workerd() -> Option<PathBuf> {
     let path = std::env::var_os("PATH")?;
     for dir in std::env::split_paths(&path) {
         let candidate = dir.join("workerd");

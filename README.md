@@ -11,7 +11,8 @@ deploy to any node and gossip does the rest; kill any node and the
 others keep serving (and evict its DNS record via a claimed task).
 
 See [DESIGN.md](./DESIGN.md) for the architecture and consistency
-model.
+model. For a repeatable first-server rollout, use the
+[VPS deployment runbook](./docs/DEPLOYMENT.md).
 
 ## Status: v0.3 (pre-release)
 
@@ -116,16 +117,18 @@ hostnames = ["edge.example.com", "*.edge.example.com"]
 # <data_dir>/certs through cluster KV.
 
 [update]                             # optional self-update from releases
-enabled = true
+enabled = false                      # hardened service uses external upgrades
 # repo = "RandallAnjie/RandallFlare"
 # interval_minutes = 30
 
 rf run --config rf.toml
 ```
 
-As a service: `infra/rf.service` (put `CF_API_TOKEN=…` in `/etc/rf.env`,
-config at `/etc/rf.toml`, binary at `/usr/local/bin/rf`). Keep the config
-and env file mode `0600` because they contain cluster credentials.
+For a systemd deployment, use `infra/deploy-vps.sh` or `infra/install.sh`.
+The supplied unit runs as an unprivileged `rf` user; config and environment
+files are `root:rf` mode `0640`. See the
+[deployment runbook](./docs/DEPLOYMENT.md) for firewall, credentials,
+installation, smoke testing, and upgrades.
 
 > Gossip datagrams and every peer API request/response are encrypted with
 > XChaCha20-Poly1305 using a key derived from the cluster secret. A

@@ -1,30 +1,42 @@
-# RandallFlare node. Install:
-#   cp infra/rf.service /etc/systemd/system/rf.service
-#   install -m600 rf.toml /etc/rf.toml
-#   install -m600 /dev/null /etc/rf.env    # CF_API_TOKEN=... (optional)
-#   systemctl daemon-reload && systemctl enable --now rf
 [Unit]
 Description=RandallFlare edge node
 After=network-online.target
 Wants=network-online.target
 
 [Service]
-ExecStart=/usr/local/bin/rf run --config /etc/rf.toml
+Type=simple
+User=rf
+Group=rf
+WorkingDirectory=/var/lib/rf
+StateDirectory=rf
+StateDirectoryMode=0700
+Environment=RUST_LOG=info,chitchat=warn
 EnvironmentFile=-/etc/rf.env
+ExecStartPre=/usr/local/bin/rf doctor --config /etc/rf.toml
+ExecStart=/usr/local/bin/rf run --config /etc/rf.toml
 Restart=always
 RestartSec=3
+TimeoutStopSec=20
+KillMode=control-group
 UMask=0077
 
-# The node needs to write its data_dir and spawn workerd; keep
-# hardening compatible with that.
+# Bind HTTP/HTTPS without running rf or its workerd children as root.
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
 NoNewPrivileges=true
-ProtectSystem=full
-ProtectHome=read-only
+ProtectSystem=strict
+ProtectHome=true
 PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+SystemCallArchitectures=native
 LimitNOFILE=65536
-# Self-update uses an atomic rename beside /usr/local/bin/rf. Remove
-# this exception if [update] is disabled and upgrades are external.
-ReadWritePaths=/usr/local/bin
 
 [Install]
 WantedBy=multi-user.target

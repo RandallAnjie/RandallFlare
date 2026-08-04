@@ -1,0 +1,50 @@
+# First public node. Replace every REPLACE_* value before installation.
+data_dir = "/var/lib/rf"
+cluster_id = "randallflare-test"
+label = "vps-1"
+operator = "REPLACE_WITH_OPERATOR_PUBLIC_ID"
+cluster_secret = "REPLACE_WITH_64_HEX_CHAR_CLUSTER_SECRET"
+public = true
+
+[gossip]
+listen = "0.0.0.0:7381"
+advertise = "REPLACE_WITH_VPS_IP:7381"
+seeds = []
+interval_ms = 1000
+
+[peer_api]
+listen = "0.0.0.0:7382"
+advertise = "REPLACE_WITH_VPS_IP:7382"
+
+[ingress]
+http = "0.0.0.0:80"
+# Enable after configuring [acme] or installing certificates:
+# https = "0.0.0.0:443"
+
+[runtime]
+workerd = "/usr/local/bin/workerd"
+port_base = 30100
+allow_local_durable_objects = false
+
+[d1]
+compact_threshold = 4096
+keep_tail = 256
+
+[update]
+# The hardened service cannot replace its root-owned executable. Upgrade with
+# infra/deploy-vps.sh or infra/install.sh after publishing a tested release.
+enabled = false
+
+# Optional Cloudflare DNS registration:
+# [dns]
+# hostname = "edge.example.com"
+# zone = "example.com"
+# api_token_env = "CF_API_TOKEN"
+# my_ipv4 = "REPLACE_WITH_VPS_IP"
+
+# Optional automatic TLS issuance (also uncomment ingress.https):
+# [acme]
+# email = "ops@example.com"
+# hostnames = ["edge.example.com", "*.edge.example.com"]
+# zone = "example.com"
+# api_token_env = "CF_API_TOKEN"

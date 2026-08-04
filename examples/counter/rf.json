@@ -1,0 +1,8 @@
+{
+  "name": "rf-smoke-counter",
+  "main": "index.js",
+  "hostnames": ["counter.smoke.rf.test"],
+  "durable_objects": {
+    "COUNTER": { "class_name": "Counter", "enable_sql": true }
+  }
+}
