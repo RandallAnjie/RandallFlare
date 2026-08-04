@@ -119,7 +119,7 @@ pub fn valid_name(name: &str) -> bool {
             .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
 }
 
-fn valid_hostname(h: &str) -> bool {
+pub fn valid_hostname(h: &str) -> bool {
     !h.is_empty()
         && h.len() <= 253
         && !h.starts_with('.')

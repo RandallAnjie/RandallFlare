@@ -106,6 +106,7 @@ nav { display: grid; gap: 3px; }
 .muted, .form-note { color: var(--muted); }
 .muted { line-height: 1.6; font-size: 13px; }
 .form-note { font-size: 11px; margin-top: 12px; line-height: 1.5; }
+.input-note { color: var(--muted); font-size: 10px; line-height: 1.45; overflow-wrap: anywhere; }
 .text-button { border: 0; background: transparent; color: var(--link); cursor: pointer; padding: 4px; font-size: 12px; }
 .empty-state { color: var(--muted); font-size: 13px; padding: 20px 0; }
 
@@ -373,7 +374,7 @@ dialog::backdrop { background: #000c; backdrop-filter: blur(3px); }
   .import-panel { padding: 18px; }
   .domain-overview { grid-template-columns: 1fr; }
   .domain-row { grid-template-columns: 30px minmax(0, 1fr) auto; align-items: start; }
-  .domain-row > button { grid-column: 3; grid-row: 1; }
+  .domain-row > button, .domain-row > .badge { grid-column: 3; grid-row: 1; }
   .domain-certificate { grid-column: 2 / -1; grid-row: 2; }
   .domain-add-form, .dns-guide { grid-template-columns: 1fr; }
   .danger-zone { align-items: stretch; flex-direction: column; }

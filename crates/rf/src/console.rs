@@ -745,8 +745,15 @@ async fn worker_get(
             .map(|record| serde_json::to_value(record).unwrap_or(Value::Null)),
         ConsoleMode::Local { .. } => None,
     };
+    let (default_hostname, effective_hostnames) = match &state.mode {
+        ConsoleMode::Public { node, .. } => (
+            node.default_worker_hostname(&manifest.name),
+            node.effective_worker_hostnames(&manifest),
+        ),
+        ConsoleMode::Local { .. } => (None, manifest.hostnames.clone()),
+    };
     let tls = match &state.mode {
-        ConsoleMode::Public { node, .. } => worker_tls_view(node, &manifest.hostnames),
+        ConsoleMode::Public { node, .. } => worker_tls_view(node, &effective_hostnames),
         ConsoleMode::Local { .. } => json!({
             "enabled": false,
             "acme_enabled": false,
@@ -754,7 +761,7 @@ async fn worker_get(
             "include_worker_hostnames": false,
             "zone": null,
             "dns_target": null,
-            "certificates": manifest.hostnames.iter().map(|hostname| json!({
+            "certificates": effective_hostnames.iter().map(|hostname| json!({
                 "hostname": hostname,
                 "status": "unknown",
                 "source": "unknown",
@@ -775,7 +782,9 @@ async fn worker_get(
             "main": manifest.main,
             "modules": manifest.modules,
             "assets": manifest.assets,
-            "hostnames": manifest.hostnames,
+            "hostnames": effective_hostnames,
+            "custom_hostnames": manifest.hostnames,
+            "default_hostname": default_hostname,
             "env": env,
             "kv_bindings": manifest.kv_bindings,
             "crons": manifest.crons,
@@ -1836,6 +1845,7 @@ mod tests {
             [ingress]
             http = "127.0.0.1:18080"
             https = "127.0.0.1:18443"
+            default_domain = "example.com"
             [acme]
             email = "ops@example.com"
             hostnames = ["*.example.com"]

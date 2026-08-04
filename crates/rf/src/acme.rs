@@ -135,15 +135,27 @@ pub fn spawn_materializer(node: Arc<Node>) {
 pub fn spawn_renewer(node: Arc<Node>, cfg: AcmeConfig, dns: DnsApi) {
     tokio::spawn(async move {
         loop {
-            let mut hostnames: BTreeSet<String> = cfg.hostnames.iter().cloned().collect();
+            let configured: BTreeSet<String> = cfg
+                .hostnames
+                .iter()
+                .map(|hostname| hostname.trim().trim_end_matches('.').to_ascii_lowercase())
+                .collect();
+            let mut hostnames = configured.clone();
             if cfg.include_worker_hostnames {
                 if let Some(zone) = cfg.zone.as_deref() {
                     let zone = zone.trim().trim_end_matches('.').to_ascii_lowercase();
                     for manifest in node.live_manifests() {
-                        for hostname in manifest.hostnames {
+                        for hostname in node.effective_worker_hostnames(&manifest) {
                             let hostname =
                                 hostname.trim().trim_end_matches('.').to_ascii_lowercase();
                             if hostname == zone || hostname.ends_with(&format!(".{zone}")) {
+                                let covered_by_configured_wildcard = hostname
+                                    .split_once('.')
+                                    .map(|(_, suffix)| format!("*.{suffix}"))
+                                    .is_some_and(|wildcard| configured.contains(&wildcard));
+                                if covered_by_configured_wildcard {
+                                    continue;
+                                }
                                 hostnames.insert(hostname);
                             }
                         }

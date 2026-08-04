@@ -18,6 +18,9 @@ advertise = "REPLACE_WITH_VPS_IP:7382"
 
 [ingress]
 http = "0.0.0.0:80"
+# Optional: with wildcard DNS/TLS in place, every Worker automatically receives
+# <worker>.workers.example.com on every node.
+# default_domain = "workers.example.com"
 # Enable after configuring [acme] or installing certificates:
 # https = "0.0.0.0:443"
 
