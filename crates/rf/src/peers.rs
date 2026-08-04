@@ -860,6 +860,87 @@ impl PeerClient {
         Ok(serde_json::from_slice(&raw)?)
     }
 
+    pub async fn flow_create(
+        &self,
+        base: &str,
+        flow: &str,
+        run_key: Option<&str>,
+        input: serde_json::Value,
+    ) -> Result<crate::flow::FlowRun> {
+        let raw = self
+            .post(
+                base,
+                &format!("/v1/flow/{}/runs", component(flow)),
+                serde_json::to_vec(&serde_json::json!({
+                    "run_key": run_key,
+                    "input": input,
+                }))?,
+            )
+            .await?;
+        Ok(serde_json::from_slice(&raw)?)
+    }
+
+    pub async fn flow_runs(
+        &self,
+        base: &str,
+        flow: &str,
+        status: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<crate::flow::FlowRun>> {
+        let mut path = format!(
+            "/v1/flow/{}/runs?limit={}",
+            component(flow),
+            limit.clamp(1, 1_000)
+        );
+        if let Some(status) = status {
+            path.push_str("&status=");
+            path.push_str(&component(status));
+        }
+        Ok(serde_json::from_slice(&self.get(base, &path).await?)?)
+    }
+
+    pub async fn flow_run(&self, base: &str, flow: &str, id: &str) -> Result<serde_json::Value> {
+        let raw = self
+            .get(
+                base,
+                &format!("/v1/flow/{}/runs/{}", component(flow), component(id)),
+            )
+            .await?;
+        Ok(serde_json::from_slice(&raw)?)
+    }
+
+    pub async fn flow_action(
+        &self,
+        base: &str,
+        flow: &str,
+        id: &str,
+        action: &str,
+    ) -> Result<serde_json::Value> {
+        if !matches!(action, "cancel" | "retry") {
+            anyhow::bail!("Flow 操作无效");
+        }
+        let raw = self
+            .post(
+                base,
+                &format!(
+                    "/v1/flow/{}/runs/{}/{}",
+                    component(flow),
+                    component(id),
+                    action
+                ),
+                vec![],
+            )
+            .await?;
+        Ok(serde_json::from_slice(&raw)?)
+    }
+
+    pub async fn flow_stats(&self, base: &str, flow: &str) -> Result<crate::flow::FlowStats> {
+        let raw = self
+            .get(base, &format!("/v1/flow/{}/stats", component(flow)))
+            .await?;
+        Ok(serde_json::from_slice(&raw)?)
+    }
+
     /// Execute SQL against a D1 database, following leader hints
     /// (bounded) — callers can point at ANY cluster node.
     pub async fn d1_exec(

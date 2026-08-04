@@ -230,6 +230,9 @@ pub fn database_name(queue: &str) -> String {
 
 pub async fn enqueue(node: &Node, queue: &str, messages: Vec<SendMessage>) -> Result<Vec<String>> {
     let (_, spec) = queue_record(node, queue).context("队列不存在")?;
+    if spec.suspended {
+        bail!("队列已暂停");
+    }
     if messages.is_empty() || messages.len() > MAX_BATCH_MESSAGES {
         bail!("每次必须发送 1 至 100 条队列消息");
     }
@@ -250,8 +253,71 @@ pub async fn enqueue(node: &Node, queue: &str, messages: Vec<SendMessage>) -> Re
     ensure_schema(node, queue).await?;
     insert_messages(node, queue, &entries).await?;
     increment_counter(node, queue, "total_produced", entries.len() as u64).await?;
-    let _ = spec;
     Ok(entries.into_iter().map(|entry| entry.0).collect())
+}
+
+/// Atomically lease and acknowledge one ready message for a Flow receive
+/// node. The D1 lease prevents a Worker consumer or another Flow from seeing
+/// the same delivery concurrently; acknowledgement and counters are durable.
+pub async fn receive_one(node: &Node, queue: &str) -> Result<Option<QueueMessage>> {
+    let (_, spec) = queue_record(node, queue).context("队列不存在")?;
+    if spec.suspended {
+        bail!("队列已暂停");
+    }
+    ensure_schema(node, queue).await?;
+    let now = now_ms();
+    let expired_before = now.saturating_sub(spec.retention_seconds.saturating_mul(1_000));
+    exec(
+        node,
+        queue,
+        "DELETE FROM queue_messages WHERE produced_at_ms < ?1",
+        json!([expired_before]),
+    )
+    .await?;
+    let lease = new_message_id();
+    exec(
+        node,
+        queue,
+        r#"UPDATE queue_messages
+           SET lease_id=?1,lease_until_ms=?2,attempts=attempts+1
+           WHERE id=(
+             SELECT id FROM queue_messages
+             WHERE available_at_ms<=?3 AND (lease_id IS NULL OR lease_until_ms<=?3)
+             ORDER BY available_at_ms,id LIMIT 1
+           ) AND (lease_id IS NULL OR lease_until_ms<=?3)"#,
+        json!([lease, now.saturating_add(spec.visibility_timeout_ms), now]),
+    )
+    .await?;
+    let message = rows(
+        exec(
+            node,
+            queue,
+            r#"SELECT id,body_json,produced_at_ms,attempts FROM queue_messages
+               WHERE lease_id=?1 LIMIT 1"#,
+            json!([lease]),
+        )
+        .await?,
+    )
+    .first()
+    .map(row_to_message)
+    .transpose()?;
+    let Some(message) = message else {
+        return Ok(None);
+    };
+    let deleted = exec(
+        node,
+        queue,
+        "DELETE FROM queue_messages WHERE id=?1 AND lease_id=?2",
+        json!([message.id, lease]),
+    )
+    .await?["rows_affected"]
+        .as_u64()
+        .unwrap_or(0);
+    if deleted != 1 {
+        bail!("队列消息确认失败：租约可能已转移");
+    }
+    increment_counter(node, queue, "total_consumed", 1).await?;
+    Ok(Some(message))
 }
 
 async fn enqueue_existing(

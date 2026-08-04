@@ -102,6 +102,20 @@ async fn handle(State(ingress): State<Ingress>, req: Request) -> Response {
             .unwrap_or_else(|never| match never {});
     }
 
+    if let Some((flow, spec)) = crate::flow::flow_records(&ingress.node)
+        .into_iter()
+        .find_map(|(view, spec)| {
+            ingress
+                .node
+                .effective_flow_hostnames(&view.resource.name, &spec)
+                .iter()
+                .any(|candidate| candidate == &host)
+                .then_some((view.resource.name, spec))
+        })
+    {
+        return serve_flow_ingress(&ingress.node, req, &flow, &spec).await;
+    }
+
     if let Some((pipeline, spec)) = crate::pipeline::pipeline_records(&ingress.node)
         .into_iter()
         .find_map(|(view, spec)| {
@@ -184,6 +198,129 @@ async fn handle(State(ingress): State<Ingress>, req: Request) -> Response {
             .into_response();
     };
     proxy(&ingress.http, req, port).await
+}
+
+async fn serve_flow_ingress(
+    node: &Node,
+    req: Request,
+    flow: &str,
+    spec: &crate::flow::FlowSpec,
+) -> Response {
+    if spec.trigger != crate::flow::FlowTrigger::Webhook {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+    if req.method() != Method::POST || !matches!(req.uri().path(), "/" | "/hook" | "/v1/run") {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+    if !flow_token_authorized(req.headers(), spec) {
+        let mut response = (StatusCode::UNAUTHORIZED, "Flow Webhook 令牌无效\n").into_response();
+        response.headers_mut().insert(
+            axum::http::header::WWW_AUTHENTICATE,
+            HeaderValue::from_static("Bearer realm=\"RandallFlare Flow\""),
+        );
+        return response;
+    }
+    let run_key = req
+        .headers()
+        .get("idempotency-key")
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_string);
+    let wait = req.uri().query().is_some_and(|query| {
+        query
+            .split('&')
+            .any(|pair| matches!(pair, "wait=1" | "sync=1"))
+    });
+    let body = match axum::body::to_bytes(req.into_body(), crate::flow::MAX_RUN_INPUT_BYTES).await {
+        Ok(body) => body,
+        Err(_) => {
+            return (StatusCode::PAYLOAD_TOO_LARGE, "Flow 输入不得超过 4 MiB\n").into_response()
+        }
+    };
+    let input = if body.is_empty() {
+        serde_json::Value::Null
+    } else {
+        match serde_json::from_slice(&body) {
+            Ok(input) => input,
+            Err(error) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    format!("Flow 输入必须是 JSON：{error}\n"),
+                )
+                    .into_response();
+            }
+        }
+    };
+    let run = match crate::flow::create_run(node, flow, run_key.as_deref(), "webhook", input).await
+    {
+        Ok(run) => run,
+        Err(error) => return (StatusCode::UNPROCESSABLE_ENTITY, error.to_string()).into_response(),
+    };
+    if !wait {
+        return (
+            StatusCode::ACCEPTED,
+            axum::Json(serde_json::json!({
+                "id": run.id,
+                "status": run.status,
+                "createdAtMs": run.created_at_ms,
+            })),
+        )
+            .into_response();
+    }
+    match crate::flow::wait_run(node, flow, &run.id, std::time::Duration::from_secs(25)).await {
+        Ok(run) if run.status == "complete" => (
+            StatusCode::OK,
+            axum::Json(serde_json::json!({
+                "ok": true,
+                "id": run.id,
+                "status": run.status,
+                "output": run.output,
+            })),
+        )
+            .into_response(),
+        Ok(run) if run.status == "failed" => (
+            StatusCode::BAD_GATEWAY,
+            axum::Json(serde_json::json!({
+                "ok": false,
+                "id": run.id,
+                "status": run.status,
+                "error": run.error,
+            })),
+        )
+            .into_response(),
+        Ok(run) if run.status == "cancelled" => (
+            StatusCode::CONFLICT,
+            axum::Json(serde_json::json!({
+                "ok": false,
+                "id": run.id,
+                "status": run.status,
+                "error": "Flow 运行已取消",
+            })),
+        )
+            .into_response(),
+        Ok(run) => (
+            StatusCode::ACCEPTED,
+            axum::Json(serde_json::json!({
+                "ok": true,
+                "id": run.id,
+                "status": run.status,
+            })),
+        )
+            .into_response(),
+        Err(error) => (StatusCode::SERVICE_UNAVAILABLE, error.to_string()).into_response(),
+    }
+}
+
+fn flow_token_authorized(headers: &axum::http::HeaderMap, spec: &crate::flow::FlowSpec) -> bool {
+    headers
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.strip_prefix("Bearer "))
+        .or_else(|| {
+            headers
+                .get("x-flow-token")
+                .and_then(|value| value.to_str().ok())
+        })
+        .is_some_and(|token| crate::flow::token_matches(spec, token.trim()))
 }
 
 async fn serve_pipeline_ingress(

@@ -274,6 +274,13 @@ pub fn router(state: ConsoleState) -> Router {
             "/api/workflows/{name}/instances/{id}/{action}",
             post(workflow_action),
         )
+        .route("/api/flows", get(flow_list).post(flow_apply))
+        .route("/api/flows/{name}", delete(flow_delete))
+        .route("/api/flows/{name}/tokens", post(flow_token_mint))
+        .route("/api/flows/{name}/tokens/{id}", delete(flow_token_revoke))
+        .route("/api/flows/{name}/runs", get(flow_runs).post(flow_trigger))
+        .route("/api/flows/{name}/runs/{id}", get(flow_run))
+        .route("/api/flows/{name}/runs/{id}/{action}", post(flow_action))
         .route("/api/auth/logout", post(logout))
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
@@ -3136,6 +3143,319 @@ async fn workflow_action(
         .workflow_action(&state.node, &name, &id, &action)
         .await?;
     Ok(Json(json!({ "ok": true })))
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FlowRequest {
+    name: String,
+    #[serde(default)]
+    description: String,
+    graph: crate::flow::FlowGraph,
+    #[serde(default)]
+    trigger: crate::flow::FlowTrigger,
+    #[serde(default)]
+    cron: Option<String>,
+    #[serde(default)]
+    hostnames: Vec<String>,
+    #[serde(default)]
+    suspended: bool,
+    #[serde(default)]
+    suspend_reason: String,
+    #[serde(default = "flow_default_retention_days")]
+    retention_days: u16,
+    #[serde(default = "flow_default_max_concurrent_runs")]
+    max_concurrent_runs: u16,
+    #[serde(default)]
+    alert_webhook_env: Option<String>,
+    /// When present, mint a first/extra Webhook token in the same signed edit.
+    #[serde(default)]
+    webhook_token_label: Option<String>,
+}
+
+fn flow_default_retention_days() -> u16 {
+    30
+}
+
+fn flow_default_max_concurrent_runs() -> u16 {
+    32
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FlowTokenRequest {
+    #[serde(default)]
+    label: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FlowTriggerRequest {
+    #[serde(default)]
+    run_key: Option<String>,
+    #[serde(default)]
+    input: Value,
+}
+
+#[derive(Debug, Deserialize)]
+struct FlowRunsQuery {
+    status: Option<String>,
+    limit: Option<usize>,
+}
+
+async fn flow_list(State(state): State<ConsoleState>) -> ApiResult<Json<Value>> {
+    let records = state
+        .client
+        .resource_heads(&state.node, Some(crate::flow::FLOW_KIND))
+        .await?;
+    let status = state.client.status(&state.node).await.ok();
+    let default_domain = status
+        .as_ref()
+        .and_then(|status| status.get("default_worker_domain"))
+        .and_then(Value::as_str);
+    let mut flows = Vec::new();
+    for view in records.into_iter().filter(|view| !view.resource.deleted) {
+        let spec = crate::flow::flow_spec(&view.resource)?;
+        let stats = state
+            .client
+            .flow_stats(&state.node, &view.resource.name)
+            .await
+            .ok();
+        let default_hostname =
+            default_domain.map(|domain| format!("flow-{}.{domain}", view.resource.name));
+        let mut hostnames = default_hostname.iter().cloned().collect::<Vec<_>>();
+        for hostname in &spec.hostnames {
+            if !hostnames.contains(hostname) {
+                hostnames.push(hostname.clone());
+            }
+        }
+        flows.push(json!({
+            "name": view.resource.name,
+            "version": view.resource.version,
+            "digest": view.digest,
+            "default_hostname": default_hostname,
+            "hostnames": hostnames,
+            "spec": spec,
+            "stats": stats,
+        }));
+    }
+    Ok(Json(json!({ "flows": flows })))
+}
+
+async fn flow_apply(
+    State(state): State<ConsoleState>,
+    Extension(principal): Extension<ConsolePrincipal>,
+    Json(request): Json<FlowRequest>,
+) -> ApiResult<Json<Value>> {
+    state.require_mutation()?;
+    let head = state
+        .client
+        .resource_head(&state.node, crate::flow::FLOW_KIND, &request.name)
+        .await?;
+    let mut tokens = head
+        .as_ref()
+        .and_then(|head| crate::flow::flow_spec(&head.resource).ok())
+        .map(|spec| spec.tokens)
+        .unwrap_or_default();
+    let minted = if let Some(label) = request.webhook_token_label {
+        let (token, plaintext) = crate::flow::mint_token(label)?;
+        let id = token.id.clone();
+        tokens.push(token);
+        Some((id, plaintext))
+    } else {
+        None
+    };
+    let spec = crate::flow::FlowSpec {
+        description: request.description,
+        graph: request.graph,
+        trigger: request.trigger,
+        cron: request.cron,
+        hostnames: request.hostnames,
+        tokens,
+        suspended: request.suspended,
+        suspend_reason: request.suspend_reason,
+        retention_days: request.retention_days,
+        max_concurrent_runs: request.max_concurrent_runs,
+        alert_webhook_env: request.alert_webhook_env,
+    };
+    let record = crate::flow::prepare_flow_after(&request.name, spec, false, head.as_ref())?;
+    let mut response = submit_flow_resource(
+        &state,
+        &principal,
+        record,
+        format!("创建或更新 Flow {}", request.name),
+    )
+    .await?
+    .0;
+    if let Some((id, plaintext)) = minted {
+        response["token"] = Value::String(plaintext);
+        response["token_id"] = Value::String(id);
+    }
+    Ok(Json(response))
+}
+
+async fn flow_delete(
+    State(state): State<ConsoleState>,
+    Extension(principal): Extension<ConsolePrincipal>,
+    Path(name): Path<String>,
+) -> ApiResult<Json<Value>> {
+    state.require_mutation()?;
+    let head = state
+        .client
+        .resource_head(&state.node, crate::flow::FLOW_KIND, &name)
+        .await?
+        .filter(|view| !view.resource.deleted)
+        .ok_or_else(|| ApiError::not_found("Flow 不存在"))?;
+    let spec = crate::flow::flow_spec(&head.resource)?;
+    let record = crate::flow::prepare_flow_after(&name, spec, true, Some(&head))?;
+    submit_flow_resource(&state, &principal, record, format!("删除 Flow {name}")).await
+}
+
+async fn flow_token_mint(
+    State(state): State<ConsoleState>,
+    Extension(principal): Extension<ConsolePrincipal>,
+    Path(name): Path<String>,
+    Json(request): Json<FlowTokenRequest>,
+) -> ApiResult<Json<Value>> {
+    state.require_mutation()?;
+    let head = state
+        .client
+        .resource_head(&state.node, crate::flow::FLOW_KIND, &name)
+        .await?
+        .filter(|view| !view.resource.deleted)
+        .ok_or_else(|| ApiError::not_found("Flow 不存在"))?;
+    let mut spec = crate::flow::flow_spec(&head.resource)?;
+    let (token, plaintext) = crate::flow::mint_token(request.label)?;
+    let token_id = token.id.clone();
+    spec.tokens.push(token);
+    let record = crate::flow::prepare_flow_after(&name, spec, false, Some(&head))?;
+    let mut response = submit_flow_resource(
+        &state,
+        &principal,
+        record,
+        format!("为 Flow {name} 签发 Webhook 令牌"),
+    )
+    .await?
+    .0;
+    response["token"] = Value::String(plaintext);
+    response["token_id"] = Value::String(token_id);
+    Ok(Json(response))
+}
+
+async fn flow_token_revoke(
+    State(state): State<ConsoleState>,
+    Extension(principal): Extension<ConsolePrincipal>,
+    Path((name, id)): Path<(String, String)>,
+) -> ApiResult<Json<Value>> {
+    state.require_mutation()?;
+    let head = state
+        .client
+        .resource_head(&state.node, crate::flow::FLOW_KIND, &name)
+        .await?
+        .filter(|view| !view.resource.deleted)
+        .ok_or_else(|| ApiError::not_found("Flow 不存在"))?;
+    let mut spec = crate::flow::flow_spec(&head.resource)?;
+    let before = spec.tokens.len();
+    spec.tokens.retain(|token| token.id != id);
+    if before == spec.tokens.len() {
+        return Err(ApiError::not_found("Flow Webhook 令牌不存在"));
+    }
+    let record = crate::flow::prepare_flow_after(&name, spec, false, Some(&head))?;
+    submit_flow_resource(
+        &state,
+        &principal,
+        record,
+        format!("撤销 Flow {name} 的 Webhook 令牌 {id}"),
+    )
+    .await
+}
+
+async fn submit_flow_resource(
+    state: &ConsoleState,
+    principal: &ConsolePrincipal,
+    record: crate::resource::ResourceRecord,
+    description: String,
+) -> ApiResult<Json<Value>> {
+    match &state.mode {
+        ConsoleMode::Local { .. } => {
+            let envelope = rf_core::envelope::Envelope::seal_any(&record, state.operator()?);
+            state.client.post_resource(&state.node, &envelope).await?;
+            Ok(Json(json!({
+                "ok": true,
+                "name": record.name,
+                "version": record.version,
+            })))
+        }
+        ConsoleMode::Public { node, .. } => {
+            let approval = node.management.create_resource(
+                principal.session_id,
+                &record,
+                format!("{description} v{}", record.version),
+            )?;
+            Ok(Json(json!({
+                "ok": true,
+                "pending_approval": true,
+                "name": record.name,
+                "version": record.version,
+                "approval": approval,
+                "approve_node": node.cfg.peer_api_advertise().to_string(),
+            })))
+        }
+    }
+}
+
+async fn flow_trigger(
+    State(state): State<ConsoleState>,
+    Path(name): Path<String>,
+    Json(request): Json<FlowTriggerRequest>,
+) -> ApiResult<Json<Value>> {
+    state.require_mutation()?;
+    let run = state
+        .client
+        .flow_create(
+            &state.node,
+            &name,
+            request.run_key.as_deref(),
+            request.input,
+        )
+        .await?;
+    Ok(Json(json!({ "ok": true, "run": run })))
+}
+
+async fn flow_runs(
+    State(state): State<ConsoleState>,
+    Path(name): Path<String>,
+    Query(query): Query<FlowRunsQuery>,
+) -> ApiResult<Json<Value>> {
+    let runs = state
+        .client
+        .flow_runs(
+            &state.node,
+            &name,
+            query.status.as_deref(),
+            query.limit.unwrap_or(100),
+        )
+        .await?;
+    Ok(Json(json!({ "runs": runs })))
+}
+
+async fn flow_run(
+    State(state): State<ConsoleState>,
+    Path((name, id)): Path<(String, String)>,
+) -> ApiResult<Json<Value>> {
+    Ok(Json(state.client.flow_run(&state.node, &name, &id).await?))
+}
+
+async fn flow_action(
+    State(state): State<ConsoleState>,
+    Path((name, id, action)): Path<(String, String, String)>,
+) -> ApiResult<Json<Value>> {
+    state.require_mutation()?;
+    let result = state
+        .client
+        .flow_action(&state.node, &name, &id, &action)
+        .await?;
+    Ok(Json(json!({ "ok": true, "result": result })))
 }
 
 async fn r2_object_list(

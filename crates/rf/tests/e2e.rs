@@ -220,6 +220,155 @@ const SECRET: [u8; 32] = [42u8; 32];
 // still run concurrently and exercise the real distributed behavior.
 static E2E_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
+#[tokio::test(flavor = "multi_thread")]
+async fn durable_flow_webhook_loops_and_resource_nodes() {
+    let _scenario = E2E_LOCK.lock().await;
+    let operator = Keypair::from_seed([37u8; 32]);
+    let operator_any = AnyKeypair::Ed(operator.clone());
+    let client = PeerClient::new(SECRET);
+    let http = reqwest::Client::new();
+    let mut node = start("flow", &operator, &[]);
+    wait_ping(&node.api, Duration::from_secs(15)).await;
+
+    let graph: rf::flow::FlowGraph = serde_json::from_value(serde_json::json!({
+        "nodes": [
+            {"id":"start","type":"flowNode","position":{"x":0,"y":0},"data":{"nodeType":"trigger","label":"开始"}},
+            {"id":"enabled","type":"flowNode","position":{"x":180,"y":0},"data":{"nodeType":"branch","label":"是否启用","condition":"input.enabled == true"}},
+            {"id":"items","type":"flowNode","position":{"x":360,"y":0},"data":{"nodeType":"loop","label":"逐项写入","items":"input.items","maxIterations":10}},
+            {"id":"store","type":"flowNode","position":{"x":540,"y":100},"data":{"nodeType":"kv","label":"保存项目","namespace":"flow-e2e","action":"put","key":"{{ item.id }}","value":"{{ item }}"}},
+            {"id":"finish","type":"flowNode","position":{"x":720,"y":0},"data":{"nodeType":"transform","label":"完成","expression":"input"}},
+            {"id":"disabled","type":"flowNode","position":{"x":360,"y":180},"data":{"nodeType":"transform","label":"未启用","template":{"skipped":true}}}
+        ],
+        "edges": [
+            {"id":"e1","source":"start","target":"enabled"},
+            {"id":"e2","source":"enabled","target":"items","sourceHandle":"true"},
+            {"id":"e3","source":"enabled","target":"disabled","sourceHandle":"false"},
+            {"id":"e4","source":"items","target":"store","sourceHandle":"each"},
+            {"id":"e5","source":"items","target":"finish","sourceHandle":"done"}
+        ]
+    }))
+    .unwrap();
+    let (token, plaintext) = rf::flow::mint_token("e2e-webhook").unwrap();
+    let record = rf::flow::prepare_flow_after(
+        "durable-map",
+        rf::flow::FlowSpec {
+            description: "Flow 端到端耐久循环".into(),
+            graph,
+            trigger: rf::flow::FlowTrigger::Webhook,
+            cron: None,
+            hostnames: vec!["flow.test".into()],
+            tokens: vec![token],
+            suspended: false,
+            suspend_reason: String::new(),
+            retention_days: 30,
+            max_concurrent_runs: 8,
+            alert_webhook_env: None,
+        },
+        false,
+        None,
+    )
+    .unwrap();
+    assert!(!record.spec_json.contains(&plaintext));
+    client
+        .post_resource(
+            &node.api,
+            &rf_core::envelope::Envelope::seal_any(&record, &operator_any),
+        )
+        .await
+        .unwrap();
+
+    let response: serde_json::Value = http
+        .post(format!("http://127.0.0.1:{}/v1/run?wait=1", node.ingress))
+        .header("host", "flow.test")
+        .bearer_auth(&plaintext)
+        .header("idempotency-key", "flow-e2e-run")
+        .json(&serde_json::json!({
+            "enabled": true,
+            "items": [{"id":"alpha","value":1},{"id":"beta","value":2}]
+        }))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let run_id = response["id"].as_str().unwrap().to_string();
+    assert_eq!(response["status"], "complete");
+    assert_eq!(response["output"][0]["key"], "alpha");
+    assert_eq!(response["output"][1]["key"], "beta");
+    let duplicate: serde_json::Value = http
+        .post(format!("http://127.0.0.1:{}/v1/run", node.ingress))
+        .header("host", "flow.test")
+        .bearer_auth(&plaintext)
+        .header("idempotency-key", "flow-e2e-run")
+        .json(&serde_json::json!({"enabled":true,"items":[]}))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(duplicate["id"], run_id);
+
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        let detail = client
+            .flow_run(&node.api, "durable-map", &run_id)
+            .await
+            .unwrap();
+        if detail["run"]["status"] == "complete" {
+            assert_eq!(detail["run"]["output"][0]["key"], "alpha");
+            assert_eq!(detail["run"]["output"][1]["key"], "beta");
+            assert!(detail["steps"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|step| step["node_id"] == "store" && step["iteration"] == 2));
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "Flow did not reach a durable terminal state: {detail}"
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    let alpha = client
+        .kv_get(&node.api, "flow-e2e", "alpha")
+        .await
+        .unwrap()
+        .unwrap();
+    let beta = client
+        .kv_get(&node.api, "flow-e2e", "beta")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&alpha).unwrap()["value"],
+        1
+    );
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&beta).unwrap()["value"],
+        2
+    );
+
+    let denied = http
+        .post(format!("http://127.0.0.1:{}/v1/run", node.ingress))
+        .header("host", "flow.test")
+        .bearer_auth("wrong")
+        .json(&serde_json::json!({}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(denied.status(), reqwest::StatusCode::UNAUTHORIZED);
+
+    node.child.kill().unwrap();
+    node.child.wait().unwrap();
+}
+
 struct TestNode {
     child: TestChild,
     api: String,

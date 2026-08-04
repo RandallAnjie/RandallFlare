@@ -131,6 +131,10 @@ pub fn router(api: Api) -> Router {
             post(workflow_action),
         )
         .route("/v1/workflow/{workflow}/stats", get(workflow_stats))
+        .route("/v1/flow/{flow}/runs", post(flow_create).get(flow_runs))
+        .route("/v1/flow/{flow}/runs/{id}", get(flow_run))
+        .route("/v1/flow/{flow}/runs/{id}/{action}", post(flow_action))
+        .route("/v1/flow/{flow}/stats", get(flow_stats))
         .route("/v1/do/{worker}/proxy", post(do_proxy))
         .route("/v1/r2/{bucket}", get(r2_list))
         .route("/v1/r2-blob/{sha}", get(r2_blob_get))
@@ -438,6 +442,7 @@ async fn status(
                 && !name.starts_with("analytics-")
                 && !name.starts_with("pipeline-")
                 && !name.starts_with("workflow-")
+                && !name.starts_with("flow-")
         })
         .collect();
     let buckets: Vec<serde_json::Value> = crate::r2::bucket_records(node)
@@ -495,6 +500,20 @@ async fn status(
             })
         })
         .collect();
+    let flows: Vec<serde_json::Value> = crate::flow::flow_records(node)
+        .into_iter()
+        .map(|(view, spec)| {
+            let hostnames = node.effective_flow_hostnames(&view.resource.name, &spec);
+            serde_json::json!({
+                "name": view.resource.name,
+                "version": view.resource.version,
+                "digest": view.digest,
+                "default_hostname": node.default_flow_hostname(&view.resource.name),
+                "hostnames": hostnames,
+                "spec": spec,
+            })
+        })
+        .collect();
     axum::Json(serde_json::json!({
         "node": node.id_hex(),
         "label": node.cfg.label,
@@ -511,6 +530,7 @@ async fn status(
         "analytics_datasets": analytics_datasets,
         "pipelines": pipelines,
         "workflows": workflows,
+        "flows": flows,
         "storage": {
             "local": true,
             "rclone": node.cfg.storage.rclone_binary.is_some(),
@@ -1519,6 +1539,155 @@ async fn workflow_stats(
         return response.into_response();
     }
     match crate::workflow::stats(&api.node, &workflow).await {
+        Ok(stats) => axum::Json(stats).into_response(),
+        Err(error) => (StatusCode::UNPROCESSABLE_ENTITY, error.to_string()).into_response(),
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FlowCreateReq {
+    #[serde(default)]
+    run_key: Option<String>,
+    #[serde(default)]
+    input: serde_json::Value,
+}
+
+async fn flow_create(
+    State(api): State<Api>,
+    ConnectInfo(remote): ConnectInfo<SocketAddr>,
+    Path(flow): Path<String>,
+    method: Method,
+    uri: Uri,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    if let Err(response) = check(&api, &remote, &headers, &method, &uri, &body) {
+        return response.into_response();
+    }
+    let Ok(request) = serde_json::from_slice::<FlowCreateReq>(&body) else {
+        return (StatusCode::BAD_REQUEST, "Flow 触发请求无效").into_response();
+    };
+    match crate::flow::create_run(
+        &api.node,
+        &flow,
+        request.run_key.as_deref(),
+        "manual",
+        request.input,
+    )
+    .await
+    {
+        Ok(run) => (StatusCode::ACCEPTED, axum::Json(run)).into_response(),
+        Err(error) => (StatusCode::UNPROCESSABLE_ENTITY, error.to_string()).into_response(),
+    }
+}
+
+#[derive(Deserialize)]
+struct FlowRunsQuery {
+    status: Option<String>,
+    limit: Option<usize>,
+}
+
+async fn flow_runs(
+    State(api): State<Api>,
+    ConnectInfo(remote): ConnectInfo<SocketAddr>,
+    Path(flow): Path<String>,
+    Query(query): Query<FlowRunsQuery>,
+    method: Method,
+    uri: Uri,
+    headers: HeaderMap,
+) -> Response {
+    if let Err(response) = check(&api, &remote, &headers, &method, &uri, b"") {
+        return response.into_response();
+    }
+    match crate::flow::runs(
+        &api.node,
+        &flow,
+        query.status.as_deref(),
+        query.limit.unwrap_or(100),
+    )
+    .await
+    {
+        Ok(runs) => axum::Json(runs).into_response(),
+        Err(error) => (StatusCode::UNPROCESSABLE_ENTITY, error.to_string()).into_response(),
+    }
+}
+
+async fn flow_run(
+    State(api): State<Api>,
+    ConnectInfo(remote): ConnectInfo<SocketAddr>,
+    Path((flow, id)): Path<(String, String)>,
+    method: Method,
+    uri: Uri,
+    headers: HeaderMap,
+) -> Response {
+    if let Err(response) = check(&api, &remote, &headers, &method, &uri, b"") {
+        return response.into_response();
+    }
+    let run = match crate::flow::run(&api.node, &flow, &id).await {
+        Ok(Some(run)) => run,
+        Ok(None) => return (StatusCode::NOT_FOUND, "Flow 运行不存在").into_response(),
+        Err(error) => return (StatusCode::UNPROCESSABLE_ENTITY, error.to_string()).into_response(),
+    };
+    let (steps, events) = tokio::join!(
+        crate::flow::run_steps(&api.node, &flow, &id),
+        crate::flow::run_events(&api.node, &flow, &id, 500),
+    );
+    match (steps, events) {
+        (Ok(steps), Ok(events)) => axum::Json(serde_json::json!({
+            "run": run,
+            "steps": steps,
+            "events": events,
+        }))
+        .into_response(),
+        (steps, events) => {
+            let error = steps
+                .err()
+                .or_else(|| events.err())
+                .expect("one branch failed");
+            (StatusCode::UNPROCESSABLE_ENTITY, error.to_string()).into_response()
+        }
+    }
+}
+
+async fn flow_action(
+    State(api): State<Api>,
+    ConnectInfo(remote): ConnectInfo<SocketAddr>,
+    Path((flow, id, action)): Path<(String, String, String)>,
+    method: Method,
+    uri: Uri,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    if let Err(response) = check(&api, &remote, &headers, &method, &uri, &body) {
+        return response.into_response();
+    }
+    match action.as_str() {
+        "cancel" => match crate::flow::cancel(&api.node, &flow, &id).await {
+            Ok(true) => axum::Json(serde_json::json!({ "ok": true })).into_response(),
+            Ok(false) => (StatusCode::CONFLICT, "Flow 运行不存在或已进入终态").into_response(),
+            Err(error) => (StatusCode::UNPROCESSABLE_ENTITY, error.to_string()).into_response(),
+        },
+        "retry" => match crate::flow::retry(&api.node, &flow, &id).await {
+            Ok(run) => (StatusCode::ACCEPTED, axum::Json(run)).into_response(),
+            Err(error) => (StatusCode::UNPROCESSABLE_ENTITY, error.to_string()).into_response(),
+        },
+        _ => (StatusCode::NOT_FOUND, "Flow 操作不存在").into_response(),
+    }
+}
+
+async fn flow_stats(
+    State(api): State<Api>,
+    ConnectInfo(remote): ConnectInfo<SocketAddr>,
+    Path(flow): Path<String>,
+    method: Method,
+    uri: Uri,
+    headers: HeaderMap,
+) -> Response {
+    if let Err(response) = check(&api, &remote, &headers, &method, &uri, b"") {
+        return response.into_response();
+    }
+    match crate::flow::stats(&api.node, &flow).await {
         Ok(stats) => axum::Json(stats).into_response(),
         Err(error) => (StatusCode::UNPROCESSABLE_ENTITY, error.to_string()).into_response(),
     }

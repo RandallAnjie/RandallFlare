@@ -68,6 +68,9 @@
           <button class="nav-item" data-view="workflows">
             <span class="nav-glyph" aria-hidden="true">↯</span><span>Workflow</span><span id="workflow-nav-count" class="count">0</span>
           </button>
+          <button class="nav-item" data-view="flows">
+            <span class="nav-glyph" aria-hidden="true">⌘</span><span>Flow 编排</span><span id="flow-nav-count" class="count">0</span>
+          </button>
         </nav>
         <div class="sidebar-foot">
           <p class="sidebar-tagline">一次构建，一次验证，处处运行。</p>
@@ -105,6 +108,7 @@
             <article class="metric"><span>Analytics 数据集</span><strong id="metric-analytics">—</strong><small>时序事件与维度聚合</small></article>
             <article class="metric"><span>Pipeline</span><strong id="metric-pipelines">—</strong><small>持久批次与 R2 输出</small></article>
             <article class="metric"><span>Workflow</span><strong id="metric-workflows">—</strong><small>可恢复步骤与外部信号</small></article>
+            <article class="metric"><span>Flow</span><strong id="metric-flows">—</strong><small>可视化 DAG 与租约接管</small></article>
             <article class="metric"><span>内容块状态</span><strong id="metric-blobs">—</strong><small>本地缺失数</small></article>
           </div>
 
@@ -585,6 +589,105 @@
                 <div class="divider"></div>
                 <h3>步骤</h3><div id="workflow-steps" class="build-list empty-state">暂无步骤。</div>
                 <h3>审计时间线</h3><div id="workflow-events" class="build-list empty-state">暂无事件。</div>
+              </article>
+            </div>
+          </div>
+        </section>
+
+        <section id="view-flows" class="view" aria-labelledby="section-title">
+          <div class="projects-header">
+            <div><p class="eyebrow">可视化编排</p><h2>Flow</h2><p class="muted">把 Worker、HTTP、KV、D1、R2、队列、Analytics、Pipeline 与 Workflow 连接成耐久 DAG。定义和运行快照完全去中心化，每一步均可审计和接管。</p></div>
+            <span id="flow-count" class="badge">0 个 Flow</span>
+          </div>
+          <div class="flow-layout">
+            <aside class="r2-sidebar-stack">
+              <article class="panel">
+                <div class="panel-head"><div><p class="eyebrow">签名定义</p><h2>Flow 设置</h2></div><span class="badge">DAG</span></div>
+                <form id="flow-form" class="stack-form">
+                  <label><span>名称</span><input id="flow-name" pattern="[a-z0-9-]{1,63}" placeholder="order-router" required></label>
+                  <label><span>说明</span><textarea id="flow-description" rows="3" placeholder="接收订单、判断风险并写入数据系统"></textarea></label>
+                  <div class="form-grid">
+                    <label><span>触发方式</span><select id="flow-trigger"><option value="manual">手动</option><option value="webhook">Webhook</option><option value="cron">定时</option></select></label>
+                    <label><span>Cron（UTC）</span><input id="flow-cron" class="code-input" placeholder="*/5 * * * *"></label>
+                  </div>
+                  <label><span>自定义域名 <em>每行一个</em></span><textarea id="flow-hostnames" class="code-input" rows="3" placeholder="hooks.example.com"></textarea></label>
+                  <div class="form-grid">
+                    <label><span>记录保留（天）</span><input id="flow-retention" type="number" min="1" max="365" value="30" required></label>
+                    <label><span>最大并发运行</span><input id="flow-concurrency" type="number" min="0" max="1000" value="32" required></label>
+                  </div>
+                  <label><span>失败告警环境变量 <em>可选</em></span><input id="flow-alert-env" class="code-input" pattern="RF_FLOW_CREDENTIAL_[A-Z0-9_]+" placeholder="RF_FLOW_CREDENTIAL_ALERT"></label>
+                  <label class="check-label"><input id="flow-suspended" type="checkbox"><span>暂停新运行与自动推进</span></label>
+                  <label><span>暂停原因</span><input id="flow-suspend-reason" placeholder="维护窗口"></label>
+                  <label id="flow-first-token-label" class="hidden"><span>首个 Webhook 令牌标签</span><input id="flow-first-token" placeholder="生产系统"></label>
+                  <button class="primary" type="submit">保存并签名</button>
+                </form>
+              </article>
+              <article class="panel">
+                <div class="panel-head"><div><p class="eyebrow">Flow 目录</p><h2>全部 Flow</h2></div></div>
+                <div id="flow-list" class="database-list empty-state">暂无 Flow。</div>
+              </article>
+            </aside>
+
+            <div class="r2-sidebar-stack flow-workspace">
+              <article class="panel flow-canvas-panel">
+                <div class="panel-head"><div><p class="eyebrow">可视化编辑器</p><h2 id="flow-active-name">新建 Flow</h2><p id="flow-endpoint" class="muted compact-copy">在下方添加节点；拖动节点可调整布局。</p></div><div class="button-row"><button id="flow-new" class="secondary compact" type="button">新建</button><button id="flow-delete" class="danger ghost compact hidden" type="button">删除</button></div></div>
+                <div id="flow-palette" class="flow-palette" role="toolbar" aria-label="添加节点">
+                  <button type="button" data-flow-add="trigger">触发器</button><button type="button" data-flow-add="worker">Worker</button><button type="button" data-flow-add="http">HTTP</button><button type="button" data-flow-add="branch">条件</button><button type="button" data-flow-add="transform">转换</button><button type="button" data-flow-add="loop">循环</button><button type="button" data-flow-add="kv">KV</button><button type="button" data-flow-add="d1">D1</button><button type="button" data-flow-add="r2">R2</button><button type="button" data-flow-add="queue">队列</button><button type="button" data-flow-add="analytics">Analytics</button><button type="button" data-flow-add="pipeline">Pipeline</button><button type="button" data-flow-add="workflow">Workflow</button><button type="button" data-flow-add="subflow">子 Flow</button><button type="button" data-flow-add="email">邮件</button>
+                </div>
+                <div id="flow-canvas" class="flow-canvas" role="region" tabindex="0" aria-label="Flow 节点画布"><svg id="flow-edges" aria-hidden="true"></svg><div id="flow-nodes"></div><p id="flow-canvas-empty" class="empty-state">先添加一个触发器，再连接资源节点。</p></div>
+              </article>
+
+              <div class="grid one-one flow-edit-grid">
+                <article class="panel">
+                  <div class="panel-head"><div><p class="eyebrow">节点检查器</p><h2 id="flow-node-title">请选择节点</h2></div></div>
+                  <form id="flow-node-form" class="stack-form hidden">
+                    <div class="form-grid"><label><span>节点 ID</span><input id="flow-node-id" class="code-input" readonly></label><label><span>类型</span><input id="flow-node-type" readonly></label></div>
+                    <label><span>显示名称</span><input id="flow-node-label" maxlength="128"></label>
+                    <label><span>失败处理</span><select id="flow-node-error"><option value="stop">停止 Flow</option><option value="continue">记录失败并继续</option><option value="branch">走 error 分支</option></select></label>
+                    <label><span>节点配置（JSON）</span><textarea id="flow-node-config" class="code-input" rows="8">{}</textarea></label>
+                    <p class="form-note">可使用 <code>{{ input.orderId }}</code>、<code>{{ nodes.lookup }}</code> 等模板。凭据只能填写 <code>credentialEnv</code>，且变量名必须以 <code>RF_FLOW_CREDENTIAL_</code> 开头。</p>
+                    <div class="button-row"><button class="primary" type="submit">应用节点配置</button><button id="flow-node-remove" class="danger ghost" type="button">移除节点</button></div>
+                  </form>
+                  <p id="flow-node-empty" class="empty-state">在画布中选择一个节点进行编辑。</p>
+                </article>
+                <article class="panel">
+                  <div class="panel-head"><div><p class="eyebrow">连线</p><h2>添加依赖</h2></div></div>
+                  <form id="flow-edge-form" class="stack-form">
+                    <div class="form-grid"><label><span>来源</span><select id="flow-edge-source" required></select></label><label><span>目标</span><select id="flow-edge-target" required></select></label></div>
+                    <label><span>来源出口 <em>条件节点用 true / false / error</em></span><input id="flow-edge-handle" class="code-input" placeholder="default"></label>
+                    <button class="secondary" type="submit">添加连线</button>
+                  </form>
+                  <div id="flow-edge-list" class="build-list empty-state">暂无连线。</div>
+                </article>
+              </div>
+
+              <article class="panel">
+                <details><summary><strong>高级：完整 FlowGraph JSON</strong><span class="muted">支持导入、精确编辑与复制</span></summary><textarea id="flow-graph-json" class="code-input flow-graph-json" rows="16"></textarea><div class="button-row"><button id="flow-graph-apply" class="secondary" type="button">应用 JSON 到画布</button><button id="flow-graph-copy" class="secondary" type="button">复制 JSON</button></div></details>
+              </article>
+
+              <div class="grid one-one">
+                <article class="panel">
+                  <div class="panel-head"><div><p class="eyebrow">Webhook 凭据</p><h2>接收令牌</h2><p class="muted compact-copy">定义只保存 SHA-256，明文仅显示一次。</p></div></div>
+                  <form id="flow-token-form" class="inline-form hidden"><label><span>标签</span><input id="flow-token-label" placeholder="生产系统"></label><span></span><button class="secondary" type="submit">签发令牌</button></form>
+                  <div id="flow-token-reveal" class="hidden"><p class="banner warning">请立即复制并安全保存，此令牌不会再次显示。</p><pre id="flow-new-token" class="result"></pre><button id="flow-copy-token" class="secondary compact" type="button">复制令牌</button></div>
+                  <div id="flow-token-list" class="build-list empty-state">暂无 Webhook 令牌。</div>
+                </article>
+                <article class="panel">
+                  <div class="panel-head"><div><p class="eyebrow">调试触发</p><h2>创建运行</h2></div></div>
+                  <form id="flow-trigger-form" class="stack-form hidden"><label><span>幂等键 <em>可选</em></span><input id="flow-run-key" class="code-input" placeholder="order-20260805-001"></label><label><span>输入（JSON）</span><textarea id="flow-input" class="code-input" rows="7">{"orderId":"demo-1"}</textarea></label><button class="secondary" type="submit">开始运行</button></form>
+                </article>
+              </div>
+
+              <article class="panel">
+                <div class="panel-head"><div><p class="eyebrow">运行账本</p><h2>最近运行</h2></div><button id="flow-refresh" class="secondary compact" type="button">刷新</button></div>
+                <div class="metrics compact-metrics"><article class="metric"><span>排队 / 运行</span><strong id="flow-active-count">—</strong></article><article class="metric"><span>已完成</span><strong id="flow-complete-count">—</strong></article><article class="metric"><span>失败</span><strong id="flow-failed-count">—</strong></article><article class="metric"><span>已取消</span><strong id="flow-cancelled-count">—</strong></article></div>
+                <div id="flow-runs" class="build-list empty-state">暂无运行。</div>
+              </article>
+              <article id="flow-run-panel" class="panel hidden">
+                <div class="panel-head"><div><p class="eyebrow">运行详情</p><h2 id="flow-run-title">—</h2><p id="flow-run-meta" class="muted compact-copy">—</p></div><span id="flow-run-status" class="badge">—</span></div>
+                <div id="flow-run-actions" class="button-row"></div>
+                <h3>节点步骤</h3><div id="flow-steps" class="build-list empty-state">暂无步骤。</div>
+                <h3>审计时间线</h3><div id="flow-events" class="build-list empty-state">暂无事件。</div>
               </article>
             </div>
           </div>

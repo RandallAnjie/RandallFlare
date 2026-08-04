@@ -108,6 +108,7 @@ pub struct Node {
     analytics_schemas: Mutex<HashSet<String>>,
     pipeline_schemas: Mutex<HashSet<String>>,
     workflow_schemas: Mutex<HashSet<String>>,
+    flow_schemas: Mutex<HashSet<String>>,
     events: broadcast::Sender<NodeEvent>,
 }
 
@@ -183,6 +184,7 @@ impl Node {
             analytics_schemas: Mutex::new(HashSet::new()),
             pipeline_schemas: Mutex::new(HashSet::new()),
             workflow_schemas: Mutex::new(HashSet::new()),
+            flow_schemas: Mutex::new(HashSet::new()),
             events,
         })
     }
@@ -579,6 +581,29 @@ impl Node {
             .map(|domain| format!("pipe-{pipeline}.{domain}"))
     }
 
+    pub fn default_flow_hostname(&self, flow: &str) -> Option<String> {
+        self.cfg
+            .default_worker_domain()
+            .map(|domain| format!("flow-{flow}.{domain}"))
+    }
+
+    pub fn effective_flow_hostnames(
+        &self,
+        flow: &str,
+        spec: &crate::flow::FlowSpec,
+    ) -> Vec<String> {
+        let mut hostnames = Vec::with_capacity(spec.hostnames.len() + 1);
+        if let Some(default) = self.default_flow_hostname(flow) {
+            hostnames.push(default);
+        }
+        for hostname in &spec.hostnames {
+            if !hostnames.contains(hostname) {
+                hostnames.push(hostname.clone());
+            }
+        }
+        hostnames
+    }
+
     pub fn effective_pipeline_hostnames(
         &self,
         pipeline: &str,
@@ -949,6 +974,14 @@ impl Node {
 
     pub(crate) fn mark_workflow_schema_ready(&self, database: String) {
         self.workflow_schemas.lock().unwrap().insert(database);
+    }
+
+    pub(crate) fn flow_schema_ready(&self, database: &str) -> bool {
+        self.flow_schemas.lock().unwrap().contains(database)
+    }
+
+    pub(crate) fn mark_flow_schema_ready(&self, database: String) {
+        self.flow_schemas.lock().unwrap().insert(database);
     }
 
     /// Periodic GC of dead claims + KV tombstones.

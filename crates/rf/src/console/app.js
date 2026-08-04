@@ -40,6 +40,12 @@ const state = {
   workflowActive: null,
   workflowInstances: [],
   workflowInstanceActive: null,
+  flows: [],
+  flowActive: null,
+  flowGraph: { nodes: [], edges: [] },
+  flowNodeActive: null,
+  flowRuns: [],
+  flowRunActive: null,
 };
 
 const titles = {
@@ -54,6 +60,7 @@ const titles = {
   analytics: ["可观测数据", "Analytics Engine"],
   pipelines: ["数据传输", "Pipeline"],
   workflows: ["耐久执行", "Workflow"],
+  flows: ["可视化编排", "Flow"],
 };
 
 function escapeHtml(value) {
@@ -224,6 +231,7 @@ function renderOverview(data) {
   const analyticsDatasets = Array.isArray(data.analytics_datasets) ? data.analytics_datasets : [];
   const pipelines = Array.isArray(data.pipelines) ? data.pipelines : [];
   const workflows = Array.isArray(data.workflows) ? data.workflows : [];
+  const flows = Array.isArray(data.flows) ? data.flows : [];
   const allNodes = [
     {
       id: data.node,
@@ -250,6 +258,8 @@ function renderOverview(data) {
   $("#pipeline-nav-count").textContent = String(pipelines.length);
   $("#metric-workflows").textContent = String(workflows.length);
   $("#workflow-nav-count").textContent = String(workflows.length);
+  $("#metric-flows").textContent = String(flows.length);
+  $("#flow-nav-count").textContent = String(flows.length);
   $("#metric-r2-backend").textContent = data.storage?.rclone ? "本地副本与 rclone 已就绪" : "集群本地多数派副本";
   $("#r2-nav-count").textContent = String(buckets.length);
   $("#metric-blobs").textContent = String(data.missing_blobs ?? 0);
@@ -1950,6 +1960,360 @@ async function deleteWorkflow() {
   } catch (error) { toast(error.message, true); }
 }
 
+const flowNodeLabels = {
+  trigger: "触发器", worker: "Worker", http: "HTTP 请求", branch: "条件分支",
+  transform: "数据转换", loop: "遍历数组", kv: "KV 存储", d1: "D1 数据库",
+  r2: "R2 对象", queue: "队列", analytics: "Analytics", pipeline: "Pipeline",
+  workflow: "Workflow", subflow: "子 Flow", email: "邮件",
+};
+
+const flowNodeDefaults = {
+  trigger: {}, worker: { worker: "", method: "POST", path: "/" },
+  http: { url: "https://api.example.com", method: "POST" },
+  branch: { condition: "input.ok == true" }, transform: { expression: "input" },
+  loop: { items: "input.items" }, kv: { namespace: "", action: "get", key: "{{ input.key }}" },
+  d1: { database: "", sql: "SELECT 1", params: [] }, r2: { bucket: "", action: "get", key: "{{ input.key }}" },
+  queue: { queue: "", body: "{{ input }}" }, analytics: { dataset: "", points: "{{ input }}" },
+  pipeline: { pipeline: "", events: "{{ input }}" }, workflow: { workflow: "", input: "{{ input }}" },
+  subflow: { flow: "", input: "{{ input }}" }, email: {},
+};
+
+function cloneJson(value) { return JSON.parse(JSON.stringify(value)); }
+
+function emptyFlowGraph() {
+  return {
+    nodes: [{ id: "start", type: "flowNode", position: { x: 60, y: 90 }, data: { nodeType: "trigger", label: "开始", onError: "stop" } }],
+    edges: [],
+  };
+}
+
+function normalizeFlowGraph(graph) {
+  return {
+    nodes: Array.isArray(graph?.nodes) ? graph.nodes.map((node) => ({
+      id: String(node.id || "node"), type: node.type || "flowNode",
+      position: { x: Number(node.position?.x || 0), y: Number(node.position?.y || 0) },
+      data: { ...node.data, nodeType: node.data?.nodeType || "transform", label: node.data?.label || "", onError: node.data?.onError || "stop" },
+    })) : [],
+    edges: Array.isArray(graph?.edges) ? graph.edges.map((edge) => ({ ...edge })) : [],
+  };
+}
+
+function flowStatusLabel(status) {
+  return { queued: "已排队", running: "运行中", complete: "已完成", failed: "失败", cancelled: "已取消", skipped: "已跳过" }[status] || status || "未知";
+}
+
+function flowNodeConfig(node) {
+  const { nodeType, label, onError, ...config } = node.data || {};
+  return config;
+}
+
+function updateFlowTriggerFields() {
+  const trigger = $("#flow-trigger").value;
+  $("#flow-cron").disabled = trigger !== "cron";
+  const flow = state.flows.find((item) => item.name === state.flowActive);
+  const needsToken = trigger === "webhook" && !(flow?.spec?.tokens || []).length;
+  $("#flow-first-token-label").classList.toggle("hidden", !needsToken);
+  $("#flow-first-token").required = needsToken;
+}
+
+function fillFlowForm(flow) {
+  const spec = flow?.spec || {};
+  $("#flow-name").value = flow?.name || "";
+  $("#flow-description").value = spec.description || "";
+  $("#flow-trigger").value = spec.trigger || "manual";
+  $("#flow-cron").value = spec.cron || "";
+  $("#flow-hostnames").value = (spec.hostnames || []).join("\n");
+  $("#flow-retention").value = spec.retention_days || 30;
+  $("#flow-concurrency").value = spec.max_concurrent_runs ?? 32;
+  $("#flow-alert-env").value = spec.alert_webhook_env || "";
+  $("#flow-suspended").checked = Boolean(spec.suspended);
+  $("#flow-suspend-reason").value = spec.suspend_reason || "";
+  $("#flow-first-token").value = "";
+  updateFlowTriggerFields();
+}
+
+function renderFlows() {
+  $("#flow-count").textContent = `${state.flows.length} 个 Flow`;
+  $("#flow-nav-count").textContent = String(state.flows.length);
+  const list = $("#flow-list");
+  list.classList.toggle("empty-state", state.flows.length === 0);
+  list.innerHTML = state.flows.length ? state.flows.map((flow) => {
+    const stats = flow.stats || {};
+    const active = flow.name === state.flowActive ? " active" : "";
+    const copy = flow.spec?.suspended ? "已暂停" : `${Number(stats.queued || 0) + Number(stats.running || 0)} 活跃 · ${stats.failed || 0} 失败`;
+    return `<button class="database-item${active}" type="button" data-flow="${escapeHtml(flow.name)}"><span><strong>${escapeHtml(flow.name)}</strong><small>${escapeHtml(flow.spec?.trigger || "manual")} · ${escapeHtml(copy)}</small></span><span>${flow.spec?.suspended ? "已暂停" : "打开 →"}</span></button>`;
+  }).join("") : "暂无 Flow。";
+}
+
+async function loadFlows({ quiet = false } = {}) {
+  try {
+    const data = await api("/api/flows");
+    state.flows = data.flows || [];
+    if (state.flowActive && !state.flows.some((item) => item.name === state.flowActive)) newFlow();
+    if (!state.flowActive && state.flowGraph.nodes.length === 0) {
+      state.flowGraph = emptyFlowGraph();
+      state.flowNodeActive = "start";
+      fillFlowForm(null);
+      renderFlowCanvas();
+    }
+    renderFlows();
+    if (!quiet) toast("Flow 已刷新");
+  } catch (error) { if (!quiet) toast(error.message, true); }
+}
+
+function newFlow() {
+  state.flowActive = null;
+  state.flowRunActive = null;
+  state.flowRuns = [];
+  state.flowGraph = emptyFlowGraph();
+  state.flowNodeActive = "start";
+  fillFlowForm(null);
+  $("#flow-active-name").textContent = "新建 Flow";
+  $("#flow-endpoint").textContent = "保存后会获得确定性的默认入口域名。";
+  $("#flow-delete").classList.add("hidden");
+  $("#flow-token-form").classList.add("hidden");
+  $("#flow-trigger-form").classList.add("hidden");
+  $("#flow-run-panel").classList.add("hidden");
+  $("#flow-runs").textContent = "暂无运行。";
+  $("#flow-runs").classList.add("empty-state");
+  renderFlows();
+  renderFlowCanvas();
+}
+
+async function selectFlow(name) {
+  const flow = state.flows.find((item) => item.name === name);
+  if (!flow) return;
+  state.flowActive = name;
+  state.flowRunActive = null;
+  state.flowNodeActive = flow.spec?.graph?.nodes?.[0]?.id || null;
+  state.flowGraph = normalizeFlowGraph(cloneJson(flow.spec?.graph || emptyFlowGraph()));
+  fillFlowForm(flow);
+  renderFlows();
+  renderFlowCanvas();
+  renderFlowTokens(flow);
+  $("#flow-active-name").textContent = name;
+  const endpoint = flow.hostnames?.[0];
+  $("#flow-endpoint").textContent = endpoint ? `入口：https://${endpoint}/ · 定义 v${flow.version}` : `定义 v${flow.version} · 当前节点未配置默认域名`;
+  $("#flow-delete").classList.remove("hidden");
+  $("#flow-token-form").classList.remove("hidden");
+  $("#flow-trigger-form").classList.remove("hidden");
+  $("#flow-run-panel").classList.add("hidden");
+  const stats = flow.stats || {};
+  $("#flow-active-count").textContent = String(Number(stats.queued || 0) + Number(stats.running || 0));
+  $("#flow-complete-count").textContent = String(stats.complete || 0);
+  $("#flow-failed-count").textContent = String(stats.failed || 0);
+  $("#flow-cancelled-count").textContent = String(stats.cancelled || 0);
+  await loadFlowRuns();
+}
+
+function renderFlowCanvas(syncJson = true) {
+  const graph = state.flowGraph;
+  const nodes = $("#flow-nodes");
+  $("#flow-canvas-empty").classList.toggle("hidden", graph.nodes.length > 0);
+  nodes.innerHTML = graph.nodes.map((node) => {
+    const selected = node.id === state.flowNodeActive ? " selected" : "";
+    const type = node.data.nodeType;
+    const icon = (flowNodeLabels[type] || type).slice(0, 2);
+    return `<button class="flow-node${selected}" type="button" data-flow-node="${escapeHtml(node.id)}" style="left:${Math.max(0, node.position.x)}px;top:${Math.max(0, node.position.y)}px"><span class="flow-node-icon">${escapeHtml(icon)}</span><span><strong>${escapeHtml(node.data.label || flowNodeLabels[type] || type)}</strong><small>${escapeHtml(type)} · ${escapeHtml(node.id)}</small></span></button>`;
+  }).join("");
+  renderFlowEdges();
+  renderFlowEdgeEditor();
+  renderFlowNodeInspector();
+  if (syncJson) $("#flow-graph-json").value = JSON.stringify(graph, null, 2);
+}
+
+function renderFlowEdges() {
+  const graph = state.flowGraph;
+  const byId = new Map(graph.nodes.map((node) => [node.id, node]));
+  $("#flow-edges").innerHTML = `<defs><marker id="flow-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path class="flow-edge-arrow" d="M 0 0 L 10 5 L 0 10 z"></path></marker></defs>${graph.edges.map((edge) => {
+    const source = byId.get(edge.source); const target = byId.get(edge.target);
+    if (!source || !target) return "";
+    const x1 = source.position.x + 174, y1 = source.position.y + 37, x2 = target.position.x, y2 = target.position.y + 37;
+    const bend = Math.max(55, Math.abs(x2 - x1) * .45);
+    return `<path class="flow-edge${edge.sourceHandle ? " branch" : ""}" d="M ${x1} ${y1} C ${x1 + bend} ${y1}, ${x2 - bend} ${y2}, ${x2} ${y2}" marker-end="url(#flow-arrow)"></path>`;
+  }).join("")}`;
+}
+
+function renderFlowNodeInspector() {
+  const node = state.flowGraph.nodes.find((node) => node.id === state.flowNodeActive);
+  $("#flow-node-form").classList.toggle("hidden", !node);
+  $("#flow-node-empty").classList.toggle("hidden", Boolean(node));
+  $("#flow-node-title").textContent = node ? node.data.label || flowNodeLabels[node.data.nodeType] || node.id : "请选择节点";
+  if (!node) return;
+  $("#flow-node-id").value = node.id;
+  $("#flow-node-type").value = node.data.nodeType;
+  $("#flow-node-label").value = node.data.label || "";
+  $("#flow-node-error").value = node.data.onError || "stop";
+  $("#flow-node-config").value = JSON.stringify(flowNodeConfig(node), null, 2);
+}
+
+function renderFlowEdgeEditor() {
+  const options = state.flowGraph.nodes.map((node) => `<option value="${escapeHtml(node.id)}">${escapeHtml(node.data.label || node.id)}</option>`).join("");
+  const sourceValue = $("#flow-edge-source").value; const targetValue = $("#flow-edge-target").value;
+  $("#flow-edge-source").innerHTML = options; $("#flow-edge-target").innerHTML = options;
+  if (state.flowGraph.nodes.some((node) => node.id === sourceValue)) $("#flow-edge-source").value = sourceValue;
+  if (state.flowGraph.nodes.some((node) => node.id === targetValue)) $("#flow-edge-target").value = targetValue;
+  const list = $("#flow-edge-list");
+  list.classList.toggle("empty-state", state.flowGraph.edges.length === 0);
+  list.innerHTML = state.flowGraph.edges.length ? state.flowGraph.edges.map((edge) => `<article class="build-row"><span class="pipeline-state success"></span><div><strong>${escapeHtml(edge.source)} → ${escapeHtml(edge.target)}</strong><small>${escapeHtml(edge.sourceHandle || "default")}</small></div><button class="mini-button danger" type="button" data-flow-edge-remove="${escapeHtml(edge.id)}">移除</button></article>`).join("") : "暂无连线。";
+}
+
+function addFlowNode(type) {
+  if (type === "trigger") {
+    const existing = state.flowGraph.nodes.find((node) => node.data.nodeType === "trigger");
+    if (existing) { state.flowNodeActive = existing.id; renderFlowCanvas(); toast("一个 Flow 只能有一个触发器", true); return; }
+  }
+  const base = type.replace(/[^a-z0-9]/g, "") || "node";
+  let index = state.flowGraph.nodes.length + 1; let id = `${base}-${index}`;
+  while (state.flowGraph.nodes.some((node) => node.id === id)) id = `${base}-${++index}`;
+  const position = { x: 60 + (state.flowGraph.nodes.length % 4) * 220, y: 70 + Math.floor(state.flowGraph.nodes.length / 4) * 130 };
+  state.flowGraph.nodes.push({ id, type: "flowNode", position, data: { nodeType: type, label: flowNodeLabels[type] || type, onError: "stop", ...cloneJson(flowNodeDefaults[type] || {}) } });
+  state.flowNodeActive = id;
+  renderFlowCanvas();
+}
+
+function saveFlowNode(event) {
+  event.preventDefault();
+  const node = state.flowGraph.nodes.find((node) => node.id === state.flowNodeActive);
+  if (!node) return;
+  let config;
+  try { config = JSON.parse($("#flow-node-config").value || "{}"); }
+  catch (error) { toast(`节点配置不是有效 JSON：${error.message}`, true); return; }
+  if (!config || Array.isArray(config) || typeof config !== "object") { toast("节点配置必须是 JSON 对象", true); return; }
+  node.data = { nodeType: node.data.nodeType, label: $("#flow-node-label").value.trim(), onError: $("#flow-node-error").value, ...config };
+  renderFlowCanvas(); toast("节点配置已应用到画布");
+}
+
+function removeFlowNode() {
+  const id = state.flowNodeActive; if (!id) return;
+  state.flowGraph.nodes = state.flowGraph.nodes.filter((node) => node.id !== id);
+  state.flowGraph.edges = state.flowGraph.edges.filter((edge) => edge.source !== id && edge.target !== id);
+  state.flowNodeActive = state.flowGraph.nodes[0]?.id || null; renderFlowCanvas();
+}
+
+function flowHasPath(from, to) {
+  const seen = new Set(); const stack = [from];
+  while (stack.length) { const id = stack.pop(); if (id === to) return true; if (seen.has(id)) continue; seen.add(id); state.flowGraph.edges.filter((edge) => edge.source === id).forEach((edge) => stack.push(edge.target)); }
+  return false;
+}
+
+function addFlowEdge(event) {
+  event.preventDefault();
+  const source = $("#flow-edge-source").value, target = $("#flow-edge-target").value;
+  if (!source || !target || source === target) { toast("请选择两个不同节点", true); return; }
+  if (flowHasPath(target, source)) { toast("这条连线会形成环；重复处理请使用 loop 节点", true); return; }
+  const sourceHandle = $("#flow-edge-handle").value.trim() || null;
+  if (state.flowGraph.edges.some((edge) => edge.source === source && edge.target === target && (edge.sourceHandle || null) === sourceHandle)) { toast("相同连线已经存在", true); return; }
+  state.flowGraph.edges.push({ id: `edge-${Date.now().toString(36)}`, source, target, sourceHandle });
+  $("#flow-edge-handle").value = ""; renderFlowCanvas();
+}
+
+function applyFlowGraphJson() {
+  try { state.flowGraph = normalizeFlowGraph(JSON.parse($("#flow-graph-json").value)); state.flowNodeActive = state.flowGraph.nodes[0]?.id || null; renderFlowCanvas(); toast("FlowGraph 已应用到画布"); }
+  catch (error) { toast(`FlowGraph JSON 无效：${error.message}`, true); }
+}
+
+function startFlowDrag(event) {
+  const element = event.target.closest("[data-flow-node]"); if (!element || event.button !== 0) return;
+  const node = state.flowGraph.nodes.find((node) => node.id === element.dataset.flowNode); if (!node) return;
+  state.flowNodeActive = node.id; renderFlowNodeInspector();
+  $$(".flow-node").forEach((item) => item.classList.toggle("selected", item.dataset.flowNode === node.id));
+  const start = { x: event.clientX, y: event.clientY, left: node.position.x, top: node.position.y };
+  const move = (moveEvent) => { node.position.x = Math.max(0, Math.round((start.left + moveEvent.clientX - start.x) / 10) * 10); node.position.y = Math.max(0, Math.round((start.top + moveEvent.clientY - start.y) / 10) * 10); element.style.left = `${node.position.x}px`; element.style.top = `${node.position.y}px`; renderFlowEdges(); };
+  const up = () => { window.removeEventListener("pointermove", move); window.removeEventListener("pointerup", up); $("#flow-graph-json").value = JSON.stringify(state.flowGraph, null, 2); };
+  window.addEventListener("pointermove", move); window.addEventListener("pointerup", up, { once: true });
+}
+
+function renderFlowTokens(flow) {
+  const tokens = flow?.spec?.tokens || []; const list = $("#flow-token-list");
+  list.classList.toggle("empty-state", tokens.length === 0);
+  list.innerHTML = tokens.length ? tokens.map((token) => `<article class="build-row"><span class="pipeline-state success"></span><div><strong>${escapeHtml(token.label || "未命名令牌")}</strong><small>尾号 ${escapeHtml(token.last_four)} · ${escapeHtml(new Date(token.created_at_ms).toLocaleString("zh-CN"))}</small><code>${escapeHtml(token.id)}</code></div><button class="mini-button danger" type="button" data-flow-token-revoke="${escapeHtml(token.id)}">撤销</button></article>`).join("") : "暂无 Webhook 令牌。";
+}
+
+async function saveFlow(event) {
+  event.preventDefault();
+  const name = $("#flow-name").value.trim();
+  const firstToken = $("#flow-first-token").value.trim();
+  const payload = { name, description: $("#flow-description").value.trim(), graph: state.flowGraph, trigger: $("#flow-trigger").value,
+    cron: $("#flow-trigger").value === "cron" ? $("#flow-cron").value.trim() : null,
+    hostnames: $("#flow-hostnames").value.split(/\r?\n/).map((value) => value.trim()).filter(Boolean),
+    retention_days: Number($("#flow-retention").value), max_concurrent_runs: Number($("#flow-concurrency").value),
+    alert_webhook_env: $("#flow-alert-env").value.trim() || null, suspended: $("#flow-suspended").checked,
+    suspend_reason: $("#flow-suspend-reason").value.trim(), webhook_token_label: firstToken || null };
+  try {
+    const result = await api("/api/flows", { method: "POST", body: JSON.stringify(payload) });
+    if (result.token) { $("#flow-new-token").textContent = result.token; $("#flow-token-reveal").classList.remove("hidden"); }
+    const complete = async () => { await loadFlows({ quiet: true }); await selectFlow(name); };
+    if (result.pending_approval) showApproval(result, `批准后，Flow ${name} 的图定义将传播到集群。`, complete);
+    else { toast(`Flow ${name} 已保存`); await complete(); }
+  } catch (error) { toast(error.message, true); }
+}
+
+async function mintFlowToken(event) {
+  event.preventDefault(); if (!state.flowActive) return;
+  try {
+    const result = await api(`/api/flows/${encodeURIComponent(state.flowActive)}/tokens`, { method: "POST", body: JSON.stringify({ label: $("#flow-token-label").value.trim() }) });
+    $("#flow-new-token").textContent = result.token; $("#flow-token-reveal").classList.remove("hidden"); $("#flow-token-label").value = "";
+    const name = state.flowActive; const complete = async () => { await loadFlows({ quiet: true }); await selectFlow(name); };
+    if (result.pending_approval) showApproval(result, "批准后，新令牌的哈希将写入签名 Flow 定义。", complete); else await complete();
+  } catch (error) { toast(error.message, true); }
+}
+
+async function revokeFlowToken(id) {
+  if (!state.flowActive || !window.confirm("要撤销此 Flow Webhook 令牌吗？使用它的调用方会立即失去访问权限。")) return;
+  try {
+    const name = state.flowActive; const result = await api(`/api/flows/${encodeURIComponent(name)}/tokens/${encodeURIComponent(id)}`, { method: "DELETE" });
+    const complete = async () => { await loadFlows({ quiet: true }); await selectFlow(name); };
+    if (result.pending_approval) showApproval(result, "批准后，令牌哈希将从签名定义移除。", complete); else await complete();
+  } catch (error) { toast(error.message, true); }
+}
+
+async function triggerFlow(event) {
+  event.preventDefault(); if (!state.flowActive) return;
+  let input; try { input = JSON.parse($("#flow-input").value); } catch (error) { toast(`输入不是有效 JSON：${error.message}`, true); return; }
+  try {
+    const data = await api(`/api/flows/${encodeURIComponent(state.flowActive)}/runs`, { method: "POST", body: JSON.stringify({ run_key: $("#flow-run-key").value.trim() || null, input }) });
+    toast(`Flow 运行 ${shortId(data.run.id, 20)} 已创建`); await loadFlows({ quiet: true }); await selectFlow(state.flowActive); await openFlowRun(data.run.id);
+  } catch (error) { toast(error.message, true); }
+}
+
+async function loadFlowRuns() {
+  if (!state.flowActive) return;
+  try { const data = await api(`/api/flows/${encodeURIComponent(state.flowActive)}/runs?limit=100`); state.flowRuns = data.runs || []; renderFlowRuns(); if (state.flowRunActive && state.flowRuns.some((run) => run.id === state.flowRunActive)) await openFlowRun(state.flowRunActive); }
+  catch (error) { toast(error.message, true); }
+}
+
+function renderFlowRuns() {
+  const list = $("#flow-runs"); list.classList.toggle("empty-state", state.flowRuns.length === 0);
+  list.innerHTML = state.flowRuns.length ? state.flowRuns.map((run) => `<button class="build-row" type="button" data-flow-run="${escapeHtml(run.id)}"><span class="pipeline-state ${workflowStatusClass(run.status)}"></span><div><strong>${escapeHtml(run.run_key || shortId(run.id, 24))}</strong><small>${escapeHtml(new Date(run.created_at_ms).toLocaleString("zh-CN"))} · ${escapeHtml(run.trigger)} · 图 v${escapeHtml(run.graph_version)}</small><code>${escapeHtml(run.id)}</code></div><span class="badge">${escapeHtml(flowStatusLabel(run.status))}</span></button>`).join("") : "暂无运行。";
+}
+
+async function openFlowRun(id) {
+  if (!state.flowActive) return; state.flowRunActive = id;
+  try {
+    const data = await api(`/api/flows/${encodeURIComponent(state.flowActive)}/runs/${encodeURIComponent(id)}`); if (state.flowRunActive !== id) return;
+    const run = data.run; $("#flow-run-panel").classList.remove("hidden"); $("#flow-run-title").textContent = run.run_key || shortId(run.id, 30);
+    $("#flow-run-status").textContent = flowStatusLabel(run.status); $("#flow-run-meta").textContent = `${run.id} · 图 v${run.graph_version}${run.error ? ` · ${run.error}` : ""}`;
+    const actions = []; if (["queued", "running"].includes(run.status)) actions.push(["cancel", "取消运行"]); if (["complete", "failed", "cancelled"].includes(run.status)) actions.push(["retry", "使用原输入重试"]);
+    $("#flow-run-actions").innerHTML = actions.map(([action, label]) => `<button class="${action === "cancel" ? "danger ghost" : "secondary"} compact" type="button" data-flow-action="${action}">${label}</button>`).join("");
+    const steps = data.steps || []; $("#flow-steps").classList.toggle("empty-state", steps.length === 0); $("#flow-steps").innerHTML = steps.length ? steps.map((step) => `<article class="build-row ${step.status === "failed" ? "failed" : ""}"><span class="pipeline-state ${workflowStatusClass(step.status)}"></span><div><strong>${escapeHtml(step.seq)}. ${escapeHtml(step.node_id)}</strong><small>${escapeHtml(flowNodeLabels[step.node_type] || step.node_type)} · ${escapeHtml(flowStatusLabel(step.status))}${step.taken ? ` · 出口 ${escapeHtml(step.taken)}` : ""}</small><code>${escapeHtml(step.error || (step.output == null ? "" : JSON.stringify(step.output)))}</code></div></article>`).join("") : "暂无步骤。";
+    const events = data.events || []; $("#flow-events").classList.toggle("empty-state", events.length === 0); $("#flow-events").innerHTML = events.length ? events.slice().reverse().map((event) => `<article class="build-row"><span class="pipeline-state active"></span><div><strong>${escapeHtml({ created: "运行已创建", completed: "运行已完成", failed: "运行失败", cancelled: "运行已取消" }[event.kind] || event.kind)}</strong><small>${escapeHtml(new Date(event.created_at_ms).toLocaleString("zh-CN"))} · 序号 ${escapeHtml(event.seq)}</small><code>${escapeHtml(JSON.stringify(event.detail || {}))}</code></div></article>`).join("") : "暂无事件。";
+  } catch (error) { toast(error.message, true); }
+}
+
+async function runFlowAction(action) {
+  if (!state.flowActive || !state.flowRunActive) return;
+  if (action === "cancel" && !window.confirm("要取消此 Flow 运行吗？当前未提交节点的结果会被丢弃。")) return;
+  try { const name = state.flowActive; const data = await api(`/api/flows/${encodeURIComponent(name)}/runs/${encodeURIComponent(state.flowRunActive)}/${action}`, { method: "POST", body: "{}" }); toast(action === "retry" ? "已创建重试运行" : "运行已取消"); await loadFlows({ quiet: true }); await selectFlow(name); if (action === "retry" && data.result?.id) await openFlowRun(data.result.id); }
+  catch (error) { toast(error.message, true); }
+}
+
+async function deleteFlow() {
+  const name = state.flowActive; if (!name || !window.confirm(`要删除 Flow“${name}”吗？定义将写入可验证墓碑，历史运行按保留策略清理。`)) return;
+  try { const result = await api(`/api/flows/${encodeURIComponent(name)}`, { method: "DELETE" }); const complete = async () => { newFlow(); await loadFlows({ quiet: true }); }; if (result.pending_approval) showApproval(result, `批准后，Flow ${name} 将停止接受新运行。`, complete); else await complete(); }
+  catch (error) { toast(error.message, true); }
+}
+
 async function loadOverview({ quiet = false } = {}) {
   try {
     const data = await api("/api/overview");
@@ -2264,7 +2628,7 @@ async function boot() {
     $("#security-copy").innerHTML = consoleMode === "public"
       ? "此节点不保存<br>任何私钥。"
       : "密钥仅保留在本地<br>控制台进程中。";
-    $$("#deploy-form button, #source-form button, #kv-editor-form button, #d1-create-form button, #d1-exec-form button, #r2-bucket-form button, #r2-upload-form button, #r2-delete-bucket, #queue-form button, #queue-send-form button, #queue-delete, #analytics-form button, #analytics-write-form button, #analytics-delete, #pipeline-form button, #pipeline-token-form button, #pipeline-ingest-form button, #pipeline-flush, #pipeline-delete, #workflow-form button, #workflow-trigger-form button, #workflow-signal-form button, #workflow-delete, #project-domain-add-form button, #project-bindings-form button, #project-triggers-form button, #project-settings-form button, #project-source-form button, #project-redeploy, #project-delete")
+    $$("#deploy-form button, #source-form button, #kv-editor-form button, #d1-create-form button, #d1-exec-form button, #r2-bucket-form button, #r2-upload-form button, #r2-delete-bucket, #queue-form button, #queue-send-form button, #queue-delete, #analytics-form button, #analytics-write-form button, #analytics-delete, #pipeline-form button, #pipeline-token-form button, #pipeline-ingest-form button, #pipeline-flush, #pipeline-delete, #workflow-form button, #workflow-trigger-form button, #workflow-signal-form button, #workflow-delete, #flow-form button, #flow-token-form button, #flow-trigger-form button, #flow-delete, #project-domain-add-form button, #project-bindings-form button, #project-triggers-form button, #project-settings-form button, #project-source-form button, #project-redeploy, #project-delete")
       .forEach((button) => { button.disabled = state.session.read_only; });
     await loadOverview({ quiet: true });
     await loadWorkerOps();
@@ -2274,6 +2638,7 @@ async function boot() {
     await loadAnalytics({ quiet: true });
     await loadPipelines({ quiet: true });
     await loadWorkflows({ quiet: true });
+    await loadFlows({ quiet: true });
   } catch (error) {
     if (consoleMode === "public" && error.status === 401) {
       state.session = null;
@@ -2329,6 +2694,7 @@ $("#refresh").addEventListener("click", async () => {
   await loadAnalytics({ quiet: true });
   await loadPipelines({ quiet: true });
   await loadWorkflows({ quiet: true });
+  await loadFlows({ quiet: true });
 });
 $("#deploy-form").addEventListener("submit", deployWorker);
 $("#deploy-file-picker").addEventListener("click", () => $("#deploy-files").click());
@@ -2372,6 +2738,21 @@ $("#workflow-trigger-form").addEventListener("submit", triggerWorkflow);
 $("#workflow-signal-form").addEventListener("submit", sendWorkflowSignal);
 $("#workflow-refresh").addEventListener("click", loadWorkflowInstances);
 $("#workflow-delete").addEventListener("click", deleteWorkflow);
+$("#flow-form").addEventListener("submit", saveFlow);
+$("#flow-trigger").addEventListener("change", updateFlowTriggerFields);
+$("#flow-new").addEventListener("click", newFlow);
+$("#flow-delete").addEventListener("click", deleteFlow);
+$("#flow-node-form").addEventListener("submit", saveFlowNode);
+$("#flow-node-remove").addEventListener("click", removeFlowNode);
+$("#flow-edge-form").addEventListener("submit", addFlowEdge);
+$("#flow-graph-apply").addEventListener("click", applyFlowGraphJson);
+$("#flow-graph-copy").addEventListener("click", () => copyText($("#flow-graph-json").value, $("#flow-graph-copy")));
+$("#flow-token-form").addEventListener("submit", mintFlowToken);
+$("#flow-copy-token").addEventListener("click", () => copyText($("#flow-new-token").textContent, $("#flow-copy-token")));
+$("#flow-trigger-form").addEventListener("submit", triggerFlow);
+$("#flow-refresh").addEventListener("click", loadFlowRuns);
+$("#flow-palette").addEventListener("click", (event) => { const button = event.target.closest("[data-flow-add]"); if (button) addFlowNode(button.dataset.flowAdd); });
+$("#flow-canvas").addEventListener("pointerdown", startFlowDrag);
 $("#r2-object-file").addEventListener("change", () => {
   const file = $("#r2-object-file").files?.[0];
   if (file && !$("#r2-object-key").value) $("#r2-object-key").value = file.name;
@@ -2475,6 +2856,11 @@ $("#workflow-instance-actions").addEventListener("click", (event) => {
   const button = event.target.closest("button[data-workflow-action]");
   if (button) runWorkflowAction(button.dataset.workflowAction);
 });
+$("#flow-list").addEventListener("click", (event) => { const button = event.target.closest("[data-flow]"); if (button) selectFlow(button.dataset.flow); });
+$("#flow-edge-list").addEventListener("click", (event) => { const button = event.target.closest("[data-flow-edge-remove]"); if (!button) return; state.flowGraph.edges = state.flowGraph.edges.filter((edge) => edge.id !== button.dataset.flowEdgeRemove); renderFlowCanvas(); });
+$("#flow-token-list").addEventListener("click", (event) => { const button = event.target.closest("[data-flow-token-revoke]"); if (button) revokeFlowToken(button.dataset.flowTokenRevoke); });
+$("#flow-runs").addEventListener("click", (event) => { const button = event.target.closest("[data-flow-run]"); if (button) openFlowRun(button.dataset.flowRun); });
+$("#flow-run-actions").addEventListener("click", (event) => { const button = event.target.closest("[data-flow-action]"); if (button) runFlowAction(button.dataset.flowAction); });
 
 setInterval(() => {
   if (state.session) {
@@ -2490,6 +2876,9 @@ setInterval(() => {
     });
     if (state.view === "workflows") loadWorkflows({ quiet: true }).then(() => {
       if (state.workflowActive) selectWorkflow(state.workflowActive);
+    });
+    if (state.view === "flows") loadFlows({ quiet: true }).then(() => {
+      if (state.flowActive) selectFlow(state.flowActive);
     });
   }
 }, 10_000);

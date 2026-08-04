@@ -15,6 +15,7 @@ pub mod d1bind;
 pub mod deploy;
 pub mod dns;
 pub mod durable;
+pub mod flow;
 pub mod gossip;
 pub mod ingress;
 pub mod keys;

@@ -320,6 +320,34 @@ button.build-row:hover { border-color: #444; background: #0e0e0e; }
 .database-item small { margin-top: 5px; color: var(--muted); font-size: 10px; white-space: nowrap; }
 .database-item > span:last-child { flex: 0 0 auto; color: var(--muted); font-size: 10px; white-space: nowrap; }
 .r2-sidebar-stack { display: grid; gap: 16px; }
+.flow-layout { display: grid; grid-template-columns: minmax(300px, .62fr) minmax(0, 1.7fr); gap: 16px; align-items: start; }
+.flow-workspace { min-width: 0; }
+.flow-canvas-panel { overflow: hidden; }
+.flow-palette { display: flex; flex-wrap: wrap; gap: 6px; margin: -3px 0 13px; }
+.flow-palette button { border: 1px solid var(--line); border-radius: 999px; padding: 6px 9px; background: #080808; color: var(--muted); cursor: pointer; font-size: 10px; }
+.flow-palette button:hover { border-color: #555; color: var(--text); background: var(--surface-3); }
+.flow-canvas { position: relative; min-height: 520px; overflow: auto; border: 1px solid var(--line); border-radius: 8px; background-color: #030303; background-image: radial-gradient(#333 1px, transparent 1px); background-size: 20px 20px; outline: none; }
+.flow-canvas:focus-visible { border-color: #777; box-shadow: 0 0 0 3px #ffffff10; }
+.flow-canvas > svg { position: absolute; inset: 0; width: 1200px; height: 720px; pointer-events: none; overflow: visible; }
+#flow-nodes { position: relative; width: 1200px; height: 720px; }
+.flow-node { position: absolute; z-index: 2; width: 174px; min-height: 74px; display: grid; grid-template-columns: 32px minmax(0, 1fr); gap: 10px; align-items: center; padding: 11px; border: 1px solid #393939; border-radius: 8px; background: #0c0c0c; color: var(--text); text-align: left; box-shadow: 0 10px 30px #0009; cursor: grab; user-select: none; touch-action: none; }
+.flow-node:hover { border-color: #666; }
+.flow-node.selected { border-color: #fff; box-shadow: 0 0 0 2px #ffffff16, 0 12px 34px #000; }
+.flow-node:active { cursor: grabbing; }
+.flow-node-icon { width: 31px; height: 31px; display: grid; place-items: center; border: 1px solid #414141; border-radius: 7px; background: #171717; color: #d7d7d7; font: 650 10px "Geist Mono", monospace; }
+.flow-node strong, .flow-node small { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.flow-node strong { font-size: 11px; }
+.flow-node small { margin-top: 5px; color: var(--muted); font: 9px "Geist Mono", monospace; }
+.flow-edge { fill: none; stroke: #626262; stroke-width: 1.5; }
+.flow-edge.branch { stroke: #a7853e; }
+.flow-edge-arrow { fill: #777; }
+#flow-canvas-empty { position: absolute; inset: 0; display: grid; place-items: center; pointer-events: none; }
+.flow-edit-grid { margin-top: 0; }
+.flow-graph-json { width: 100%; margin: 16px 0 10px; min-height: 280px; }
+.panel details > summary { display: flex; justify-content: space-between; gap: 16px; cursor: pointer; }
+.panel details > summary::marker { color: var(--muted); }
+#flow-edge-list { max-height: 250px; overflow: auto; }
+#flow-edge-list .build-row { grid-template-columns: 8px minmax(0, 1fr) auto; }
 .r2-bucket-button { align-items: center; font-family: inherit; }
 .r2-bucket-button > span:first-child { min-width: 0; text-align: left; }
 .r2-bucket-button strong, .r2-bucket-button small { display: block; }
@@ -347,7 +375,7 @@ dialog::backdrop { background: #000c; backdrop-filter: blur(3px); }
 
 @media (max-width: 1120px) {
   .metrics { grid-template-columns: repeat(2, 1fr); }
-  .two-one, .one-two, .one-one, .kv-grid, .d1-grid, .r2-grid { grid-template-columns: 1fr; }
+  .two-one, .one-two, .one-one, .kv-grid, .d1-grid, .r2-grid, .flow-layout { grid-template-columns: 1fr; }
   .r2-upload-form { grid-template-columns: 1fr 1fr auto; }
   .build-row { grid-template-columns: 9px minmax(150px, 1fr) auto; }
   .build-stage { display: none; }
@@ -403,6 +431,8 @@ dialog::backdrop { background: #000c; backdrop-filter: blur(3px); }
   .domain-certificate { grid-column: 2 / -1; grid-row: 2; }
   .domain-add-form, .dns-guide { grid-template-columns: 1fr; }
   .danger-zone { align-items: stretch; flex-direction: column; }
+  .flow-canvas { min-height: 430px; }
+  .flow-node { width: 154px; }
   .content-metrics { grid-template-columns: 1fr; }
   .content-metrics div { border-right: 0; border-bottom: 1px solid var(--line-soft); }
   .content-metrics div:last-child { border-bottom: 0; }

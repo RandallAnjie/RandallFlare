@@ -135,6 +135,11 @@ enum Cmd {
         #[command(subcommand)]
         cmd: WorkflowCmd,
     },
+    /// 可视化、持久化的去中心化 Flow 编排。
+    Flow {
+        #[command(subcommand)]
+        cmd: FlowCmd,
+    },
     /// Fetch and verify a worker's transparency log (hash chain).
     Log {
         worker: String,
@@ -710,6 +715,139 @@ enum WorkflowCmd {
 
 #[derive(clap::Args)]
 struct WorkflowActionArgs {
+    name: String,
+    id: String,
+    #[arg(long, env = "RF_NODE")]
+    node: String,
+    #[arg(long, env = "RF_CLUSTER_SECRET")]
+    secret: String,
+}
+
+#[derive(Subcommand)]
+enum FlowCmd {
+    /// 列出已签名 Flow 及运行统计。
+    List {
+        #[arg(long, env = "RF_NODE")]
+        node: String,
+        #[arg(long, env = "RF_CLUSTER_SECRET")]
+        secret: String,
+    },
+    /// 从 FlowGraph JSON 文件创建或更新 Flow。
+    Create {
+        name: String,
+        #[arg(long)]
+        graph: PathBuf,
+        #[arg(long, default_value = "manual")]
+        trigger: String,
+        #[arg(long)]
+        cron: Option<String>,
+        #[arg(long, default_value = "")]
+        description: String,
+        #[arg(long)]
+        hostname: Vec<String>,
+        #[arg(long, default_value_t = 30)]
+        retention_days: u16,
+        #[arg(long, default_value_t = 32)]
+        max_concurrent_runs: u16,
+        #[arg(long)]
+        suspended: bool,
+        #[arg(long, default_value = "")]
+        suspend_reason: String,
+        /// 节点本地的失败告警 URL 环境变量名，不保存 URL 本身。
+        #[arg(long)]
+        alert_webhook_env: Option<String>,
+        /// 同时签发一个 Webhook 令牌；明文只打印一次。
+        #[arg(long)]
+        webhook_token_label: Option<String>,
+        #[arg(long, env = "RF_NODE")]
+        node: String,
+        #[arg(long, env = "RF_OPERATOR_KEY")]
+        key: Option<PathBuf>,
+        #[arg(long, env = "RF_CLUSTER_SECRET")]
+        secret: String,
+    },
+    /// 删除（写入墓碑）Flow 定义。
+    Delete {
+        name: String,
+        #[arg(long, env = "RF_NODE")]
+        node: String,
+        #[arg(long, env = "RF_OPERATOR_KEY")]
+        key: Option<PathBuf>,
+        #[arg(long, env = "RF_CLUSTER_SECRET")]
+        secret: String,
+    },
+    /// 为 Webhook Flow 签发令牌，明文只打印一次。
+    TokenCreate {
+        name: String,
+        #[arg(long, default_value = "Webhook")]
+        label: String,
+        #[arg(long, env = "RF_NODE")]
+        node: String,
+        #[arg(long, env = "RF_OPERATOR_KEY")]
+        key: Option<PathBuf>,
+        #[arg(long, env = "RF_CLUSTER_SECRET")]
+        secret: String,
+    },
+    /// 按公开 ID 撤销 Webhook 令牌。
+    TokenRevoke {
+        name: String,
+        id: String,
+        #[arg(long, env = "RF_NODE")]
+        node: String,
+        #[arg(long, env = "RF_OPERATOR_KEY")]
+        key: Option<PathBuf>,
+        #[arg(long, env = "RF_CLUSTER_SECRET")]
+        secret: String,
+    },
+    /// 手动创建一次 Flow 运行。
+    Trigger {
+        name: String,
+        #[arg(long, default_value = "{}")]
+        input: String,
+        #[arg(long)]
+        idempotency_key: Option<String>,
+        #[arg(long, env = "RF_NODE")]
+        node: String,
+        #[arg(long, env = "RF_CLUSTER_SECRET")]
+        secret: String,
+    },
+    /// 列出最近的 Flow 运行。
+    Runs {
+        name: String,
+        #[arg(long)]
+        status: Option<String>,
+        #[arg(long, default_value_t = 100)]
+        limit: usize,
+        #[arg(long, env = "RF_NODE")]
+        node: String,
+        #[arg(long, env = "RF_CLUSTER_SECRET")]
+        secret: String,
+    },
+    /// 查看运行、节点步骤和审计事件。
+    Run {
+        name: String,
+        id: String,
+        #[arg(long, env = "RF_NODE")]
+        node: String,
+        #[arg(long, env = "RF_CLUSTER_SECRET")]
+        secret: String,
+    },
+    /// 取消尚未结束的运行。
+    Cancel(FlowActionArgs),
+    /// 从原输入重试终态运行。
+    Retry(FlowActionArgs),
+    /// 查看每种状态的运行计数。
+    Stats {
+        name: String,
+        #[arg(long, env = "RF_NODE")]
+        node: String,
+        #[arg(long, env = "RF_CLUSTER_SECRET")]
+        secret: String,
+    },
+}
+
+#[derive(clap::Args)]
+struct FlowActionArgs {
     name: String,
     id: String,
     #[arg(long, env = "RF_NODE")]
@@ -1724,6 +1862,220 @@ async fn async_main(cli: Cli) -> Result<()> {
                 Ok(())
             }
         },
+        Cmd::Flow { cmd } => match cmd {
+            FlowCmd::List { node, secret } => {
+                let client = PeerClient::new(secret_bytes(&secret)?);
+                let records = client
+                    .resource_heads(&node, Some(rf::flow::FLOW_KIND))
+                    .await?;
+                let mut flows = Vec::new();
+                for view in records.into_iter().filter(|view| !view.resource.deleted) {
+                    let spec = rf::flow::flow_spec(&view.resource)?;
+                    let stats = client.flow_stats(&node, &view.resource.name).await.ok();
+                    flows.push(serde_json::json!({
+                        "name": view.resource.name,
+                        "version": view.resource.version,
+                        "digest": view.digest,
+                        "spec": spec,
+                        "stats": stats,
+                    }));
+                }
+                println!("{}", serde_json::to_string_pretty(&flows)?);
+                Ok(())
+            }
+            FlowCmd::Create {
+                name,
+                graph,
+                trigger,
+                cron,
+                description,
+                hostname,
+                retention_days,
+                max_concurrent_runs,
+                suspended,
+                suspend_reason,
+                alert_webhook_env,
+                webhook_token_label,
+                node,
+                key,
+                secret,
+            } => {
+                let graph: rf::flow::FlowGraph = serde_json::from_str(
+                    &std::fs::read_to_string(&graph)
+                        .with_context(|| format!("无法读取 Flow 图 {}", graph.display()))?,
+                )
+                .context("Flow 图文件必须是有效 FlowGraph JSON")?;
+                let trigger = match trigger.as_str() {
+                    "manual" => rf::flow::FlowTrigger::Manual,
+                    "webhook" => rf::flow::FlowTrigger::Webhook,
+                    "cron" => rf::flow::FlowTrigger::Cron,
+                    _ => anyhow::bail!("Flow trigger 只允许 manual、webhook 或 cron"),
+                };
+                let client = PeerClient::new(secret_bytes(&secret)?);
+                let head = client
+                    .resource_head(&node, rf::flow::FLOW_KIND, &name)
+                    .await?;
+                let mut tokens = head
+                    .as_ref()
+                    .and_then(|head| rf::flow::flow_spec(&head.resource).ok())
+                    .map(|spec| spec.tokens)
+                    .unwrap_or_default();
+                let plaintext = if let Some(label) = webhook_token_label {
+                    let (token, plaintext) = rf::flow::mint_token(label)?;
+                    tokens.push(token);
+                    Some(plaintext)
+                } else {
+                    None
+                };
+                let spec = rf::flow::FlowSpec {
+                    description,
+                    graph,
+                    trigger,
+                    cron,
+                    hostnames: hostname,
+                    tokens,
+                    suspended,
+                    suspend_reason,
+                    retention_days,
+                    max_concurrent_runs,
+                    alert_webhook_env,
+                };
+                let record = rf::flow::prepare_flow_after(&name, spec, false, head.as_ref())?;
+                let envelope = rf_core::envelope::Envelope::seal_any(&record, &operator_key(key)?);
+                client.post_resource(&node, &envelope).await?;
+                println!("Flow {} 已更新至 v{}", record.name, record.version);
+                if let Some(plaintext) = plaintext {
+                    println!("Webhook 令牌（仅显示一次）：{plaintext}");
+                }
+                Ok(())
+            }
+            FlowCmd::Delete {
+                name,
+                node,
+                key,
+                secret,
+            } => {
+                let client = PeerClient::new(secret_bytes(&secret)?);
+                let head = client
+                    .resource_head(&node, rf::flow::FLOW_KIND, &name)
+                    .await?
+                    .filter(|view| !view.resource.deleted)
+                    .with_context(|| format!("Flow {name} 不存在"))?;
+                let spec = rf::flow::flow_spec(&head.resource)?;
+                let record = rf::flow::prepare_flow_after(&name, spec, true, Some(&head))?;
+                let envelope = rf_core::envelope::Envelope::seal_any(&record, &operator_key(key)?);
+                client.post_resource(&node, &envelope).await?;
+                println!("Flow {} 已删除（v{}）", record.name, record.version);
+                Ok(())
+            }
+            FlowCmd::TokenCreate {
+                name,
+                label,
+                node,
+                key,
+                secret,
+            } => {
+                let client = PeerClient::new(secret_bytes(&secret)?);
+                let head = client
+                    .resource_head(&node, rf::flow::FLOW_KIND, &name)
+                    .await?
+                    .filter(|view| !view.resource.deleted)
+                    .with_context(|| format!("Flow {name} 不存在"))?;
+                let mut spec = rf::flow::flow_spec(&head.resource)?;
+                let (token, plaintext) = rf::flow::mint_token(label)?;
+                spec.tokens.push(token);
+                let record = rf::flow::prepare_flow_after(&name, spec, false, Some(&head))?;
+                let envelope = rf_core::envelope::Envelope::seal_any(&record, &operator_key(key)?);
+                client.post_resource(&node, &envelope).await?;
+                println!("{plaintext}");
+                Ok(())
+            }
+            FlowCmd::TokenRevoke {
+                name,
+                id,
+                node,
+                key,
+                secret,
+            } => {
+                let client = PeerClient::new(secret_bytes(&secret)?);
+                let head = client
+                    .resource_head(&node, rf::flow::FLOW_KIND, &name)
+                    .await?
+                    .filter(|view| !view.resource.deleted)
+                    .with_context(|| format!("Flow {name} 不存在"))?;
+                let mut spec = rf::flow::flow_spec(&head.resource)?;
+                let before = spec.tokens.len();
+                spec.tokens.retain(|token| token.id != id);
+                if before == spec.tokens.len() {
+                    anyhow::bail!("Flow Webhook 令牌 {id} 不存在");
+                }
+                let record = rf::flow::prepare_flow_after(&name, spec, false, Some(&head))?;
+                let envelope = rf_core::envelope::Envelope::seal_any(&record, &operator_key(key)?);
+                client.post_resource(&node, &envelope).await?;
+                println!("Flow Webhook 令牌 {id} 已撤销");
+                Ok(())
+            }
+            FlowCmd::Trigger {
+                name,
+                input,
+                idempotency_key,
+                node,
+                secret,
+            } => {
+                let input = serde_json::from_str(&input).context("Flow 输入必须是有效 JSON")?;
+                let run = PeerClient::new(secret_bytes(&secret)?)
+                    .flow_create(&node, &name, idempotency_key.as_deref(), input)
+                    .await?;
+                println!("{}", serde_json::to_string_pretty(&run)?);
+                Ok(())
+            }
+            FlowCmd::Runs {
+                name,
+                status,
+                limit,
+                node,
+                secret,
+            } => {
+                let runs = PeerClient::new(secret_bytes(&secret)?)
+                    .flow_runs(&node, &name, status.as_deref(), limit)
+                    .await?;
+                println!("{}", serde_json::to_string_pretty(&runs)?);
+                Ok(())
+            }
+            FlowCmd::Run {
+                name,
+                id,
+                node,
+                secret,
+            } => {
+                let run = PeerClient::new(secret_bytes(&secret)?)
+                    .flow_run(&node, &name, &id)
+                    .await?;
+                println!("{}", serde_json::to_string_pretty(&run)?);
+                Ok(())
+            }
+            FlowCmd::Cancel(args) => {
+                PeerClient::new(secret_bytes(&args.secret)?)
+                    .flow_action(&args.node, &args.name, &args.id, "cancel")
+                    .await?;
+                println!("Flow 运行 {} 已取消", args.id);
+                Ok(())
+            }
+            FlowCmd::Retry(args) => {
+                let run = PeerClient::new(secret_bytes(&args.secret)?)
+                    .flow_action(&args.node, &args.name, &args.id, "retry")
+                    .await?;
+                println!("{}", serde_json::to_string_pretty(&run)?);
+                Ok(())
+            }
+            FlowCmd::Stats { name, node, secret } => {
+                let stats = PeerClient::new(secret_bytes(&secret)?)
+                    .flow_stats(&node, &name)
+                    .await?;
+                println!("{}", serde_json::to_string_pretty(&stats)?);
+                Ok(())
+            }
+        },
         Cmd::Log {
             worker,
             node,
@@ -2173,6 +2525,7 @@ async fn run(config_path: PathBuf) -> Result<()> {
     rf::gossip::spawn_blob_fetcher(node.clone());
     rf::pipeline::spawn_driver(node.clone());
     rf::workflow::spawn_driver(node.clone());
+    rf::flow::spawn_driver(node.clone());
     tracing::info!("gossip on {}", node.cfg.gossip.listen);
 
     tokio::spawn(rf::runtime::Runtime::new(node.clone(), durable.clone()).run());

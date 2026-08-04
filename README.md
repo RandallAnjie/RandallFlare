@@ -84,6 +84,16 @@ Working today, verified by multi-process fault-injection e2e tests:
   pause/resume/terminate/restart, retention GC, Worker bindings, encrypted API,
   CLI and the Chinese instance/step timeline are exercised against real
   workerd.
+- **Visual durable Flows**: a dedicated Chinese management page combines a
+  draggable DAG canvas, node inspector, signed settings, one-time Webhook
+  tokens and run/step/audit views. Manual, Cron and public Webhook triggers
+  execute from version-frozen graphs in per-Flow D1 quorums with fenced
+  leases, recovery, idempotency, cancellation, retry, retention and durable
+  loop iterations. Worker, HTTP, KV, D1, R2, Queue, Analytics, Pipeline,
+  Workflow and inline sub-Flow nodes share typed templates and cross-node
+  outputs. Public Flow domains support asynchronous 202 responses or
+  request/response mode with `?wait=1`; credentials remain node-local and
+  outbound HTTP is protected against SSRF. See [the Flow guide](./docs/FLOWS.md).
 
 Also in: HTTPS ingress (SNI cert store, hot-reload, wildcard files,
 self-signed fallback) and **native workerd kvNamespace bindings** —
