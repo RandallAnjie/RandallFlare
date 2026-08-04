@@ -13,7 +13,7 @@ use axum::extract::{ConnectInfo, DefaultBodyLimit, Path, Query, State};
 use axum::http::{HeaderMap, Method, Request, StatusCode, Uri};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, post};
+use axum::routing::{delete, get, post};
 use axum::Router;
 use rf_core::envelope::Envelope;
 use serde::Deserialize;
@@ -104,6 +104,10 @@ pub fn router(api: Api) -> Router {
         .route("/v1/queue/{queue}/stats", get(queue_stats))
         .route("/v1/queue/{queue}/dead", get(queue_dead_letters))
         .route("/v1/queue/{queue}/dead/{id}/redrive", post(queue_redrive))
+        .route("/v1/cron/{worker}/runs", get(cron_runs))
+        .route("/v1/cron/{worker}/fire", post(cron_fire))
+        .route("/v1/cron/{worker}/runs/{id}", delete(cron_delete_dlq))
+        .route("/v1/cron/{worker}/runs/{id}/replay", post(cron_replay))
         .route(
             "/v1/analytics/{dataset}/events",
             post(analytics_write).get(analytics_recent),
@@ -1181,6 +1185,103 @@ async fn queue_redrive(
     match crate::queue::redrive_dead_letter(&api.node, &queue, &id).await {
         Ok(true) => axum::Json(serde_json::json!({ "ok": true })).into_response(),
         Ok(false) => (StatusCode::NOT_FOUND, "dead letter not found").into_response(),
+        Err(error) => (StatusCode::UNPROCESSABLE_ENTITY, error.to_string()).into_response(),
+    }
+}
+
+#[derive(serde::Deserialize)]
+struct CronRunsQuery {
+    #[serde(default)]
+    dlq: bool,
+    limit: Option<usize>,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CronFireRequest {
+    #[serde(default)]
+    expression: Option<String>,
+}
+
+async fn cron_runs(
+    State(api): State<Api>,
+    ConnectInfo(remote): ConnectInfo<SocketAddr>,
+    Path(worker): Path<String>,
+    Query(query): Query<CronRunsQuery>,
+    method: Method,
+    uri: Uri,
+    headers: HeaderMap,
+) -> Response {
+    if let Err(response) = check(&api, &remote, &headers, &method, &uri, b"") {
+        return response.into_response();
+    }
+    match crate::cron_driver::list_runs(&api.node, &worker, query.dlq, query.limit.unwrap_or(100))
+        .await
+    {
+        Ok(runs) => axum::Json(serde_json::json!({ "runs": runs })).into_response(),
+        Err(error) => (StatusCode::UNPROCESSABLE_ENTITY, error.to_string()).into_response(),
+    }
+}
+
+async fn cron_fire(
+    State(api): State<Api>,
+    ConnectInfo(remote): ConnectInfo<SocketAddr>,
+    Path(worker): Path<String>,
+    method: Method,
+    uri: Uri,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    if let Err(response) = check(&api, &remote, &headers, &method, &uri, &body) {
+        return response.into_response();
+    }
+    let request = if body.is_empty() {
+        CronFireRequest { expression: None }
+    } else {
+        match serde_json::from_slice::<CronFireRequest>(&body) {
+            Ok(request) => request,
+            Err(_) => return (StatusCode::BAD_REQUEST, "bad Cron fire request").into_response(),
+        }
+    };
+    match crate::cron_driver::fire_now(&api.node, &worker, request.expression.as_deref()).await {
+        Ok(run) => axum::Json(run).into_response(),
+        Err(error) => (StatusCode::UNPROCESSABLE_ENTITY, error.to_string()).into_response(),
+    }
+}
+
+async fn cron_replay(
+    State(api): State<Api>,
+    ConnectInfo(remote): ConnectInfo<SocketAddr>,
+    Path((worker, id)): Path<(String, String)>,
+    method: Method,
+    uri: Uri,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    if let Err(response) = check(&api, &remote, &headers, &method, &uri, &body) {
+        return response.into_response();
+    }
+    match crate::cron_driver::replay_dlq(&api.node, &worker, &id).await {
+        Ok(Some(run)) => axum::Json(run).into_response(),
+        Ok(None) => (StatusCode::NOT_FOUND, "Cron DLQ run not found").into_response(),
+        Err(error) => (StatusCode::UNPROCESSABLE_ENTITY, error.to_string()).into_response(),
+    }
+}
+
+async fn cron_delete_dlq(
+    State(api): State<Api>,
+    ConnectInfo(remote): ConnectInfo<SocketAddr>,
+    Path((worker, id)): Path<(String, String)>,
+    method: Method,
+    uri: Uri,
+    headers: HeaderMap,
+) -> Response {
+    if let Err(response) = check(&api, &remote, &headers, &method, &uri, b"") {
+        return response.into_response();
+    }
+    match crate::cron_driver::delete_dlq(&api.node, &worker, &id).await {
+        Ok(true) => axum::Json(serde_json::json!({ "ok": true })).into_response(),
+        Ok(false) => (StatusCode::NOT_FOUND, "Cron DLQ run not found").into_response(),
         Err(error) => (StatusCode::UNPROCESSABLE_ENTITY, error.to_string()).into_response(),
     }
 }

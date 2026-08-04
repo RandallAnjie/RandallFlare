@@ -301,6 +301,11 @@
 
           <div id="project-tab-triggers" class="project-tab">
             <article class="panel settings-panel"><div class="settings-copy"><p class="eyebrow">自动运行</p><h2>定时触发器</h2><p class="muted">采用标准五段 Cron 表达式。获批后，每个节点都会收到同一份触发器配置。</p></div><form id="project-triggers-form" class="settings-form"><label><span>Cron 表达式 <em>每行一条</em></span><textarea id="project-crons" class="code-input" rows="8" placeholder="*/5 * * * *"></textarea></label><button class="primary" type="submit">保存触发器</button></form></article>
+            <article class="panel settings-panel"><div class="settings-copy"><p class="eyebrow">立即验证</p><h2>手动触发</h2><p class="muted">通过节点内部随机令牌调用当前版本的 <code>scheduled()</code>，不会开放公共触发 URL。结果写入下方的 D1 微仲裁历史。</p></div><form id="project-cron-fire-form" class="settings-form"><label><span>事件表达式</span><select id="project-cron-fire-expression"><option value="manual">manual（手动）</option></select></label><button class="primary" type="submit">立即运行一次</button></form></article>
+            <div class="grid one-one">
+              <article class="panel"><div class="panel-head"><div><p class="eyebrow">最近 7 天</p><h2>执行历史</h2></div><button id="project-cron-refresh" class="secondary compact" type="button">刷新</button></div><p class="form-note">自动任务失败后按 30 秒、60 秒退避，共尝试三次。成功与普通失败记录保留 7 天。</p><div id="project-cron-runs" class="build-list empty-state">尚无 Cron 执行记录。</div></article>
+              <article class="panel"><div class="panel-head"><div><p class="eyebrow">人工处理</p><h2>死信队列</h2></div><span id="project-cron-dlq-count" class="badge">0 条</span></div><p class="form-note">耗尽三次尝试的任务会保留在这里；重放只执行一次，并记录来源。</p><div id="project-cron-dlq" class="build-list empty-state">Cron DLQ 为空。</div></article>
+            </div>
           </div>
 
           <div id="project-tab-source" class="project-tab">

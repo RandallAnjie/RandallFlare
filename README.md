@@ -27,7 +27,11 @@ Working today, verified by multi-process fault-injection e2e tests:
   propagation (CF KV consistency contract)
 - Claim engine (抢单): signed, HLC-ordered, deterministically
   adjudicated leases — used for cron ticks and DNS reconciliation
-- Cron triggers (at-least-once, CF parity)
+- **Durable Cron triggers**: signed five-field schedules are claim-deduplicated
+  across live runtimes, invoke the real workerd `scheduled()` export through a
+  process-random internal token, retry failures after 30/60 seconds, and retain
+  attempts plus DLQ/replay state in a per-Worker D1 micro-quorum. History,
+  manual fire, replay and DLQ deletion are available in CLI and Chinese UI.
 - DNS self-registration + claimed stray-record cleanup (Cloudflare
   API), with a partition guard
 - workerd process supervision (config generation + lifecycle)
@@ -334,6 +338,10 @@ rf status
 rf kv put ns1 greeting hello
 rf kv list ns1 --prefix greet
 rf kv delete ns1 greeting
+rf cron list site
+rf cron fire site --expression '*/5 * * * *'
+rf cron list site --dlq
+rf cron replay site <run-id>
 rf worker-delete site
 ```
 

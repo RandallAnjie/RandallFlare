@@ -572,6 +572,76 @@ impl PeerClient {
         }
     }
 
+    pub async fn cron_runs(
+        &self,
+        base: &str,
+        worker: &str,
+        dlq: bool,
+        limit: usize,
+    ) -> Result<Vec<crate::cron_driver::CronRun>> {
+        let raw = self
+            .get(
+                base,
+                &format!(
+                    "/v1/cron/{}/runs?dlq={}&limit={}",
+                    component(worker),
+                    dlq,
+                    limit.clamp(1, 1_000)
+                ),
+            )
+            .await?;
+        let response: serde_json::Value = serde_json::from_slice(&raw)?;
+        Ok(serde_json::from_value(
+            response
+                .get("runs")
+                .cloned()
+                .unwrap_or_else(|| serde_json::json!([])),
+        )?)
+    }
+
+    pub async fn cron_fire(
+        &self,
+        base: &str,
+        worker: &str,
+        expression: Option<&str>,
+    ) -> Result<crate::cron_driver::CronRun> {
+        let raw = self
+            .post(
+                base,
+                &format!("/v1/cron/{}/fire", component(worker)),
+                serde_json::to_vec(&serde_json::json!({ "expression": expression }))?,
+            )
+            .await?;
+        Ok(serde_json::from_slice(&raw)?)
+    }
+
+    pub async fn cron_replay(
+        &self,
+        base: &str,
+        worker: &str,
+        id: &str,
+    ) -> Result<Option<crate::cron_driver::CronRun>> {
+        let path = format!(
+            "/v1/cron/{}/runs/{}/replay",
+            component(worker),
+            component(id)
+        );
+        match self.post(base, &path, vec![]).await {
+            Ok(raw) => Ok(Some(serde_json::from_slice(&raw)?)),
+            Err(error) if peer_http_status(&error) == Some(404) => Ok(None),
+            Err(error) => Err(error),
+        }
+    }
+
+    pub async fn cron_delete_dlq(&self, base: &str, worker: &str, id: &str) -> Result<bool> {
+        let path = format!("/v1/cron/{}/runs/{}", component(worker), component(id));
+        match self.delete(base, &path).await {
+            Ok(_) => Ok(true),
+            Err(error) if peer_http_status(&error) == Some(404) => Ok(false),
+            Err(error) => Err(error),
+        }
+    }
+
     pub async fn analytics_write(
         &self,
         base: &str,

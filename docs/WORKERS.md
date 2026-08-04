@@ -66,6 +66,31 @@ GitHub 来源项目也能紧急编辑，但下一次仓库构建会以仓库内�
 按清单把它们原样写入 workerd 配置，因此可用标志以该 RandallFlare 版本固定的 workerd
 版本为准。
 
+## Cron 执行、历史与死信
+
+清单中的 `crons` 使用标准五段表达式。每个有本地运行实例的节点都计算相同的分钟边界，
+再通过集群 Claim 为 `(Worker, 表达式, 分钟)` 选出唯一执行者；在网络分区下仍保持与
+Cloudflare 一致的至少一次语义。获胜节点不会把内部入口暴露到公网，而是使用每次启动
+随机生成、仅存于当前进程的事件令牌调用 workerd 中真正的 `scheduled()` 导出。
+
+每次自动执行最多尝试三次，失败后分别等待 30 秒和 60 秒。每次尝试都会写入该 Worker
+独立的 D1 微仲裁数据库，包括计划时间、实际开始/结束时间、节点、HTTP 状态和最多
+400 字节的错误摘要。普通记录保留 7 天；耗尽预算的最后一次失败进入 DLQ，保留到管理
+员重放或删除。重放只执行一次，并在新记录中链接原 DLQ ID。
+
+控制台的“触发器”页可以手动触发、查看历史和处理 DLQ；CLI 对应命令为：
+
+```bash
+rf cron list frontend
+rf cron fire frontend --expression '*/5 * * * *'
+rf cron list frontend --dlq
+rf cron replay frontend <run-id>
+rf cron delete frontend <run-id>
+```
+
+手动触发指定表达式时，该表达式必须存在于当前签名清单；省略则向 `scheduled()` 发送
+`manual`。纯静态 Worker 没有 JavaScript 运行时，因此不能触发 Cron。
+
 ## 写入后不可回读的 Secret
 
 Secret 不属于 `rf.json`，也不会混入普通环境变量编辑框。通过 HTTPS 管理后台写入，或

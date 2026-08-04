@@ -106,6 +106,11 @@ enum Cmd {
         #[command(subcommand)]
         cmd: SecretCmd,
     },
+    /// Worker Cron 执行历史、手动触发与死信重放。
+    Cron {
+        #[command(subcommand)]
+        cmd: CronCmd,
+    },
     /// KV operations against any node.
     Kv {
         #[command(subcommand)]
@@ -198,6 +203,50 @@ enum SecretCmd {
         node: String,
         #[arg(long, env = "RF_OPERATOR_KEY")]
         key: Option<PathBuf>,
+        #[arg(long, env = "RF_CLUSTER_SECRET")]
+        secret: String,
+    },
+}
+
+#[derive(Subcommand)]
+enum CronCmd {
+    /// 列出最近 7 天的执行记录；--dlq 只列死信。
+    List {
+        worker: String,
+        #[arg(long)]
+        dlq: bool,
+        #[arg(long, default_value_t = 100)]
+        limit: usize,
+        #[arg(long, env = "RF_NODE")]
+        node: String,
+        #[arg(long, env = "RF_CLUSTER_SECRET")]
+        secret: String,
+    },
+    /// 立即调用一次 scheduled()；默认表达式为 manual。
+    Fire {
+        worker: String,
+        #[arg(long)]
+        expression: Option<String>,
+        #[arg(long, env = "RF_NODE")]
+        node: String,
+        #[arg(long, env = "RF_CLUSTER_SECRET")]
+        secret: String,
+    },
+    /// 重放一条 DLQ 记录；重放本身只执行一次。
+    Replay {
+        worker: String,
+        id: String,
+        #[arg(long, env = "RF_NODE")]
+        node: String,
+        #[arg(long, env = "RF_CLUSTER_SECRET")]
+        secret: String,
+    },
+    /// 永久删除一条 DLQ 记录。
+    Delete {
+        worker: String,
+        id: String,
+        #[arg(long, env = "RF_NODE")]
+        node: String,
         #[arg(long, env = "RF_CLUSTER_SECRET")]
         secret: String,
     },
@@ -1253,6 +1302,60 @@ async fn async_main(cli: Cli) -> Result<()> {
                 let envelope = rf_core::envelope::Envelope::seal_any(&updated, &operator);
                 client.post_manifest(&node, &envelope).await?;
                 println!("已删除 {worker} 的 Secret {binding}，发布 v{version}");
+                Ok(())
+            }
+        },
+        Cmd::Cron { cmd } => match cmd {
+            CronCmd::List {
+                worker,
+                dlq,
+                limit,
+                node,
+                secret,
+            } => {
+                let client = PeerClient::new(secret_bytes(&secret)?);
+                let runs = client.cron_runs(&node, &worker, dlq, limit).await?;
+                println!("{}", serde_json::to_string_pretty(&runs)?);
+                Ok(())
+            }
+            CronCmd::Fire {
+                worker,
+                expression,
+                node,
+                secret,
+            } => {
+                let client = PeerClient::new(secret_bytes(&secret)?);
+                let run = client
+                    .cron_fire(&node, &worker, expression.as_deref())
+                    .await?;
+                println!("{}", serde_json::to_string_pretty(&run)?);
+                Ok(())
+            }
+            CronCmd::Replay {
+                worker,
+                id,
+                node,
+                secret,
+            } => {
+                let client = PeerClient::new(secret_bytes(&secret)?);
+                let run = client
+                    .cron_replay(&node, &worker, &id)
+                    .await?
+                    .with_context(|| format!("Cron DLQ 记录 {id} 不存在"))?;
+                println!("{}", serde_json::to_string_pretty(&run)?);
+                Ok(())
+            }
+            CronCmd::Delete {
+                worker,
+                id,
+                node,
+                secret,
+            } => {
+                let client = PeerClient::new(secret_bytes(&secret)?);
+                if !client.cron_delete_dlq(&node, &worker, &id).await? {
+                    anyhow::bail!("Cron DLQ 记录 {id} 不存在");
+                }
+                println!("Cron DLQ 记录 {id} 已删除");
                 Ok(())
             }
         },

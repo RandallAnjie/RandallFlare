@@ -22,6 +22,8 @@ const state = {
   activeWorker: null,
   workerDetail: null,
   workerFile: null,
+  cronRuns: [],
+  cronDlq: [],
   projectTab: "overview",
   r2Buckets: [],
   r2Active: null,
@@ -449,6 +451,7 @@ function switchProjectTab(tab) {
   $$(".project-tab").forEach((panel) => panel.classList.toggle("active", panel.id === `project-tab-${tab}`));
   if (tab === "logs") loadDetailLogs();
   if (tab === "deployments") loadDetailHistory();
+  if (tab === "triggers" && state.activeWorker) loadCronRuns();
   if (tab === "code" && state.workerDetail && !state.workerFile) {
     const worker = state.workerDetail.worker;
     const first = worker.main || worker.modules?.[0]?.path || worker.assets?.[0]?.path;
@@ -745,6 +748,9 @@ function renderWorkerDetail(data) {
   $("#project-service-bindings").value = mapToLines(worker.service_bindings);
   renderWorkerSecrets(worker.secret_names || []);
   $("#project-crons").value = (worker.crons || []).join("\n");
+  $("#project-cron-fire-expression").innerHTML = ["manual", ...(worker.crons || [])]
+    .map((expression) => `<option value="${escapeHtml(expression)}">${escapeHtml(expression === "manual" ? "manual（手动）" : expression)}</option>`)
+    .join("");
   $("#project-compatibility-date").value = worker.compatibility_date;
   $("#project-compatibility-flags").value = (worker.compatibility_flags || []).join("\n");
   $("#project-source-repository").value = source?.repository?.replace(/\.git$/, "") || "";
@@ -937,6 +943,82 @@ async function saveProjectTriggers(event) {
   event.preventDefault();
   const crons = $("#project-crons").value.split(/\r?\n/).map((value) => value.trim()).filter(Boolean);
   await updateWorkerSettings({ crons }, `更新 ${state.activeWorker} 的定时触发器。`);
+}
+
+function renderCronRuns() {
+  const recent = $("#project-cron-runs");
+  recent.classList.toggle("empty-state", state.cronRuns.length === 0);
+  recent.innerHTML = state.cronRuns.length
+    ? state.cronRuns.map((run) => {
+      const success = run.status === "success";
+      return `<article class="build-row ${success ? "success" : "failed"}"><span class="pipeline-state ${success ? "success" : "failed"}"></span><div><strong>${escapeHtml(run.expression)}</strong><small>${escapeHtml(new Date(run.started_at_ms).toLocaleString("zh-CN"))} · 第 ${escapeHtml(run.attempt)} 次尝试 · 节点 ${escapeHtml(shortId(run.node, 14))}</small><code>${escapeHtml(run.id)}</code></div><div><span class="badge">${success ? "成功" : "失败"}${run.status_code ? ` · ${escapeHtml(run.status_code)}` : ""}</span><small>${escapeHtml(run.error_brief || (run.replay_of ? `重放自 ${run.replay_of}` : ""))}</small></div></article>`;
+    }).join("")
+    : "尚无 Cron 执行记录。";
+  const dlq = $("#project-cron-dlq");
+  $("#project-cron-dlq-count").textContent = `${state.cronDlq.length} 条`;
+  dlq.classList.toggle("empty-state", state.cronDlq.length === 0);
+  dlq.innerHTML = state.cronDlq.length
+    ? state.cronDlq.map((run) => `<article class="build-row failed"><span class="pipeline-state failed"></span><div><strong>${escapeHtml(run.expression)}</strong><small>${escapeHtml(new Date(run.scheduled_at_ms).toLocaleString("zh-CN"))} · 第 ${escapeHtml(run.attempt)} 次尝试${run.replayed_at_ms ? ` · 最近重放 ${escapeHtml(new Date(run.replayed_at_ms).toLocaleString("zh-CN"))}` : ""}</small><code>${escapeHtml(run.error_brief || run.id)}</code></div><div class="table-actions"><button class="mini-button" type="button" data-cron-replay="${escapeHtml(run.id)}">重放</button><button class="mini-button danger" type="button" data-cron-delete="${escapeHtml(run.id)}">删除</button></div></article>`).join("")
+    : "Cron DLQ 为空。";
+}
+
+async function loadCronRuns({ quiet = false } = {}) {
+  const worker = state.activeWorker;
+  if (!worker) return;
+  try {
+    const [recent, dlq] = await Promise.all([
+      api(`/api/workers/${encodeURIComponent(worker)}/cron-runs?limit=100`),
+      api(`/api/workers/${encodeURIComponent(worker)}/cron-runs?dlq=true&limit=100`),
+    ]);
+    if (state.activeWorker !== worker) return;
+    state.cronRuns = recent.runs || [];
+    state.cronDlq = dlq.runs || [];
+    renderCronRuns();
+  } catch (error) {
+    if (!quiet) toast(error.message, true);
+  }
+}
+
+async function fireProjectCron(event) {
+  event.preventDefault();
+  const worker = state.activeWorker;
+  if (!worker) return;
+  const expression = $("#project-cron-fire-expression").value;
+  try {
+    const result = await api(`/api/workers/${encodeURIComponent(worker)}/cron-fire`, {
+      method: "POST",
+      body: JSON.stringify({ expression }),
+    });
+    const run = result.run;
+    toast(`Cron ${expression} 已执行：${run.status === "success" ? "成功" : "失败"}${run.status_code ? `（HTTP ${run.status_code}）` : ""}`, run.status !== "success");
+    await Promise.all([loadCronRuns({ quiet: true }), loadDetailLogs()]);
+  } catch (error) {
+    toast(error.message, true);
+  }
+}
+
+async function replayProjectCron(id) {
+  const worker = state.activeWorker;
+  if (!worker || !window.confirm("要立即重放这条 Cron 死信吗？本次只执行一次。")) return;
+  try {
+    const result = await api(`/api/workers/${encodeURIComponent(worker)}/cron-runs/${encodeURIComponent(id)}/replay`, { method: "POST", body: "{}" });
+    toast(`Cron 重放完成：${result.run.status === "success" ? "成功" : "失败"}`, result.run.status !== "success");
+    await Promise.all([loadCronRuns({ quiet: true }), loadDetailLogs()]);
+  } catch (error) {
+    toast(error.message, true);
+  }
+}
+
+async function deleteProjectCronDlq(id) {
+  const worker = state.activeWorker;
+  if (!worker || !window.confirm("要永久删除这条 Cron DLQ 记录吗？")) return;
+  try {
+    await api(`/api/workers/${encodeURIComponent(worker)}/cron-runs/${encodeURIComponent(id)}`, { method: "DELETE" });
+    toast("Cron DLQ 记录已删除");
+    await loadCronRuns({ quiet: true });
+  } catch (error) {
+    toast(error.message, true);
+  }
 }
 
 async function saveProjectSettings(event) {
@@ -3151,7 +3233,7 @@ async function boot() {
     $("#security-copy").innerHTML = consoleMode === "public"
       ? "此节点不保存<br>任何私钥。"
       : "密钥仅保留在本地<br>控制台进程中。";
-    $$("#deploy-form button, #source-form button, #kv-editor-form button, #d1-create-form button, #d1-exec-form button, #r2-bucket-form button, #r2-upload-form button, #r2-delete-bucket, #queue-form button, #queue-send-form button, #queue-delete, #analytics-form button, #analytics-write-form button, #analytics-delete, #pipeline-form button, #pipeline-token-form button, #pipeline-ingest-form button, #pipeline-flush, #pipeline-delete, #workflow-form button, #workflow-trigger-form button, #workflow-signal-form button, #workflow-delete, #flow-form button, #flow-token-form button, #flow-trigger-form button, #flow-delete, #email-domain-form button, #email-route-form button, #email-send-form button, #email-delete, #email-verify, #project-domain-add-form button, #project-bindings-form button, #project-secret-form button, #project-file-form button, #project-file-new, #project-triggers-form button, #project-settings-form button, #project-source-form button, #project-redeploy, #project-delete")
+    $$("#deploy-form button, #source-form button, #kv-editor-form button, #d1-create-form button, #d1-exec-form button, #r2-bucket-form button, #r2-upload-form button, #r2-delete-bucket, #queue-form button, #queue-send-form button, #queue-delete, #analytics-form button, #analytics-write-form button, #analytics-delete, #pipeline-form button, #pipeline-token-form button, #pipeline-ingest-form button, #pipeline-flush, #pipeline-delete, #workflow-form button, #workflow-trigger-form button, #workflow-signal-form button, #workflow-delete, #flow-form button, #flow-token-form button, #flow-trigger-form button, #flow-delete, #email-domain-form button, #email-route-form button, #email-send-form button, #email-delete, #email-verify, #project-domain-add-form button, #project-bindings-form button, #project-secret-form button, #project-file-form button, #project-file-new, #project-triggers-form button, #project-cron-fire-form button, #project-cron-dlq button, #project-settings-form button, #project-source-form button, #project-redeploy, #project-delete")
       .forEach((button) => { button.disabled = state.session.read_only; });
     await loadOverview({ quiet: true });
     await loadWorkerOps();
@@ -3217,6 +3299,14 @@ $("#project-file-type").addEventListener("change", () => {
   if (!module) $("#project-file-main").checked = false;
 });
 $("#project-triggers-form").addEventListener("submit", saveProjectTriggers);
+$("#project-cron-fire-form").addEventListener("submit", fireProjectCron);
+$("#project-cron-refresh").addEventListener("click", () => loadCronRuns());
+$("#project-cron-dlq").addEventListener("click", (event) => {
+  const replay = event.target.closest("button[data-cron-replay]");
+  const remove = event.target.closest("button[data-cron-delete]");
+  if (replay) replayProjectCron(replay.dataset.cronReplay);
+  if (remove) deleteProjectCronDlq(remove.dataset.cronDelete);
+});
 $("#project-settings-form").addEventListener("submit", saveProjectSettings);
 $("#project-source-form").addEventListener("submit", saveProjectSource);
 $("#project-source-disconnect").addEventListener("click", () => state.activeWorker && disconnectSource(state.activeWorker));

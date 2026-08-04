@@ -112,6 +112,7 @@ pub struct Node {
     workflow_schemas: Mutex<HashSet<String>>,
     flow_schemas: Mutex<HashSet<String>>,
     email_schemas: Mutex<HashSet<String>>,
+    cron_schemas: Mutex<HashSet<String>>,
     events: broadcast::Sender<NodeEvent>,
 }
 
@@ -191,6 +192,7 @@ impl Node {
             workflow_schemas: Mutex::new(HashSet::new()),
             flow_schemas: Mutex::new(HashSet::new()),
             email_schemas: Mutex::new(HashSet::new()),
+            cron_schemas: Mutex::new(HashSet::new()),
             events,
         })
     }
@@ -1012,6 +1014,14 @@ impl Node {
 
     pub(crate) fn mark_email_schema_ready(&self, database: String) {
         self.email_schemas.lock().unwrap().insert(database);
+    }
+
+    pub(crate) fn cron_schema_ready(&self, database: &str) -> bool {
+        self.cron_schemas.lock().unwrap().contains(database)
+    }
+
+    pub(crate) fn mark_cron_schema_ready(&self, database: String) {
+        self.cron_schemas.lock().unwrap().insert(database);
     }
 
     /// Periodic GC of dead claims + KV tombstones.

@@ -696,6 +696,7 @@ async fn module_worker_on_real_workerd() {
             "pipelines":{"ARCHIVE":"events-pipe"},
             "workflows":{"ORDER_WORKFLOW":"order-flow"},
             "services":{"BACKEND":"backend"},
+            "crons":["0 0 * * *"],
             "compatibility_flags":["nodejs_compat"]}"#,
     )
     .unwrap();
@@ -809,6 +810,12 @@ export default {
         JSON.stringify({ attempts: message.attempts, queue: batch.queue }),
       ));
     }
+  },
+  async scheduled(event, env, context) {
+    context.waitUntil(env.CACHE.put("cron-last", JSON.stringify({
+      cron: event.cron,
+      scheduledTime: event.scheduledTime,
+    })));
   }
 };"#,
     )
@@ -1016,6 +1023,57 @@ export default {
         !n._dir.join("data/workers/api/2/config.capnp").exists(),
         "含 Secret 的明文 workerd 配置应在启动成功后删除"
     );
+    let cron = client
+        .cron_fire(&n.api, "api", Some("0 0 * * *"))
+        .await
+        .unwrap();
+    assert_eq!(cron.status, "success");
+    assert_eq!(cron.status_code, Some(204));
+    assert_eq!(cron.expression, "0 0 * * *");
+    let cron_value: serde_json::Value = serde_json::from_slice(
+        &client
+            .kv_get(&n.api, "ns1", "cron-last")
+            .await
+            .unwrap()
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(cron_value["cron"], "0 0 * * *");
+    assert!(cron_value["scheduledTime"].as_u64().unwrap() > 0);
+    let cron_runs = client.cron_runs(&n.api, "api", false, 10).await.unwrap();
+    assert!(cron_runs.iter().any(|run| run.id == cron.id));
+    assert!(client
+        .cron_replay(&n.api, "api", &cron.id)
+        .await
+        .unwrap()
+        .is_none());
+    let dlq_id = "AAAAAAAAAAAAAAAAAAAAAA";
+    client
+        .d1_exec(
+            &n.api,
+            &rf::cron_driver::database_name("api"),
+            r#"INSERT INTO cron_runs
+               (id, expression, scheduled_at_ms, started_at_ms, finished_at_ms,
+                attempt, status, status_code, error_brief, dlq, replay_of,
+                replayed_at_ms, node_id)
+               VALUES (?1,?2,?3,?3,?3,3,'failed',500,'synthetic DLQ',1,NULL,NULL,?4)"#,
+            serde_json::json!([dlq_id, "0 0 * * *", rf::node::now_ms(), "test-node"]),
+        )
+        .await
+        .unwrap();
+    let replay = client
+        .cron_replay(&n.api, "api", dlq_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(replay.status, "success");
+    assert_eq!(replay.replay_of.as_deref(), Some(dlq_id));
+    let dlq = client.cron_runs(&n.api, "api", true, 10).await.unwrap();
+    assert!(dlq
+        .iter()
+        .any(|run| run.id == dlq_id && run.replayed_at_ms.is_some()));
+    assert!(client.cron_delete_dlq(&n.api, "api", dlq_id).await.unwrap());
+    assert!(!client.cron_delete_dlq(&n.api, "api", dlq_id).await.unwrap());
     let workflow_trigger: serde_json::Value = http
         .get(format!("http://127.0.0.1:{}/workflow-trigger", n.ingress))
         .header("host", "api.test")

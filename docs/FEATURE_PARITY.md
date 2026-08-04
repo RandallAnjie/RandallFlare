@@ -56,7 +56,7 @@ surface yet.
 | GitHub source, sandboxed build, webhook deploy | done | GitHub App auth, PR checks/comments, SSH deploy keys |
 | versions, hash-chain audit and rollback | done | version-pinned preview aliases |
 | default/custom domains and wildcard TLS | done | custom-domain DNS ownership workflow |
-| environment, encrypted Secrets, KV bindings, Cron | done | write-only XChaCha20-Poly1305 Secrets, names-only API/console and KV metadata + bulk get are verified; Cron replay/history remains |
+| environment, encrypted Secrets, KV bindings, Cron | done | write-only XChaCha20-Poly1305 Secrets, names-only API/console, KV metadata + bulk get, and real scheduled-event Cron with D1 history/retry/DLQ/replay are verified |
 | compatibility date and flags | done | compatibility date plus validated, signed workerd compatibility flags are done; the supported-flag catalogue must track the pinned workerd release |
 | runtime/build logs and cluster distribution | done | request logs, analytics and retention |
 | previews and pull-request deployments | planned | deterministic preview hostnames and cleanup |

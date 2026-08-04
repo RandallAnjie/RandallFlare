@@ -1029,6 +1029,28 @@ async function __rfEmailEvent(request, env, context) {
   return Response.json(state);
 }
 
+async function __rfCronEvent(request, env, context) {
+  if (!__rfUserDefault || typeof __rfUserDefault.scheduled !== "function") {
+    return new Response("scheduled handler not exported", { status: 404 });
+  }
+  const expression = request.headers.get("x-edge-cron-expression") || "manual";
+  const seconds = Number(request.headers.get("x-edge-cron-time"));
+  const scheduledTime = Number.isFinite(seconds) && seconds > 0 ? seconds * 1000 : Date.now();
+  const pending = [];
+  const eventContext = {
+    waitUntil(promise) { pending.push(Promise.resolve(promise)); },
+    passThroughOnException() {},
+  };
+  const event = { cron: expression, scheduledTime, noRetry() {} };
+  try {
+    await __rfUserDefault.scheduled(event, __rfWrapEnv(env, eventContext), eventContext);
+    await Promise.all(pending);
+    return new Response(null, { status: 204 });
+  } catch (error) {
+    return new Response(String(error && error.stack || error).slice(0, 4000), { status: 500 });
+  }
+}
+
 const __rfOut = { ...__rfUserDefault };
 __rfOut.fetch = (request, env, context) => {
   const url = new URL(request.url);
@@ -1040,6 +1062,9 @@ __rfOut.fetch = (request, env, context) => {
   }
   if (url.pathname === "/.rf/internal/email" && request.headers.get("x-rf-internal-event") === __rfEventToken) {
     return __rfEmailEvent(request, env, context);
+  }
+  if (url.pathname === "/.rf/internal/cron" && request.headers.get("x-rf-internal-event") === __rfEventToken) {
+    return __rfCronEvent(request, env, context);
   }
   if (__rfUserDefault && typeof __rfUserDefault.fetch === "function") {
     return __rfUserDefault.fetch(request, __rfWrapEnv(env, context), context);
@@ -1555,6 +1580,10 @@ mod tests {
         assert!(cfg.contains("uniqueKey = \"rf--w--Counter\", enableSql = true"));
         assert!(cfg.contains("durableObjectStorage = (localDisk = \"do-storage\")"));
         assert!(cfg.contains("disk = (path = \"/tmp/rf-do\", writable = true)"));
+        let entry = rf_entry_source(&m, &BTreeMap::new(), "test-event-token");
+        assert!(entry.contains("/.rf/internal/cron"));
+        assert!(entry.contains("__rfUserDefault.scheduled"));
+        assert!(entry.contains("x-rf-internal-event"));
     }
 
     #[test]

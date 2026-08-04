@@ -231,6 +231,16 @@ pub fn router(state: ConsoleState) -> Router {
         .route("/api/workers/{name}/build", post(worker_build))
         .route("/api/workers/{name}/files", post(worker_files_update))
         .route("/api/workers/{name}/files/{*path}", get(worker_file_get))
+        .route("/api/workers/{name}/cron-runs", get(worker_cron_runs))
+        .route("/api/workers/{name}/cron-fire", post(worker_cron_fire))
+        .route(
+            "/api/workers/{name}/cron-runs/{id}",
+            delete(worker_cron_delete_dlq),
+        )
+        .route(
+            "/api/workers/{name}/cron-runs/{id}/replay",
+            post(worker_cron_replay),
+        )
         .route("/api/workers/{name}/secrets", get(worker_secret_list))
         .route(
             "/api/workers/{name}/secrets/{binding}",
@@ -2350,6 +2360,81 @@ async fn worker_runtime_log(
         "node": node.id_hex(),
         "lines": node.runtime_logs(&name, query.limit),
     })))
+}
+
+#[derive(Deserialize)]
+struct WorkerCronRunsQuery {
+    #[serde(default)]
+    dlq: bool,
+    #[serde(default = "default_cron_runs_limit")]
+    limit: usize,
+}
+
+fn default_cron_runs_limit() -> usize {
+    100
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WorkerCronFireRequest {
+    #[serde(default)]
+    expression: Option<String>,
+}
+
+async fn worker_cron_runs(
+    State(state): State<ConsoleState>,
+    Path(name): Path<String>,
+    Query(query): Query<WorkerCronRunsQuery>,
+) -> ApiResult<Json<Value>> {
+    if !valid_name(&name) {
+        return Err(ApiError::bad_request("Worker 名称无效"));
+    }
+    let runs = state
+        .client
+        .cron_runs(&state.node, &name, query.dlq, query.limit)
+        .await?;
+    Ok(Json(json!({ "worker": name, "runs": runs })))
+}
+
+async fn worker_cron_fire(
+    State(state): State<ConsoleState>,
+    Path(name): Path<String>,
+    Json(request): Json<WorkerCronFireRequest>,
+) -> ApiResult<Json<Value>> {
+    state.require_mutation()?;
+    let run = state
+        .client
+        .cron_fire(&state.node, &name, request.expression.as_deref())
+        .await?;
+    Ok(Json(json!({ "ok": true, "run": run })))
+}
+
+async fn worker_cron_replay(
+    State(state): State<ConsoleState>,
+    Path((name, id)): Path<(String, String)>,
+) -> ApiResult<Json<Value>> {
+    state.require_mutation()?;
+    let run = state
+        .client
+        .cron_replay(&state.node, &name, &id)
+        .await?
+        .ok_or_else(|| ApiError::not_found("Cron DLQ 记录不存在"))?;
+    Ok(Json(json!({ "ok": true, "run": run })))
+}
+
+async fn worker_cron_delete_dlq(
+    State(state): State<ConsoleState>,
+    Path((name, id)): Path<(String, String)>,
+) -> ApiResult<Json<Value>> {
+    state.require_mutation()?;
+    if !state
+        .client
+        .cron_delete_dlq(&state.node, &name, &id)
+        .await?
+    {
+        return Err(ApiError::not_found("Cron DLQ 记录不存在"));
+    }
+    Ok(Json(json!({ "ok": true })))
 }
 
 fn manifest_log_entry(manifest: &WorkerManifest, envelope: &rf_core::envelope::Envelope) -> Value {
