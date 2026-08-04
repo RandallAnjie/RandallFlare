@@ -26,6 +26,7 @@ use std::process::Stdio;
 use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, AsyncRead, BufReader};
 use tokio::process::{Child, Command};
+use zeroize::Zeroize;
 
 pub struct Runtime {
     node: Arc<Node>,
@@ -246,6 +247,11 @@ impl Runtime {
             .join(m.version.to_string());
         let src = dir.join("src");
         std::fs::create_dir_all(&src)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))?;
+        }
         for module in &m.modules {
             let path = src.join(&module.path);
             if let Some(parent) = path.parent() {
@@ -285,7 +291,9 @@ impl Runtime {
         {
             self.durable.restore(&m.name).await?;
         }
-        let config = generate_config(
+        let cluster_secret = self.node.cfg.cluster_secret_bytes()?;
+        let mut secret_bindings = crate::worker_secret::decrypt_manifest(&cluster_secret, m)?;
+        let mut config = generate_config(
             m,
             port,
             BindingPorts {
@@ -297,10 +305,24 @@ impl Runtime {
                 pipeline: self.node.pbind_port(),
                 workflow: self.node.workflowbind_port(),
                 email: self.node.emailbind_port(),
+                service: self.node.servicebind_port(),
             },
             &durable_dir,
+            &secret_bindings,
         );
-        std::fs::write(dir.join("config.capnp"), config)?;
+        for value in secret_bindings.values_mut() {
+            value.zeroize();
+        }
+        let config_path = dir.join("config.capnp");
+        std::fs::write(&config_path, config.as_bytes())?;
+        config.zeroize();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&config_path, std::fs::Permissions::from_mode(0o600))?;
+        }
+        let _secret_config_cleanup =
+            SecretConfigCleanup((!secret_bindings.is_empty()).then_some(config_path.clone()));
 
         let mut cmd = Command::new(workerd);
         cmd.arg("serve");
@@ -407,6 +429,16 @@ impl Runtime {
             },
         );
         Ok(())
+    }
+}
+
+struct SecretConfigCleanup(Option<std::path::PathBuf>);
+
+impl Drop for SecretConfigCleanup {
+    fn drop(&mut self) {
+        if let Some(path) = self.0.take() {
+            let _ = std::fs::remove_file(path);
+        }
     }
 }
 
@@ -1052,6 +1084,7 @@ pub struct BindingPorts {
     pub pipeline: u16,
     pub workflow: u16,
     pub email: u16,
+    pub service: u16,
 }
 
 pub fn generate_config(
@@ -1059,6 +1092,7 @@ pub fn generate_config(
     port: u16,
     binding_ports: BindingPorts,
     durable_dir: &std::path::Path,
+    secret_bindings: &std::collections::BTreeMap<String, String>,
 ) -> String {
     let BindingPorts {
         kv: kvbind_port,
@@ -1069,6 +1103,7 @@ pub fn generate_config(
         pipeline: pbind_port,
         workflow: workflowbind_port,
         email: emailbind_port,
+        service: servicebind_port,
     } = binding_ports;
     let mut modules = String::new();
     modules
@@ -1101,6 +1136,8 @@ pub fn generate_config(
             || k == crate::deploy::PIPELINE_METADATA_ENV
             || k == crate::deploy::WORKFLOW_METADATA_ENV
             || k == crate::deploy::EMAIL_METADATA_ENV
+            || k == crate::deploy::SERVICE_METADATA_ENV
+            || k == crate::deploy::SECRET_METADATA_ENV
         {
             continue;
         }
@@ -1108,6 +1145,13 @@ pub fn generate_config(
             "        (name = {}, text = {}),\n",
             capnp_string(k),
             capnp_string(v)
+        ));
+    }
+    for (binding, value) in secret_bindings {
+        bindings.push_str(&format!(
+            "        (name = {}, text = {}),\n",
+            capnp_string(binding),
+            capnp_string(value),
         ));
     }
     // Native kvNamespace bindings: each one routes to the node's
@@ -1255,6 +1299,27 @@ pub fn generate_config(
             worker = capnp_string(&m.name),
         ));
     }
+    let mut worker_services = String::new();
+    for (binding, target) in crate::deploy::service_bindings(m) {
+        let service = format!("worker-service-{binding}");
+        bindings.push_str(&format!(
+            "        (name = {binding}, service = {service}),\n",
+            binding = capnp_string(&binding),
+            service = capnp_string(&service),
+        ));
+        worker_services.push_str(&format!(
+            "    (name = {service}, external = (address = \"127.0.0.1:{servicebind_port}\", \
+             http = (injectRequestHeaders = [\
+               (name = \"{source_header}\", value = {source}),\
+               (name = \"{target_header}\", value = {target})\
+             ]))),\n",
+            service = capnp_string(&service),
+            source_header = crate::servicebind::SOURCE_HEADER,
+            source = capnp_string(&m.name),
+            target_header = crate::servicebind::TARGET_HEADER,
+            target = capnp_string(&target),
+        ));
+    }
     let durable_objects = crate::deploy::durable_objects(m);
     let mut durable_namespaces = String::new();
     let mut seen_durable = std::collections::BTreeSet::new();
@@ -1301,7 +1366,7 @@ const config :Workerd.Config = (
       bindings = [
 {bindings}      ],
 {durable_worker}    )),
-{kv_services}{r2_services}{d1_services}{queue_services}{analytics_services}{pipeline_services}{workflow_services}{email_services}{durable_service}  ],
+{kv_services}{r2_services}{d1_services}{queue_services}{analytics_services}{pipeline_services}{workflow_services}{email_services}{worker_services}{durable_service}  ],
   sockets = [
     (name = "http", address = "127.0.0.1:{port}", http = (), service = "main"),
   ],
@@ -1411,6 +1476,14 @@ mod tests {
             )]))
             .unwrap(),
         );
+        m.env.insert(
+            crate::deploy::SERVICE_METADATA_ENV.into(),
+            serde_json::to_string(&BTreeMap::from([(
+                "BACKEND".to_string(),
+                "backend".to_string(),
+            )]))
+            .unwrap(),
+        );
         let cfg = generate_config(
             &m,
             30111,
@@ -1423,13 +1496,17 @@ mod tests {
                 pipeline: 7387,
                 workflow: 7388,
                 email: 7389,
+                service: 7390,
             },
             std::path::Path::new("/tmp/rf-do"),
+            &BTreeMap::from([("API_TOKEN".into(), "private-value".into())]),
         );
         assert!(cfg.contains("esModule = embed \"src/index.js\""));
         assert!(cfg.contains("127.0.0.1:30111"));
         assert!(cfg.contains("GREETING"));
         assert!(cfg.contains("hi \\\"there\\\""));
+        assert!(cfg.contains("API_TOKEN"));
+        assert!(cfg.contains("private-value"));
         assert!(cfg.contains("(name = \"CACHE\", kvNamespace = (name = \"kv-CACHE\"))"));
         assert!(cfg.contains("external = (address = \"127.0.0.1:7382\""));
         assert!(cfg.contains("injectRequestHeaders = [(name = \"x-rf-kv-ns\", value = \"ns1\")]"));
@@ -1456,6 +1533,10 @@ mod tests {
         assert!(cfg.contains("address = \"127.0.0.1:7389\""));
         assert!(cfg.contains("x-rf-email-domain\", value = \"primary-mail\""));
         assert!(cfg.contains("x-rf-worker\", value = \"w\""));
+        assert!(cfg.contains("(name = \"BACKEND\", service = \"worker-service-BACKEND\")"));
+        assert!(cfg.contains("address = \"127.0.0.1:7390\""));
+        assert!(cfg.contains("x-rf-service-source\", value = \"w\""));
+        assert!(cfg.contains("x-rf-service-target\", value = \"backend\""));
         assert!(cfg.contains("name = \"randallflare:workers\""));
         assert!(cfg.contains("compatibilityDate = \"2026-07-31\""));
         assert!(cfg.contains("durableObjectNamespace = (className = \"Counter\")"));

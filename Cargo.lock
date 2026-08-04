@@ -2754,6 +2754,7 @@ dependencies = [
  "tower",
  "tracing",
  "tracing-subscriber",
+ "zeroize",
  "zstd",
 ]
 

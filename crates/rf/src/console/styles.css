@@ -302,6 +302,12 @@ button.build-row:hover { border-color: #444; background: #0e0e0e; }
 .settings-copy h2 { margin: 5px 0 8px; }
 .settings-copy p:last-child { margin-bottom: 0; }
 .settings-form { gap: 13px; }
+.secret-list { display: grid; gap: 7px; }
+.secret-row { display: flex; align-items: center; justify-content: space-between; gap: 16px; padding: 11px 12px; border: 1px solid var(--line-soft); border-radius: 7px; background: #070707; }
+.secret-row div { min-width: 0; }
+.secret-row strong, .secret-row small { display: block; }
+.secret-row strong { overflow: hidden; text-overflow: ellipsis; font: 600 11px "Geist Mono", monospace; }
+.secret-row small { margin-top: 4px; color: var(--muted); font-size: 10px; }
 .form-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; }
 .danger-zone { display: flex; align-items: center; justify-content: space-between; gap: 24px; border-color: #562929; }
 .danger-zone h2 { margin: 5px 0; }

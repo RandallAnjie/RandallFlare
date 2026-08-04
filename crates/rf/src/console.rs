@@ -16,7 +16,7 @@ use axum::extract::{DefaultBodyLimit, Extension, Path, Query, State};
 use axum::http::{header, HeaderMap, HeaderValue, Method, Request, StatusCode, Uri};
 use axum::middleware::{self, Next};
 use axum::response::{Html, IntoResponse, Response};
-use axum::routing::{delete, get, post};
+use axum::routing::{delete, get, post, put};
 use axum::{Json, Router};
 use rand::RngCore;
 use rf_core::identity::AnyKeypair;
@@ -28,6 +28,7 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
+use zeroize::Zeroize;
 
 const INDEX_HTML: &str = include_str!("console/index.html");
 const APP_JS: &str = include_str!("console/app.js");
@@ -55,6 +56,7 @@ enum ConsoleMode {
 pub struct ConsoleState {
     node: Arc<str>,
     client: PeerClient,
+    secret: [u8; 32],
     mode: ConsoleMode,
     started: Instant,
 }
@@ -66,6 +68,7 @@ impl ConsoleState {
         Self {
             node: node.into(),
             client: PeerClient::new(secret),
+            secret,
             mode: ConsoleMode::Local {
                 operator: operator.map(Arc::new),
                 token: hex::encode(token).into(),
@@ -76,9 +79,11 @@ impl ConsoleState {
 
     pub fn public(node: Arc<Node>, secure_cookies: bool) -> Result<Self> {
         let peer = format!("127.0.0.1:{}", node.cfg.peer_api.listen.port());
+        let secret = node.cfg.cluster_secret_bytes()?;
         Ok(Self {
             node: peer.into(),
-            client: PeerClient::new(node.cfg.cluster_secret_bytes()?),
+            client: PeerClient::new(secret),
+            secret,
             mode: ConsoleMode::Public {
                 node,
                 secure_cookies,
@@ -135,6 +140,17 @@ impl ConsoleState {
 
     fn is_read_only(&self) -> bool {
         matches!(self.mode, ConsoleMode::Local { operator: None, .. })
+    }
+
+    fn allows_secret_writes(&self) -> bool {
+        matches!(
+            self.mode,
+            ConsoleMode::Local { .. }
+                | ConsoleMode::Public {
+                    secure_cookies: true,
+                    ..
+                }
+        )
     }
 
     fn origin_scheme(&self) -> &'static str {
@@ -210,6 +226,11 @@ pub fn router(state: ConsoleState) -> Router {
         .route("/api/workers/{name}/log", get(worker_log))
         .route("/api/workers/{name}/runtime-log", get(worker_runtime_log))
         .route("/api/workers/{name}/build", post(worker_build))
+        .route("/api/workers/{name}/secrets", get(worker_secret_list))
+        .route(
+            "/api/workers/{name}/secrets/{binding}",
+            put(worker_secret_put).delete(worker_secret_delete),
+        )
         .route(
             "/api/workers/{name}/rollback/{version}",
             post(worker_rollback),
@@ -774,6 +795,8 @@ struct WorkerSettingsRequest {
     #[serde(default)]
     email_bindings: Option<BTreeMap<String, String>>,
     #[serde(default)]
+    service_bindings: Option<BTreeMap<String, String>>,
+    #[serde(default)]
     crons: Option<Vec<String>>,
     #[serde(default)]
     compatibility_date: Option<String>,
@@ -823,15 +846,7 @@ async fn worker_get(
     Path(name): Path<String>,
 ) -> ApiResult<Json<Value>> {
     let (manifest, digest) = current_manifest(&state, &name).await?;
-    let mut env = manifest.env.clone();
-    env.remove(deploy::DO_METADATA_ENV);
-    env.remove(deploy::R2_METADATA_ENV);
-    env.remove(deploy::D1_METADATA_ENV);
-    env.remove(deploy::QUEUE_METADATA_ENV);
-    env.remove(deploy::ANALYTICS_METADATA_ENV);
-    env.remove(deploy::PIPELINE_METADATA_ENV);
-    env.remove(deploy::WORKFLOW_METADATA_ENV);
-    env.remove(deploy::EMAIL_METADATA_ENV);
+    let env = worker_console_environment(&manifest);
     let durable_objects = deploy::durable_objects(&manifest);
     let r2_bindings = deploy::r2_bindings(&manifest);
     let d1_bindings = deploy::d1_bindings(&manifest);
@@ -840,6 +855,10 @@ async fn worker_get(
     let pipeline_bindings = deploy::pipeline_bindings(&manifest);
     let workflow_bindings = deploy::workflow_bindings(&manifest);
     let email_bindings = deploy::email_bindings(&manifest);
+    let service_bindings = deploy::service_bindings(&manifest);
+    let secret_names: Vec<String> = crate::worker_secret::encrypted_secrets_checked(&manifest)?
+        .into_keys()
+        .collect();
     let source = match &state.mode {
         ConsoleMode::Public { node, .. } => crate::build::source_head(node, &name)
             .filter(|record| !record.source.deleted)
@@ -895,6 +914,8 @@ async fn worker_get(
             "pipeline_bindings": pipeline_bindings,
             "workflow_bindings": workflow_bindings,
             "email_bindings": email_bindings,
+            "service_bindings": service_bindings,
+            "secret_names": secret_names,
             "crons": manifest.crons,
             "compatibility_date": manifest.compatibility_date,
             "durable_objects": durable_objects,
@@ -902,6 +923,21 @@ async fn worker_get(
         "source": source,
         "tls": tls,
     })))
+}
+
+fn worker_console_environment(manifest: &WorkerManifest) -> BTreeMap<String, String> {
+    let mut env = manifest.env.clone();
+    env.remove(deploy::DO_METADATA_ENV);
+    env.remove(deploy::R2_METADATA_ENV);
+    env.remove(deploy::D1_METADATA_ENV);
+    env.remove(deploy::QUEUE_METADATA_ENV);
+    env.remove(deploy::ANALYTICS_METADATA_ENV);
+    env.remove(deploy::PIPELINE_METADATA_ENV);
+    env.remove(deploy::WORKFLOW_METADATA_ENV);
+    env.remove(deploy::EMAIL_METADATA_ENV);
+    env.remove(deploy::SERVICE_METADATA_ENV);
+    env.remove(deploy::SECRET_METADATA_ENV);
+    env
 }
 
 fn worker_tls_view(node: &Node, hostnames: &[String]) -> Value {
@@ -1142,6 +1178,7 @@ fn apply_worker_settings(
         pipeline_bindings,
         workflow_bindings,
         email_bindings,
+        service_bindings,
         crons,
         compatibility_date,
     } = request;
@@ -1155,6 +1192,7 @@ fn apply_worker_settings(
         && pipeline_bindings.is_none()
         && workflow_bindings.is_none()
         && email_bindings.is_none()
+        && service_bindings.is_none()
         && crons.is_none()
         && compatibility_date.is_none()
     {
@@ -1174,15 +1212,7 @@ fn apply_worker_settings(
         manifest.hostnames = normalized;
     }
     if let Some(mut env) = env {
-        if env.contains_key(deploy::DO_METADATA_ENV)
-            || env.contains_key(deploy::R2_METADATA_ENV)
-            || env.contains_key(deploy::D1_METADATA_ENV)
-            || env.contains_key(deploy::QUEUE_METADATA_ENV)
-            || env.contains_key(deploy::ANALYTICS_METADATA_ENV)
-            || env.contains_key(deploy::PIPELINE_METADATA_ENV)
-            || env.contains_key(deploy::WORKFLOW_METADATA_ENV)
-            || env.contains_key(deploy::EMAIL_METADATA_ENV)
-        {
+        if env.keys().any(|key| key.starts_with("__RF_")) {
             return Err(ApiError::bad_request(
                 "不能修改 RandallFlare 保留的环境变量",
             ));
@@ -1211,6 +1241,12 @@ fn apply_worker_settings(
         }
         if let Some(email) = manifest.env.get(deploy::EMAIL_METADATA_ENV).cloned() {
             env.insert(deploy::EMAIL_METADATA_ENV.into(), email);
+        }
+        if let Some(services) = manifest.env.get(deploy::SERVICE_METADATA_ENV).cloned() {
+            env.insert(deploy::SERVICE_METADATA_ENV.into(), services);
+        }
+        if let Some(secrets) = manifest.env.get(deploy::SECRET_METADATA_ENV).cloned() {
+            env.insert(deploy::SECRET_METADATA_ENV.into(), secrets);
         }
         manifest.env = env;
     }
@@ -1404,6 +1440,32 @@ fn apply_worker_settings(
             );
         }
     }
+    if let Some(service_bindings) = service_bindings {
+        validate_settings_map(&service_bindings, "Service 绑定")?;
+        let identifier = |value: &str| {
+            let mut chars = value.chars();
+            chars.next().is_some_and(|character| {
+                character.is_ascii_alphabetic() || matches!(character, '_' | '$')
+            }) && chars.all(|character| {
+                character.is_ascii_alphanumeric() || matches!(character, '_' | '$')
+            })
+        };
+        for (binding, target) in &service_bindings {
+            if !identifier(binding) || !valid_name(target) || target == &manifest.name {
+                return Err(ApiError::bad_request(format!(
+                    "Service 绑定 {binding} 或目标 Worker 名称无效，且不能绑定自身"
+                )));
+            }
+        }
+        if service_bindings.is_empty() {
+            manifest.env.remove(deploy::SERVICE_METADATA_ENV);
+        } else {
+            manifest.env.insert(
+                deploy::SERVICE_METADATA_ENV.into(),
+                serde_json::to_string(&service_bindings)?,
+            );
+        }
+    }
     if let Some(crons) = crons {
         if crons.len() > 256 {
             return Err(ApiError::bad_request(
@@ -1423,6 +1485,7 @@ fn apply_worker_settings(
         }
         manifest.compatibility_date = compatibility_date;
     }
+    let encrypted_secrets = crate::worker_secret::encrypted_secrets_checked(&manifest)?;
     let mut binding_names = std::collections::BTreeSet::new();
     for name in manifest
         .env
@@ -1437,6 +1500,8 @@ fn apply_worker_settings(
         .chain(deploy::pipeline_bindings(&manifest).keys())
         .chain(deploy::workflow_bindings(&manifest).keys())
         .chain(deploy::email_bindings(&manifest).keys())
+        .chain(deploy::service_bindings(&manifest).keys())
+        .chain(encrypted_secrets.keys())
     {
         if !binding_names.insert(name.clone()) {
             return Err(ApiError::bad_request(format!("绑定名称 {name} 被重复使用")));
@@ -1483,6 +1548,115 @@ async fn worker_update(
                 "pending_approval": true,
                 "name": manifest.name,
                 "version": manifest.version,
+                "approval": approval,
+                "approve_node": node.cfg.peer_api_advertise().to_string(),
+            })))
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WorkerSecretPutRequest {
+    value: String,
+}
+
+async fn worker_secret_list(
+    State(state): State<ConsoleState>,
+    Path(name): Path<String>,
+) -> ApiResult<Json<Value>> {
+    let (manifest, _) = current_manifest(&state, &name).await?;
+    let secrets = crate::worker_secret::encrypted_secrets_checked(&manifest)?;
+    Ok(Json(json!({
+        "worker": manifest.name,
+        "secrets": secrets.into_keys().collect::<Vec<_>>(),
+    })))
+}
+
+async fn worker_secret_put(
+    State(state): State<ConsoleState>,
+    Extension(principal): Extension<ConsolePrincipal>,
+    Path((name, binding)): Path<(String, String)>,
+    Json(mut request): Json<WorkerSecretPutRequest>,
+) -> ApiResult<Json<Value>> {
+    state.require_mutation()?;
+    if !state.allows_secret_writes() {
+        return Err(ApiError::forbidden(
+            "公共控制台只能通过 HTTPS 写入 Worker Secret",
+        ));
+    }
+    let (manifest, digest) = current_manifest(&state, &name).await?;
+    let manifest_result = mutate_worker_secret(
+        manifest,
+        digest,
+        &binding,
+        Some(&request.value),
+        &state.secret,
+    );
+    request.value.zeroize();
+    let manifest = manifest_result?;
+    submit_secret_manifest(&state, &principal, manifest, &binding, "写入或替换").await
+}
+
+async fn worker_secret_delete(
+    State(state): State<ConsoleState>,
+    Extension(principal): Extension<ConsolePrincipal>,
+    Path((name, binding)): Path<(String, String)>,
+) -> ApiResult<Json<Value>> {
+    state.require_mutation()?;
+    let (manifest, digest) = current_manifest(&state, &name).await?;
+    let manifest = mutate_worker_secret(manifest, digest, &binding, None, &state.secret)?;
+    submit_secret_manifest(&state, &principal, manifest, &binding, "删除").await
+}
+
+fn mutate_worker_secret(
+    manifest: WorkerManifest,
+    digest: [u8; 32],
+    binding: &str,
+    value: Option<&str>,
+    cluster_secret: &[u8; 32],
+) -> ApiResult<WorkerManifest> {
+    let result = if let Some(value) = value {
+        crate::worker_secret::put_manifest_secret(manifest, digest, cluster_secret, binding, value)
+    } else {
+        crate::worker_secret::delete_manifest_secret(manifest, digest, binding)
+    };
+    result.map_err(|error| ApiError::bad_request(format!("Secret 配置无效：{error:#}")))
+}
+
+async fn submit_secret_manifest(
+    state: &ConsoleState,
+    principal: &ConsolePrincipal,
+    manifest: WorkerManifest,
+    binding: &str,
+    action: &str,
+) -> ApiResult<Json<Value>> {
+    match &state.mode {
+        ConsoleMode::Local { .. } => {
+            let envelope = rf_core::envelope::Envelope::seal_any(&manifest, state.operator()?);
+            state.client.post_manifest(&state.node, &envelope).await?;
+            Ok(Json(json!({
+                "ok": true,
+                "name": manifest.name,
+                "version": manifest.version,
+                "secret": binding,
+            })))
+        }
+        ConsoleMode::Public { node, .. } => {
+            let approval = node.management.create_manifest(
+                principal.session_id,
+                &manifest,
+                format!(
+                    "{action} Worker {} 的加密 Secret {} 并发布 v{}",
+                    manifest.name, binding, manifest.version
+                ),
+            )?;
+            Ok(Json(json!({
+                "ok": true,
+                "pending_approval": true,
+                "name": manifest.name,
+                "version": manifest.version,
+                "secret": binding,
                 "approval": approval,
                 "approve_node": node.cfg.peer_api_advertise().to_string(),
             })))
@@ -4069,6 +4243,17 @@ mod tests {
             deploy::PIPELINE_METADATA_ENV.into(),
             r#"{"OLD_PIPE":"archive"}"#.into(),
         );
+        let encrypted = crate::worker_secret::encrypt(
+            &[7; 32],
+            "demo",
+            "API_TOKEN",
+            "console-must-never-return-this",
+        )
+        .unwrap();
+        env.insert(
+            deploy::SECRET_METADATA_ENV.into(),
+            serde_json::to_string(&BTreeMap::from([("API_TOKEN", encrypted)])).unwrap(),
+        );
         let manifest = WorkerManifest {
             name: "demo".into(),
             version: 4,
@@ -4106,6 +4291,7 @@ mod tests {
                     "SUPPORT_MAIL".into(),
                     "support-mail".into(),
                 )])),
+                service_bindings: Some(BTreeMap::from([("BACKEND".into(), "backend".into())])),
                 crons: Some(vec!["*/5 * * * *".into()]),
                 compatibility_date: Some("2026-08-04".into()),
             },
@@ -4132,8 +4318,20 @@ mod tests {
             deploy::workflow_bindings(&updated)["ORDER_FLOW"],
             "order-flow"
         );
+        assert_eq!(deploy::service_bindings(&updated)["BACKEND"], "backend");
         assert_eq!(updated.kv_bindings["CACHE"], "shared");
         assert_eq!(updated.crons, vec!["*/5 * * * *"]);
+        assert!(updated.env.contains_key(deploy::SECRET_METADATA_ENV));
+        let exposed = worker_console_environment(&updated);
+        let exposed_json = serde_json::to_string(&exposed).unwrap();
+        assert!(!exposed.contains_key(deploy::SECRET_METADATA_ENV));
+        assert!(!exposed_json.contains("console-must-never-return-this"));
+        assert_eq!(
+            crate::worker_secret::encrypted_secrets(&updated)
+                .into_keys()
+                .collect::<Vec<_>>(),
+            vec!["API_TOKEN"]
+        );
     }
 
     #[test]

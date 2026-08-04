@@ -573,6 +573,32 @@ async fn module_worker_on_real_workerd() {
     let mut n = start("wd", &operator, &[]);
     wait_ping(&n.api, Duration::from_secs(15)).await;
 
+    let backend_dir =
+        std::env::temp_dir().join(format!("rf-e2e-service-{}", rand::random::<u32>()));
+    std::fs::create_dir_all(&backend_dir).unwrap();
+    std::fs::write(
+        backend_dir.join("rf.json"),
+        r#"{"name":"backend","main":"index.js"}"#,
+    )
+    .unwrap();
+    std::fs::write(
+        backend_dir.join("index.js"),
+        r#"export default { async fetch(request) {
+  const url = new URL(request.url);
+  return Response.json({
+    path: url.pathname,
+    query: url.search,
+    sourceHeader: request.headers.get("x-rf-service-source"),
+    targetHeader: request.headers.get("x-rf-service-target")
+  });
+} };"#,
+    )
+    .unwrap();
+    let backend_bundle = rf::deploy::read_bundle(&backend_dir).unwrap();
+    rf::deploy::deploy(&backend_bundle, &client, &n.api, &op_any)
+        .await
+        .unwrap();
+
     // Seed a KV value the worker will read through its binding.
     client
         .kv_put(&n.api, "ns1", "greet", b"kv-through-binding".to_vec())
@@ -589,7 +615,8 @@ async fn module_worker_on_real_workerd() {
             "d1":{"DB":"worker-db"},"queues":{"EVENTS":"events"},
             "analytics":{"METRICS":"web-metrics"},
             "pipelines":{"ARCHIVE":"events-pipe"},
-            "workflows":{"ORDER_WORKFLOW":"order-flow"}}"#,
+            "workflows":{"ORDER_WORKFLOW":"order-flow"},
+            "services":{"BACKEND":"backend"}}"#,
     )
     .unwrap();
     std::fs::write(
@@ -675,6 +702,12 @@ export default {
       ]);
       return new Response("accepted");
     }
+    if (url.pathname === "/service") {
+      return env.BACKEND.fetch(new Request("http://backend/from-frontend?source=service", {
+        headers: { "x-rf-service-target": "attempted-override" }
+      }));
+    }
+    if (url.pathname === "/secret") return new Response(env.API_TOKEN);
     if (url.pathname === "/workflow-trigger") {
       const instance = await env.ORDER_WORKFLOW.create({ id: "order-e2e", params: { orderId: "RF-1001" } });
       return Response.json({ id: instance.id, status: await instance.status() });
@@ -826,6 +859,31 @@ export default {
     rf::deploy::deploy(&bundle, &client, &n.api, &op_any)
         .await
         .unwrap();
+    let secret_plaintext = format!("runtime-secret-{}", rand::random::<u64>());
+    let envelopes = client.worker_log(&n.api, "api").await.unwrap();
+    let manifest = rf_core::manifest::verify_chain(&envelopes, &op_any.signer_id())
+        .unwrap()
+        .last()
+        .unwrap()
+        .clone();
+    let secret_manifest = rf::worker_secret::put_manifest_secret(
+        manifest,
+        envelopes.last().unwrap().digest(),
+        &SECRET,
+        "API_TOKEN",
+        &secret_plaintext,
+    )
+    .unwrap();
+    assert!(!serde_json::to_string(&secret_manifest)
+        .unwrap()
+        .contains(&secret_plaintext));
+    client
+        .post_manifest(
+            &n.api,
+            &rf_core::envelope::Envelope::seal_any(&secret_manifest, &op_any),
+        )
+        .await
+        .unwrap();
 
     // Runtime reconciles on the manifest event; workerd needs a
     // moment to boot. Poll through ingress.
@@ -847,6 +905,37 @@ export default {
         }
         tokio::time::sleep(Duration::from_millis(300)).await;
     }
+    let service_response: serde_json::Value = http
+        .get(format!("http://127.0.0.1:{}/service", n.ingress))
+        .header("host", "api.test")
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(service_response["path"], "/from-frontend");
+    assert_eq!(service_response["query"], "?source=service");
+    assert!(service_response["sourceHeader"].is_null());
+    assert!(service_response["targetHeader"].is_null());
+    let secret_response = http
+        .get(format!("http://127.0.0.1:{}/secret", n.ingress))
+        .header("host", "api.test")
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert_eq!(secret_response, secret_plaintext);
+    assert!(
+        !n._dir.join("data/workers/api/2/config.capnp").exists(),
+        "含 Secret 的明文 workerd 配置应在启动成功后删除"
+    );
     let workflow_trigger: serde_json::Value = http
         .get(format!("http://127.0.0.1:{}/workflow-trigger", n.ingress))
         .header("host", "api.test")

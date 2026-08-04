@@ -322,7 +322,8 @@ my-worker/
                    #  "analytics":{"METRICS":"web-metrics"},
                    #  "pipelines":{"ARCHIVE":"event-archive"},
                    #  "workflows":{"ORDER_FLOW":"order-flow"},
-                   #  "email":{"MAIL":"support-mail"}}
+                   #  "email":{"MAIL":"support-mail"},
+                   #  "services":{"BACKEND":"api-worker"}}
   index.js         # omit "main" entirely for a pure static site
   public/…
 
@@ -334,6 +335,27 @@ rf kv list ns1 --prefix greet
 rf kv delete ns1 greeting
 rf worker-delete site
 ```
+
+Worker-to-Worker Service bindings are node-local capabilities backed by the
+signed manifest. A module Worker calls `await env.BACKEND.fetch(request)`; the
+loopback adapter rechecks that the caller is allowed to reach the named target
+and resolves the target's current workerd port after every restart.
+
+Sensitive values use encrypted Secret bindings rather than `env` in
+`rf.json`. The console shows names only. The CLI also never accepts a value on
+the command line:
+
+```bash
+printf %s 'value-from-a-password-manager' | rf secret put site API_TOKEN --from-file -
+rf secret list site
+rf secret delete site API_TOKEN
+```
+
+The first command encrypts the value with XChaCha20-Poly1305 before signing the
+new manifest. Nodes decrypt it only into a mode-`0600` temporary workerd config
+and remove that plaintext file as soon as workerd is listening.
+Use HTTPS for the public console; the UI disables Secret writes on public HTTP.
+See [Worker bindings and encrypted Secrets](./docs/WORKERS.md).
 
 Workflow classes import RandallFlare's built-in runtime module; no npm package
 or central orchestrator is required:

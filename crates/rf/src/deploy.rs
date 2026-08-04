@@ -26,6 +26,8 @@ pub const ANALYTICS_METADATA_ENV: &str = "__RF_ANALYTICS_BINDINGS_V1";
 pub const PIPELINE_METADATA_ENV: &str = "__RF_PIPELINE_BINDINGS_V1";
 pub const WORKFLOW_METADATA_ENV: &str = "__RF_WORKFLOW_BINDINGS_V1";
 pub const EMAIL_METADATA_ENV: &str = "__RF_EMAIL_BINDINGS_V1";
+pub const SERVICE_METADATA_ENV: &str = "__RF_SERVICE_BINDINGS_V1";
+pub const SECRET_METADATA_ENV: &str = "__RF_SECRET_BINDINGS_V1";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DurableObjectBinding {
@@ -92,6 +94,13 @@ pub fn email_bindings(m: &WorkerManifest) -> BTreeMap<String, String> {
         .unwrap_or_default()
 }
 
+pub fn service_bindings(m: &WorkerManifest) -> BTreeMap<String, String> {
+    m.env
+        .get(SERVICE_METADATA_ENV)
+        .and_then(|raw| serde_json::from_str(raw).ok())
+        .unwrap_or_default()
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct DeploySpec {
@@ -129,6 +138,9 @@ pub struct DeploySpec {
     /// binding name → signed Email Domain resource name.
     #[serde(default)]
     pub email: BTreeMap<String, String>,
+    /// binding name → target Worker name.
+    #[serde(default)]
+    pub services: BTreeMap<String, String>,
     #[serde(default)]
     pub crons: Vec<String>,
     /// Relative dir of static assets.
@@ -153,15 +165,7 @@ fn module_kind(path: &Path) -> ModuleKind {
 }
 
 fn validate_spec(spec: &DeploySpec) -> Result<()> {
-    if spec.env.contains_key(DO_METADATA_ENV)
-        || spec.env.contains_key(R2_METADATA_ENV)
-        || spec.env.contains_key(D1_METADATA_ENV)
-        || spec.env.contains_key(QUEUE_METADATA_ENV)
-        || spec.env.contains_key(ANALYTICS_METADATA_ENV)
-        || spec.env.contains_key(PIPELINE_METADATA_ENV)
-        || spec.env.contains_key(WORKFLOW_METADATA_ENV)
-        || spec.env.contains_key(EMAIL_METADATA_ENV)
-    {
+    if spec.env.keys().any(|key| key.starts_with("__RF_")) {
         bail!("env keys beginning with __RF_ are reserved by rf");
     }
     let mut binding_names = std::collections::BTreeSet::new();
@@ -177,9 +181,15 @@ fn validate_spec(spec: &DeploySpec) -> Result<()> {
         .chain(spec.pipelines.keys())
         .chain(spec.workflows.keys())
         .chain(spec.email.keys())
+        .chain(spec.services.keys())
     {
         if !binding_names.insert(name) {
             bail!("binding name {name:?} is used more than once");
+        }
+    }
+    for target in spec.services.values() {
+        if !rf_core::manifest::valid_name(target) || target == &spec.name {
+            bail!("invalid Worker Service binding target {target:?}");
         }
     }
     if let Some(assets) = &spec.assets {
@@ -604,6 +614,28 @@ fn manifest_from_bundle(
             serde_json::to_string(&bundle.spec.email)?,
         );
     }
+    if !bundle.spec.services.is_empty() {
+        let identifier = |value: &str| {
+            let mut characters = value.chars();
+            characters.next().is_some_and(|character| {
+                character.is_ascii_alphabetic() || character == '_' || character == '$'
+            }) && characters.all(|character| {
+                character.is_ascii_alphanumeric() || character == '_' || character == '$'
+            })
+        };
+        for (binding, target) in &bundle.spec.services {
+            if !identifier(binding)
+                || !rf_core::manifest::valid_name(target)
+                || target == &bundle.spec.name
+            {
+                bail!("invalid Worker Service binding {binding:?}");
+            }
+        }
+        env.insert(
+            SERVICE_METADATA_ENV.into(),
+            serde_json::to_string(&bundle.spec.services)?,
+        );
+    }
     let manifest = WorkerManifest {
         name: bundle.spec.name.clone(),
         version,
@@ -695,7 +727,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("rf-bundle-{}", rand::random::<u32>()));
         write_bundle(
             &dir,
-            r#"{"name":"w","main":"index.js","assets":"public","hostnames":["a.example.com"]}"#,
+            r#"{"name":"w","main":"index.js","assets":"public","hostnames":["a.example.com"],"services":{"BACKEND":"backend"}}"#,
             &[
                 ("index.js", "export default {}"),
                 ("lib/util.js", "export const x = 1"),
@@ -705,10 +737,23 @@ mod tests {
         );
         let b = read_bundle(&dir).unwrap();
         assert_eq!(b.spec.name, "w");
+        assert_eq!(b.spec.services["BACKEND"], "backend");
         let mpaths: Vec<&str> = b.modules.iter().map(|(p, _, _)| p.as_str()).collect();
         assert_eq!(mpaths, vec!["index.js", "lib/util.js"]);
         let apaths: Vec<&str> = b.assets.iter().map(|(p, _)| p.as_str()).collect();
         assert_eq!(apaths, vec!["css/site.css", "index.html"]);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn worker_service_binding_cannot_target_itself() {
+        let dir = std::env::temp_dir().join(format!("rf-bundle-{}", rand::random::<u32>()));
+        write_bundle(
+            &dir,
+            r#"{"name":"frontend","main":"index.js","services":{"SELF":"frontend"}}"#,
+            &[("index.js", "export default {}")],
+        );
+        assert!(read_bundle(&dir).is_err());
         std::fs::remove_dir_all(&dir).ok();
     }
 

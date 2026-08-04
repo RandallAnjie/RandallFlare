@@ -91,6 +91,7 @@ pub struct Inner {
     pub pbind_port: u16,
     pub workflowbind_port: u16,
     pub emailbind_port: u16,
+    pub servicebind_port: u16,
     /// Per-process unguessable tokens used only for rf → workerd event
     /// delivery. They are regenerated on every Worker start and never gossip.
     pub worker_event_tokens: HashMap<String, String>,
@@ -156,6 +157,7 @@ impl Node {
             pbind_port: 0,
             workflowbind_port: 0,
             emailbind_port: 0,
+            servicebind_port: 0,
             worker_event_tokens: HashMap::new(),
         };
         // Hydrate: static stability means booting entirely from disk.
@@ -921,6 +923,14 @@ impl Node {
 
     pub fn emailbind_port(&self) -> u16 {
         self.inner.lock().unwrap().emailbind_port
+    }
+
+    pub fn set_servicebind_port(&self, port: u16) {
+        self.inner.lock().unwrap().servicebind_port = port;
+    }
+
+    pub fn servicebind_port(&self) -> u16 {
+        self.inner.lock().unwrap().servicebind_port
     }
 
     pub fn set_worker_event_token(&self, worker: &str, token: String) {

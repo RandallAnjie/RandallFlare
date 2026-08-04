@@ -56,11 +56,11 @@ surface yet.
 | GitHub source, sandboxed build, webhook deploy | done | GitHub App auth, PR checks/comments, SSH deploy keys |
 | versions, hash-chain audit and rollback | done | version-pinned preview aliases |
 | default/custom domains and wildcard TLS | done | custom-domain DNS ownership workflow |
-| environment, KV bindings, Cron | done | KV metadata + bulk get verified; secret-value encryption and Cron replay/history remain |
+| environment, encrypted Secrets, KV bindings, Cron | done | write-only XChaCha20-Poly1305 Secrets, names-only API/console and KV metadata + bulk get are verified; Cron replay/history remains |
 | compatibility date | done | compatibility flags |
 | runtime/build logs and cluster distribution | done | request logs, analytics and retention |
 | previews and pull-request deployments | planned | deterministic preview hostnames and cleanup |
-| service bindings and placement tags | planned | loopback/mesh service router |
+| service bindings and placement tags | partial | signed node-local dynamic Service router and native `env.SERVICE.fetch()` are done; placement-aware mesh fallback and cycle diagnostics remain |
 | R2, D1, Queue, Analytics, Pipeline, Workflow, Email, Binary bindings | partial | native R2, CF-shaped D1, Queue producer/consumer, Analytics Engine, Pipeline, Workflow and Email bindings + console editors done; Binary Deliver remains |
 
 ### Data and storage

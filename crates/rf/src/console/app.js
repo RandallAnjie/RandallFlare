@@ -523,6 +523,22 @@ function renderProjectDomains(worker, tls = {}) {
     <div><span>3</span><p><strong>启用 HTTPS</strong><small>${escapeHtml(certificateInstruction)}</small></p></div>`;
 }
 
+function renderWorkerSecrets(names = []) {
+  const values = [...names].sort();
+  const list = $("#project-secret-list");
+  list.classList.toggle("empty-state", values.length === 0);
+  list.innerHTML = values.length
+    ? values.map((name) => `<div class="secret-row"><div><strong>${escapeHtml(name)}</strong><small>已加密 · 值不可回读</small></div><button class="mini-button danger" type="button" data-delete-secret="${escapeHtml(name)}">删除</button></div>`).join("")
+    : "尚未配置 Secret。";
+  const secure = consoleMode === "local" || Boolean(state.session?.secure_transport);
+  $("#project-secret-transport").textContent = secure
+    ? "当前连接允许安全写入；后台和 API 始终只返回变量名。"
+    : "当前是非加密公共连接，已禁用 Secret 写入。请先启用 HTTPS。";
+  $("#project-secret-form button[type=submit]").disabled = Boolean(state.session?.read_only) || !secure;
+  $("#project-secret-name").disabled = !secure;
+  $("#project-secret-value").disabled = !secure;
+}
+
 function renderWorkerDetail(data) {
   const worker = data.worker;
   const summary = (state.overview?.workers || []).find((item) => item.name === worker.name) || {};
@@ -557,6 +573,8 @@ function renderWorkerDetail(data) {
     <div><dt>Pipeline 绑定</dt><dd>${escapeHtml(Object.keys(worker.pipeline_bindings || {}).length)} 项</dd></div>
     <div><dt>Workflow 绑定</dt><dd>${escapeHtml(Object.keys(worker.workflow_bindings || {}).length)} 项</dd></div>
     <div><dt>Email 绑定</dt><dd>${escapeHtml(Object.keys(worker.email_bindings || {}).length)} 项</dd></div>
+    <div><dt>Service 绑定</dt><dd>${escapeHtml(Object.keys(worker.service_bindings || {}).length)} 项</dd></div>
+    <div><dt>加密 Secret</dt><dd>${escapeHtml(worker.secret_names?.length || 0)} 项</dd></div>
     <div><dt>定时任务</dt><dd>${escapeHtml(worker.crons?.length || 0)} 条</dd></div>`;
   $("#detail-distribution-count").textContent = `${distribution.ready}/${distribution.total} 个节点`;
   $("#detail-distribution").innerHTML = (distribution.nodes || []).map((node) => {
@@ -576,6 +594,8 @@ function renderWorkerDetail(data) {
   $("#project-pipeline-bindings").value = mapToLines(worker.pipeline_bindings);
   $("#project-workflow-bindings").value = mapToLines(worker.workflow_bindings);
   $("#project-email-bindings").value = mapToLines(worker.email_bindings);
+  $("#project-service-bindings").value = mapToLines(worker.service_bindings);
+  renderWorkerSecrets(worker.secret_names || []);
   $("#project-crons").value = (worker.crons || []).join("\n");
   $("#project-compatibility-date").value = worker.compatibility_date;
   $("#project-source-repository").value = source?.repository?.replace(/\.git$/, "") || "";
@@ -703,8 +723,56 @@ async function saveProjectBindings(event) {
       pipeline_bindings: linesToMap($("#project-pipeline-bindings").value, "Pipeline 绑定"),
       workflow_bindings: linesToMap($("#project-workflow-bindings").value, "Workflow 绑定"),
       email_bindings: linesToMap($("#project-email-bindings").value, "Email 绑定"),
+      service_bindings: linesToMap($("#project-service-bindings").value, "Service 绑定"),
     };
     await updateWorkerSettings(payload, `更新 ${state.activeWorker} 的变量与绑定。`);
+  } catch (error) {
+    toast(error.message, true);
+  }
+}
+
+async function saveWorkerSecret(event) {
+  event.preventDefault();
+  const worker = state.activeWorker;
+  const binding = $("#project-secret-name").value.trim();
+  const valueInput = $("#project-secret-value");
+  if (!worker || !binding || !valueInput.value) return;
+  if (consoleMode === "public" && !state.session?.secure_transport) {
+    toast("必须先通过 HTTPS 打开管理后台，才能写入 Secret", true);
+    return;
+  }
+  try {
+    const result = await api(`/api/workers/${encodeURIComponent(worker)}/secrets/${encodeURIComponent(binding)}`, {
+      method: "PUT",
+      body: JSON.stringify({ value: valueInput.value }),
+    });
+    valueInput.value = "";
+    $("#project-secret-name").value = "";
+    if (result.pending_approval) {
+      showApproval(result, `写入 ${worker} 的加密 Secret ${binding}。`);
+    } else {
+      toast(`${binding} 已加密写入 ${worker}`);
+      await loadOverview({ quiet: true });
+      await openWorkerDetail(worker, state.projectTab);
+    }
+  } catch (error) {
+    valueInput.value = "";
+    toast(error.message, true);
+  }
+}
+
+async function deleteWorkerSecret(binding) {
+  const worker = state.activeWorker;
+  if (!worker || !window.confirm(`要从 ${worker} 删除 Secret“${binding}”吗？依赖它的请求可能立即失败。`)) return;
+  try {
+    const result = await api(`/api/workers/${encodeURIComponent(worker)}/secrets/${encodeURIComponent(binding)}`, { method: "DELETE" });
+    if (result.pending_approval) {
+      showApproval(result, `删除 ${worker} 的加密 Secret ${binding}。`);
+    } else {
+      toast(`${binding} 已从 ${worker} 删除`);
+      await loadOverview({ quiet: true });
+      await openWorkerDetail(worker, state.projectTab);
+    }
   } catch (error) {
     toast(error.message, true);
   }
@@ -2925,7 +2993,7 @@ async function boot() {
     $("#security-copy").innerHTML = consoleMode === "public"
       ? "此节点不保存<br>任何私钥。"
       : "密钥仅保留在本地<br>控制台进程中。";
-    $$("#deploy-form button, #source-form button, #kv-editor-form button, #d1-create-form button, #d1-exec-form button, #r2-bucket-form button, #r2-upload-form button, #r2-delete-bucket, #queue-form button, #queue-send-form button, #queue-delete, #analytics-form button, #analytics-write-form button, #analytics-delete, #pipeline-form button, #pipeline-token-form button, #pipeline-ingest-form button, #pipeline-flush, #pipeline-delete, #workflow-form button, #workflow-trigger-form button, #workflow-signal-form button, #workflow-delete, #flow-form button, #flow-token-form button, #flow-trigger-form button, #flow-delete, #email-domain-form button, #email-route-form button, #email-send-form button, #email-delete, #email-verify, #project-domain-add-form button, #project-bindings-form button, #project-triggers-form button, #project-settings-form button, #project-source-form button, #project-redeploy, #project-delete")
+    $$("#deploy-form button, #source-form button, #kv-editor-form button, #d1-create-form button, #d1-exec-form button, #r2-bucket-form button, #r2-upload-form button, #r2-delete-bucket, #queue-form button, #queue-send-form button, #queue-delete, #analytics-form button, #analytics-write-form button, #analytics-delete, #pipeline-form button, #pipeline-token-form button, #pipeline-ingest-form button, #pipeline-flush, #pipeline-delete, #workflow-form button, #workflow-trigger-form button, #workflow-signal-form button, #workflow-delete, #flow-form button, #flow-token-form button, #flow-trigger-form button, #flow-delete, #email-domain-form button, #email-route-form button, #email-send-form button, #email-delete, #email-verify, #project-domain-add-form button, #project-bindings-form button, #project-secret-form button, #project-triggers-form button, #project-settings-form button, #project-source-form button, #project-redeploy, #project-delete")
       .forEach((button) => { button.disabled = state.session.read_only; });
     await loadOverview({ quiet: true });
     await loadWorkerOps();
@@ -2979,6 +3047,7 @@ $("#project-redeploy").addEventListener("click", () => {
 });
 $("#project-domain-add-form").addEventListener("submit", saveProjectDomains);
 $("#project-bindings-form").addEventListener("submit", saveProjectBindings);
+$("#project-secret-form").addEventListener("submit", saveWorkerSecret);
 $("#project-triggers-form").addEventListener("submit", saveProjectTriggers);
 $("#project-settings-form").addEventListener("submit", saveProjectSettings);
 $("#project-source-form").addEventListener("submit", saveProjectSource);
@@ -3088,6 +3157,10 @@ $("#workers-table").addEventListener("click", (event) => {
 $("#project-domain-list").addEventListener("click", (event) => {
   const button = event.target.closest("button[data-remove-domain]");
   if (button) removeProjectDomain(button.dataset.removeDomain);
+});
+$("#project-secret-list").addEventListener("click", (event) => {
+  const button = event.target.closest("button[data-delete-secret]");
+  if (button) deleteWorkerSecret(button.dataset.deleteSecret);
 });
 $("#detail-builds").addEventListener("click", (event) => {
   const button = event.target.closest("button[data-build-action]");

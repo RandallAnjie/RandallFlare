@@ -8,6 +8,7 @@ use rf::peers::PeerClient;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
+use zeroize::Zeroize;
 
 #[derive(Parser)]
 #[command(
@@ -100,6 +101,11 @@ enum Cmd {
         #[arg(long, env = "RF_CLUSTER_SECRET")]
         secret: String,
     },
+    /// 写入后不可回读的加密 Worker Secret。
+    Secret {
+        #[command(subcommand)]
+        cmd: SecretCmd,
+    },
     /// KV operations against any node.
     Kv {
         #[command(subcommand)]
@@ -158,6 +164,42 @@ enum Cmd {
         operator: Option<String>,
         #[arg(long, env = "RF_OPERATOR_KEY")]
         key: Option<PathBuf>,
+    },
+}
+
+#[derive(Subcommand)]
+enum SecretCmd {
+    /// 仅列出 Secret 变量名，绝不返回值或密文。
+    List {
+        worker: String,
+        #[arg(long, env = "RF_NODE")]
+        node: String,
+        #[arg(long, env = "RF_CLUSTER_SECRET")]
+        secret: String,
+    },
+    /// 从文件安全读取值并加密写入；使用 - 可从标准输入读取。
+    Put {
+        worker: String,
+        binding: String,
+        #[arg(long = "from-file")]
+        from_file: PathBuf,
+        #[arg(long, env = "RF_NODE")]
+        node: String,
+        #[arg(long, env = "RF_OPERATOR_KEY")]
+        key: Option<PathBuf>,
+        #[arg(long, env = "RF_CLUSTER_SECRET")]
+        secret: String,
+    },
+    /// 删除一个 Secret 绑定并发布新的签名版本。
+    Delete {
+        worker: String,
+        binding: String,
+        #[arg(long, env = "RF_NODE")]
+        node: String,
+        #[arg(long, env = "RF_OPERATOR_KEY")]
+        key: Option<PathBuf>,
+        #[arg(long, env = "RF_CLUSTER_SECRET")]
+        secret: String,
     },
 }
 
@@ -997,6 +1039,40 @@ fn default_operator_key_path() -> PathBuf {
     home.join(".rf").join("operator.key")
 }
 
+async fn verified_worker_head(
+    client: &PeerClient,
+    node: &str,
+    worker: &str,
+) -> Result<(
+    rf_core::manifest::WorkerManifest,
+    [u8; 32],
+    rf_core::identity::SignerId,
+)> {
+    if !rf_core::manifest::valid_name(worker) {
+        anyhow::bail!("Worker 名称无效");
+    }
+    let status = client.status(node).await?;
+    let operator: rf_core::identity::SignerId = status
+        .get("operator")
+        .and_then(serde_json::Value::as_str)
+        .context("节点状态中缺少 operator")?
+        .parse()
+        .map_err(|error| anyhow::anyhow!("节点返回的管理员身份无效：{error}"))?;
+    let envelopes = client.worker_log(node, worker).await?;
+    let chain = rf_core::manifest::verify_chain(&envelopes, &operator)
+        .map_err(|error| anyhow::anyhow!("Worker 透明日志验证失败：{error}"))?;
+    let manifest = chain
+        .last()
+        .filter(|manifest| !manifest.deleted)
+        .cloned()
+        .with_context(|| format!("Worker {worker} 不存在或已删除"))?;
+    let digest = envelopes
+        .last()
+        .map(rf_core::envelope::Envelope::digest)
+        .context("Worker 透明日志为空")?;
+    Ok((manifest, digest, operator))
+}
+
 fn main() -> Result<()> {
     let cli = Cli::parse();
     // Two worker threads: the coordination layer must stay tiny; the
@@ -1103,6 +1179,83 @@ async fn async_main(cli: Cli) -> Result<()> {
             println!("tombstoned {name} at v{v}");
             Ok(())
         }
+        Cmd::Secret { cmd } => match cmd {
+            SecretCmd::List {
+                worker,
+                node,
+                secret,
+            } => {
+                let client = PeerClient::new(secret_bytes(&secret)?);
+                let (manifest, _, _) = verified_worker_head(&client, &node, &worker).await?;
+                for binding in rf::worker_secret::encrypted_secrets_checked(&manifest)?.keys() {
+                    println!("{binding}");
+                }
+                Ok(())
+            }
+            SecretCmd::Put {
+                worker,
+                binding,
+                from_file,
+                node,
+                key,
+                secret,
+            } => {
+                let cluster_secret = secret_bytes(&secret)?;
+                let client = PeerClient::new(cluster_secret);
+                let operator = operator_key(key)?;
+                let (manifest, digest, configured_operator) =
+                    verified_worker_head(&client, &node, &worker).await?;
+                if operator.signer_id() != configured_operator {
+                    anyhow::bail!("管理员密钥与节点配置的管理员身份不匹配");
+                }
+                let bytes = if from_file.as_os_str() == "-" {
+                    use std::io::Read as _;
+                    let mut bytes = Vec::new();
+                    std::io::stdin().read_to_end(&mut bytes)?;
+                    bytes
+                } else {
+                    std::fs::read(&from_file)
+                        .with_context(|| format!("无法读取 Secret 文件 {}", from_file.display()))?
+                };
+                let mut value = String::from_utf8(bytes).context("Secret 文件必须是 UTF-8 文本")?;
+                let updated_result = rf::worker_secret::put_manifest_secret(
+                    manifest,
+                    digest,
+                    &cluster_secret,
+                    &binding,
+                    &value,
+                );
+                value.zeroize();
+                let updated = updated_result?;
+                let version = updated.version;
+                let envelope = rf_core::envelope::Envelope::seal_any(&updated, &operator);
+                client.post_manifest(&node, &envelope).await?;
+                println!("已加密写入 {worker} 的 Secret {binding}，发布 v{version}");
+                Ok(())
+            }
+            SecretCmd::Delete {
+                worker,
+                binding,
+                node,
+                key,
+                secret,
+            } => {
+                let client = PeerClient::new(secret_bytes(&secret)?);
+                let operator = operator_key(key)?;
+                let (manifest, digest, configured_operator) =
+                    verified_worker_head(&client, &node, &worker).await?;
+                if operator.signer_id() != configured_operator {
+                    anyhow::bail!("管理员密钥与节点配置的管理员身份不匹配");
+                }
+                let updated =
+                    rf::worker_secret::delete_manifest_secret(manifest, digest, &binding)?;
+                let version = updated.version;
+                let envelope = rf_core::envelope::Envelope::seal_any(&updated, &operator);
+                client.post_manifest(&node, &envelope).await?;
+                println!("已删除 {worker} 的 Secret {binding}，发布 v{version}");
+                Ok(())
+            }
+        },
         Cmd::Kv { cmd } => match cmd {
             KvCmd::List {
                 ns,
@@ -2882,6 +3035,9 @@ async fn run(config_path: PathBuf) -> Result<()> {
     let emailbind_port = rf::emailbind::serve(node.clone()).await?;
     node.set_emailbind_port(emailbind_port);
     tracing::info!("Email binding on 127.0.0.1:{emailbind_port}");
+    let servicebind_port = rf::servicebind::serve(node.clone()).await?;
+    node.set_servicebind_port(servicebind_port);
+    tracing::info!("Worker Service binding on 127.0.0.1:{servicebind_port}");
 
     let _gossip = rf::gossip::start(node.clone()).await?;
     durable.spawn_ensurer();

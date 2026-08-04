@@ -748,7 +748,7 @@ async fn proxy(client: &reqwest::Client, req: Request, port: u16) -> Response {
     }
 }
 
-fn is_hop_header(name: &str) -> bool {
+pub(crate) fn is_hop_header(name: &str) -> bool {
     matches!(
         name.to_ascii_lowercase().as_str(),
         "connection"
