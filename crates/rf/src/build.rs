@@ -817,7 +817,63 @@ fn sandbox_command(
     }
     command.arg("/bin/sh").arg("-lc").arg(build_command);
     command.env_clear();
+    // The hardened service carries CAP_NET_BIND_SERVICE so the daemon can own
+    // :80/:443 without running as root. bubblewrap deliberately refuses to
+    // start when an ordinary (non-setuid) invocation arrives with unexpected
+    // capabilities. Strip the inherited capability set in the forked build
+    // child immediately before exec; the daemon and workerd lifecycle keep
+    // their existing service policy.
+    #[cfg(target_os = "linux")]
+    unsafe {
+        command.pre_exec(clear_child_capabilities);
+    }
     Ok(command)
+}
+
+#[cfg(target_os = "linux")]
+fn clear_child_capabilities() -> std::io::Result<()> {
+    #[repr(C)]
+    struct CapHeader {
+        version: u32,
+        pid: i32,
+    }
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    struct CapData {
+        effective: u32,
+        permitted: u32,
+        inheritable: u32,
+    }
+
+    // Clear ambient first; otherwise the next exec would restore that
+    // capability into the permitted/effective sets.
+    let ambient = unsafe {
+        libc::prctl(
+            libc::PR_CAP_AMBIENT,
+            libc::PR_CAP_AMBIENT_CLEAR_ALL,
+            0,
+            0,
+            0,
+        )
+    };
+    if ambient != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    const LINUX_CAPABILITY_VERSION_3: u32 = 0x2008_0522;
+    let header = CapHeader {
+        version: LINUX_CAPABILITY_VERSION_3,
+        pid: 0,
+    };
+    let data = [CapData {
+        effective: 0,
+        permitted: 0,
+        inheritable: 0,
+    }; 2];
+    let cleared = unsafe { libc::syscall(libc::SYS_capset, &header, &data) };
+    if cleared != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
 }
 
 fn sanitized_env(command: &mut Command, home: &Path) {
@@ -1093,5 +1149,38 @@ mod tests {
         let attacker = AnyKeypair::Ed(Keypair::from_seed([43; 32]));
         assert!(ingest_source(&node, &Envelope::seal_any(&second, &attacker)).is_err());
         std::fs::remove_dir_all(data_dir).ok();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn bubblewrap_command_can_write_only_the_checkout() {
+        let Some(bwrap) = configured_binary(None, "bwrap") else {
+            return;
+        };
+        let root = std::env::temp_dir().join(format!(
+            "rf-bwrap-test-{}-{}",
+            std::process::id(),
+            rand::random::<u32>()
+        ));
+        let checkout = root.join("repo");
+        std::fs::create_dir_all(&checkout).unwrap();
+        std::fs::write(checkout.join("rf.json"), b"{}").unwrap();
+        let mut command = sandbox_command(
+            &bwrap,
+            &checkout,
+            ".",
+            "test -f rf.json && printf sandbox-ok > artifact.txt",
+        )
+        .unwrap();
+        let output = command.output().await.unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            std::fs::read_to_string(checkout.join("artifact.txt")).unwrap(),
+            "sandbox-ok"
+        );
+        std::fs::remove_dir_all(root).ok();
     }
 }
