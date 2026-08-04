@@ -1,0 +1,181 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="color-scheme" content="dark">
+    <meta name="rf-console-token" content="__RF_TOKEN__">
+    <title>RandallFlare Console</title>
+    <link rel="stylesheet" href="/styles.css">
+  </head>
+  <body>
+    <a class="skip-link" href="#content">Skip to content</a>
+    <div class="shell">
+      <aside class="sidebar">
+        <div class="brand">
+          <div class="brand-mark" aria-hidden="true"><span>R</span></div>
+          <div><strong>RandallFlare</strong><small>Operator Console</small></div>
+        </div>
+        <nav aria-label="Console sections">
+          <button class="nav-item active" data-view="overview">
+            <span class="nav-glyph">⌁</span><span>Overview</span>
+          </button>
+          <button class="nav-item" data-view="workers">
+            <span class="nav-glyph">◇</span><span>Workers</span><span id="worker-nav-count" class="count">0</span>
+          </button>
+          <button class="nav-item" data-view="kv">
+            <span class="nav-glyph">≋</span><span>KV Store</span>
+          </button>
+          <button class="nav-item" data-view="d1">
+            <span class="nav-glyph">◫</span><span>D1 Databases</span>
+          </button>
+        </nav>
+        <div class="sidebar-foot">
+          <div class="security-note"><span>●</span> Credentials isolated</div>
+          <small>Secrets remain in the local<br>console process.</small>
+        </div>
+      </aside>
+
+      <main id="content" class="main">
+        <header class="topbar">
+          <div>
+            <p class="eyebrow" id="section-eyebrow">CLUSTER CONTROL</p>
+            <h1 id="section-title">Overview</h1>
+          </div>
+          <div class="topbar-actions">
+            <div class="connection"><span id="connection-dot" class="dot pending"></span><span id="connection-text">Connecting</span></div>
+            <button id="refresh" class="icon-button" type="button" aria-label="Refresh data">↻</button>
+          </div>
+        </header>
+
+        <div id="loading" class="loading-line" aria-hidden="true"></div>
+        <div id="global-error" class="banner error hidden" role="alert"></div>
+
+        <section id="view-overview" class="view active" aria-labelledby="section-title">
+          <div class="metrics">
+            <article class="metric"><span>Live nodes</span><strong id="metric-nodes">—</strong><small id="metric-public">Awaiting cluster</small></article>
+            <article class="metric"><span>Workers</span><strong id="metric-workers">—</strong><small id="metric-routes">No routing data</small></article>
+            <article class="metric"><span>D1 databases</span><strong id="metric-databases">—</strong><small>Replicated quorums</small></article>
+            <article class="metric"><span>Blob health</span><strong id="metric-blobs">—</strong><small>Missing locally</small></article>
+          </div>
+
+          <div class="grid two-one">
+            <article class="panel">
+              <div class="panel-head"><div><p class="eyebrow">TOPOLOGY</p><h2>Cluster nodes</h2></div><span id="cluster-version" class="badge">rf —</span></div>
+              <div id="node-list" class="node-list empty-state">Waiting for node status…</div>
+            </article>
+            <article class="panel identity-panel">
+              <p class="eyebrow">CONNECTED NODE</p>
+              <h2 id="node-label">—</h2>
+              <dl>
+                <div><dt>Node ID</dt><dd id="node-id">—</dd></div>
+                <div><dt>Peer API</dt><dd id="node-api">—</dd></div>
+                <div><dt>Operator</dt><dd id="operator-id">—</dd></div>
+                <div><dt>Manifest digest</dt><dd id="manifest-digest">—</dd></div>
+                <div><dt>Console mode</dt><dd id="console-mode">—</dd></div>
+              </dl>
+            </article>
+          </div>
+
+          <article class="panel">
+            <div class="panel-head"><div><p class="eyebrow">ROUTING SURFACE</p><h2>Active workers</h2></div><button class="text-button" data-go="workers">Manage workers →</button></div>
+            <div id="overview-workers" class="worker-strip empty-state">No active workers.</div>
+          </article>
+        </section>
+
+        <section id="view-workers" class="view" aria-labelledby="section-title">
+          <div class="grid one-two">
+            <article class="panel deploy-panel">
+              <p class="eyebrow">SIGNED RELEASE</p>
+              <h2>Deploy a Worker</h2>
+              <p class="muted">Select a local bundle directory containing <code>rf.json</code>. The console signs the manifest without exposing your key to the browser.</p>
+              <form id="deploy-form">
+                <label for="deploy-path">Local bundle path</label>
+                <input id="deploy-path" name="path" type="text" placeholder="/absolute/path/to/worker" autocomplete="off" required>
+                <button class="primary" type="submit">Deploy signed version</button>
+              </form>
+              <div id="deploy-mode" class="form-note"></div>
+            </article>
+            <article class="panel">
+              <div class="panel-head"><div><p class="eyebrow">MANIFESTS</p><h2>Worker inventory</h2></div><span id="worker-count" class="badge">0 live</span></div>
+              <div class="table-wrap">
+                <table>
+                  <thead><tr><th>Worker</th><th>Version</th><th>Content</th><th>Routes</th><th>Durable state</th><th><span class="sr-only">Actions</span></th></tr></thead>
+                  <tbody id="workers-table"><tr><td colspan="6" class="empty-state">No workers found.</td></tr></tbody>
+                </table>
+              </div>
+            </article>
+          </div>
+        </section>
+
+        <section id="view-kv" class="view" aria-labelledby="section-title">
+          <div class="grid kv-grid">
+            <article class="panel">
+              <div class="panel-head"><div><p class="eyebrow">NAMESPACE BROWSER</p><h2>Keys</h2></div><span id="kv-count" class="badge">0 keys</span></div>
+              <form id="kv-search-form" class="inline-form">
+                <label><span>Namespace</span><input id="kv-namespace" value="rf-smoke" list="kv-namespaces" required><datalist id="kv-namespaces"></datalist></label>
+                <label><span>Prefix</span><input id="kv-prefix" placeholder="optional"></label>
+                <button class="secondary" type="submit">Load</button>
+              </form>
+              <div id="kv-keys" class="key-list empty-state">Choose a namespace to inspect.</div>
+            </article>
+            <article class="panel editor-panel">
+              <p class="eyebrow">VALUE EDITOR</p>
+              <h2 id="kv-editor-title">New key</h2>
+              <form id="kv-editor-form">
+                <label for="kv-key">Key</label>
+                <input id="kv-key" required autocomplete="off">
+                <label for="kv-value">UTF-8 value</label>
+                <textarea id="kv-value" rows="12" required></textarea>
+                <div class="button-row">
+                  <button class="primary" type="submit">Save value</button>
+                  <button id="kv-new" class="secondary" type="button">Clear</button>
+                  <button id="kv-delete" class="danger ghost hidden" type="button">Delete</button>
+                </div>
+              </form>
+              <p class="form-note">System namespaces beginning with <code>__rf</code> are protected from writes.</p>
+            </article>
+          </div>
+        </section>
+
+        <section id="view-d1" class="view" aria-labelledby="section-title">
+          <div class="grid d1-grid">
+            <article class="panel">
+              <p class="eyebrow">DATABASE CATALOG</p>
+              <h2>Create database</h2>
+              <form id="d1-create-form" class="stack-form">
+                <label for="d1-create-name">Database name</label>
+                <input id="d1-create-name" pattern="[a-z0-9-]{1,63}" placeholder="analytics" required>
+                <button class="primary" type="submit">Create quorum</button>
+              </form>
+              <div class="divider"></div>
+              <h3>Known databases</h3>
+              <div id="database-list" class="database-list empty-state">No databases reported.</div>
+            </article>
+            <article class="panel sql-panel">
+              <div class="panel-head"><div><p class="eyebrow">QUERY CONSOLE</p><h2>Execute SQL</h2></div><span class="badge">Leader-routed</span></div>
+              <form id="d1-exec-form">
+                <label for="d1-name">Database</label>
+                <input id="d1-name" value="rf-smoke" required>
+                <label for="d1-sql">SQL statement</label>
+                <textarea id="d1-sql" class="code-input" rows="8">SELECT * FROM probes LIMIT 50</textarea>
+                <label for="d1-params">JSON parameters</label>
+                <input id="d1-params" class="code-input" value="[]">
+                <button class="primary" type="submit">Run statement</button>
+              </form>
+              <div class="result-head"><h3>Result</h3><span id="d1-result-meta" class="muted"></span></div>
+              <pre id="d1-result" class="result">Run a statement to inspect its result.</pre>
+            </article>
+          </div>
+        </section>
+      </main>
+    </div>
+
+    <dialog id="history-dialog">
+      <div class="dialog-head"><div><p class="eyebrow">VERIFIABLE HISTORY</p><h2 id="history-title">Worker log</h2></div><button id="history-close" class="icon-button" aria-label="Close">×</button></div>
+      <div id="history-content"></div>
+    </dialog>
+    <div id="toast" class="toast" role="status" aria-live="polite"></div>
+    <script src="/app.js" defer></script>
+  </body>
+</html>

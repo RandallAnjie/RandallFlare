@@ -25,7 +25,9 @@ jobs:
       - name: Install musl toolchain
         run: sudo apt-get update && sudo apt-get install -y musl-tools
       - name: Validate deployment scripts
-        run: bash -n infra/*.sh
+        run: |
+          bash -n infra/*.sh
+          infra/install-release.sh --help >/dev/null
       - name: Install pinned workerd for real-runtime tests
         run: |
           infra/fetch-workerd.sh --output "$RUNNER_TEMP/workerd-bin/workerd"

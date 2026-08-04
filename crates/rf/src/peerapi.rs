@@ -327,6 +327,16 @@ async fn status(
             })
         })
         .collect();
+    let kv_namespaces: Vec<String> = node
+        .kv_digests()
+        .into_keys()
+        .filter(|namespace| !namespace.starts_with("__rf"))
+        .collect();
+    let databases: Vec<String> = node
+        .kv_list(crate::acme::NS, "d1/", 10_000)
+        .into_iter()
+        .filter_map(|key| key.strip_prefix("d1/").map(str::to_string))
+        .collect();
     axum::Json(serde_json::json!({
         "node": node.id_hex(),
         "label": node.cfg.label,
@@ -334,6 +344,10 @@ async fn status(
         "version": env!("CARGO_PKG_VERSION"),
         "peers": peers,
         "workers": workers,
+        "databases": databases,
+        "kv_namespaces": kv_namespaces,
+        "manifest_digest": node.manifest_digest_hex(),
+        "routes": node.routes(),
         "missing_blobs": node.missing_blobs().len(),
     }))
     .into_response()

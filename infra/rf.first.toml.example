@@ -32,7 +32,7 @@ keep_tail = 256
 
 [update]
 # The hardened service cannot replace its root-owned executable. Upgrade with
-# infra/deploy-vps.sh or infra/install.sh after publishing a tested release.
+# infra/install-release.sh after publishing a tested GitHub release.
 enabled = false
 
 # Optional Cloudflare DNS registration:
