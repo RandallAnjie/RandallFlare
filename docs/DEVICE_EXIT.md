@@ -143,6 +143,39 @@ HTTPS 使用 `CONNECT`。本地监听必须保持在回环地址；如需为整�
 局域网提供代理，应在主机防火墙、身份认证与独立隧道中显式处理，而不是直接暴露此
 无认证的本地入口。
 
+Linux 设备也可以显式启用整机透明分流，不需要逐个给应用配置代理：
+
+```bash
+sudo rf device tun \
+  --control https://node.example.com \
+  --name randall-phone \
+  --token-file ~/.rf/devices/randall-phone.token \
+  --tun-name rf-tun0 \
+  --tun-mtu 1400
+```
+
+该模式把纯 Rust TCP/UDP 用户态网络栈编译进同一个 `rf`，不下载、调用或旁加载外部
+`tun2socks` 程序。它需要 `/dev/net/tun`、`iproute2`，以及 root 或
+`CAP_NET_ADMIN`。RandallFlare
+只在专用路由表中添加默认路由，并按固定优先级添加管理旁路、Tailscale 标记旁路、
+自身 socket 标记与最后的捕获规则；主路由表的默认路由不会被替换。当前 SSH 对端、
+控制节点、已知出口、回环、局域网、CGNAT、链路本地和组播网段会自动走主路由表，
+也可以重复传入 `--tun-bypass IP/CIDR`。
+
+应用的 DNS 查询优先进入 TUN：UDP 53 由虚拟 DNS 回答，使随后 TCP、UDP 与 QUIC
+连接仍能按原始域名执行签名规则；TCP 53 也留在签名代理路径内。RandallFlare 自己的
+DNS socket 则带旁路标记，直接查询系统发现的真实上游，避免把 `198.18.0.0/15` 虚拟
+地址拿去直连。无法自动发现非回环上游时，使用一个或多个 `--tun-dns IP` 明确提供。
+控制节点在接管前完成解析，刷新时固定使用真实地址但保留 HTTPS SNI 和证书校验。
+
+接管时全局捕获规则最后安装；退出时最先删除。`SIGINT`、`SIGTERM`、网络栈故障、
+本地代理故障和连续 300 秒无法刷新签名配置都会先恢复路由，再停止 TUN。接口 FD
+关闭后内核会删除非持久 TUN；下次启动还会清理同一 mark/表号遗留的精确规则。可用
+`--tun-deadman-seconds` 调整失联自救时间（不得短于 60 秒），`--tun-table` 和
+`--tun-mark` 解决与既有策略路由的编号冲突。Linux IPv4/IPv6、真实内核 TCP 与标准
+SOCKS5 UDP 路径均在隔离网络命名空间中做端到端测试；macOS/iOS 仍应由受系统签名的
+Network Extension 持有 utun FD，不能用 Linux 路由命令替代。
+
 每台设备必须明确选择至少一条规则。规则按 `priority` 从小到大、同优先级按资源名
 排序，首个匹配项生效。设备记录先于规则抵达新节点时，配置读取和出口认证会失败关闭，
 不会临时降级为直连。配置每 30 秒刷新；短暂断网时保留最后一份已验证配置。

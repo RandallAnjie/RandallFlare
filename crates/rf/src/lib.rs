@@ -18,6 +18,7 @@ pub mod d1_backup;
 pub mod d1bind;
 pub mod data_audit;
 pub mod deploy;
+pub mod device_tun;
 pub mod dns;
 pub mod durable;
 pub mod email;

@@ -829,6 +829,42 @@ enum DeviceCmd {
         #[arg(long, default_value = "127.0.0.1:7388")]
         listen: SocketAddr,
     },
+    /// Linux 整机透明分流：内置 TCP/UDP 网络栈并安全接管系统路由。
+    Tun {
+        #[arg(long)]
+        control: String,
+        #[arg(long)]
+        name: String,
+        #[arg(long)]
+        token_file: PathBuf,
+        /// 内置回环 SOCKS 入口；端口为 0 时由系统自动分配。
+        #[arg(long, default_value = "127.0.0.1:7388")]
+        listen: SocketAddr,
+        #[arg(long, default_value = "rf-tun0")]
+        tun_name: String,
+        #[arg(long, default_value_t = 1400)]
+        tun_mtu: u16,
+        /// 标记 RandallFlare 自身出口 socket，防止流量再次进入 TUN。
+        #[arg(long, default_value_t = 0x52f1)]
+        tun_mark: u32,
+        /// RandallFlare 独占的 Linux 策略路由表编号。
+        #[arg(long, default_value_t = 7388)]
+        tun_table: u32,
+        /// 是否同时透明接管 IPv6。
+        #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
+        tun_ipv6: bool,
+        /// 始终走主路由表的额外 IP 或 CIDR；可重复使用。
+        #[arg(long = "tun-bypass")]
+        tun_bypass: Vec<String>,
+        /// RandallFlare 自身解析域名时直连的 DNS 上游；可重复，默认自动发现。
+        #[arg(long = "tun-dns")]
+        tun_dns: Vec<std::net::IpAddr>,
+        #[arg(long, default_value_t = 512)]
+        tun_max_sessions: usize,
+        /// 连续无法刷新签名配置后自动恢复系统路由的秒数。
+        #[arg(long, default_value_t = 300)]
+        tun_deadman_seconds: u64,
+    },
 }
 
 #[derive(clap::Args)]
@@ -1638,6 +1674,24 @@ fn device_expiry(days: Option<u32>) -> Result<Option<u64>> {
             .checked_add(duration)
             .context("设备到期时间溢出")?,
     ))
+}
+
+fn read_device_token(path: &std::path::Path) -> Result<String> {
+    let metadata =
+        std::fs::metadata(path).with_context(|| format!("读取设备令牌文件 {}", path.display()))?;
+    if !metadata.is_file() || metadata.len() > 512 {
+        anyhow::bail!("设备令牌文件必须是普通小文件");
+    }
+    let mut token = std::fs::read_to_string(path)
+        .with_context(|| format!("读取设备令牌文件 {}", path.display()))?;
+    token = token.trim().to_string();
+    if !token.starts_with(rf::exit::DEVICE_TOKEN_PREFIX)
+        || token.len() != rf::exit::DEVICE_TOKEN_PREFIX.len() + 43
+    {
+        token.zeroize();
+        anyhow::bail!("设备令牌格式无效");
+    }
+    Ok(token)
 }
 
 fn access_expiry(days: Option<u32>) -> Result<Option<u64>> {
@@ -3142,20 +3196,7 @@ async fn async_main(cli: Cli) -> Result<()> {
                 token_file,
                 listen,
             } => {
-                let metadata = std::fs::metadata(&token_file)
-                    .with_context(|| format!("读取设备令牌文件 {}", token_file.display()))?;
-                if !metadata.is_file() || metadata.len() > 512 {
-                    anyhow::bail!("设备令牌文件必须是普通小文件");
-                }
-                let mut token = std::fs::read_to_string(&token_file)
-                    .with_context(|| format!("读取设备令牌文件 {}", token_file.display()))?;
-                token = token.trim().to_string();
-                if !token.starts_with(rf::exit::DEVICE_TOKEN_PREFIX)
-                    || token.len() != rf::exit::DEVICE_TOKEN_PREFIX.len() + 43
-                {
-                    token.zeroize();
-                    anyhow::bail!("设备令牌格式无效");
-                }
+                let token = read_device_token(&token_file)?;
                 let _ = tracing_subscriber::fmt()
                     .with_env_filter(
                         tracing_subscriber::EnvFilter::try_from_default_env()
@@ -3164,6 +3205,50 @@ async fn async_main(cli: Cli) -> Result<()> {
                     .try_init();
                 println!("设备代理监听 {listen}；SOCKS5 TCP/UDP 与 HTTP 代理共用此入口");
                 rf::exitproxy::run_device_proxy(control, name, token, listen).await
+            }
+            DeviceCmd::Tun {
+                control,
+                name,
+                token_file,
+                listen,
+                tun_name,
+                tun_mtu,
+                tun_mark,
+                tun_table,
+                tun_ipv6,
+                tun_bypass,
+                tun_dns,
+                tun_max_sessions,
+                tun_deadman_seconds,
+            } => {
+                let token = read_device_token(&token_file)?;
+                let _ = tracing_subscriber::fmt()
+                    .with_env_filter(
+                        tracing_subscriber::EnvFilter::try_from_default_env()
+                            .unwrap_or_else(|_| "info".into()),
+                    )
+                    .try_init();
+                println!(
+                    "正在启用 Linux 整机透明分流：接口 {tun_name}，MTU {tun_mtu}；退出或失联时自动恢复路由"
+                );
+                rf::exitproxy::run_device_tun(
+                    control,
+                    name,
+                    token,
+                    listen,
+                    rf::device_tun::Options {
+                        name: tun_name,
+                        mtu: tun_mtu,
+                        mark: tun_mark,
+                        table: tun_table,
+                        ipv6: tun_ipv6,
+                        bypass: tun_bypass,
+                        dns_servers: tun_dns,
+                        max_sessions: tun_max_sessions,
+                        deadman_seconds: tun_deadman_seconds,
+                    },
+                )
+                .await
             }
         },
         Cmd::Queue { cmd } => match cmd {
@@ -5149,7 +5234,7 @@ async fn run(config_path: PathBuf) -> Result<()> {
 
 #[cfg(test)]
 mod cli_tests {
-    use super::{describe_approval, parse_ping, AccessCmd, Cli, Cmd};
+    use super::{describe_approval, parse_ping, AccessCmd, Cli, Cmd, DeviceCmd};
     use clap::Parser as _;
     use rf::management::{ApprovalKind, ConsoleGrant, CONSOLE_GRANT_VERSION};
 
@@ -5200,6 +5285,51 @@ mod cli_tests {
         assert_eq!(label, "监控");
         assert_eq!(scopes, ["node:read", "audit:read"]);
         assert_eq!(expires_in_days, Some(90));
+    }
+
+    #[test]
+    fn device_tun_parses_safe_defaults_and_explicit_dns() {
+        let cli = Cli::try_parse_from([
+            "rf",
+            "device",
+            "tun",
+            "--control",
+            "https://node.example.com",
+            "--name",
+            "phone",
+            "--token-file",
+            "/tmp/device.token",
+            "--tun-dns",
+            "1.1.1.1",
+            "--tun-bypass",
+            "203.0.113.7",
+        ])
+        .unwrap();
+        let Cmd::Device {
+            cmd:
+                DeviceCmd::Tun {
+                    tun_name,
+                    tun_mtu,
+                    tun_mark,
+                    tun_table,
+                    tun_ipv6,
+                    tun_dns,
+                    tun_bypass,
+                    tun_deadman_seconds,
+                    ..
+                },
+        } = cli.cmd
+        else {
+            panic!("device tun did not parse into its command variant");
+        };
+        assert_eq!(tun_name, "rf-tun0");
+        assert_eq!(tun_mtu, 1400);
+        assert_eq!(tun_mark, 0x52f1);
+        assert_eq!(tun_table, 7388);
+        assert!(tun_ipv6);
+        assert_eq!(tun_dns, ["1.1.1.1".parse::<std::net::IpAddr>().unwrap()]);
+        assert_eq!(tun_bypass, ["203.0.113.7"]);
+        assert_eq!(tun_deadman_seconds, 300);
     }
 
     #[test]

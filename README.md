@@ -172,8 +172,12 @@ Working today, verified by multi-process fault-injection e2e tests:
   re-evaluate the same signed policy and resolve destinations themselves with
   strict private, metadata, transition-prefix and reserved-address SSRF
   blocking. Remote rule-set and GEOIP content is frozen into the signed
-  resource, while exit roles remain optional node-local capabilities. CLI and
-  a dedicated Chinese management page are included. See
+  resource, while exit roles remain optional node-local capabilities. The
+  opt-in Linux whole-device mode embeds a TCP/UDP userspace stack, virtual DNS,
+  marked self-resolution, a dedicated policy table, automatic management
+  bypasses, reverse-order cleanup and a configuration-refresh dead-man switch;
+  no external tun2socks executable is needed. CLI and a dedicated Chinese
+  management page are included. See
   [the device and exit guide](./docs/DEVICE_EXIT.md).
 
 Also in: HTTPS ingress (SNI cert store, hot-reload, wildcard files,

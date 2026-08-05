@@ -15,6 +15,8 @@ use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+#[cfg(target_os = "linux")]
+use std::{io, os::fd::AsRawFd};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::sync::{RwLock, Semaphore};
@@ -171,7 +173,22 @@ async fn serve_egress<S>(node: &Node, stream: &mut S) -> Result<()>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
-    let (principal, request) = server_socks_handshake(node, stream).await?;
+    let (principal, request) =
+        tokio::time::timeout(HANDSHAKE_TIMEOUT, server_socks_handshake(node, stream))
+            .await
+            .context("设备出口 SOCKS 认证超时")??;
+    serve_authenticated_egress(node, stream, principal, request).await
+}
+
+async fn serve_authenticated_egress<S>(
+    node: &Node,
+    stream: &mut S,
+    principal: DevicePrincipal,
+    request: EgressRequest,
+) -> Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
     let EgressRequest::Connect { host, port } = request else {
         socks_reply(stream, REP_OK).await?;
         return serve_udp_tunnel(node, &principal, stream).await;
@@ -201,7 +218,7 @@ where
         bail!("设备规则不允许从此节点转发目标");
     }
     let timeout = Duration::from_secs(node.cfg.exit.connect_timeout_seconds);
-    let mut upstream = match connect_candidates(&allowed, timeout).await {
+    let mut upstream = match connect_candidates(&allowed, timeout, None).await {
         Ok(stream) => stream,
         Err(error) => {
             socks_reply(stream, REP_HOST_UNREACHABLE).await?;
@@ -470,6 +487,7 @@ async fn udp_exchange(
     addresses: &[SocketAddr],
     payload: &[u8],
     timeout: Duration,
+    bypass_mark: Option<u32>,
 ) -> Result<Vec<u8>> {
     let mut errors = Vec::new();
     for address in addresses {
@@ -485,6 +503,10 @@ async fn udp_exchange(
                 continue;
             }
         };
+        if let Err(error) = mark_socket(&socket, bypass_mark) {
+            errors.push(format!("{address}: 设置 TUN 旁路标记失败：{error}"));
+            continue;
+        }
         if let Err(error) = socket.connect(address).await {
             errors.push(format!("{address}: {error}"));
             continue;
@@ -545,6 +567,7 @@ where
                 &allowed,
                 &packet.payload,
                 Duration::from_secs(node.cfg.exit.connect_timeout_seconds),
+                None,
             )
             .await?;
             encode_socks_udp_packet(&SocksUdpPacket { payload, ..packet })
@@ -581,11 +604,20 @@ async fn public_candidates(host: &str, port: u16) -> Result<Vec<SocketAddr>> {
     Ok(safe)
 }
 
-async fn direct_candidates(host: &str, port: u16) -> Result<Vec<SocketAddr>> {
-    let addresses = tokio::net::lookup_host((host, port))
-        .await
-        .with_context(|| format!("解析直连目标 {host}"))?;
+async fn direct_candidates(
+    host: &str,
+    port: u16,
+    resolver: Option<&crate::device_tun::MarkedResolver>,
+) -> Result<Vec<SocketAddr>> {
+    let addresses = match resolver {
+        Some(resolver) => resolver.lookup(host, port).await?,
+        None => tokio::net::lookup_host((host, port))
+            .await
+            .with_context(|| format!("解析直连目标 {host}"))?
+            .collect(),
+    };
     let mut safe = addresses
+        .into_iter()
         .filter(|address| safe_direct_ip(address.ip()))
         .collect::<Vec<_>>();
     safe.sort();
@@ -665,16 +697,68 @@ pub fn public_egress_ip(ip: IpAddr) -> bool {
     }
 }
 
-async fn connect_candidates(addresses: &[SocketAddr], timeout: Duration) -> Result<TcpStream> {
+async fn connect_candidates(
+    addresses: &[SocketAddr],
+    timeout: Duration,
+    bypass_mark: Option<u32>,
+) -> Result<TcpStream> {
     let mut errors = Vec::new();
     for address in addresses {
-        match tokio::time::timeout(timeout, TcpStream::connect(address)).await {
+        let socket = if address.is_ipv4() {
+            tokio::net::TcpSocket::new_v4()
+        } else {
+            tokio::net::TcpSocket::new_v6()
+        };
+        let socket = match socket {
+            Ok(socket) => socket,
+            Err(error) => {
+                errors.push(format!("{address}: {error}"));
+                continue;
+            }
+        };
+        if let Err(error) = mark_socket(&socket, bypass_mark) {
+            errors.push(format!("{address}: 设置 TUN 旁路标记失败：{error}"));
+            continue;
+        }
+        match tokio::time::timeout(timeout, socket.connect(*address)).await {
             Ok(Ok(stream)) => return Ok(stream),
             Ok(Err(error)) => errors.push(format!("{address}: {error}")),
             Err(_) => errors.push(format!("{address}: 超时")),
         }
     }
     bail!("所有目标地址连接失败：{}", errors.join("；"))
+}
+
+#[cfg(target_os = "linux")]
+fn mark_socket<T: AsRawFd>(socket: &T, mark: Option<u32>) -> io::Result<()> {
+    let Some(mark) = mark else {
+        return Ok(());
+    };
+    let result = unsafe {
+        libc::setsockopt(
+            socket.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_MARK,
+            (&mark as *const u32).cast(),
+            std::mem::size_of::<u32>() as libc::socklen_t,
+        )
+    };
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn mark_socket<T>(_socket: &T, mark: Option<u32>) -> std::io::Result<()> {
+    if mark.is_some() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "socket mark 仅受 Linux 支持",
+        ));
+    }
+    Ok(())
 }
 
 #[derive(Clone)]
@@ -684,6 +768,11 @@ struct ClientState {
     token: Arc<Zeroizing<String>>,
     config: Arc<RwLock<DeviceConfig>>,
     tls: Arc<rustls::ClientConfig>,
+    http: reqwest::Client,
+    resolver: Option<Arc<crate::device_tun::MarkedResolver>>,
+    bypass_mark: Option<u32>,
+    last_refresh: Arc<std::sync::Mutex<Instant>>,
+    refresh_ceiling_seconds: u64,
 }
 
 pub async fn run_device_proxy(
@@ -692,11 +781,167 @@ pub async fn run_device_proxy(
     token: String,
     listen: SocketAddr,
 ) -> Result<()> {
+    let (state, listener) =
+        prepare_device_proxy(control, device, token, listen, None, &[], 300).await?;
+    serve_local_proxy(state, listener).await
+}
+
+/// Run the loopback policy proxy behind an opt-in whole-device Linux TUN.
+/// The TUN catch-all is removed before either task is stopped, so normal
+/// routing is restored even when the userspace stack or refresh loop fails.
+pub async fn run_device_tun(
+    control: String,
+    device: String,
+    token: String,
+    listen: SocketAddr,
+    options: crate::device_tun::Options,
+) -> Result<()> {
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (control, device, token, listen, options);
+        bail!("整机 TUN 接管目前只支持 Linux；macOS/iOS 应使用 Network Extension 适配器")
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        run_linux_device_tun(control, device, token, listen, options).await
+    }
+}
+
+#[cfg(target_os = "linux")]
+async fn run_linux_device_tun(
+    control: String,
+    device: String,
+    token: String,
+    listen: SocketAddr,
+    options: crate::device_tun::Options,
+) -> Result<()> {
+    options.validate()?;
+    let (state, listener) = prepare_device_proxy(
+        control.clone(),
+        device,
+        token,
+        listen,
+        Some(options.mark),
+        &options.dns_servers,
+        (options.deadman_seconds / 2).clamp(10, 300),
+    )
+    .await?;
+    let proxy_address = listener.local_addr()?;
+    let initial = state.config.read().await.clone();
+    let bypass = crate::device_tun::automatic_bypass(&control, &initial, &options.bypass).await?;
+    let tun = crate::device_tun::open_device(&options)?;
+    let tun_name = crate::device_tun::tun_name(&tun)?;
+    let stack_args = crate::device_tun::stack_args(proxy_address, &options)?;
+    let cancellation = tun2proxy::CancellationToken::new();
+    let stack_cancel = cancellation.clone();
+    let mtu = options.mtu;
+    let mut stack_task =
+        tokio::spawn(async move { tun2proxy::run(tun, mtu, stack_args, stack_cancel).await });
+    tokio::task::yield_now().await;
+    if stack_task.is_finished() {
+        return match stack_task.await {
+            Ok(Ok(_)) => bail!("TUN 用户态网络栈在路由接管前意外停止"),
+            Ok(Err(error)) => Err(anyhow::anyhow!(error).context("启动 TUN 用户态网络栈")),
+            Err(error) => Err(error.into()),
+        };
+    }
+
+    let mut routes =
+        match crate::device_tun::RouteGuard::install(options.clone(), &tun_name, bypass) {
+            Ok(routes) => routes,
+            Err(error) => {
+                cancellation.cancel();
+                stack_task.abort();
+                let _ = stack_task.await;
+                return Err(error.context("安装 TUN 策略路由"));
+            }
+        };
+    let mut proxy_task = tokio::spawn(serve_local_proxy(state.clone(), listener));
+    let mut deadman = tokio::time::interval(Duration::from_secs(30));
+    deadman.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let shutdown = device_shutdown_signal();
+    tokio::pin!(shutdown);
+    tracing::info!(
+        interface = %tun_name,
+        mtu = options.mtu,
+        mark = format_args!("0x{:x}", options.mark),
+        table = options.table,
+        ipv6 = options.ipv6,
+        "整机 TUN 分流已启动"
+    );
+
+    let result = loop {
+        tokio::select! {
+            signal = &mut shutdown => break signal,
+            result = &mut proxy_task => {
+                break match result {
+                    Ok(Ok(())) => Err(anyhow::anyhow!("设备本地代理意外停止")),
+                    Ok(Err(error)) => Err(error.context("设备本地代理停止")),
+                    Err(error) => Err(error.into()),
+                };
+            }
+            result = &mut stack_task => {
+                break match result {
+                    Ok(Ok(sessions)) => Err(anyhow::anyhow!(
+                        "TUN 用户态网络栈意外停止（退出时仍有 {sessions} 个会话）"
+                    )),
+                    Ok(Err(error)) => Err(anyhow::anyhow!(error).context("TUN 用户态网络栈停止")),
+                    Err(error) => Err(error.into()),
+                };
+            }
+            _ = deadman.tick() => {
+                let elapsed = state
+                    .last_refresh
+                    .lock()
+                    .map(|refresh| refresh.elapsed())
+                    .unwrap_or(Duration::MAX);
+                if elapsed >= Duration::from_secs(options.deadman_seconds) {
+                    break Err(anyhow::anyhow!(
+                        "TUN 失联自救已触发：{} 秒未能刷新签名设备配置",
+                        options.deadman_seconds
+                    ));
+                }
+            }
+        }
+    };
+
+    // Stop capture first, then let the stack and local proxy drain. RouteGuard
+    // also repeats this cleanup from Drop if unwinding occurs mid-shutdown.
+    routes.restore();
+    cancellation.cancel();
+    proxy_task.abort();
+    if !stack_task.is_finished() {
+        let _ = tokio::time::timeout(Duration::from_secs(5), &mut stack_task).await;
+    }
+    result
+}
+
+#[cfg(target_os = "linux")]
+async fn device_shutdown_signal() -> Result<()> {
+    let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+    tokio::select! {
+        result = tokio::signal::ctrl_c() => result.context("监听 Ctrl-C")?,
+        _ = terminate.recv() => {},
+    }
+    Ok(())
+}
+
+async fn prepare_device_proxy(
+    control: String,
+    device: String,
+    token: String,
+    listen: SocketAddr,
+    bypass_mark: Option<u32>,
+    tun_dns_servers: &[IpAddr],
+    refresh_ceiling_seconds: u64,
+) -> Result<(ClientState, TcpListener)> {
     if !listen.ip().is_loopback() {
         bail!("设备本地代理只能监听回环地址；拒绝暴露无认证入口");
     }
     let token = Arc::new(Zeroizing::new(token));
-    let initial = fetch_device_config(&control, &device, token.as_str()).await?;
+    let http = build_control_client(&control).await?;
+    let initial = fetch_device_config(&http, &control, &device, token.as_str()).await?;
     if initial.device != device {
         bail!("控制节点返回了其他设备的配置");
     }
@@ -713,11 +958,27 @@ pub async fn run_device_proxy(
         token,
         config: Arc::new(RwLock::new(initial)),
         tls,
+        http,
+        #[cfg(target_os = "linux")]
+        resolver: bypass_mark
+            .map(|mark| crate::device_tun::MarkedResolver::new(mark, tun_dns_servers))
+            .transpose()?
+            .map(Arc::new),
+        #[cfg(not(target_os = "linux"))]
+        resolver: None,
+        bypass_mark,
+        last_refresh: Arc::new(std::sync::Mutex::new(Instant::now())),
+        refresh_ceiling_seconds,
     };
-    spawn_config_refresh(state.clone());
     let listener = TcpListener::bind(listen)
         .await
         .with_context(|| format!("监听设备本地代理 {listen}"))?;
+    spawn_config_refresh(state.clone());
+    Ok((state, listener))
+}
+
+async fn serve_local_proxy(state: ClientState, listener: TcpListener) -> Result<()> {
+    let listen = listener.local_addr()?;
     tracing::info!(%listen, device = %state.device, "设备分流代理已启动");
     loop {
         let (stream, remote) = listener.accept().await?;
@@ -738,11 +999,21 @@ fn spawn_config_refresh(state: ClientState) {
                 .read()
                 .await
                 .refresh_after_seconds
-                .clamp(10, 300);
+                .clamp(10, state.refresh_ceiling_seconds);
             tokio::time::sleep(Duration::from_secs(delay)).await;
-            match fetch_device_config(&state.control, &state.device, state.token.as_str()).await {
+            match fetch_device_config(
+                &state.http,
+                &state.control,
+                &state.device,
+                state.token.as_str(),
+            )
+            .await
+            {
                 Ok(config) if config.device == *state.device => {
                     *state.config.write().await = config;
+                    if let Ok(mut refreshed) = state.last_refresh.lock() {
+                        *refreshed = Instant::now();
+                    }
                 }
                 Ok(_) => tracing::warn!("设备配置身份不一致，保留上一份签名配置"),
                 Err(error) => tracing::warn!("刷新设备配置失败，保留上一份配置：{error:#}"),
@@ -751,15 +1022,41 @@ fn spawn_config_refresh(state: ClientState) {
     });
 }
 
-async fn fetch_device_config(control: &str, device: &str, token: &str) -> Result<DeviceConfig> {
+async fn build_control_client(control: &str) -> Result<reqwest::Client> {
+    let mut builder = reqwest::Client::builder().timeout(Duration::from_secs(20));
+    let url = reqwest::Url::parse(control).context("控制节点 URL 无效")?;
+    if let Some(host) = url.host_str() {
+        if host.parse::<IpAddr>().is_err() {
+            let port = url.port_or_known_default().unwrap_or(443);
+            let mut addresses = tokio::net::lookup_host((host, port))
+                .await
+                .with_context(|| format!("预解析控制节点 {host}"))?
+                .collect::<Vec<_>>();
+            addresses.sort();
+            addresses.dedup();
+            if addresses.is_empty() {
+                bail!("控制节点 {host} 没有解析结果");
+            }
+            // Keep HTTPS SNI and Host unchanged, but pin the already-resolved
+            // addresses so refreshes never consume virtual-DNS answers.
+            builder = builder.resolve_to_addrs(host, &addresses);
+        }
+    }
+    Ok(builder.build()?)
+}
+
+async fn fetch_device_config(
+    client: &reqwest::Client,
+    control: &str,
+    device: &str,
+    token: &str,
+) -> Result<DeviceConfig> {
     let url = format!(
         "{}/device/v1/config/{}",
         control.trim_end_matches('/'),
         percent_encoding::utf8_percent_encode(device, percent_encoding::NON_ALPHANUMERIC)
     );
-    let response = reqwest::Client::builder()
-        .timeout(Duration::from_secs(20))
-        .build()?
+    let response = client
         .get(url)
         .bearer_auth(token)
         .send()
@@ -804,7 +1101,9 @@ async fn handle_local(state: ClientState, mut downstream: TcpStream) -> Result<(
         LocalRequest::SocksUdp { .. } => unreachable!(),
     };
     let config = state.config.read().await.clone();
-    let resolved = direct_candidates(&host, port).await.ok();
+    let resolved = direct_candidates(&host, port, state.resolver.as_deref())
+        .await
+        .ok();
     let ip = resolved
         .as_ref()
         .and_then(|addresses| addresses.first())
@@ -818,9 +1117,11 @@ async fn handle_local(state: ClientState, mut downstream: TcpStream) -> Result<(
         Decision::Direct => {
             let addresses = resolved.context("直连目标无法解析");
             match addresses {
-                Ok(addresses) => connect_candidates(&addresses, Duration::from_secs(15))
-                    .await
-                    .map(|stream| Box::new(stream) as Box<dyn AsyncStream>),
+                Ok(addresses) => {
+                    connect_candidates(&addresses, Duration::from_secs(15), state.bypass_mark)
+                        .await
+                        .map(|stream| Box::new(stream) as Box<dyn AsyncStream>)
+                }
                 Err(error) => Err(error),
             }
         }
@@ -838,12 +1139,14 @@ async fn handle_local(state: ClientState, mut downstream: TcpStream) -> Result<(
                 Err(error) => Err(error),
             }
         }
-        Decision::Nearest => match nearest_exit(&config.exits).await {
-            Ok(exit) => connect_exit(&state, &exit, &host, port)
-                .await
-                .map(|stream| Box::new(stream) as Box<dyn AsyncStream>),
-            Err(error) => Err(error),
-        },
+        Decision::Nearest => {
+            match nearest_exit(&config.exits, state.bypass_mark, state.resolver.as_deref()).await {
+                Ok(exit) => connect_exit(&state, &exit, &host, port)
+                    .await
+                    .map(|stream| Box::new(stream) as Box<dyn AsyncStream>),
+                Err(error) => Err(error),
+            }
+        }
     };
     let mut upstream = match upstream {
         Ok(upstream) => upstream,
@@ -1067,7 +1370,9 @@ async fn route_local_udp(
 ) -> Result<Vec<u8>> {
     let packet = parse_socks_udp_packet(frame)?;
     let config = state.config.read().await.clone();
-    let resolved = direct_candidates(&packet.host, packet.port).await.ok();
+    let resolved = direct_candidates(&packet.host, packet.port, state.resolver.as_deref())
+        .await
+        .ok();
     let ip = resolved
         .as_ref()
         .and_then(|addresses| addresses.first())
@@ -1076,8 +1381,13 @@ async fn route_local_udp(
         Decision::Reject => bail!("UDP 目标被出口规则拒绝"),
         Decision::Direct => {
             let addresses = resolved.context("UDP 直连目标无法解析")?;
-            let payload =
-                udp_exchange(&addresses, &packet.payload, Duration::from_secs(15)).await?;
+            let payload = udp_exchange(
+                &addresses,
+                &packet.payload,
+                Duration::from_secs(15),
+                state.bypass_mark,
+            )
+            .await?;
             encode_socks_udp_packet(&SocksUdpPacket { payload, ..packet })
         }
         Decision::Node(node_id) => {
@@ -1096,7 +1406,10 @@ async fn route_local_udp(
                     .iter()
                     .any(|exit| exit.node_id == cached.node_id)
             }) {
-                *nearest_cache = Some(nearest_exit(&config.exits).await?);
+                *nearest_cache = Some(
+                    nearest_exit(&config.exits, state.bypass_mark, state.resolver.as_deref())
+                        .await?,
+                );
             }
             let exit = nearest_cache.as_ref().context("当前没有可达出口节点")?;
             exchange_exit_udp(state, exit, frame, exit_sessions).await
@@ -1168,21 +1481,23 @@ where
     .context("UDP 出口响应超时")?
 }
 
-async fn nearest_exit(exits: &[DeviceExit]) -> Result<DeviceExit> {
+async fn nearest_exit(
+    exits: &[DeviceExit],
+    bypass_mark: Option<u32>,
+    resolver: Option<&crate::device_tun::MarkedResolver>,
+) -> Result<DeviceExit> {
     if exits.is_empty() {
         bail!("当前没有可达出口节点");
     }
     let probes = futures_util::future::join_all(exits.iter().cloned().map(|exit| async move {
         let started = Instant::now();
-        let result = resolve_endpoint(&exit.endpoint)
+        let result = resolve_endpoint(&exit.endpoint, resolver)
             .await
             .and_then(|addresses| addresses.first().copied().context("出口端点没有解析结果"));
         let reachable = match result {
-            Ok(address) => {
-                tokio::time::timeout(Duration::from_secs(2), TcpStream::connect(address))
-                    .await
-                    .is_ok_and(|result| result.is_ok())
-            }
+            Ok(address) => connect_candidates(&[address], Duration::from_secs(2), bypass_mark)
+                .await
+                .is_ok(),
             Err(_) => false,
         };
         (exit, reachable.then(|| started.elapsed()))
@@ -1196,7 +1511,10 @@ async fn nearest_exit(exits: &[DeviceExit]) -> Result<DeviceExit> {
         .context("所有出口节点均不可达")
 }
 
-async fn resolve_endpoint(endpoint: &str) -> Result<Vec<SocketAddr>> {
+async fn resolve_endpoint(
+    endpoint: &str,
+    resolver: Option<&crate::device_tun::MarkedResolver>,
+) -> Result<Vec<SocketAddr>> {
     if let Ok(address) = endpoint.parse::<SocketAddr>() {
         return Ok(vec![address]);
     }
@@ -1204,9 +1522,10 @@ async fn resolve_endpoint(endpoint: &str) -> Result<Vec<SocketAddr>> {
         .rsplit_once(':')
         .context("出口端点不是 hostname:port")?;
     let port: u16 = port.parse().context("出口端点端口无效")?;
-    let mut addresses = tokio::net::lookup_host((host, port))
-        .await?
-        .collect::<Vec<_>>();
+    let mut addresses = match resolver {
+        Some(resolver) => resolver.lookup(host, port).await?,
+        None => tokio::net::lookup_host((host, port)).await?.collect(),
+    };
     addresses.sort();
     addresses.dedup();
     if addresses.is_empty() {
@@ -1237,8 +1556,8 @@ async fn connect_exit(
     host: &str,
     port: u16,
 ) -> Result<tokio_rustls::client::TlsStream<TcpStream>> {
-    let addresses = resolve_endpoint(&exit.endpoint).await?;
-    let tcp = connect_candidates(&addresses, Duration::from_secs(10)).await?;
+    let addresses = resolve_endpoint(&exit.endpoint, state.resolver.as_deref()).await?;
+    let tcp = connect_candidates(&addresses, Duration::from_secs(10), state.bypass_mark).await?;
     let connector = TlsConnector::from(state.tls.clone());
     let mut tls = connector
         .connect(endpoint_server_name(&exit.endpoint)?, tcp)
@@ -1252,8 +1571,8 @@ async fn connect_exit_udp_association(
     state: &ClientState,
     exit: &DeviceExit,
 ) -> Result<tokio_rustls::client::TlsStream<TcpStream>> {
-    let addresses = resolve_endpoint(&exit.endpoint).await?;
-    let tcp = connect_candidates(&addresses, Duration::from_secs(10)).await?;
+    let addresses = resolve_endpoint(&exit.endpoint, state.resolver.as_deref()).await?;
+    let tcp = connect_candidates(&addresses, Duration::from_secs(10), state.bypass_mark).await?;
     let connector = TlsConnector::from(state.tls.clone());
     let mut tls = connector
         .connect(endpoint_server_name(&exit.endpoint)?, tcp)
@@ -1440,7 +1759,7 @@ mod tests {
             response.extend_from_slice(&payload[..length]);
             echo.send_to(&response, peer).await.unwrap();
         });
-        let response = udp_exchange(&[address], &[0, 1, 255], Duration::from_secs(2))
+        let response = udp_exchange(&[address], &[0, 1, 255], Duration::from_secs(2), None)
             .await
             .unwrap();
         assert_eq!(response, b"echo:\0\x01\xff");
@@ -1525,6 +1844,11 @@ mod tests {
                     .with_root_certificates(rustls::RootCertStore::empty())
                     .with_no_client_auth(),
             ),
+            http: reqwest::Client::new(),
+            resolver: None,
+            bypass_mark: None,
+            last_refresh: Arc::new(std::sync::Mutex::new(Instant::now())),
+            refresh_ceiling_seconds: 300,
         };
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let proxy_address = listener.local_addr().unwrap();
