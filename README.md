@@ -73,13 +73,24 @@ Working today, verified by multi-process fault-injection e2e tests:
   Drain/suspend policies also remove nodes from DNS rotation, while previews
   and initial Durable Object quorum selection obey the same requirements. See
   [the node placement guide](./docs/NODES.md).
+- **Cluster-wide security policy and scoped automation**: operator-signed
+  quotas cover Worker count/size, custom hostnames, aggregate R2 objects/local
+  bytes, request rate and Worker outbound networking. Personal API tokens are
+  one-way SHA-256 credentials with exact read/write scopes, optional expiry and
+  signed revocation; raw values are displayed once. The cookie-free `/api/v1`
+  surface spans Workers, KV, D1, R2, Queues, Analytics, Pipelines, Workflows,
+  Flows, Email, nodes and the transparency log. See
+  [Security, API and S3 access](./docs/SECURITY_API.md).
 - **R2-compatible object storage**: operator-signed buckets, per-bucket D1
   metadata quorums, content-addressed local replicas or node-local rclone
   remotes, quotas, metadata, ranges, conditions, delimiter listing,
   multipart upload, lifecycle expiry and delayed reference-safe collection.
   Stock workerd receives native `R2Bucket` bindings; public buckets get
   `r2-<bucket>.<default_domain>` plus optional custom hostnames, CORS and
-  ETag/Range-aware object delivery.
+  ETag/Range-aware object delivery. Operator-signed, revocable S3 credentials
+  support full-account or per-bucket read/write grants through the path-style
+  Signature V4 endpoint at `/s3`, including multipart upload. Secret Access
+  Keys are sealed cluster-wide and shown only once.
 - **Decentralized Queues**: operator-signed queue definitions and independent
   D1 micro-quorum ledgers provide delayed JSON messages, batches, visibility
   leases, bounded retries, durable dead letters and redrive. Workers produce

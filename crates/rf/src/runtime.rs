@@ -39,6 +39,7 @@ pub struct Runtime {
 struct RunningWorker {
     version: u64,
     port: u16,
+    outbound_allowed: bool,
     child: Option<Child>,
 }
 
@@ -47,6 +48,7 @@ struct DesiredWorker {
     revision: u64,
     manifest: WorkerManifest,
     preview: bool,
+    outbound_allowed: bool,
 }
 
 /// Where ingress should send traffic for a module worker.
@@ -127,6 +129,16 @@ impl Runtime {
     }
 
     async fn reconcile(&mut self) {
+        // Treat an invalid replicated policy as deny-by-default. Admission
+        // prevents new invalid policies on current nodes, but this also keeps
+        // mixed-version clusters safe while they converge.
+        let outbound_allowed = match crate::quota::policy(&self.node) {
+            Ok(policy) => policy.worker_outbound_allowed,
+            Err(error) => {
+                tracing::warn!("集群配额策略无效，已禁用 Worker 出站网络：{error:#}");
+                false
+            }
+        };
         let mut desired: Vec<DesiredWorker> = self
             .node
             .live_manifests()
@@ -148,6 +160,7 @@ impl Runtime {
                 revision: manifest.version,
                 manifest,
                 preview: false,
+                outbound_allowed,
             })
             .collect();
         desired.extend(
@@ -162,6 +175,7 @@ impl Runtime {
                     revision: view.resource.version,
                     manifest: spec.manifest,
                     preview: true,
+                    outbound_allowed,
                 }),
         );
 
@@ -196,7 +210,10 @@ impl Runtime {
             let m = &worker.manifest;
             let current = self.running.get(&worker.id);
             let up = current.map(|rw| rw.child.is_some()).unwrap_or(false);
-            if current.map(|rw| rw.version) == Some(worker.revision) && up {
+            if current.map(|rw| (rw.version, rw.outbound_allowed))
+                == Some((worker.revision, worker.outbound_allowed))
+                && up
+            {
                 continue; // already running this version
             }
             if m.blob_refs().any(|sha| !self.node.blobs.has(&sha)) {
@@ -358,6 +375,7 @@ impl Runtime {
             },
             &durable_dir,
             &secret_bindings,
+            desired.outbound_allowed,
         );
         for value in secret_bindings.values_mut() {
             value.zeroize();
@@ -473,6 +491,7 @@ impl Runtime {
             RunningWorker {
                 version: revision,
                 port,
+                outbound_allowed: desired.outbound_allowed,
                 child: Some(child),
             },
         );
@@ -1166,6 +1185,7 @@ pub fn generate_config(
     binding_ports: BindingPorts,
     durable_dir: &std::path::Path,
     secret_bindings: &std::collections::BTreeMap<String, String>,
+    outbound_allowed: bool,
 ) -> String {
     let BindingPorts {
         kv: kvbind_port,
@@ -1420,6 +1440,16 @@ pub fn generate_config(
             "      durableObjectNamespaces = [\n{durable_namespaces}      ],\n      durableObjectStorage = (localDisk = \"do-storage\"),\n"
         )
     };
+    let global_outbound = if outbound_allowed {
+        String::new()
+    } else {
+        "      globalOutbound = \"blocked-outbound\",\n".to_string()
+    };
+    let blocked_outbound_service = if outbound_allowed {
+        String::new()
+    } else {
+        "    (name = \"blocked-outbound\", network = (allow = [])),\n".to_string()
+    };
     let compatibility_flags = crate::deploy::compatibility_flags(m)
         .iter()
         .map(|flag| capnp_string(flag))
@@ -1446,8 +1476,8 @@ const config :Workerd.Config = (
       compatibilityFlags = [{compatibility_flags}],
       bindings = [
 {bindings}      ],
-{durable_worker}    )),
-{kv_services}{r2_services}{d1_services}{queue_services}{analytics_services}{pipeline_services}{workflow_services}{email_services}{worker_services}{durable_service}  ],
+{global_outbound}{durable_worker}    )),
+{kv_services}{r2_services}{d1_services}{queue_services}{analytics_services}{pipeline_services}{workflow_services}{email_services}{worker_services}{durable_service}{blocked_outbound_service}  ],
   sockets = [
     (name = "http", address = "127.0.0.1:{port}", http = (), service = "main"),
   ],
@@ -1585,6 +1615,7 @@ mod tests {
             },
             std::path::Path::new("/tmp/rf-do"),
             &BTreeMap::from([("API_TOKEN".into(), "private-value".into())]),
+            true,
         );
         assert!(cfg.contains("esModule = embed \"src/index.js\""));
         assert!(cfg.contains("127.0.0.1:30111"));
@@ -1629,6 +1660,27 @@ mod tests {
         assert!(cfg.contains("uniqueKey = \"rf--w--Counter\", enableSql = true"));
         assert!(cfg.contains("durableObjectStorage = (localDisk = \"do-storage\")"));
         assert!(cfg.contains("disk = (path = \"/tmp/rf-do\", writable = true)"));
+        assert!(!cfg.contains("globalOutbound = \"blocked-outbound\""));
+        let blocked_cfg = generate_config(
+            &m,
+            30111,
+            BindingPorts {
+                kv: 7382,
+                r2: 7383,
+                d1: 7384,
+                queue: 7385,
+                analytics: 7386,
+                pipeline: 7387,
+                workflow: 7388,
+                email: 7389,
+                service: 7390,
+            },
+            std::path::Path::new("/tmp/rf-do"),
+            &BTreeMap::new(),
+            false,
+        );
+        assert!(blocked_cfg.contains("globalOutbound = \"blocked-outbound\""));
+        assert!(blocked_cfg.contains("(name = \"blocked-outbound\", network = (allow = []))"));
         let entry = rf_entry_source(&m, &BTreeMap::new(), "test-event-token");
         assert!(entry.contains("/.rf/internal/cron"));
         assert!(entry.contains("__rfUserDefault.scheduled"));

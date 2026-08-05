@@ -41,10 +41,10 @@ surface yet.
 | encrypted membership and peer API | done | multi-VPS production soak |
 | public/inner nodes, DNS rotation, TLS/ACME | done | multi-provider DNS adapters |
 | decentralized browser authentication | done | hardware-wallet browser approval UX |
-| signed audit/transparency history | partial | include every platform resource and mutation |
+| signed audit/transparency history | partial | Worker manifests and every signed platform resource are exposed through a redacted cluster audit; KV/D1 data-plane mutation export and archival remain |
 | node tags, placement requirements, drain/suspend | partial | signed policies, system/custom/region tags, Worker constraints, encrypted exact-revision peer fallback, preview placement, DNS draining, capability-aware initial DO quorums and Chinese node UI are implemented and two-node tested; existing-DO owner migration and multi-VPS production soak remain |
-| topology, quotas, request metrics, DLQ | partial | placement topology, privacy-bounded per-node request history, encrypted live-node aggregation, 24-hour status trends and Cron/Queue DLQ are done; enforceable cross-resource quotas remain |
-| access tokens and scoped API credentials | planned | signed grants, revocation and least-privilege scopes |
+| topology, quotas, request metrics, DLQ | partial | placement topology, privacy-bounded request history, aggregation, status trends and DLQs are done; signed Worker/hostname/R2/outbound quotas and deterministic per-live-node request admission are implemented; partition/fault soak remains |
+| access tokens and scoped API credentials | partial | one-way signed tokens, exact read/write scopes, expiry/revocation, last-used telemetry, cookie-isolated `/api/v1` and Chinese UI are implemented; CLI management and production soak remain |
 | device/exit networking | planned | capability-tagged exits and encrypted tunnel enrolment |
 
 ### Workers (including Pages)
@@ -73,7 +73,7 @@ surface yet.
 | R2 objects | partial | native binding + get/head/put/delete/list, metadata, ranges, conditions and delimiter cursors done; streaming multi-GiB IO remains |
 | R2 multipart | partial | create/upload/complete/abort and ETags done; administrative upload listing remains |
 | R2 public/custom domains and CORS | partial | signed hostnames, deterministic defaults, ACME discovery, CORS and Range delivery done; DNS ownership workflow remains |
-| R2 credentials/grants/S3 API | planned | scoped keys, rotation and signature-v4 endpoint |
+| R2 credentials/grants/S3 API | partial | sealed Secret Access Keys, signed revocation/rotation, full-account or per-bucket grants, path-style Signature V4, conditional/ranged GET and multipart are implemented; SDK compatibility matrix and production soak remain |
 | R2 quotas/lifecycle/dedup/replication | partial | atomic bucket quotas, lifecycle, delayed cross-bucket orphan checks, local-majority writes and repair done; multi-node fault soak remains |
 | rclone backend | partial | credential-isolated config, remote probe and verified read/write/delete done; streaming IO and read cache remain |
 | storage policy/sharding | planned | deterministic remote selection and online migration |

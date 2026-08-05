@@ -154,9 +154,14 @@ pub fn ingest(node: &Node, envelope: &Envelope) -> Result<ResourceRecord> {
     if node.kv_get(RESOURCE_NAMESPACE, &key).is_none() {
         node.kv_put(RESOURCE_NAMESPACE, &key, Some(envelope.to_bytes()), None)?;
     }
-    if resource.kind == crate::placement::NODE_POLICY_KIND {
+    if matches!(
+        resource.kind.as_str(),
+        crate::placement::NODE_POLICY_KIND | crate::quota::POLICY_KIND
+    ) {
         // Placement changes affect even assets-only Workers, which have no
         // runtime process whose port change could otherwise trigger gossip.
+        // Quota policy changes can alter outbound-network permissions for an
+        // otherwise unchanged module Worker.
         node.notify_runtime_changed();
     }
     Ok(resource)

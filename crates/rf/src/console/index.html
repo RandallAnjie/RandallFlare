@@ -77,6 +77,9 @@
           <button class="nav-item" data-view="email">
             <span class="nav-glyph" aria-hidden="true">@</span><span>邮件路由</span><span id="email-nav-count" class="count">0</span>
           </button>
+          <button class="nav-item" data-view="security">
+            <span class="nav-glyph" aria-hidden="true">⌾</span><span>安全与访问</span>
+          </button>
         </nav>
         <div class="sidebar-foot">
           <p class="sidebar-tagline">一次构建，一次验证，处处运行。</p>
@@ -918,6 +921,78 @@ Content-Type: text/plain; charset=utf-8
               <pre id="d1-result" class="result">执行一条语句后，结果会显示在这里。</pre>
             </article>
           </div>
+        </section>
+
+        <section id="view-security" class="view" aria-labelledby="section-title">
+          <div class="projects-header">
+            <div><p class="eyebrow">签名安全策略</p><h2>安全、配额与程序化访问</h2><p class="muted">配额、令牌与 S3 凭据都是操作员签名资源，可由任意节点独立验证。API 令牌只保存摘要；S3 Secret 使用集群密钥加密，明文只显示一次。</p></div>
+            <button id="security-refresh" class="secondary" type="button">刷新安全状态</button>
+          </div>
+
+          <div class="metrics compact-metrics">
+            <article class="metric"><span>Worker</span><strong id="security-worker-usage">—</strong><small id="security-worker-limit">—</small></article>
+            <article class="metric"><span>自定义域名</span><strong id="security-hostname-usage">—</strong><small id="security-hostname-limit">—</small></article>
+            <article class="metric"><span>R2 本地字节</span><strong id="security-r2-byte-usage">—</strong><small id="security-r2-byte-limit">—</small></article>
+            <article class="metric"><span>R2 对象</span><strong id="security-r2-object-usage">—</strong><small id="security-r2-object-limit">—</small></article>
+          </div>
+
+          <div id="credential-transport-warning" class="banner warning hidden" role="status">当前连接不是 HTTPS。你仍可查看安全状态和提交配额策略，但 API 令牌与 S3 Secret 只允许通过 HTTPS 管理界面创建。</div>
+
+          <div class="grid one-one security-grid">
+            <div class="r2-sidebar-stack">
+              <article class="panel settings-panel security-policy-panel">
+              <div class="settings-copy"><p class="eyebrow">集群级准入控制</p><h2>资源与网络配额</h2><p class="muted">请求预算按在线公开节点确定性拆分；关闭公网出站后，Worker 的全局 fetch 无法访问网络，平台绑定与 Service Binding 仍可用。</p></div>
+              <form id="quota-form" class="settings-form">
+                <div class="form-grid"><label><span>Worker 上限</span><input id="quota-workers" type="number" min="1" required></label><label><span>自定义域名上限</span><input id="quota-hostnames" type="number" min="1" required></label></div>
+                <label><span>单个 Worker 内容上限（字节）</span><input id="quota-worker-bytes" type="number" min="1" required><small>模块与静态资源的签名清单大小合计。</small></label>
+                <label><span>集群每分钟请求上限</span><input id="quota-requests" type="number" min="1" required></label>
+                <div class="form-grid"><label><span>R2 本地字节上限</span><input id="quota-r2-bytes" type="number" min="1" required></label><label><span>R2 对象上限</span><input id="quota-r2-objects" type="number" min="1" required></label></div>
+                <label class="check-label"><input id="quota-outbound" type="checkbox"><span>允许 Worker 通过全局 fetch 访问公网</span></label>
+                <button class="primary" type="submit">提交签名配额策略</button>
+              </form>
+              </article>
+              <article class="panel">
+                <div class="panel-head"><div><p class="eyebrow">AWS Signature V4</p><h2>创建 R2/S3 凭据</h2><p class="muted compact-copy">路径式 Endpoint 为当前控制台域名下的 <code>/s3</code>。支持 aws-cli、boto3、rclone 与 AWS SDK。</p></div></div>
+                <form id="s3-credential-form" class="stack-form">
+                  <label><span>用途名称</span><input id="s3-credential-label" maxlength="120" placeholder="备份服务器" required></label>
+                  <label class="check-label"><input id="s3-acl-enabled" type="checkbox" checked><span>启用逐 bucket 最小权限（未授权默认拒绝）</span></label>
+                  <div id="s3-grant-list" class="grant-list empty-state">创建 R2 bucket 后可在这里分配读写权限。</div>
+                  <div class="button-row"><button id="s3-credential-submit" class="primary" type="submit">生成加密 S3 凭据</button><button id="s3-credential-cancel" class="secondary hidden" type="button">取消编辑</button></div>
+                </form>
+              </article>
+            </div>
+
+            <div class="r2-sidebar-stack">
+              <article class="panel">
+                <div class="panel-head"><div><p class="eyebrow">Bearer API</p><h2>创建作用域访问令牌</h2><p class="muted compact-copy">令牌以 <code>rfp_</code> 开头，明文不会进入资源链。</p></div></div>
+                <form id="access-token-form" class="stack-form">
+                  <label><span>用途名称</span><input id="access-token-label" maxlength="120" placeholder="GitHub Actions 生产部署" required></label>
+                  <label><span>有效期（天）<em>留空表示长期有效</em></span><input id="access-token-days" type="number" min="1" max="3650" placeholder="90"></label>
+                  <fieldset class="scope-fieldset"><legend>最小权限作用域</legend><div id="access-token-scopes" class="scope-grid"></div></fieldset>
+                  <button class="primary" type="submit">生成并等待签名</button>
+                </form>
+              </article>
+              <article class="panel">
+                <div class="panel-head"><div><p class="eyebrow">已签名凭据</p><h2>API 访问令牌</h2></div></div>
+                <div id="access-token-list" class="database-list empty-state">暂无访问令牌。</div>
+              </article>
+              <article class="panel">
+                <div class="panel-head"><div><p class="eyebrow">凭据与授权</p><h2>R2/S3 客户端</h2></div><code id="s3-endpoint">/s3</code></div>
+                <div id="s3-credential-list" class="database-list empty-state">暂无 S3 凭据。</div>
+              </article>
+            </div>
+          </div>
+
+          <article id="credential-reveal" class="panel credential-reveal hidden" role="status">
+            <div class="panel-head"><div><p class="eyebrow">只显示一次</p><h2 id="credential-reveal-title">请立即保存凭据</h2><p class="muted">关闭或刷新后无法重新读取；丢失时请撤销并创建新凭据。</p></div><button id="credential-reveal-close" class="icon-button" type="button" aria-label="关闭">×</button></div>
+            <pre id="credential-reveal-value" class="result"></pre>
+            <button id="credential-reveal-copy" class="secondary" type="button">复制全部</button>
+          </article>
+
+          <article class="panel">
+            <div class="panel-head"><div><p class="eyebrow">全资源透明日志</p><h2>签名变更审计</h2><p class="muted compact-copy">每条记录都有前序摘要、版本与当前摘要；令牌摘要和凭据密文在控制台审计响应中整体隐藏。</p></div><button id="security-audit-refresh" class="secondary compact" type="button">刷新审计</button></div>
+            <div id="security-audit-list" class="build-list empty-state">正在读取签名资源历史…</div>
+          </article>
         </section>
       </main>
     </div>

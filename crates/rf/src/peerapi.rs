@@ -716,17 +716,8 @@ async fn manifest_post(
     let Ok(env) = Envelope::from_bytes(&body) else {
         return (StatusCode::BAD_REQUEST, "bad envelope").into_response();
     };
-    match api.node.ingest_manifest(&env) {
-        Ok(changed) => {
-            if let Ok(manifest) = env.open::<rf_core::manifest::WorkerManifest>(None) {
-                if !crate::deploy::durable_objects(&manifest).is_empty() {
-                    if let Err(e) = api.durable.ensure_worker(&manifest.name) {
-                        return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
-                    }
-                }
-            }
-            axum::Json(serde_json::json!({ "changed": changed })).into_response()
-        }
+    match ingest_manifest_envelope(&api, &env) {
+        Ok(changed) => axum::Json(serde_json::json!({ "changed": changed })).into_response(),
         Err(e) => (StatusCode::UNPROCESSABLE_ENTITY, e.to_string()).into_response(),
     }
 }
@@ -796,13 +787,13 @@ async fn authorization_post(
     if approved.kind != crate::management::ApprovalKind::Login {
         let result = match approved.kind {
             crate::management::ApprovalKind::Manifest => {
-                ingest_manifest_envelope(&api, &approved.envelope)
+                ingest_manifest_envelope(&api, &approved.envelope).map(|_| ())
             }
             crate::management::ApprovalKind::Source => {
                 crate::build::ingest_source(&api.node, &approved.envelope).map(|_| ())
             }
             crate::management::ApprovalKind::Resource => {
-                crate::resource::ingest(&api.node, &approved.envelope).map(|_| ())
+                ingest_resource_envelope(&api, &approved.envelope).map(|_| ())
             }
             crate::management::ApprovalKind::Login => unreachable!(),
         };
@@ -824,16 +815,29 @@ async fn authorization_post(
     .into_response()
 }
 
-fn ingest_manifest_envelope(api: &Api, envelope: &Envelope) -> Result<()> {
-    api.node.ingest_manifest(envelope)?;
+fn ingest_manifest_envelope(api: &Api, envelope: &Envelope) -> Result<bool> {
     let manifest: rf_core::manifest::WorkerManifest =
         envelope
             .open(Some(&api.node.cfg.operator))
             .map_err(|error| anyhow::anyhow!("approved manifest could not be decoded: {error}"))?;
+    crate::quota::validate_manifest_admission(&api.node, &manifest)?;
+    let changed = api.node.ingest_manifest(envelope)?;
     if !crate::deploy::durable_objects(&manifest).is_empty() {
         api.durable.ensure_worker(&manifest.name)?;
     }
-    Ok(())
+    Ok(changed)
+}
+
+fn ingest_resource_envelope(
+    api: &Api,
+    envelope: &Envelope,
+) -> Result<crate::resource::ResourceRecord> {
+    let record: crate::resource::ResourceRecord = envelope
+        .open(Some(&api.node.cfg.operator))
+        .map_err(|error| anyhow::anyhow!("平台资源签名无效：{error}"))?;
+    record.validate()?;
+    crate::quota::validate_resource_admission(&api.node, &record)?;
+    crate::resource::ingest(&api.node, envelope)
 }
 
 async fn worker_get(
@@ -2417,7 +2421,7 @@ async fn resource_post(
         Ok(envelope) => envelope,
         Err(error) => return (StatusCode::BAD_REQUEST, error.to_string()).into_response(),
     };
-    match crate::resource::ingest(&api.node, &envelope) {
+    match ingest_resource_envelope(&api, &envelope) {
         Ok(resource) => axum::Json(resource).into_response(),
         Err(error) => (StatusCode::BAD_REQUEST, error.to_string()).into_response(),
     }

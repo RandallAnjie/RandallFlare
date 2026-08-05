@@ -100,6 +100,9 @@ pub struct Inner {
     /// Per-process unguessable tokens used only for rf → workerd event
     /// delivery. They are regenerated on every Worker start and never gossip.
     pub worker_event_tokens: HashMap<String, String>,
+    /// Current local share of the signed cluster request/minute budget:
+    /// (unix-minute, accepted requests).
+    pub quota_request_window: (u64, u64),
 }
 
 pub struct Node {
@@ -118,6 +121,10 @@ pub struct Node {
     flow_schemas: Mutex<HashSet<String>>,
     email_schemas: Mutex<HashSet<String>>,
     cron_schemas: Mutex<HashSet<String>>,
+    /// Serializes cluster-quota preflight with the following local R2 metadata
+    /// commit. Cross-node admission remains intentionally conservative and is
+    /// backed by the per-bucket D1 quorum.
+    pub(crate) r2_quota_gate: tokio::sync::Mutex<()>,
     events: broadcast::Sender<NodeEvent>,
 }
 
@@ -166,6 +173,7 @@ impl Node {
             emailbind_port: 0,
             servicebind_port: 0,
             worker_event_tokens: HashMap::new(),
+            quota_request_window: (0, 0),
         };
         // Hydrate: static stability means booting entirely from disk.
         for env in store.load_manifests()? {
@@ -199,6 +207,7 @@ impl Node {
             flow_schemas: Mutex::new(HashSet::new()),
             email_schemas: Mutex::new(HashSet::new()),
             cron_schemas: Mutex::new(HashSet::new()),
+            r2_quota_gate: tokio::sync::Mutex::new(()),
             events,
         })
     }
@@ -582,6 +591,44 @@ impl Node {
         self.inner.lock().unwrap().peers.clone()
     }
 
+    /// Consume this node's deterministic share of the cluster request budget.
+    /// Live public node identities are sorted; any division remainder is given
+    /// to the first identities, so a converged membership view sums exactly to
+    /// the operator-signed global limit rather than multiplying it per node.
+    pub fn admit_public_request(&self) -> Result<bool> {
+        let limit = crate::quota::policy(self)?.max_requests_per_minute;
+        let minute = now_ms() / 60_000;
+        let mut inner = self.inner.lock().unwrap();
+        let mut public_nodes = inner
+            .peers
+            .iter()
+            .filter(|(_, peer)| peer.public)
+            .map(|(id, _)| id.clone())
+            .collect::<BTreeSet<_>>();
+        if self.cfg.public {
+            public_nodes.insert(self.id_hex());
+        }
+        if public_nodes.is_empty() {
+            public_nodes.insert(self.id_hex());
+        }
+        let count = public_nodes.len() as u64;
+        let base = limit / count;
+        let remainder = limit % count;
+        let rank = public_nodes
+            .iter()
+            .position(|id| id == &self.id_hex())
+            .unwrap_or(0) as u64;
+        let local_limit = base + u64::from(rank < remainder);
+        if inner.quota_request_window.0 != minute {
+            inner.quota_request_window = (minute, 0);
+        }
+        if inner.quota_request_window.1 >= local_limit {
+            return Ok(false);
+        }
+        inner.quota_request_window.1 += 1;
+        Ok(true)
+    }
+
     /// Routing table: hostname → worker.
     pub fn routes(&self) -> BTreeMap<String, String> {
         let inner = self.inner.lock().unwrap();
@@ -699,6 +746,22 @@ impl Node {
             .live()
             .map(|r| r.manifest.clone())
             .collect()
+    }
+
+    /// All known Worker identities, including deleted heads, for the signed
+    /// transparency/audit surface.
+    pub fn manifest_names(&self) -> Vec<String> {
+        let mut names = self
+            .inner
+            .lock()
+            .unwrap()
+            .manifests
+            .all()
+            .map(|record| record.manifest.name.clone())
+            .collect::<Vec<_>>();
+        names.sort();
+        names.dedup();
+        names
     }
 
     /// Transparency log for one worker (version-ascending envelopes).

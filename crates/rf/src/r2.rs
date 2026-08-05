@@ -121,6 +121,12 @@ pub struct ObjectList {
     pub cursor: Option<String>,
 }
 
+#[derive(Debug, Clone, Copy, Default, Serialize)]
+pub struct BucketUsage {
+    pub bytes: u64,
+    pub objects: u64,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MultipartUpload {
     pub upload_id: String,
@@ -230,12 +236,15 @@ async fn commit_object(
     if !node.objects.supports(&spec.storage) {
         bail!("当前节点不具备此 bucket 所需的存储后端");
     }
+    let group = ensure_schema(node, bucket).await?;
+    let _quota_guard = node.r2_quota_gate.lock().await;
+    let previous = head_object(node, bucket, key).await?;
+    crate::quota::validate_r2_write(node, bucket, previous.as_ref(), bytes.len() as u64).await?;
+    // Failed quota admission must not consume unindexed local/rclone storage.
     let sha = node.objects.put(&spec.storage, bytes).await?;
     let sha256 = hex::encode(sha);
     let etag = sha256.clone();
     let uploaded_at_ms = now_ms();
-    let group = ensure_schema(node, bucket).await?;
-    let previous = head_object(node, bucket, key).await?;
     if spec.storage == StorageLocation::Local {
         replicate_local_blob(node, &group, &sha, bytes).await?;
     }
@@ -651,6 +660,30 @@ pub async fn list_objects(
         delimited_prefixes: vec![],
         truncated,
         cursor,
+    })
+}
+
+/// Strongly-consistent usage counters for one bucket. The bytes value counts
+/// logical object bytes (not multipart staging or deduplicated physical
+/// blobs); callers decide whether the bucket's backing store is local/rclone.
+pub async fn bucket_usage(node: &Node, bucket: &str) -> Result<BucketUsage> {
+    bucket_record(node, bucket).context("R2 bucket 不存在")?;
+    ensure_schema(node, bucket).await?;
+    let result = exec(
+        node,
+        bucket,
+        "SELECT COALESCE(SUM(size), 0) AS bytes, COUNT(*) AS objects FROM objects",
+        json!([]),
+    )
+    .await?;
+    let row = result["rows"]
+        .as_array()
+        .and_then(|rows| rows.first())
+        .and_then(Value::as_object)
+        .context("R2 使用量统计缺失")?;
+    Ok(BucketUsage {
+        bytes: row.get("bytes").and_then(Value::as_u64).unwrap_or(0),
+        objects: row.get("objects").and_then(Value::as_u64).unwrap_or(0),
     })
 }
 

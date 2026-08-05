@@ -16,7 +16,7 @@ use axum::extract::{DefaultBodyLimit, Extension, Path, Query, State};
 use axum::http::{header, HeaderMap, HeaderValue, Method, Request, StatusCode, Uri};
 use axum::middleware::{self, Next};
 use axum::response::{Html, IntoResponse, Response};
-use axum::routing::{delete, get, post, put};
+use axum::routing::{any, delete, get, post, put};
 use axum::{Json, Router};
 use rand::RngCore;
 use rf_core::identity::AnyKeypair;
@@ -218,11 +218,133 @@ fn validate_listen(listen: SocketAddr) -> Result<()> {
 }
 
 pub fn router(state: ConsoleState) -> Router {
+    let token_api = Router::new()
+        .route("/api/v1", get(public_api_discovery))
+        .route("/api/v1/status", get(public_api_status))
+        .route("/api/v1/workers", get(public_api_workers))
+        .route(
+            "/api/v1/workers/{name}",
+            get(public_api_worker).post(public_api_worker_submit),
+        )
+        .route(
+            "/api/v1/resources",
+            get(public_api_resources).post(public_api_resource_submit),
+        )
+        .route("/api/v1/resources/{kind}/{name}", get(public_api_resource))
+        .route("/api/v1/audit", get(public_api_audit))
+        .route("/api/v1/kv/{namespace}", get(public_api_kv_list))
+        .route(
+            "/api/v1/kv/{namespace}/{*key}",
+            get(public_api_kv_get)
+                .put(public_api_kv_put)
+                .delete(public_api_kv_delete),
+        )
+        .route("/api/v1/r2", get(public_api_r2_buckets))
+        .route("/api/v1/r2/{bucket}", get(public_api_r2_list))
+        .route(
+            "/api/v1/r2/{bucket}/{*key}",
+            get(public_api_r2_get)
+                .put(public_api_r2_put)
+                .delete(public_api_r2_delete),
+        )
+        .route("/api/v1/d1", get(public_api_d1_list))
+        .route("/api/v1/d1/{database}/query", post(public_api_d1_query))
+        .route("/api/v1/d1/{database}/exec", post(public_api_d1_exec))
+        .route("/api/v1/queues", get(public_api_queues))
+        .route(
+            "/api/v1/queues/{queue}",
+            get(public_api_queue_status).post(public_api_queue_send),
+        )
+        .route("/api/v1/queues/{queue}/dead", get(public_api_queue_dead))
+        .route(
+            "/api/v1/queues/{queue}/dead/{id}/redrive",
+            post(public_api_queue_redrive),
+        )
+        .route("/api/v1/analytics", get(public_api_analytics))
+        .route(
+            "/api/v1/analytics/{dataset}/events",
+            get(public_api_analytics_events).post(public_api_analytics_write),
+        )
+        .route(
+            "/api/v1/analytics/{dataset}/stats",
+            get(public_api_analytics_stats),
+        )
+        .route("/api/v1/pipelines", get(public_api_pipelines))
+        .route(
+            "/api/v1/pipelines/{pipeline}/events",
+            post(public_api_pipeline_ingest),
+        )
+        .route(
+            "/api/v1/pipelines/{pipeline}/status",
+            get(public_api_pipeline_status),
+        )
+        .route(
+            "/api/v1/pipelines/{pipeline}/batches",
+            get(public_api_pipeline_batches),
+        )
+        .route(
+            "/api/v1/pipelines/{pipeline}/flush",
+            post(public_api_pipeline_flush),
+        )
+        .route("/api/v1/workflows", get(public_api_workflows))
+        .route(
+            "/api/v1/workflows/{workflow}/instances",
+            get(public_api_workflow_instances).post(public_api_workflow_trigger),
+        )
+        .route(
+            "/api/v1/workflows/{workflow}/instances/{id}",
+            get(public_api_workflow_instance),
+        )
+        .route(
+            "/api/v1/workflows/{workflow}/instances/{id}/signal",
+            post(public_api_workflow_signal),
+        )
+        .route(
+            "/api/v1/workflows/{workflow}/instances/{id}/{action}",
+            post(public_api_workflow_action),
+        )
+        .route("/api/v1/flows", get(public_api_flows))
+        .route(
+            "/api/v1/flows/{flow}/runs",
+            get(public_api_flow_runs).post(public_api_flow_trigger),
+        )
+        .route("/api/v1/flows/{flow}/runs/{id}", get(public_api_flow_run))
+        .route(
+            "/api/v1/flows/{flow}/runs/{id}/{action}",
+            post(public_api_flow_action),
+        )
+        .route("/api/v1/email", get(public_api_email_domains))
+        .route(
+            "/api/v1/email/{domain}/messages",
+            get(public_api_email_messages).post(public_api_email_send),
+        )
+        .route(
+            "/api/v1/email/{domain}/messages/{id}",
+            get(public_api_email_message),
+        )
+        .route(
+            "/api/v1/email/{domain}/messages/{id}/raw",
+            get(public_api_email_raw),
+        )
+        .route_layer(middleware::from_fn_with_state(
+            state.clone(),
+            require_access_token,
+        ));
     let api = Router::new()
         .route("/api/session", get(session))
         .route("/api/overview", get(overview))
         .route("/api/nodes", get(node_list))
         .route("/api/nodes/{id}", axum::routing::patch(node_update))
+        .route("/api/security", get(security_overview))
+        .route("/api/security/audit", get(security_audit))
+        .route("/api/security/quota", axum::routing::patch(quota_update))
+        .route("/api/security/tokens", post(access_token_create))
+        .route("/api/security/tokens/{id}", delete(access_token_revoke))
+        .route("/api/security/s3", post(s3_credential_create))
+        .route(
+            "/api/security/s3/{id}",
+            axum::routing::patch(s3_credential_update).delete(s3_credential_revoke),
+        )
         .route("/api/workers/deploy", post(worker_deploy))
         .route(
             "/api/workers/{name}",
@@ -355,11 +477,1092 @@ pub fn router(state: ConsoleState) -> Router {
         .route("/api/auth/challenge", post(auth_challenge))
         .route("/api/auth/challenge/{id}", get(auth_poll))
         .route("/api/webhooks/github/{name}", post(github_webhook))
+        .route("/s3", any(s3_endpoint))
+        .route("/s3/{*path}", any(s3_endpoint))
+        .merge(token_api)
         .merge(api)
         .fallback(not_found)
         .with_state(state)
         .layer(DefaultBodyLimit::max(MAX_CONSOLE_UPLOAD * 2))
         .layer(middleware::from_fn(security_headers))
+}
+
+async fn s3_endpoint(
+    State(state): State<ConsoleState>,
+    request: Request<axum::body::Body>,
+) -> Response {
+    match state.public_node() {
+        Ok(node) => crate::s3::handle(node.clone(), request).await,
+        Err(error) => error.into_response(),
+    }
+}
+
+async fn require_access_token(
+    State(state): State<ConsoleState>,
+    mut request: Request<axum::body::Body>,
+    next: Next,
+) -> Response {
+    let node = match state.public_node() {
+        Ok(node) => node,
+        Err(error) => return error.into_response(),
+    };
+    let principal =
+        crate::access::bearer(request.headers()).and_then(|raw| crate::access::resolve(node, raw));
+    let Some(principal) = principal else {
+        let mut response =
+            ApiError::unauthorized("Bearer API 访问令牌缺失、过期或已撤销").into_response();
+        response.headers_mut().insert(
+            header::WWW_AUTHENTICATE,
+            HeaderValue::from_static("Bearer realm=\"RandallFlare API\""),
+        );
+        return response;
+    };
+    request.extensions_mut().insert(principal);
+    next.run(request).await
+}
+
+fn require_api_scope(principal: &crate::access::AccessPrincipal, scope: &str) -> ApiResult<()> {
+    if principal.allows(scope) {
+        Ok(())
+    } else {
+        Err(ApiError::forbidden(format!("访问令牌缺少作用域 {scope}")))
+    }
+}
+
+async fn public_api_discovery(
+    Extension(principal): Extension<crate::access::AccessPrincipal>,
+) -> Json<Value> {
+    Json(json!({
+        "name": "RandallFlare API",
+        "version": "v1",
+        "principal": { "id": principal.id, "label": principal.label, "scopes": principal.scopes },
+        "endpoints": {
+            "workers": "/api/v1/workers",
+            "resources": "/api/v1/resources",
+            "kv": "/api/v1/kv/{namespace}/{key}",
+            "d1": "/api/v1/d1/{database}/query",
+            "r2": "/api/v1/r2/{bucket}/{key}",
+            "queues": "/api/v1/queues/{queue}",
+            "analytics": "/api/v1/analytics/{dataset}/events",
+            "pipelines": "/api/v1/pipelines/{pipeline}/events",
+            "workflows": "/api/v1/workflows/{workflow}/instances",
+            "flows": "/api/v1/flows/{flow}/runs",
+            "email": "/api/v1/email/{domain}/messages",
+            "audit": "/api/v1/audit",
+            "s3": "/s3"
+        }
+    }))
+}
+
+async fn public_api_status(
+    State(state): State<ConsoleState>,
+    Extension(principal): Extension<crate::access::AccessPrincipal>,
+) -> ApiResult<Json<Value>> {
+    require_api_scope(&principal, "node:read")?;
+    let node = state.public_node()?;
+    let peers = node.peers();
+    Ok(Json(json!({
+        "cluster_id": node.cfg.cluster_id,
+        "node_id": node.id_hex(),
+        "label": node.cfg.label,
+        "public": node.cfg.public,
+        "live_nodes": peers.len() + 1,
+        "workers": node.live_manifests().len(),
+        "manifest_digest": node.anchor_digest().0,
+    })))
+}
+
+async fn public_api_workers(
+    State(state): State<ConsoleState>,
+    Extension(principal): Extension<crate::access::AccessPrincipal>,
+) -> ApiResult<Json<Value>> {
+    require_api_scope(&principal, "worker:read")?;
+    let node = state.public_node()?;
+    let workers = node
+        .live_manifests()
+        .into_iter()
+        .map(|manifest| public_worker_view(node, manifest))
+        .collect::<Vec<_>>();
+    Ok(Json(json!({ "workers": workers })))
+}
+
+async fn public_api_worker(
+    State(state): State<ConsoleState>,
+    Extension(principal): Extension<crate::access::AccessPrincipal>,
+    Path(name): Path<String>,
+) -> ApiResult<Json<Value>> {
+    require_api_scope(&principal, "worker:read")?;
+    let node = state.public_node()?;
+    let manifest = node
+        .manifest(&name)
+        .filter(|manifest| !manifest.deleted)
+        .ok_or_else(|| ApiError::not_found("Worker 不存在"))?;
+    Ok(Json(public_worker_view(node, manifest)))
+}
+
+fn public_worker_view(node: &Node, manifest: WorkerManifest) -> Value {
+    json!({
+        "name": manifest.name,
+        "version": manifest.version,
+        "main": manifest.main,
+        "hostnames": node.effective_worker_hostnames(&manifest),
+        "custom_hostnames": manifest.hostnames,
+        "environment": worker_console_environment(&manifest),
+        "secret_names": crate::worker_secret::encrypted_secrets(&manifest).into_keys().collect::<Vec<_>>(),
+        "kv_bindings": manifest.kv_bindings,
+        "r2_bindings": deploy::r2_bindings(&manifest),
+        "d1_bindings": deploy::d1_bindings(&manifest),
+        "queue_bindings": deploy::queue_bindings(&manifest),
+        "analytics_bindings": deploy::analytics_bindings(&manifest),
+        "pipeline_bindings": deploy::pipeline_bindings(&manifest),
+        "workflow_bindings": deploy::workflow_bindings(&manifest),
+        "email_bindings": deploy::email_bindings(&manifest),
+        "service_bindings": deploy::service_bindings(&manifest),
+        "required_tags": crate::placement::required_tags(&manifest),
+        "crons": manifest.crons,
+        "compatibility_date": manifest.compatibility_date,
+        "modules": manifest.modules,
+        "assets": manifest.assets,
+    })
+}
+
+async fn public_api_worker_submit(
+    State(state): State<ConsoleState>,
+    Extension(principal): Extension<crate::access::AccessPrincipal>,
+    Path(name): Path<String>,
+    body: Bytes,
+) -> ApiResult<Json<Value>> {
+    require_api_scope(&principal, "worker:write")?;
+    let envelope = rf_core::envelope::Envelope::from_bytes(&body)
+        .map_err(|error| ApiError::bad_request(error.to_string()))?;
+    let node = state.public_node()?;
+    let manifest: WorkerManifest = envelope
+        .open(Some(&node.cfg.operator))
+        .map_err(|error| ApiError::forbidden(format!("Worker 清单签名无效：{error}")))?;
+    if manifest.name != name {
+        return Err(ApiError::bad_request("路径 Worker 名称与签名清单不一致"));
+    }
+    crate::quota::validate_manifest_admission(node, &manifest)?;
+    state.client.post_manifest(&state.node, &envelope).await?;
+    Ok(Json(
+        json!({ "ok": true, "name": name, "version": manifest.version }),
+    ))
+}
+
+#[derive(Debug, Deserialize)]
+struct PublicResourceQuery {
+    kind: Option<String>,
+}
+
+async fn public_api_resources(
+    State(state): State<ConsoleState>,
+    Extension(principal): Extension<crate::access::AccessPrincipal>,
+    Query(query): Query<PublicResourceQuery>,
+) -> ApiResult<Json<Value>> {
+    let kind = query
+        .kind
+        .as_deref()
+        .ok_or_else(|| ApiError::bad_request("必须指定 kind 查询参数"))?;
+    let scope = crate::access::scope_for_resource(kind, false)
+        .ok_or_else(|| ApiError::forbidden("此资源类型不允许通过公开 API 读取"))?;
+    require_api_scope(&principal, &scope)?;
+    let node = state.public_node()?;
+    let resources = crate::resource::heads(node, Some(kind))
+        .into_iter()
+        .filter(|view| !view.resource.deleted)
+        .map(|view| public_resource_view(node, &view))
+        .collect::<Vec<_>>();
+    Ok(Json(json!({ "resources": resources })))
+}
+
+async fn public_api_resource(
+    State(state): State<ConsoleState>,
+    Extension(principal): Extension<crate::access::AccessPrincipal>,
+    Path((kind, name)): Path<(String, String)>,
+) -> ApiResult<Json<Value>> {
+    let scope = crate::access::scope_for_resource(&kind, false)
+        .ok_or_else(|| ApiError::forbidden("此资源类型不允许通过公开 API 读取"))?;
+    require_api_scope(&principal, &scope)?;
+    let resource = crate::resource::head(state.public_node()?, &kind, &name)
+        .filter(|view| !view.resource.deleted)
+        .ok_or_else(|| ApiError::not_found("平台资源不存在"))?;
+    Ok(Json(public_resource_view(state.public_node()?, &resource)))
+}
+
+fn public_resource_view(node: &Node, view: &crate::resource::ResourceView) -> Value {
+    json!({
+        "schema": view.resource.schema,
+        "kind": view.resource.kind,
+        "name": view.resource.name,
+        "version": view.resource.version,
+        "previous": view.resource.prev.map(hex::encode),
+        "deleted": view.resource.deleted,
+        "spec": public_resource_spec(node, &view.resource),
+        "digest": view.digest,
+    })
+}
+
+fn public_resource_spec(node: &Node, record: &crate::resource::ResourceRecord) -> Value {
+    if record.deleted {
+        return Value::Null;
+    }
+    match record.kind.as_str() {
+        crate::pipeline::PIPELINE_KIND => crate::pipeline::pipeline_spec(record)
+            .map(|spec| pipeline_spec_view(&spec))
+            .unwrap_or(Value::Null),
+        crate::flow::FLOW_KIND => crate::flow::flow_spec(record)
+            .map(|spec| public_flow_spec(&spec))
+            .unwrap_or(Value::Null),
+        crate::preview::PREVIEW_KIND => crate::preview::preview_spec(record)
+            .map(|spec| {
+                json!({
+                    "schema": spec.schema,
+                    "worker": spec.worker,
+                    "hostname": spec.hostname,
+                    "manifest": public_worker_view(node, spec.manifest),
+                    "source": spec.source,
+                    "created_at_ms": spec.created_at_ms,
+                    "expires_at_ms": spec.expires_at_ms,
+                })
+            })
+            .unwrap_or(Value::Null),
+        crate::access::TOKEN_KIND | crate::s3::CREDENTIAL_KIND => Value::Null,
+        _ => record.spec().unwrap_or(Value::Null),
+    }
+}
+
+async fn public_api_resource_submit(
+    State(state): State<ConsoleState>,
+    Extension(principal): Extension<crate::access::AccessPrincipal>,
+    body: Bytes,
+) -> ApiResult<Json<Value>> {
+    let envelope = rf_core::envelope::Envelope::from_bytes(&body)
+        .map_err(|error| ApiError::bad_request(error.to_string()))?;
+    let node = state.public_node()?;
+    let record: crate::resource::ResourceRecord = envelope
+        .open(Some(&node.cfg.operator))
+        .map_err(|error| ApiError::forbidden(format!("平台资源签名无效：{error}")))?;
+    let scope = crate::access::scope_for_resource(&record.kind, true)
+        .ok_or_else(|| ApiError::forbidden("此资源类型不允许通过公开 API 写入"))?;
+    require_api_scope(&principal, &scope)?;
+    crate::quota::validate_resource_admission(node, &record)?;
+    state.client.post_resource(&state.node, &envelope).await?;
+    Ok(Json(
+        json!({ "ok": true, "kind": record.kind, "name": record.name, "version": record.version }),
+    ))
+}
+
+async fn public_api_audit(
+    State(state): State<ConsoleState>,
+    Extension(principal): Extension<crate::access::AccessPrincipal>,
+) -> ApiResult<Json<Value>> {
+    require_api_scope(&principal, "audit:read")?;
+    let node = state.public_node()?;
+    let mut records = crate::resource::records(node, None, None)
+        .into_iter()
+        .map(|view| {
+            json!({
+                "kind": view.resource.kind,
+                "name": view.resource.name,
+                "version": view.resource.version,
+                "previous": view.resource.prev.map(hex::encode),
+                "deleted": view.resource.deleted,
+                "digest": view.digest,
+            })
+        })
+        .collect::<Vec<_>>();
+    records.extend(worker_audit_records(node, None)?);
+    records.sort_by(audit_value_order);
+    Ok(Json(json!({ "records": records })))
+}
+
+#[derive(Debug, Deserialize)]
+struct PublicListQuery {
+    #[serde(default)]
+    prefix: String,
+    cursor: Option<String>,
+    limit: Option<usize>,
+}
+
+async fn public_api_kv_list(
+    State(state): State<ConsoleState>,
+    Extension(principal): Extension<crate::access::AccessPrincipal>,
+    Path(namespace): Path<String>,
+    Query(query): Query<PublicListQuery>,
+) -> ApiResult<Json<Value>> {
+    require_api_scope(&principal, "kv:read")?;
+    validate_kv(&namespace, None, false)?;
+    let keys = state
+        .client
+        .kv_list(&state.node, &namespace, &query.prefix)
+        .await?;
+    Ok(Json(json!({ "namespace": namespace, "keys": keys })))
+}
+
+async fn public_api_kv_get(
+    State(state): State<ConsoleState>,
+    Extension(principal): Extension<crate::access::AccessPrincipal>,
+    Path((namespace, key)): Path<(String, String)>,
+) -> ApiResult<Response> {
+    require_api_scope(&principal, "kv:read")?;
+    validate_kv(&namespace, Some(&key), false)?;
+    let value = state
+        .client
+        .kv_get(&state.node, &namespace, &key)
+        .await?
+        .ok_or_else(|| ApiError::not_found("KV 键不存在"))?;
+    Ok(([(header::CONTENT_TYPE, "application/octet-stream")], value).into_response())
+}
+
+async fn public_api_kv_put(
+    State(state): State<ConsoleState>,
+    Extension(principal): Extension<crate::access::AccessPrincipal>,
+    Path((namespace, key)): Path<(String, String)>,
+    body: Bytes,
+) -> ApiResult<Json<Value>> {
+    require_api_scope(&principal, "kv:write")?;
+    validate_kv(&namespace, Some(&key), true)?;
+    if body.len() > MAX_CONSOLE_VALUE {
+        return Err(ApiError::bad_request("KV 值不得超过 1 MiB"));
+    }
+    state
+        .client
+        .kv_put(&state.node, &namespace, &key, body.to_vec())
+        .await?;
+    Ok(Json(json!({ "ok": true })))
+}
+
+async fn public_api_kv_delete(
+    State(state): State<ConsoleState>,
+    Extension(principal): Extension<crate::access::AccessPrincipal>,
+    Path((namespace, key)): Path<(String, String)>,
+) -> ApiResult<Json<Value>> {
+    require_api_scope(&principal, "kv:write")?;
+    validate_kv(&namespace, Some(&key), true)?;
+    state
+        .client
+        .kv_delete(&state.node, &namespace, &key)
+        .await?;
+    Ok(Json(json!({ "ok": true })))
+}
+
+async fn public_api_r2_buckets(
+    State(state): State<ConsoleState>,
+    Extension(principal): Extension<crate::access::AccessPrincipal>,
+) -> ApiResult<Json<Value>> {
+    require_api_scope(&principal, "r2:read")?;
+    let buckets = crate::r2::bucket_records(state.public_node()?)
+        .into_iter()
+        .map(|(view, spec)| json!({ "name": view.resource.name, "version": view.resource.version, "spec": spec }))
+        .collect::<Vec<_>>();
+    Ok(Json(json!({ "buckets": buckets })))
+}
+
+async fn public_api_r2_list(
+    State(state): State<ConsoleState>,
+    Extension(principal): Extension<crate::access::AccessPrincipal>,
+    Path(bucket): Path<String>,
+    Query(query): Query<PublicListQuery>,
+) -> ApiResult<Json<Value>> {
+    require_api_scope(&principal, "r2:read")?;
+    let list = state
+        .client
+        .r2_list(
+            &state.node,
+            &bucket,
+            &query.prefix,
+            query.cursor.as_deref(),
+            query.limit.unwrap_or(1000),
+        )
+        .await?;
+    Ok(Json(serde_json::to_value(list)?))
+}
+
+async fn public_api_r2_get(
+    State(state): State<ConsoleState>,
+    Extension(principal): Extension<crate::access::AccessPrincipal>,
+    Path((bucket, key)): Path<(String, String)>,
+) -> ApiResult<Response> {
+    require_api_scope(&principal, "r2:read")?;
+    let (meta, bytes) = state
+        .client
+        .r2_get(&state.node, &bucket, &key)
+        .await?
+        .ok_or_else(|| ApiError::not_found("R2 对象不存在"))?;
+    let mut response = bytes.into_response();
+    response.headers_mut().insert(
+        header::ETAG,
+        HeaderValue::from_str(&format!("\"{}\"", meta.etag)).unwrap(),
+    );
+    if let Some(content_type) = meta
+        .content_type
+        .and_then(|value| HeaderValue::from_str(&value).ok())
+    {
+        response
+            .headers_mut()
+            .insert(header::CONTENT_TYPE, content_type);
+    }
+    Ok(response)
+}
+
+async fn public_api_r2_put(
+    State(state): State<ConsoleState>,
+    Extension(principal): Extension<crate::access::AccessPrincipal>,
+    Path((bucket, key)): Path<(String, String)>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> ApiResult<Json<Value>> {
+    require_api_scope(&principal, "r2:write")?;
+    let options = crate::r2::PutOptions {
+        content_type: headers
+            .get(header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_string),
+        ..Default::default()
+    };
+    let meta = state
+        .client
+        .r2_put(&state.node, &bucket, &key, &body, &options)
+        .await?;
+    Ok(Json(serde_json::to_value(meta)?))
+}
+
+async fn public_api_r2_delete(
+    State(state): State<ConsoleState>,
+    Extension(principal): Extension<crate::access::AccessPrincipal>,
+    Path((bucket, key)): Path<(String, String)>,
+) -> ApiResult<Json<Value>> {
+    require_api_scope(&principal, "r2:write")?;
+    let deleted = state.client.r2_delete(&state.node, &bucket, &key).await?;
+    Ok(Json(json!({ "ok": true, "deleted": deleted })))
+}
+
+async fn public_api_d1_list(
+    State(state): State<ConsoleState>,
+    Extension(principal): Extension<crate::access::AccessPrincipal>,
+) -> ApiResult<Json<Value>> {
+    require_api_scope(&principal, "d1:read")?;
+    Ok(Json(
+        json!({ "databases": crate::d1::database_names(state.public_node()?) }),
+    ))
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PublicD1Request {
+    sql: String,
+    #[serde(default = "empty_json_array")]
+    params: Value,
+}
+
+fn empty_json_array() -> Value {
+    json!([])
+}
+
+async fn public_api_d1_query(
+    State(state): State<ConsoleState>,
+    Extension(principal): Extension<crate::access::AccessPrincipal>,
+    Path(database): Path<String>,
+    Json(request): Json<PublicD1Request>,
+) -> ApiResult<Json<Value>> {
+    require_api_scope(&principal, "d1:read")?;
+    validate_public_d1_request(&database, &request)?;
+    if !public_sql_is_read_only(&request.sql) {
+        return Err(ApiError::forbidden(
+            "d1:read 只允许 SELECT、只读 WITH、EXPLAIN 或只读 PRAGMA",
+        ));
+    }
+    let result = state
+        .client
+        .d1_exec(&state.node, &database, &request.sql, request.params)
+        .await?;
+    Ok(Json(result))
+}
+
+async fn public_api_d1_exec(
+    State(state): State<ConsoleState>,
+    Extension(principal): Extension<crate::access::AccessPrincipal>,
+    Path(database): Path<String>,
+    Json(request): Json<PublicD1Request>,
+) -> ApiResult<Json<Value>> {
+    require_api_scope(&principal, "d1:write")?;
+    validate_public_d1_request(&database, &request)?;
+    let result = state
+        .client
+        .d1_exec(&state.node, &database, &request.sql, request.params)
+        .await?;
+    Ok(Json(result))
+}
+
+fn validate_public_d1_request(database: &str, request: &PublicD1Request) -> ApiResult<()> {
+    if !valid_name(database) {
+        return Err(ApiError::bad_request("数据库名称无效"));
+    }
+    if request.sql.trim().is_empty() || request.sql.len() > MAX_CONSOLE_VALUE {
+        return Err(ApiError::bad_request(
+            "SQL 长度必须介于 1 字节与 1 MiB 之间",
+        ));
+    }
+    let params = request
+        .params
+        .as_array()
+        .ok_or_else(|| ApiError::bad_request("参数必须是 JSON 数组"))?;
+    if params.len() > 1000 {
+        return Err(ApiError::bad_request("D1 单条语句最多接受 1000 个参数"));
+    }
+    Ok(())
+}
+
+fn public_sql_is_read_only(sql: &str) -> bool {
+    let mut cleaned = String::with_capacity(sql.len());
+    let mut chars = sql.chars().peekable();
+    let mut quote = None;
+    while let Some(character) = chars.next() {
+        if let Some(end) = quote {
+            if character == end {
+                quote = None;
+            }
+            cleaned.push(' ');
+            continue;
+        }
+        if matches!(character, '\'' | '"' | '`') {
+            quote = Some(character);
+            cleaned.push(' ');
+            continue;
+        }
+        if character == '-' && chars.peek() == Some(&'-') {
+            for next in chars.by_ref() {
+                if next == '\n' {
+                    break;
+                }
+            }
+            cleaned.push(' ');
+            continue;
+        }
+        if character == '/' && chars.peek() == Some(&'*') {
+            chars.next();
+            let mut previous = '\0';
+            for next in chars.by_ref() {
+                if previous == '*' && next == '/' {
+                    break;
+                }
+                previous = next;
+            }
+            cleaned.push(' ');
+            continue;
+        }
+        cleaned.push(character);
+    }
+    let statement = cleaned.trim();
+    let statement = statement.strip_suffix(';').unwrap_or(statement).trim_end();
+    if statement.contains(';') {
+        return false;
+    }
+    let tokens = statement
+        .split(|character: char| !character.is_ascii_alphanumeric() && character != '_')
+        .filter(|token| !token.is_empty())
+        .map(str::to_ascii_uppercase)
+        .collect::<Vec<_>>();
+    let Some(first) = tokens.first().map(String::as_str) else {
+        return false;
+    };
+    if !matches!(first, "SELECT" | "WITH" | "EXPLAIN" | "PRAGMA") {
+        return false;
+    }
+    if tokens.iter().any(|token| {
+        matches!(
+            token.as_str(),
+            "INSERT"
+                | "UPDATE"
+                | "DELETE"
+                | "REPLACE"
+                | "CREATE"
+                | "DROP"
+                | "ALTER"
+                | "VACUUM"
+                | "ATTACH"
+                | "DETACH"
+                | "REINDEX"
+                | "ANALYZE"
+        )
+    }) {
+        return false;
+    }
+    if first != "PRAGMA" {
+        return true;
+    }
+
+    // SQLite PRAGMA has both query and assignment forms. A lexical "no DML"
+    // check alone would let d1:read mutate persistent database metadata.
+    if cleaned.contains('=') {
+        return false;
+    }
+    let pragma = tokens
+        .iter()
+        .skip(1)
+        .find(|token| !matches!(token.as_str(), "MAIN" | "TEMP"))
+        .map(String::as_str);
+    let Some(pragma) = pragma else {
+        return false;
+    };
+    let argument_is_read_only = matches!(
+        pragma,
+        "TABLE_INFO"
+            | "TABLE_XINFO"
+            | "INDEX_LIST"
+            | "INDEX_INFO"
+            | "INDEX_XINFO"
+            | "FOREIGN_KEY_LIST"
+            | "FOREIGN_KEY_CHECK"
+            | "INTEGRITY_CHECK"
+            | "QUICK_CHECK"
+    );
+    if cleaned.contains('(') && !argument_is_read_only {
+        return false;
+    }
+    argument_is_read_only
+        || matches!(
+            pragma,
+            "DATABASE_LIST"
+                | "TABLE_LIST"
+                | "COMPILE_OPTIONS"
+                | "COLLATION_LIST"
+                | "FUNCTION_LIST"
+                | "MODULE_LIST"
+                | "PRAGMA_LIST"
+                | "ENCODING"
+                | "PAGE_COUNT"
+                | "FREELIST_COUNT"
+                | "SCHEMA_VERSION"
+                | "USER_VERSION"
+                | "APPLICATION_ID"
+        )
+}
+
+async fn public_api_queues(
+    State(state): State<ConsoleState>,
+    Extension(principal): Extension<crate::access::AccessPrincipal>,
+) -> ApiResult<Json<Value>> {
+    require_api_scope(&principal, "queue:read")?;
+    let queues = crate::queue::queue_records(state.public_node()?)
+        .into_iter()
+        .map(|(view, spec)| json!({ "name": view.resource.name, "version": view.resource.version, "spec": spec }))
+        .collect::<Vec<_>>();
+    Ok(Json(json!({ "queues": queues })))
+}
+
+async fn public_api_queue_status(
+    State(state): State<ConsoleState>,
+    Extension(principal): Extension<crate::access::AccessPrincipal>,
+    Path(queue): Path<String>,
+) -> ApiResult<Json<Value>> {
+    require_api_scope(&principal, "queue:read")?;
+    Ok(Json(serde_json::to_value(
+        state.client.queue_stats(&state.node, &queue).await?,
+    )?))
+}
+
+async fn public_api_queue_send(
+    State(state): State<ConsoleState>,
+    Extension(principal): Extension<crate::access::AccessPrincipal>,
+    Path(queue): Path<String>,
+    Json(request): Json<QueueSendRequest>,
+) -> ApiResult<Json<Value>> {
+    require_api_scope(&principal, "queue:write")?;
+    let message_ids = state
+        .client
+        .queue_send(&state.node, &queue, &request.messages)
+        .await?;
+    Ok(Json(json!({ "message_ids": message_ids })))
+}
+
+async fn public_api_queue_dead(
+    State(state): State<ConsoleState>,
+    Extension(principal): Extension<crate::access::AccessPrincipal>,
+    Path(queue): Path<String>,
+    Query(query): Query<QueueDeadQuery>,
+) -> ApiResult<Json<Value>> {
+    require_api_scope(&principal, "queue:read")?;
+    let dead_letters = state
+        .client
+        .queue_dead_letters(&state.node, &queue, query.limit.unwrap_or(100))
+        .await?;
+    Ok(Json(json!({ "dead_letters": dead_letters })))
+}
+
+async fn public_api_queue_redrive(
+    State(state): State<ConsoleState>,
+    Extension(principal): Extension<crate::access::AccessPrincipal>,
+    Path((queue, id)): Path<(String, String)>,
+) -> ApiResult<Json<Value>> {
+    require_api_scope(&principal, "queue:write")?;
+    let redriven = state.client.queue_redrive(&state.node, &queue, &id).await?;
+    Ok(Json(json!({ "ok": redriven })))
+}
+
+async fn public_api_analytics(
+    State(state): State<ConsoleState>,
+    Extension(principal): Extension<crate::access::AccessPrincipal>,
+) -> ApiResult<Json<Value>> {
+    require_api_scope(&principal, "analytics:read")?;
+    let datasets = crate::analytics::dataset_records(state.public_node()?)
+        .into_iter()
+        .map(|(view, spec)| json!({ "name": view.resource.name, "version": view.resource.version, "spec": spec }))
+        .collect::<Vec<_>>();
+    Ok(Json(json!({ "datasets": datasets })))
+}
+
+async fn public_api_analytics_events(
+    State(state): State<ConsoleState>,
+    Extension(principal): Extension<crate::access::AccessPrincipal>,
+    Path(dataset): Path<String>,
+    Query(query): Query<AnalyticsRecentQuery>,
+) -> ApiResult<Json<Value>> {
+    require_api_scope(&principal, "analytics:read")?;
+    let events = state
+        .client
+        .analytics_recent(
+            &state.node,
+            &dataset,
+            query.before,
+            query.limit.unwrap_or(100),
+        )
+        .await?;
+    Ok(Json(json!({ "events": events })))
+}
+
+async fn public_api_analytics_write(
+    State(state): State<ConsoleState>,
+    Extension(principal): Extension<crate::access::AccessPrincipal>,
+    Path(dataset): Path<String>,
+    Json(request): Json<AnalyticsWriteRequest>,
+) -> ApiResult<Json<Value>> {
+    require_api_scope(&principal, "analytics:write")?;
+    let written = state
+        .client
+        .analytics_write(&state.node, &dataset, &request.points)
+        .await?;
+    Ok(Json(json!({ "written": written })))
+}
+
+async fn public_api_analytics_stats(
+    State(state): State<ConsoleState>,
+    Extension(principal): Extension<crate::access::AccessPrincipal>,
+    Path(dataset): Path<String>,
+) -> ApiResult<Json<Value>> {
+    require_api_scope(&principal, "analytics:read")?;
+    Ok(Json(serde_json::to_value(
+        state.client.analytics_stats(&state.node, &dataset).await?,
+    )?))
+}
+
+async fn public_api_pipelines(
+    State(state): State<ConsoleState>,
+    Extension(principal): Extension<crate::access::AccessPrincipal>,
+) -> ApiResult<Json<Value>> {
+    require_api_scope(&principal, "pipeline:read")?;
+    let pipelines = crate::pipeline::pipeline_records(state.public_node()?)
+        .into_iter()
+        .map(|(view, spec)| json!({ "name": view.resource.name, "version": view.resource.version, "spec": pipeline_spec_view(&spec) }))
+        .collect::<Vec<_>>();
+    Ok(Json(json!({ "pipelines": pipelines })))
+}
+
+async fn public_api_pipeline_ingest(
+    State(state): State<ConsoleState>,
+    Extension(principal): Extension<crate::access::AccessPrincipal>,
+    Path(pipeline): Path<String>,
+    Json(request): Json<PipelineIngestRequest>,
+) -> ApiResult<Json<Value>> {
+    require_api_scope(&principal, "pipeline:write")?;
+    let accepted = state
+        .client
+        .pipeline_ingest(&state.node, &pipeline, &request.events)
+        .await?;
+    Ok(Json(json!({ "accepted": accepted })))
+}
+
+async fn public_api_pipeline_status(
+    State(state): State<ConsoleState>,
+    Extension(principal): Extension<crate::access::AccessPrincipal>,
+    Path(pipeline): Path<String>,
+) -> ApiResult<Json<Value>> {
+    require_api_scope(&principal, "pipeline:read")?;
+    Ok(Json(serde_json::to_value(
+        state.client.pipeline_status(&state.node, &pipeline).await?,
+    )?))
+}
+
+async fn public_api_pipeline_batches(
+    State(state): State<ConsoleState>,
+    Extension(principal): Extension<crate::access::AccessPrincipal>,
+    Path(pipeline): Path<String>,
+    Query(query): Query<PipelineBatchQuery>,
+) -> ApiResult<Json<Value>> {
+    require_api_scope(&principal, "pipeline:read")?;
+    let batches = state
+        .client
+        .pipeline_batches(&state.node, &pipeline, query.limit.unwrap_or(100))
+        .await?;
+    Ok(Json(json!({ "batches": batches })))
+}
+
+async fn public_api_pipeline_flush(
+    State(state): State<ConsoleState>,
+    Extension(principal): Extension<crate::access::AccessPrincipal>,
+    Path(pipeline): Path<String>,
+) -> ApiResult<Json<Value>> {
+    require_api_scope(&principal, "pipeline:write")?;
+    let batch = state.client.pipeline_flush(&state.node, &pipeline).await?;
+    Ok(Json(json!({ "batch": batch })))
+}
+
+async fn public_api_workflows(
+    State(state): State<ConsoleState>,
+    Extension(principal): Extension<crate::access::AccessPrincipal>,
+) -> ApiResult<Json<Value>> {
+    require_api_scope(&principal, "workflow:read")?;
+    let workflows = crate::workflow::workflow_records(state.public_node()?)
+        .into_iter()
+        .map(|(view, spec)| json!({ "name": view.resource.name, "version": view.resource.version, "spec": spec }))
+        .collect::<Vec<_>>();
+    Ok(Json(json!({ "workflows": workflows })))
+}
+
+async fn public_api_workflow_instances(
+    State(state): State<ConsoleState>,
+    Extension(principal): Extension<crate::access::AccessPrincipal>,
+    Path(workflow): Path<String>,
+    Query(query): Query<WorkflowInstancesQuery>,
+) -> ApiResult<Json<Value>> {
+    require_api_scope(&principal, "workflow:read")?;
+    let instances = state
+        .client
+        .workflow_instances(
+            &state.node,
+            &workflow,
+            query.status.as_deref(),
+            query.limit.unwrap_or(100),
+        )
+        .await?;
+    Ok(Json(json!({ "instances": instances })))
+}
+
+async fn public_api_workflow_trigger(
+    State(state): State<ConsoleState>,
+    Extension(principal): Extension<crate::access::AccessPrincipal>,
+    Path(workflow): Path<String>,
+    Json(request): Json<WorkflowTriggerRequest>,
+) -> ApiResult<Json<Value>> {
+    require_api_scope(&principal, "workflow:write")?;
+    let instance = state
+        .client
+        .workflow_create(
+            &state.node,
+            &workflow,
+            request.instance_key.as_deref(),
+            request.input,
+        )
+        .await?;
+    Ok(Json(json!({ "instance": instance })))
+}
+
+async fn public_api_workflow_instance(
+    State(state): State<ConsoleState>,
+    Extension(principal): Extension<crate::access::AccessPrincipal>,
+    Path((workflow, id)): Path<(String, String)>,
+) -> ApiResult<Json<Value>> {
+    require_api_scope(&principal, "workflow:read")?;
+    Ok(Json(
+        state
+            .client
+            .workflow_instance(&state.node, &workflow, &id)
+            .await?,
+    ))
+}
+
+async fn public_api_workflow_signal(
+    State(state): State<ConsoleState>,
+    Extension(principal): Extension<crate::access::AccessPrincipal>,
+    Path((workflow, id)): Path<(String, String)>,
+    Json(request): Json<WorkflowSignalRequest>,
+) -> ApiResult<Json<Value>> {
+    require_api_scope(&principal, "workflow:write")?;
+    let signal_id = state
+        .client
+        .workflow_signal(&state.node, &workflow, &id, &request.name, request.payload)
+        .await?;
+    Ok(Json(json!({ "signal_id": signal_id })))
+}
+
+async fn public_api_workflow_action(
+    State(state): State<ConsoleState>,
+    Extension(principal): Extension<crate::access::AccessPrincipal>,
+    Path((workflow, id, action)): Path<(String, String, String)>,
+) -> ApiResult<Json<Value>> {
+    require_api_scope(&principal, "workflow:write")?;
+    state
+        .client
+        .workflow_action(&state.node, &workflow, &id, &action)
+        .await?;
+    Ok(Json(json!({ "ok": true })))
+}
+
+fn public_flow_spec(spec: &crate::flow::FlowSpec) -> Value {
+    let mut value = serde_json::to_value(spec).unwrap_or(Value::Null);
+    if let Some(tokens) = value.get_mut("tokens").and_then(Value::as_array_mut) {
+        for token in tokens {
+            if let Some(object) = token.as_object_mut() {
+                object.remove("sha256");
+            }
+        }
+    }
+    value
+}
+
+async fn public_api_flows(
+    State(state): State<ConsoleState>,
+    Extension(principal): Extension<crate::access::AccessPrincipal>,
+) -> ApiResult<Json<Value>> {
+    require_api_scope(&principal, "flow:read")?;
+    let flows = crate::flow::flow_records(state.public_node()?)
+        .into_iter()
+        .map(|(view, spec)| json!({ "name": view.resource.name, "version": view.resource.version, "spec": public_flow_spec(&spec) }))
+        .collect::<Vec<_>>();
+    Ok(Json(json!({ "flows": flows })))
+}
+
+async fn public_api_flow_runs(
+    State(state): State<ConsoleState>,
+    Extension(principal): Extension<crate::access::AccessPrincipal>,
+    Path(flow): Path<String>,
+    Query(query): Query<FlowRunsQuery>,
+) -> ApiResult<Json<Value>> {
+    require_api_scope(&principal, "flow:read")?;
+    let runs = state
+        .client
+        .flow_runs(
+            &state.node,
+            &flow,
+            query.status.as_deref(),
+            query.limit.unwrap_or(100),
+        )
+        .await?;
+    Ok(Json(json!({ "runs": runs })))
+}
+
+async fn public_api_flow_trigger(
+    State(state): State<ConsoleState>,
+    Extension(principal): Extension<crate::access::AccessPrincipal>,
+    Path(flow): Path<String>,
+    Json(request): Json<FlowTriggerRequest>,
+) -> ApiResult<Json<Value>> {
+    require_api_scope(&principal, "flow:write")?;
+    let run = state
+        .client
+        .flow_create(
+            &state.node,
+            &flow,
+            request.run_key.as_deref(),
+            request.input,
+        )
+        .await?;
+    Ok(Json(json!({ "run": run })))
+}
+
+async fn public_api_flow_run(
+    State(state): State<ConsoleState>,
+    Extension(principal): Extension<crate::access::AccessPrincipal>,
+    Path((flow, id)): Path<(String, String)>,
+) -> ApiResult<Json<Value>> {
+    require_api_scope(&principal, "flow:read")?;
+    Ok(Json(state.client.flow_run(&state.node, &flow, &id).await?))
+}
+
+async fn public_api_flow_action(
+    State(state): State<ConsoleState>,
+    Extension(principal): Extension<crate::access::AccessPrincipal>,
+    Path((flow, id, action)): Path<(String, String, String)>,
+) -> ApiResult<Json<Value>> {
+    require_api_scope(&principal, "flow:write")?;
+    Ok(Json(
+        state
+            .client
+            .flow_action(&state.node, &flow, &id, &action)
+            .await?,
+    ))
+}
+
+async fn public_api_email_domains(
+    State(state): State<ConsoleState>,
+    Extension(principal): Extension<crate::access::AccessPrincipal>,
+) -> ApiResult<Json<Value>> {
+    require_api_scope(&principal, "email:read")?;
+    let domains = crate::email::email_domain_records(state.public_node()?)
+        .into_iter()
+        .map(|(view, spec)| json!({ "name": view.resource.name, "version": view.resource.version, "spec": spec }))
+        .collect::<Vec<_>>();
+    Ok(Json(json!({ "domains": domains })))
+}
+
+async fn public_api_email_messages(
+    State(state): State<ConsoleState>,
+    Extension(principal): Extension<crate::access::AccessPrincipal>,
+    Path(domain): Path<String>,
+    Query(query): Query<EmailMessagesQuery>,
+) -> ApiResult<Json<Value>> {
+    require_api_scope(&principal, "email:read")?;
+    let messages = state
+        .client
+        .email_messages(&state.node, &domain, query.limit.unwrap_or(100))
+        .await?;
+    Ok(Json(json!({ "messages": messages })))
+}
+
+async fn public_api_email_message(
+    State(state): State<ConsoleState>,
+    Extension(principal): Extension<crate::access::AccessPrincipal>,
+    Path((domain, id)): Path<(String, String)>,
+) -> ApiResult<Json<Value>> {
+    require_api_scope(&principal, "email:read")?;
+    Ok(Json(
+        json!({ "message": state.client.email_message(&state.node, &domain, &id).await? }),
+    ))
+}
+
+async fn public_api_email_raw(
+    State(state): State<ConsoleState>,
+    Extension(principal): Extension<crate::access::AccessPrincipal>,
+    Path((domain, id)): Path<(String, String)>,
+) -> ApiResult<Response> {
+    require_api_scope(&principal, "email:read")?;
+    let raw = state
+        .client
+        .email_message_raw(&state.node, &domain, &id)
+        .await?;
+    Ok(([(header::CONTENT_TYPE, "message/rfc822")], raw).into_response())
+}
+
+async fn public_api_email_send(
+    State(state): State<ConsoleState>,
+    Extension(principal): Extension<crate::access::AccessPrincipal>,
+    Path(domain): Path<String>,
+    Json(request): Json<EmailSendRequest>,
+) -> ApiResult<Json<Value>> {
+    require_api_scope(&principal, "email:write")?;
+    use base64::Engine as _;
+    let raw = base64::engine::general_purpose::STANDARD
+        .decode(request.raw_base64)
+        .map_err(|_| ApiError::bad_request("RFC 822 原文不是有效 Base64"))?;
+    let metadata = crate::email::EmailSendMetadata {
+        mail_from: request.mail_from,
+        recipients: request.recipients,
+    };
+    let queued = state
+        .client
+        .email_send(&state.node, &domain, &metadata, &raw)
+        .await?;
+    Ok(Json(json!({ "queued": queued })))
 }
 
 async fn require_console_auth(
@@ -916,6 +2119,361 @@ async fn node_update(
 
 fn short_node_id(id: &str) -> &str {
     id.get(..12).unwrap_or(id)
+}
+
+async fn security_overview(State(state): State<ConsoleState>) -> ApiResult<Json<Value>> {
+    let node = state.public_node()?;
+    let quota = crate::quota::policy(node)?;
+    let usage = crate::quota::usage(node).await?;
+    Ok(Json(json!({
+        "quota": quota,
+        "usage": usage,
+        "access_tokens": crate::access::views(node),
+        "s3_credentials": crate::s3::views(node),
+        "scopes": crate::access::ALL_SCOPES,
+        "s3_endpoint": "/s3",
+    })))
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct QuotaUpdateRequest {
+    max_workers: u32,
+    max_custom_hostnames: u32,
+    max_worker_bytes: u64,
+    max_requests_per_minute: u64,
+    worker_outbound_allowed: bool,
+    max_r2_local_bytes: u64,
+    max_r2_objects: u64,
+}
+
+async fn quota_update(
+    State(state): State<ConsoleState>,
+    Extension(principal): Extension<ConsolePrincipal>,
+    Json(request): Json<QuotaUpdateRequest>,
+) -> ApiResult<Json<Value>> {
+    state.require_mutation()?;
+    let node = state.public_node()?;
+    let head = crate::resource::head(node, crate::quota::POLICY_KIND, crate::quota::POLICY_NAME);
+    let policy = crate::quota::ClusterQuotaPolicy {
+        schema: crate::quota::POLICY_SCHEMA,
+        max_workers: request.max_workers,
+        max_custom_hostnames: request.max_custom_hostnames,
+        max_worker_bytes: request.max_worker_bytes,
+        max_requests_per_minute: request.max_requests_per_minute,
+        worker_outbound_allowed: request.worker_outbound_allowed,
+        max_r2_local_bytes: request.max_r2_local_bytes,
+        max_r2_objects: request.max_r2_objects,
+    };
+    let record = crate::quota::prepare_after(policy, head.as_ref())?;
+    submit_security_resource(
+        &state,
+        &principal,
+        node,
+        record,
+        "更新 RandallFlare 集群安全配额".into(),
+        json!({}),
+    )
+    .await
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AccessTokenCreateRequest {
+    label: String,
+    scopes: Vec<String>,
+    #[serde(default)]
+    expires_in_days: Option<u32>,
+}
+
+async fn access_token_create(
+    State(state): State<ConsoleState>,
+    Extension(principal): Extension<ConsolePrincipal>,
+    Json(request): Json<AccessTokenCreateRequest>,
+) -> ApiResult<Json<Value>> {
+    state.require_mutation()?;
+    if !state.allows_secret_writes() {
+        return Err(ApiError::forbidden(
+            "API 访问令牌只允许通过 HTTPS 或本机控制台创建",
+        ));
+    }
+    let node = state.public_node()?;
+    let expires_at_ms = request
+        .expires_in_days
+        .map(|days| {
+            if !(1..=3650).contains(&days) {
+                return Err(ApiError::bad_request(
+                    "API 访问令牌有效期必须介于 1 和 3650 天",
+                ));
+            }
+            Ok(now_ms().saturating_add(u64::from(days) * 86_400_000))
+        })
+        .transpose()?;
+    let (record, raw) = crate::access::mint(node, request.label, request.scopes, expires_at_ms)?;
+    submit_security_resource(
+        &state,
+        &principal,
+        node,
+        record,
+        "创建有作用域的 RandallFlare API 访问令牌".into(),
+        json!({ "token": raw, "shown_once": true }),
+    )
+    .await
+}
+
+async fn access_token_revoke(
+    State(state): State<ConsoleState>,
+    Extension(principal): Extension<ConsolePrincipal>,
+    Path(id): Path<String>,
+) -> ApiResult<Json<Value>> {
+    state.require_mutation()?;
+    let node = state.public_node()?;
+    let record = crate::access::revoke(node, &id)?;
+    submit_security_resource(
+        &state,
+        &principal,
+        node,
+        record,
+        format!("撤销 API 访问令牌 {id}"),
+        json!({}),
+    )
+    .await
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct S3CredentialCreateRequest {
+    label: String,
+    #[serde(default)]
+    acl_enabled: bool,
+    #[serde(default)]
+    grants: BTreeMap<String, crate::s3::BucketGrant>,
+}
+
+async fn s3_credential_create(
+    State(state): State<ConsoleState>,
+    Extension(principal): Extension<ConsolePrincipal>,
+    Json(request): Json<S3CredentialCreateRequest>,
+) -> ApiResult<Json<Value>> {
+    state.require_mutation()?;
+    if !state.allows_secret_writes() {
+        return Err(ApiError::forbidden(
+            "R2/S3 凭据只允许通过 HTTPS 或本机控制台创建",
+        ));
+    }
+    let node = state.public_node()?;
+    let (record, access_key_id, secret_access_key) =
+        crate::s3::mint(node, request.label, request.acl_enabled, request.grants)?;
+    submit_security_resource(
+        &state,
+        &principal,
+        node,
+        record,
+        "创建加密的 R2/S3 Signature V4 凭据".into(),
+        json!({
+            "access_key_id": access_key_id,
+            "secret_access_key": secret_access_key,
+            "shown_once": true,
+        }),
+    )
+    .await
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct S3CredentialUpdateRequest {
+    #[serde(default)]
+    label: Option<String>,
+    #[serde(default)]
+    acl_enabled: Option<bool>,
+    #[serde(default)]
+    grants: Option<BTreeMap<String, crate::s3::BucketGrant>>,
+}
+
+async fn s3_credential_update(
+    State(state): State<ConsoleState>,
+    Extension(principal): Extension<ConsolePrincipal>,
+    Path(id): Path<String>,
+    Json(request): Json<S3CredentialUpdateRequest>,
+) -> ApiResult<Json<Value>> {
+    state.require_mutation()?;
+    let node = state.public_node()?;
+    let record = crate::s3::update(
+        node,
+        &id,
+        request.label,
+        request.acl_enabled,
+        request.grants,
+        false,
+    )?;
+    submit_security_resource(
+        &state,
+        &principal,
+        node,
+        record,
+        format!("更新 R2/S3 凭据 {id} 的最小权限"),
+        json!({}),
+    )
+    .await
+}
+
+async fn s3_credential_revoke(
+    State(state): State<ConsoleState>,
+    Extension(principal): Extension<ConsolePrincipal>,
+    Path(id): Path<String>,
+) -> ApiResult<Json<Value>> {
+    state.require_mutation()?;
+    let node = state.public_node()?;
+    let record = crate::s3::update(node, &id, None, None, None, true)?;
+    submit_security_resource(
+        &state,
+        &principal,
+        node,
+        record,
+        format!("撤销 R2/S3 凭据 {id}"),
+        json!({}),
+    )
+    .await
+}
+
+async fn submit_security_resource(
+    state: &ConsoleState,
+    principal: &ConsolePrincipal,
+    node: &Node,
+    record: crate::resource::ResourceRecord,
+    summary: String,
+    extra: Value,
+) -> ApiResult<Json<Value>> {
+    crate::quota::validate_resource_admission(node, &record)?;
+    let mut response = extra.as_object().cloned().unwrap_or_default();
+    response.insert("ok".into(), Value::Bool(true));
+    response.insert("name".into(), Value::String(record.name.clone()));
+    response.insert("version".into(), Value::from(record.version));
+    match &state.mode {
+        ConsoleMode::Local { .. } => {
+            let envelope = rf_core::envelope::Envelope::seal_any(&record, state.operator()?);
+            state.client.post_resource(&state.node, &envelope).await?;
+        }
+        ConsoleMode::Public { .. } => {
+            let approval =
+                node.management
+                    .create_resource(principal.session_id, &record, summary)?;
+            response.insert("pending_approval".into(), Value::Bool(true));
+            response.insert("approval".into(), serde_json::to_value(approval)?);
+            response.insert(
+                "approve_node".into(),
+                Value::String(node.cfg.peer_api_advertise().to_string()),
+            );
+        }
+    }
+    Ok(Json(Value::Object(response)))
+}
+
+#[derive(Debug, Deserialize)]
+struct SecurityAuditQuery {
+    kind: Option<String>,
+    name: Option<String>,
+    limit: Option<usize>,
+}
+
+async fn security_audit(
+    State(state): State<ConsoleState>,
+    Query(query): Query<SecurityAuditQuery>,
+) -> ApiResult<Json<Value>> {
+    let node = state.public_node()?;
+    let limit = query.limit.unwrap_or(500).clamp(1, 5000);
+    let include_resources = query.kind.as_deref() != Some("worker_manifest");
+    let resource_kind = query
+        .kind
+        .as_deref()
+        .filter(|kind| *kind != "worker_manifest");
+    let mut records = if include_resources {
+        crate::resource::records(node, resource_kind, query.name.as_deref())
+    } else {
+        Vec::new()
+    }
+    .into_iter()
+    .map(|view| {
+        let sensitive = matches!(
+            view.resource.kind.as_str(),
+            crate::access::TOKEN_KIND
+                | crate::s3::CREDENTIAL_KIND
+                | crate::pipeline::PIPELINE_KIND
+                | crate::flow::FLOW_KIND
+                | crate::preview::PREVIEW_KIND
+        );
+        json!({
+            "kind": view.resource.kind,
+            "name": view.resource.name,
+            "version": view.resource.version,
+            "previous": view.resource.prev.map(hex::encode),
+            "digest": view.digest,
+            "deleted": view.resource.deleted,
+            "spec": public_resource_spec(node, &view.resource),
+            "redacted": sensitive,
+        })
+    })
+    .collect::<Vec<_>>();
+    if query
+        .kind
+        .as_deref()
+        .is_none_or(|kind| kind == "worker_manifest")
+    {
+        records.extend(worker_audit_records(node, query.name.as_deref())?);
+    }
+    records.sort_by(audit_value_order);
+    records.truncate(limit);
+    Ok(Json(json!({ "records": records })))
+}
+
+fn worker_audit_records(node: &Node, name: Option<&str>) -> ApiResult<Vec<Value>> {
+    let mut records = Vec::new();
+    for worker in node
+        .manifest_names()
+        .into_iter()
+        .filter(|worker| name.is_none_or(|name| worker == name))
+    {
+        let envelopes = node.manifest_log(&worker)?;
+        let chain = rf_core::manifest::verify_chain(&envelopes, &node.cfg.operator)
+            .map_err(|error| ApiError::upstream(error.to_string()))?;
+        records.extend(chain.iter().zip(&envelopes).map(|(manifest, envelope)| {
+            json!({
+                "kind": "worker_manifest",
+                "name": manifest.name,
+                "version": manifest.version,
+                "previous": manifest.prev.map(hex::encode),
+                "digest": hex::encode(envelope.digest()),
+                "deleted": manifest.deleted,
+                "spec": {
+                    "hostnames": manifest.hostnames,
+                    "modules": manifest.modules.len(),
+                    "assets": manifest.assets.len(),
+                    "bytes": crate::quota::worker_bytes(manifest),
+                    "secret_bindings": crate::worker_secret::encrypted_secrets(manifest).len(),
+                },
+                "redacted": true,
+            })
+        }));
+    }
+    Ok(records)
+}
+
+fn audit_value_order(left: &Value, right: &Value) -> std::cmp::Ordering {
+    let version = |value: &Value| value.get("version").and_then(Value::as_u64).unwrap_or(0);
+    (
+        audit_string(right, "kind"),
+        audit_string(right, "name"),
+        version(right),
+    )
+        .cmp(&(
+            audit_string(left, "kind"),
+            audit_string(left, "name"),
+            version(left),
+        ))
+}
+
+fn audit_string<'a>(value: &'a Value, name: &str) -> &'a str {
+    value.get(name).and_then(Value::as_str).unwrap_or_default()
 }
 
 #[derive(Deserialize)]
@@ -4502,7 +6060,7 @@ async fn flow_list(State(state): State<ConsoleState>) -> ApiResult<Json<Value>> 
             "digest": view.digest,
             "default_hostname": default_hostname,
             "hostnames": hostnames,
-            "spec": spec,
+            "spec": public_flow_spec(&spec),
             "stats": stats,
         }));
     }
@@ -5553,6 +7111,102 @@ mod tests {
     fn internal_kv_writes_are_rejected() {
         assert!(validate_kv("__rf", Some("d1/test"), true).is_err());
         assert!(validate_kv("public", Some("key"), true).is_ok());
+    }
+
+    #[test]
+    fn public_d1_read_scope_rejects_mutating_sql_and_pragmas() {
+        for sql in [
+            "SELECT * FROM events",
+            "WITH recent AS (SELECT * FROM events) SELECT * FROM recent",
+            "EXPLAIN QUERY PLAN SELECT * FROM events",
+            "PRAGMA table_info(events)",
+            "PRAGMA main.index_list(events)",
+            "-- comment\nPRAGMA user_version",
+        ] {
+            assert!(public_sql_is_read_only(sql), "expected read-only: {sql}");
+        }
+        for sql in [
+            "PRAGMA user_version=7",
+            "PRAGMA user_version(7)",
+            "PRAGMA journal_mode=WAL",
+            "SELECT 1; PRAGMA user_version=7",
+            "WITH changed AS (DELETE FROM events RETURNING *) SELECT * FROM changed",
+            "EXPLAIN DELETE FROM events",
+            "INSERT INTO events VALUES (1)",
+        ] {
+            assert!(!public_sql_is_read_only(sql), "expected rejected: {sql}");
+        }
+    }
+
+    #[tokio::test]
+    async fn bearer_api_enforces_authentication_and_exact_scopes() {
+        let (state, node, operator) = public_state(false);
+        let (kv_record, kv_raw) =
+            crate::access::mint(&node, "KV 写入".into(), vec!["kv:write".into()], None).unwrap();
+        crate::resource::ingest(
+            &node,
+            &rf_core::envelope::Envelope::seal_any(&kv_record, &operator),
+        )
+        .unwrap();
+        let app = router(state.clone());
+
+        let missing = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/status")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(missing.status(), StatusCode::UNAUTHORIZED);
+
+        let wrong_scope = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/status")
+                    .header(header::AUTHORIZATION, format!("Bearer {kv_raw}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(wrong_scope.status(), StatusCode::FORBIDDEN);
+
+        let internal_write = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::PUT)
+                    .uri("/api/v1/kv/__rf/cluster-policy")
+                    .header(header::AUTHORIZATION, format!("Bearer {kv_raw}"))
+                    .body(Body::from("forbidden"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(internal_write.status(), StatusCode::FORBIDDEN);
+
+        let (node_record, node_raw) =
+            crate::access::mint(&node, "节点读取".into(), vec!["node:read".into()], None).unwrap();
+        crate::resource::ingest(
+            &node,
+            &rf_core::envelope::Envelope::seal_any(&node_record, &operator),
+        )
+        .unwrap();
+        let allowed = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/status")
+                    .header(header::AUTHORIZATION, format!("Bearer {node_raw}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(allowed.status(), StatusCode::OK);
     }
 
     #[test]

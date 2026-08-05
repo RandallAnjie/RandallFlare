@@ -191,6 +191,29 @@ async fn serve_observed_worker(
     runtime_id: &str,
     durable_coordinator: bool,
 ) -> Response {
+    match ingress.node.admit_public_request() {
+        Ok(true) => {}
+        Ok(false) => {
+            let mut response = (
+                StatusCode::TOO_MANY_REQUESTS,
+                "已达到 RandallFlare 集群每分钟请求配额\n",
+            )
+                .into_response();
+            response.headers_mut().insert(
+                axum::http::header::RETRY_AFTER,
+                HeaderValue::from_static("60"),
+            );
+            return response;
+        }
+        Err(error) => {
+            tracing::error!("无法读取集群配额策略：{error:#}");
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "集群配额策略无效，已安全拒绝请求\n",
+            )
+                .into_response();
+        }
+    }
     let method = req.method().as_str().to_string();
     // Deliberately discard the query string. Observability stores only the
     // matched path and never inspects headers or bodies.

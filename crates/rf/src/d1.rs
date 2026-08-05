@@ -73,6 +73,21 @@ pub fn kv_key(name: &str) -> String {
     format!("d1/{name}")
 }
 
+pub fn database_names(node: &Node) -> Vec<String> {
+    let mut names = node
+        .kv_dump(acme_ns())
+        .into_iter()
+        .filter_map(|(key, entry)| {
+            entry
+                .visible(crate::node::now_ms())
+                .and_then(|_| key.strip_prefix("d1/").map(str::to_string))
+        })
+        .collect::<Vec<_>>();
+    names.sort();
+    names.dedup();
+    names
+}
+
 /// Create a fixed micro-quorum record if absent. The caller should do
 /// this after membership has converged; the group is immutable once
 /// published, exactly like user-created D1 databases.

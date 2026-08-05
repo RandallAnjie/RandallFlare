@@ -60,6 +60,10 @@ const state = {
   emailMessages: [],
   emailMessageActive: null,
   emailContext: { buckets: [], workers: [], email_node: null },
+  security: null,
+  securityDirty: false,
+  s3Editing: null,
+  auditRecords: [],
 };
 
 const titles = {
@@ -77,6 +81,7 @@ const titles = {
   workflows: ["耐久执行", "Workflow"],
   flows: ["可视化编排", "Flow"],
   email: ["去中心化邮件", "邮件路由"],
+  security: ["安全边界", "安全与访问"],
 };
 
 function escapeHtml(value) {
@@ -3056,6 +3061,237 @@ async function sendEmailMessage(event) {
   } catch (error) { toast(error.message, true); }
 }
 
+const scopeAreaCopy = {
+  worker: ["Worker", "项目、部署与日志"],
+  kv: ["KV", "键值命名空间"],
+  d1: ["D1", "SQL 数据库"],
+  r2: ["R2", "bucket 与对象"],
+  queue: ["队列", "消息与死信"],
+  analytics: ["Analytics", "事件与聚合"],
+  pipeline: ["Pipeline", "摄取与批次"],
+  workflow: ["Workflow", "实例与信号"],
+  flow: ["Flow", "定义与运行"],
+  email: ["邮件", "域名与消息"],
+  node: ["节点", "成员与调度"],
+  quota: ["配额", "集群安全策略"],
+  audit: ["审计", "签名透明日志"],
+};
+
+function credentialWritesAllowed() {
+  return consoleMode === "public" && Boolean(state.session?.secure_transport);
+}
+
+function renderSecurity() {
+  const data = state.security;
+  if (!data) return;
+  const quota = data.quota || {};
+  const usage = data.usage || {};
+  $("#security-worker-usage").textContent = String(usage.workers ?? 0);
+  $("#security-worker-limit").textContent = `配额 ${quota.max_workers ?? "—"}`;
+  $("#security-hostname-usage").textContent = String(usage.custom_hostnames ?? 0);
+  $("#security-hostname-limit").textContent = `配额 ${quota.max_custom_hostnames ?? "—"}`;
+  $("#security-r2-byte-usage").textContent = formatBytes(usage.r2_local_bytes || 0);
+  $("#security-r2-byte-limit").textContent = `配额 ${formatBytes(quota.max_r2_local_bytes || 0)}`;
+  $("#security-r2-object-usage").textContent = String(usage.r2_objects ?? 0);
+  $("#security-r2-object-limit").textContent = `配额 ${quota.max_r2_objects ?? "—"}`;
+  if (!state.securityDirty) {
+    $("#quota-workers").value = quota.max_workers ?? "";
+    $("#quota-hostnames").value = quota.max_custom_hostnames ?? "";
+    $("#quota-worker-bytes").value = quota.max_worker_bytes ?? "";
+    $("#quota-requests").value = quota.max_requests_per_minute ?? "";
+    $("#quota-r2-bytes").value = quota.max_r2_local_bytes ?? "";
+    $("#quota-r2-objects").value = quota.max_r2_objects ?? "";
+    $("#quota-outbound").checked = Boolean(quota.worker_outbound_allowed);
+  }
+  const selectedScopes = new Set(
+    $$("#access-token-scopes input:checked").map((input) => input.value),
+  );
+  const availableScopes = new Set(data.scopes || []);
+  const disabled = credentialWritesAllowed() ? "" : "disabled";
+  const wildcard = availableScopes.has("*")
+    ? `<div class="scope-group wildcard"><span><strong>全部权限</strong><small>仅授予完全受信任的自动化</small></span><label class="scope-choice"><input type="checkbox" value="*" ${selectedScopes.has("*") ? "checked" : ""} ${disabled}><span>启用 *</span></label></div>`
+    : "";
+  const grouped = Object.entries(scopeAreaCopy).map(([area, copy]) => {
+    const read = `${area}:read`;
+    const write = `${area}:write`;
+    if (!availableScopes.has(read) && !availableScopes.has(write)) return "";
+    return `<div class="scope-group"><span><strong>${escapeHtml(copy[0])}</strong><small>${escapeHtml(copy[1])}</small></span><div class="scope-actions">${availableScopes.has(read) ? `<label class="scope-choice"><input type="checkbox" value="${escapeHtml(read)}" ${selectedScopes.has(read) ? "checked" : ""} ${disabled}><span>读取</span></label>` : ""}${availableScopes.has(write) ? `<label class="scope-choice"><input type="checkbox" value="${escapeHtml(write)}" ${selectedScopes.has(write) ? "checked" : ""} ${disabled}><span>写入</span></label>` : ""}</div></div>`;
+  }).join("");
+  $("#access-token-scopes").innerHTML = wildcard + grouped;
+  renderAccessTokens(data.access_tokens || []);
+  const editing = state.s3Editing
+    ? (data.s3_credentials || []).find((item) => item.id === state.s3Editing)
+    : null;
+  renderS3GrantList(editing?.grants || null);
+  renderS3Credentials(data.s3_credentials || []);
+  $("#s3-endpoint").textContent = `${location.origin}${data.s3_endpoint || "/s3"}`;
+}
+
+function renderAccessTokens(tokens) {
+  const box = $("#access-token-list");
+  box.classList.toggle("empty-state", tokens.length === 0);
+  box.innerHTML = tokens.length ? tokens.map((item) => `<div class="database-row"><div><strong>${escapeHtml(item.label)}</strong><small><code>${escapeHtml(item.prefix)}…</code> · ${item.active ? "有效" : item.revoked_at_ms ? "已撤销" : "已过期"}</small><div class="tag-row">${(item.scopes || []).map((scope) => `<span class="badge">${escapeHtml(scope)}</span>`).join("")}</div><small>创建 ${escapeHtml(formatDate(item.created_at_ms))} · 最近使用 ${escapeHtml(item.last_used_at_ms ? formatDate(item.last_used_at_ms) : "从未")}${item.expires_at_ms ? ` · 到期 ${escapeHtml(formatDate(item.expires_at_ms))}` : ""}</small></div>${item.active ? `<button class="mini-button danger" type="button" data-token-revoke="${escapeHtml(item.id)}">撤销</button>` : '<span class="badge">不可用</span>'}</div>`).join("") : "暂无访问令牌。";
+}
+
+function renderS3GrantList(grants = null) {
+  const buckets = state.r2Buckets || [];
+  const acl = $("#s3-acl-enabled").checked;
+  const writable = credentialWritesAllowed();
+  const box = $("#s3-grant-list");
+  box.classList.toggle("empty-state", buckets.length === 0);
+  box.classList.toggle("disabled", !acl);
+  box.innerHTML = buckets.length ? buckets.map((bucket) => {
+    const current = grants?.[bucket.name] || {};
+    return `<div class="grant-row"><strong>${escapeHtml(bucket.name)}</strong><label class="check-label compact"><input type="checkbox" data-s3-grant-read="${escapeHtml(bucket.name)}" ${current.read ? "checked" : ""} ${acl && writable ? "" : "disabled"}><span>读取</span></label><label class="check-label compact"><input type="checkbox" data-s3-grant-write="${escapeHtml(bucket.name)}" ${current.write ? "checked" : ""} ${acl && writable ? "" : "disabled"}><span>写入</span></label></div>`;
+  }).join("") : "创建 R2 bucket 后可在这里分配读写权限。";
+}
+
+function renderS3Credentials(credentials) {
+  const box = $("#s3-credential-list");
+  box.classList.toggle("empty-state", credentials.length === 0);
+  box.innerHTML = credentials.length ? credentials.map((item) => `<div class="database-row"><div><strong>${escapeHtml(item.label)}</strong><small><code>${escapeHtml(item.access_key_id)}</code> · ${item.active ? "有效" : "已撤销"}</small><div class="tag-row">${item.acl_enabled ? Object.entries(item.grants || {}).map(([bucket, grant]) => `<span class="badge">${escapeHtml(bucket)} ${grant.read ? "读" : ""}${grant.write ? "写" : ""}</span>`).join("") || '<span class="badge danger">默认拒绝</span>' : '<span class="badge active">全部 bucket 读写</span>'}</div><small>最近使用 ${escapeHtml(item.last_used_at_ms ? formatDate(item.last_used_at_ms) : "从未")}</small></div><div class="table-actions">${item.active ? `<button class="mini-button" type="button" data-s3-edit="${escapeHtml(item.id)}">权限</button><button class="mini-button danger" type="button" data-s3-revoke="${escapeHtml(item.id)}">撤销</button>` : '<span class="badge">不可用</span>'}</div></div>`).join("") : "暂无 S3 凭据。";
+}
+
+function formatDate(at) {
+  const date = new Date(Number(at));
+  return Number.isNaN(date.getTime()) ? "—" : date.toLocaleString("zh-CN");
+}
+
+async function loadSecurity({ quiet = false } = {}) {
+  try {
+    state.security = await api("/api/security");
+    renderSecurity();
+    await loadSecurityAudit({ quiet: true });
+    if (!quiet) toast("安全策略与凭据已刷新");
+  } catch (error) {
+    if (!quiet) toast(error.message, true);
+  }
+}
+
+async function saveQuota(event) {
+  event.preventDefault();
+  const payload = {
+    max_workers: Number($("#quota-workers").value),
+    max_custom_hostnames: Number($("#quota-hostnames").value),
+    max_worker_bytes: Number($("#quota-worker-bytes").value),
+    max_requests_per_minute: Number($("#quota-requests").value),
+    worker_outbound_allowed: $("#quota-outbound").checked,
+    max_r2_local_bytes: Number($("#quota-r2-bytes").value),
+    max_r2_objects: Number($("#quota-r2-objects").value),
+  };
+  try {
+    const result = await api("/api/security/quota", { method: "PATCH", body: JSON.stringify(payload) });
+    const complete = async () => { state.securityDirty = false; await loadSecurity({ quiet: true }); };
+    if (result.pending_approval) showApproval(result, "更新集群资源、网络与请求配额。", complete);
+    else await complete();
+  } catch (error) { toast(error.message, true); }
+}
+
+function showCredential(title, value) {
+  $("#credential-reveal-title").textContent = title;
+  $("#credential-reveal-value").textContent = value;
+  $("#credential-reveal").classList.remove("hidden");
+  $("#credential-reveal").scrollIntoView({ behavior: "smooth", block: "center" });
+}
+
+async function createAccessToken(event) {
+  event.preventDefault();
+  const scopes = $$("#access-token-scopes input:checked").map((input) => input.value);
+  if (!scopes.length) return toast("请至少选择一个作用域", true);
+  if (scopes.includes("*") && scopes.length > 1) return toast("全部权限必须单独选择", true);
+  const days = $("#access-token-days").value.trim();
+  const payload = { label: $("#access-token-label").value.trim(), scopes, expires_in_days: days ? Number(days) : null };
+  try {
+    const result = await api("/api/security/tokens", { method: "POST", body: JSON.stringify(payload) });
+    showCredential("新的 API 访问令牌", result.token);
+    const complete = async () => { $("#access-token-form").reset(); await loadSecurity({ quiet: true }); };
+    if (result.pending_approval) showApproval(result, "启用新 API 访问令牌；明文已在安全页面显示一次。", complete);
+    else await complete();
+  } catch (error) { toast(error.message, true); }
+}
+
+async function revokeAccessToken(id) {
+  if (!window.confirm("撤销后使用此令牌的自动化会立即失去访问权限。继续吗？")) return;
+  try {
+    const result = await api(`/api/security/tokens/${encodeURIComponent(id)}`, { method: "DELETE" });
+    const complete = () => loadSecurity({ quiet: true });
+    if (result.pending_approval) showApproval(result, `撤销 API 访问令牌 ${id}。`, complete);
+    else await complete();
+  } catch (error) { toast(error.message, true); }
+}
+
+function collectS3Grants() {
+  const grants = {};
+  for (const bucket of state.r2Buckets || []) {
+    const read = $(`[data-s3-grant-read="${CSS.escape(bucket.name)}"]`)?.checked || false;
+    const write = $(`[data-s3-grant-write="${CSS.escape(bucket.name)}"]`)?.checked || false;
+    if (read || write) grants[bucket.name] = { read, write };
+  }
+  return grants;
+}
+
+function resetS3CredentialForm() {
+  state.s3Editing = null;
+  $("#s3-credential-form").reset();
+  $("#s3-acl-enabled").checked = true;
+  $("#s3-credential-submit").textContent = "生成加密 S3 凭据";
+  $("#s3-credential-cancel").classList.add("hidden");
+  renderS3GrantList();
+}
+
+function editS3Credential(id) {
+  const credential = state.security?.s3_credentials?.find((item) => item.id === id);
+  if (!credential) return;
+  state.s3Editing = id;
+  $("#s3-credential-label").value = credential.label;
+  $("#s3-acl-enabled").checked = credential.acl_enabled;
+  $("#s3-credential-submit").textContent = "保存最小权限";
+  $("#s3-credential-cancel").classList.remove("hidden");
+  renderS3GrantList(credential.grants || {});
+  $("#s3-credential-form").scrollIntoView({ behavior: "smooth" });
+}
+
+async function saveS3Credential(event) {
+  event.preventDefault();
+  const payload = { label: $("#s3-credential-label").value.trim(), acl_enabled: $("#s3-acl-enabled").checked, grants: collectS3Grants() };
+  try {
+    if (state.s3Editing) {
+      const id = state.s3Editing;
+      const result = await api(`/api/security/s3/${encodeURIComponent(id)}`, { method: "PATCH", body: JSON.stringify(payload) });
+      const complete = async () => { resetS3CredentialForm(); await loadSecurity({ quiet: true }); };
+      if (result.pending_approval) showApproval(result, `更新 S3 凭据 ${id} 的 bucket 权限。`, complete);
+      else await complete();
+      return;
+    }
+    const result = await api("/api/security/s3", { method: "POST", body: JSON.stringify(payload) });
+    showCredential("新的 R2/S3 凭据", `Endpoint: ${location.origin}/s3\nAccess Key ID: ${result.access_key_id}\nSecret Access Key: ${result.secret_access_key}\nRegion: auto`);
+    const complete = async () => { resetS3CredentialForm(); await loadSecurity({ quiet: true }); };
+    if (result.pending_approval) showApproval(result, "启用新的加密 R2/S3 Signature V4 凭据。", complete);
+    else await complete();
+  } catch (error) { toast(error.message, true); }
+}
+
+async function revokeS3Credential(id) {
+  if (!window.confirm("撤销后，使用此 Access Key 的 S3 客户端会立即失败。继续吗？")) return;
+  try {
+    const result = await api(`/api/security/s3/${encodeURIComponent(id)}`, { method: "DELETE" });
+    const complete = () => loadSecurity({ quiet: true });
+    if (result.pending_approval) showApproval(result, `撤销 R2/S3 凭据 ${id}。`, complete);
+    else await complete();
+  } catch (error) { toast(error.message, true); }
+}
+
+async function loadSecurityAudit({ quiet = false } = {}) {
+  try {
+    const data = await api("/api/security/audit?limit=500");
+    state.auditRecords = data.records || [];
+    const box = $("#security-audit-list");
+    box.classList.toggle("empty-state", state.auditRecords.length === 0);
+    box.innerHTML = state.auditRecords.length ? state.auditRecords.map((record) => `<article class="build-row success"><span class="pipeline-state success"></span><div><strong>${escapeHtml(record.kind)}/${escapeHtml(record.name)} · v${escapeHtml(record.version)}</strong><small>${record.deleted ? "墓碑" : record.redacted ? "敏感配置已隐藏" : "签名配置"}</small><code>${escapeHtml(record.digest)}</code></div><div><span class="badge">前序 ${escapeHtml(record.previous ? shortId(record.previous, 14) : "创世")}</span></div></article>`).join("") : "暂无平台资源历史。";
+    if (!quiet) toast("签名资源审计已刷新");
+  } catch (error) { if (!quiet) toast(error.message, true); }
+}
+
 async function loadOverview({ quiet = false } = {}) {
   try {
     const data = await api("/api/overview");
@@ -3442,12 +3678,18 @@ async function boot() {
       "hidden",
       consoleMode !== "public" || state.session.secure_transport,
     );
+    $("#credential-transport-warning").classList.toggle("hidden", credentialWritesAllowed());
+    const credentialWritable = credentialWritesAllowed();
+    $$("#access-token-form input, #access-token-form button, #s3-credential-form input, #s3-credential-form button")
+      .forEach((control) => { control.disabled = !credentialWritable; });
     $("#security-copy").innerHTML = consoleMode === "public"
       ? "此节点不保存<br>任何私钥。"
       : "密钥仅保留在本地<br>控制台进程中。";
-    $$("#deploy-form button, #source-form button, #kv-editor-form button, #d1-create-form button, #d1-exec-form button, #r2-bucket-form button, #r2-upload-form button, #r2-delete-bucket, #queue-form button, #queue-send-form button, #queue-delete, #analytics-form button, #analytics-write-form button, #analytics-delete, #pipeline-form button, #pipeline-token-form button, #pipeline-ingest-form button, #pipeline-flush, #pipeline-delete, #workflow-form button, #workflow-trigger-form button, #workflow-signal-form button, #workflow-delete, #flow-form button, #flow-token-form button, #flow-trigger-form button, #flow-delete, #email-domain-form button, #email-route-form button, #email-send-form button, #email-delete, #email-verify, #project-domain-add-form button, #project-bindings-form button, #project-secret-form button, #project-file-form button, #project-file-new, #project-triggers-form button, #project-cron-fire-form button, #project-cron-dlq button, #project-settings-form button, #project-preview-form button, #project-preview-list button, #project-source-form button, #project-redeploy, #project-delete")
+    $$("#deploy-form button, #source-form button, #kv-editor-form button, #d1-create-form button, #d1-exec-form button, #r2-bucket-form button, #r2-upload-form button, #r2-delete-bucket, #queue-form button, #queue-send-form button, #queue-delete, #analytics-form button, #analytics-write-form button, #analytics-delete, #pipeline-form button, #pipeline-token-form button, #pipeline-ingest-form button, #pipeline-flush, #pipeline-delete, #workflow-form button, #workflow-trigger-form button, #workflow-signal-form button, #workflow-delete, #flow-form button, #flow-token-form button, #flow-trigger-form button, #flow-delete, #email-domain-form button, #email-route-form button, #email-send-form button, #email-delete, #email-verify, #project-domain-add-form button, #project-bindings-form button, #project-secret-form button, #project-file-form button, #project-file-new, #project-triggers-form button, #project-cron-fire-form button, #project-cron-dlq button, #project-settings-form button, #project-preview-form button, #project-preview-list button, #project-source-form button, #project-redeploy, #project-delete, #quota-form button, #access-token-form button, #s3-credential-form button")
       .forEach((button) => { button.disabled = state.session.read_only; });
     $("#node-policy-form button").disabled = state.session.read_only;
+    $$("#access-token-form input, #access-token-form button, #s3-credential-form input, #s3-credential-form button")
+      .forEach((control) => { control.disabled = !credentialWritable; });
     await loadOverview({ quiet: true });
     await loadNodes({ quiet: true });
     await loadWorkerOps();
@@ -3459,6 +3701,7 @@ async function boot() {
     await loadWorkflows({ quiet: true });
     await loadFlows({ quiet: true });
     await loadEmail({ quiet: true });
+    await loadSecurity({ quiet: true });
   } catch (error) {
     if (consoleMode === "public" && error.status === 401) {
       state.session = null;
@@ -3473,6 +3716,7 @@ async function boot() {
 $$(".nav-item").forEach((button) => button.addEventListener("click", () => {
   switchView(button.dataset.view);
   if (button.dataset.view === "nodes") loadNodes({ quiet: true });
+  if (button.dataset.view === "security") loadSecurity({ quiet: true });
 }));
 $$('[data-go]').forEach((button) => button.addEventListener("click", () => switchView(button.dataset.go)));
 $("#overview-workers").addEventListener("click", (event) => {
@@ -3487,6 +3731,27 @@ $("#node-policy-form").addEventListener("submit", saveNodePolicy);
 $("#node-policy-form").addEventListener("input", () => { state.nodePolicyDirty = true; });
 $("#node-policy-form").addEventListener("change", () => { state.nodePolicyDirty = true; });
 $("#nodes-refresh").addEventListener("click", () => loadNodes());
+$("#security-refresh").addEventListener("click", () => loadSecurity());
+$("#security-audit-refresh").addEventListener("click", () => loadSecurityAudit());
+$("#quota-form").addEventListener("submit", saveQuota);
+$("#quota-form").addEventListener("input", () => { state.securityDirty = true; });
+$("#quota-form").addEventListener("change", () => { state.securityDirty = true; });
+$("#access-token-form").addEventListener("submit", createAccessToken);
+$("#access-token-list").addEventListener("click", (event) => { const button = event.target.closest("[data-token-revoke]"); if (button) revokeAccessToken(button.dataset.tokenRevoke); });
+$("#s3-credential-form").addEventListener("submit", saveS3Credential);
+$("#s3-acl-enabled").addEventListener("change", () => {
+  const editing = state.s3Editing ? state.security?.s3_credentials?.find((item) => item.id === state.s3Editing) : null;
+  renderS3GrantList(editing?.grants || null);
+});
+$("#s3-credential-cancel").addEventListener("click", resetS3CredentialForm);
+$("#s3-credential-list").addEventListener("click", (event) => {
+  const edit = event.target.closest("[data-s3-edit]");
+  const revoke = event.target.closest("[data-s3-revoke]");
+  if (edit) editS3Credential(edit.dataset.s3Edit);
+  if (revoke) revokeS3Credential(revoke.dataset.s3Revoke);
+});
+$("#credential-reveal-copy").addEventListener("click", () => copyText($("#credential-reveal-value").textContent, $("#credential-reveal-copy")));
+$("#credential-reveal-close").addEventListener("click", () => { $("#credential-reveal-value").textContent = ""; $("#credential-reveal").classList.add("hidden"); });
 $("#new-project").addEventListener("click", () => {
   state.activeWorker = null;
   state.workerDetail = null;
@@ -3779,6 +4044,7 @@ setInterval(() => {
     if (state.view === "email") loadEmail({ quiet: true }).then(() => {
       if (state.emailActive) loadEmailMessages();
     });
+    if (state.view === "security") loadSecurity({ quiet: true });
   }
 }, 10_000);
 boot();

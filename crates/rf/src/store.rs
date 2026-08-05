@@ -27,6 +27,9 @@ const D1LOG: TableDefinition<&str, &[u8]> = TableDefinition::new("d1_log");
 const LOG: TableDefinition<&str, &[u8]> = TableDefinition::new("manifest_log");
 /// Node-local Worker request metadata. The key preserves worker/time ordering.
 const REQUEST_LOGS: TableDefinition<&str, &[u8]> = TableDefinition::new("request_logs");
+/// Node-local best-effort credential activity. Secrets/hashes never enter this
+/// table; each node only records the last successful use it observed.
+const CREDENTIAL_USAGE: TableDefinition<&str, u64> = TableDefinition::new("credential_usage");
 
 pub struct Store {
     db: Database,
@@ -54,6 +57,7 @@ impl Store {
             tx.open_table(D1META)?;
             tx.open_table(D1LOG)?;
             tx.open_table(REQUEST_LOGS)?;
+            tx.open_table(CREDENTIAL_USAGE)?;
         }
         tx.commit()?;
         Ok(Self { db })
@@ -300,6 +304,25 @@ impl Store {
     }
 
     // ---- node-local Worker request logs ----
+
+    pub fn touch_credential(&self, id: &str, at_ms: u64) -> Result<()> {
+        let tx = self.db.begin_write()?;
+        {
+            let mut table = tx.open_table(CREDENTIAL_USAGE)?;
+            let previous = table.get(id)?.map(|value| value.value()).unwrap_or(0);
+            if at_ms > previous {
+                table.insert(id, at_ms)?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn credential_last_used(&self, id: &str) -> Result<Option<u64>> {
+        let tx = self.db.begin_read()?;
+        let table = tx.open_table(CREDENTIAL_USAGE)?;
+        Ok(table.get(id)?.map(|value| value.value()))
+    }
 
     fn request_log_key(entry: &RequestLogEntry) -> String {
         format!("{}\0{:020}\0{}", entry.worker, entry.called_at_ms, entry.id)
