@@ -2273,6 +2273,80 @@ async fn d1_quorum_replicates_and_survives_replica_loss() {
         .await
         .unwrap();
     assert_eq!(count["rows"][0]["n"], 2, "both writes visible: {count}");
+    let failed_batch = client
+        .d1_batch(
+            &a.api,
+            "appdb",
+            &[
+                rf::d1::Statement {
+                    sql: "INSERT INTO t (id, v) VALUES (99, 'must-roll-back')".into(),
+                    params: vec![],
+                },
+                rf::d1::Statement {
+                    sql: "INSERT INTO t (id, v) VALUES (1, 'duplicate')".into(),
+                    params: vec![],
+                },
+            ],
+        )
+        .await;
+    assert!(
+        failed_batch.is_err(),
+        "constraint failure must reject the batch"
+    );
+    let rolled_back = client
+        .d1_exec(
+            &b.api,
+            "appdb",
+            "SELECT COUNT(*) AS n FROM t WHERE id = 99",
+            serde_json::json!([]),
+        )
+        .await
+        .unwrap();
+    assert_eq!(rolled_back["rows"][0]["n"], 0);
+
+    let committed_batch = client
+        .d1_batch(
+            &c.api,
+            "appdb",
+            &[
+                rf::d1::Statement {
+                    sql: "INSERT INTO t (v) VALUES (?1)".into(),
+                    params: vec![serde_json::json!("batch-three")],
+                },
+                rf::d1::Statement {
+                    sql: "SELECT COUNT(*) AS n FROM t".into(),
+                    params: vec![],
+                },
+            ],
+        )
+        .await
+        .unwrap();
+    assert_eq!(committed_batch["batch"][0]["rows_affected"], 1);
+    assert_eq!(committed_batch["batch"][1]["rows"][0]["n"], 3);
+
+    let snapshot = client.d1_export(&b.api, "appdb").await.unwrap();
+    assert!(snapshot.starts_with(b"SQLite format 3\0"));
+    let snapshot_path = std::env::temp_dir().join(format!(
+        "rf-e2e-d1-export-{}-{}.sqlite",
+        std::process::id(),
+        rand::random::<u64>()
+    ));
+    std::fs::write(&snapshot_path, snapshot).unwrap();
+    let exported = rusqlite::Connection::open(&snapshot_path).unwrap();
+    let exported_rows: i64 = exported
+        .query_row("SELECT COUNT(*) FROM t", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(exported_rows, 3);
+    let marker: i64 = exported
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_schema WHERE name = '_rf_applied'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(marker, 0, "portable export must omit the Raft marker");
+    drop(exported);
+    std::fs::remove_file(snapshot_path).unwrap();
     let cte = client
         .d1_exec(
             &b.api,
@@ -2282,7 +2356,7 @@ async fn d1_quorum_replicates_and_survives_replica_loss() {
         )
         .await
         .unwrap();
-    assert_eq!(cte["rows"][0]["n"], 2, "CTE reads stay read-only: {cte}");
+    assert_eq!(cte["rows"][0]["n"], 3, "CTE reads stay read-only: {cte}");
     client
         .d1_exec(
             &a.api,
@@ -2336,7 +2410,7 @@ async fn d1_quorum_replicates_and_survives_replica_loss() {
         .await
         .unwrap();
     assert_eq!(
-        count["rows"][0]["n"], 3,
+        count["rows"][0]["n"], 4,
         "acked writes survive leader loss: {count}"
     );
     let pragma = client

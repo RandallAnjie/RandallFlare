@@ -34,10 +34,36 @@ pub struct DbMeta {
 /// A committed command: one SQL statement with JSON params.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct Cmd {
+    #[serde(default)]
     pub sql: String,
+    #[serde(default)]
     pub params: Vec<serde_json::Value>,
+    /// Newer commands may contain an atomic ordered batch. Empty keeps the
+    /// original single-statement wire format backward-compatible with stored
+    /// Raft logs and snapshots.
+    #[serde(default)]
+    pub statements: Vec<Statement>,
     /// Random tag so the proposer can recognize its own entry.
     pub tag: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Statement {
+    pub sql: String,
+    #[serde(default)]
+    pub params: Vec<serde_json::Value>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StatementResult {
+    pub rows: Option<Vec<serde_json::Map<String, serde_json::Value>>>,
+    pub rows_affected: Option<u64>,
+}
+
+pub struct SnapshotResult {
+    pub data: Option<Vec<u8>>,
+    pub leader_hint: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -50,6 +76,8 @@ pub struct WireMsg {
 pub struct ExecResult {
     pub rows: Option<Vec<serde_json::Map<String, serde_json::Value>>>,
     pub rows_affected: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub batch: Option<Vec<StatementResult>>,
     /// Set when this node isn't the leader: api addr to retry against.
     pub leader_hint: Option<String>,
 }
@@ -60,6 +88,13 @@ pub enum DriverCmd {
         sql: String,
         params: Vec<serde_json::Value>,
         resp: oneshot::Sender<Result<ExecResult>>,
+    },
+    Batch {
+        statements: Vec<Statement>,
+        resp: oneshot::Sender<Result<ExecResult>>,
+    },
+    Snapshot {
+        resp: oneshot::Sender<Result<SnapshotResult>>,
     },
 }
 
@@ -303,6 +338,23 @@ impl Driver {
                     Some(DriverCmd::Exec { sql, params, resp }) => {
                         self.exec(sql, params, resp).await;
                     }
+                    Some(DriverCmd::Batch { statements, resp }) => {
+                        self.batch(statements, resp).await;
+                    }
+                    Some(DriverCmd::Snapshot { resp }) => {
+                        if self.raft.is_leader() {
+                            let result = self.export_snapshot().map(|data| SnapshotResult {
+                                data: Some(data),
+                                leader_hint: None,
+                            });
+                            let _ = resp.send(result);
+                        } else {
+                            let _ = resp.send(Ok(SnapshotResult {
+                                data: None,
+                                leader_hint: self.leader_api_addr(),
+                            }));
+                        }
+                    }
                     None => return,
                 },
                 _ = heartbeat.tick() => {
@@ -331,6 +383,7 @@ impl Driver {
             let _ = resp.send(Ok(ExecResult {
                 rows: None,
                 rows_affected: None,
+                batch: None,
                 leader_hint: hint,
             }));
             return;
@@ -347,7 +400,85 @@ impl Driver {
             }
         }
         let tag: u64 = rand::random();
-        let cmd = Cmd { sql, params, tag };
+        let cmd = Cmd {
+            sql,
+            params,
+            statements: Vec::new(),
+            tag,
+        };
+        self.propose(cmd, resp).await;
+    }
+
+    async fn batch(
+        &mut self,
+        statements: Vec<Statement>,
+        resp: oneshot::Sender<Result<ExecResult>>,
+    ) {
+        if !self.raft.is_leader() {
+            let hint = self.leader_api_addr();
+            let _ = resp.send(Ok(ExecResult {
+                rows: None,
+                rows_affected: None,
+                batch: None,
+                leader_hint: hint,
+            }));
+            return;
+        }
+        if statements.is_empty() || statements.len() > 100 {
+            let _ = resp.send(Err(anyhow::anyhow!(
+                "D1 atomic batch must contain 1..100 statements"
+            )));
+            return;
+        }
+        if let Some(statement) = statements.iter().find(|statement| {
+            statement.sql.trim().is_empty()
+                || statement.sql.len() > 1024 * 1024
+                || statement.params.len() > 1000
+        }) {
+            let _ = resp.send(Err(anyhow::anyhow!(
+                "invalid D1 batch statement: {:?}",
+                statement.sql.chars().take(80).collect::<String>()
+            )));
+            return;
+        }
+        let reads_only = statements
+            .iter()
+            .map(|statement| is_read(&self.sql, &statement.sql))
+            .collect::<Result<Vec<_>>>();
+        match reads_only {
+            Ok(kinds) if kinds.iter().all(|read| *read) => {
+                let result = (|| -> Result<ExecResult> {
+                    let tx = self.sql.unchecked_transaction()?;
+                    let results = run_statements(&tx, &statements)?;
+                    tx.commit()?;
+                    Ok(ExecResult {
+                        rows: None,
+                        rows_affected: Some(0),
+                        batch: Some(results),
+                        leader_hint: None,
+                    })
+                })();
+                let _ = resp.send(result);
+                return;
+            }
+            Ok(_) => {}
+            Err(error) => {
+                let _ = resp.send(Err(error));
+                return;
+            }
+        }
+        let tag: u64 = rand::random();
+        let cmd = Cmd {
+            sql: String::new(),
+            params: Vec::new(),
+            statements,
+            tag,
+        };
+        self.propose(cmd, resp).await;
+    }
+
+    async fn propose(&mut self, cmd: Cmd, resp: oneshot::Sender<Result<ExecResult>>) {
+        let tag = cmd.tag;
         let bytes = serde_json::to_vec(&cmd).expect("cmd encode");
         match self.raft.propose(bytes) {
             Ok((seq, actions)) => {
@@ -360,6 +491,7 @@ impl Driver {
                 let _ = resp.send(Ok(ExecResult {
                     rows: None,
                     rows_affected: None,
+                    batch: None,
                     leader_hint: hint,
                 }));
             }
@@ -482,6 +614,7 @@ impl Driver {
                         let _ = resp.send(Ok(ExecResult {
                             rows: None,
                             rows_affected: None,
+                            batch: None,
                             leader_hint: None,
                         }));
                     }
@@ -505,6 +638,19 @@ impl Driver {
             .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |_| Ok(()))
             .context("wal checkpoint")?;
         std::fs::read(&self.path).context("reading sqlite file")
+    }
+
+    /// Create a portable SQLite backup for an operator download. The Raft
+    /// apply marker is stripped from the copy, never from the live database.
+    fn export_snapshot(&mut self) -> Result<Vec<u8>> {
+        let path = self
+            .path
+            .with_extension(format!("export-{}.sqlite", rand::random::<u64>()));
+        let result = portable_sqlite_backup(&self.sql, &path);
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(path.with_extension("sqlite-wal"));
+        let _ = std::fs::remove_file(path.with_extension("sqlite-shm"));
+        result
     }
 
     /// Replace the local database with a shipped snapshot.
@@ -579,28 +725,53 @@ impl Driver {
     }
 
     fn apply(&mut self, entry: Entry) {
-        let result = (|| -> Result<u64> {
+        let result = (|| -> Result<(bool, Vec<StatementResult>)> {
             let cmd: Cmd = serde_json::from_slice(&entry.cmd).context("cmd decode")?;
-            let tx = self.sql.unchecked_transaction()?;
-            let affected = {
-                let mut stmt = tx.prepare(&cmd.sql)?;
-                bind_params(&mut stmt, &cmd.params)?;
-                stmt.raw_execute()? as u64
+            let is_batch = !cmd.statements.is_empty();
+            let statements = if is_batch {
+                cmd.statements
+            } else {
+                vec![Statement {
+                    sql: cmd.sql,
+                    params: cmd.params,
+                }]
             };
+            let tx = self.sql.unchecked_transaction()?;
+            let results = run_statements(&tx, &statements)?;
             tx.execute(
                 "UPDATE _rf_applied SET seq = ?1 WHERE id = 0",
                 [entry.seq as i64],
             )?;
             tx.commit()?;
-            Ok(affected)
+            Ok((is_batch, results))
         })();
         // Answer the proposer if this was ours.
         if let Some(tag) = self.my_entries.remove(&entry.seq) {
             if let Some(resp) = self.pending.remove(&tag) {
-                let _ = resp.send(result.map(|rows_affected| ExecResult {
-                    rows: None,
-                    rows_affected: Some(rows_affected),
-                    leader_hint: None,
+                let _ = resp.send(result.map(|(is_batch, mut results)| {
+                    if is_batch {
+                        let rows_affected = results
+                            .iter()
+                            .filter_map(|result| result.rows_affected)
+                            .sum();
+                        ExecResult {
+                            rows: None,
+                            rows_affected: Some(rows_affected),
+                            batch: Some(results),
+                            leader_hint: None,
+                        }
+                    } else {
+                        let result = results.pop().unwrap_or(StatementResult {
+                            rows: None,
+                            rows_affected: Some(0),
+                        });
+                        ExecResult {
+                            rows: result.rows,
+                            rows_affected: result.rows_affected,
+                            batch: None,
+                            leader_hint: None,
+                        }
+                    }
                 }));
                 return;
             }
@@ -633,6 +804,50 @@ fn bind_params(stmt: &mut rusqlite::Statement<'_>, params: &[serde_json::Value])
     Ok(())
 }
 
+fn run_statements(
+    connection: &rusqlite::Connection,
+    statements: &[Statement],
+) -> Result<Vec<StatementResult>> {
+    let mut results = Vec::with_capacity(statements.len());
+    for statement in statements {
+        let mut prepared = connection.prepare(&statement.sql)?;
+        bind_params(&mut prepared, &statement.params)?;
+        if prepared.readonly() {
+            results.push(StatementResult {
+                rows: Some(read_prepared_rows(&mut prepared)?),
+                rows_affected: None,
+            });
+        } else {
+            results.push(StatementResult {
+                rows: None,
+                rows_affected: Some(prepared.raw_execute()? as u64),
+            });
+        }
+    }
+    Ok(results)
+}
+
+fn portable_sqlite_backup(
+    connection: &rusqlite::Connection,
+    path: &std::path::Path,
+) -> Result<Vec<u8>> {
+    connection
+        .backup(rusqlite::MAIN_DB, path, None)
+        .context("creating D1 SQLite backup")?;
+    let exported = rusqlite::Connection::open(path)?;
+    exported.execute_batch(
+        "DROP TABLE IF EXISTS _rf_applied;
+         PRAGMA journal_mode = DELETE;
+         VACUUM;",
+    )?;
+    drop(exported);
+    let bytes = std::fs::read(path)?;
+    if bytes.len() > crate::binary::MAX_BINARY_BYTES {
+        anyhow::bail!("D1 export exceeds the 200 MiB transfer limit");
+    }
+    Ok(bytes)
+}
+
 fn run_query(
     conn: &rusqlite::Connection,
     sql: &str,
@@ -640,10 +855,25 @@ fn run_query(
 ) -> Result<ExecResult> {
     let mut stmt = conn.prepare(sql)?;
     bind_params(&mut stmt, params)?;
+    let rows = read_prepared_rows(&mut stmt)?;
+    Ok(ExecResult {
+        rows: Some(rows),
+        rows_affected: None,
+        batch: None,
+        leader_hint: None,
+    })
+}
+
+fn read_prepared_rows(
+    stmt: &mut rusqlite::Statement<'_>,
+) -> Result<Vec<serde_json::Map<String, serde_json::Value>>> {
     let cols: Vec<String> = stmt.column_names().iter().map(|c| c.to_string()).collect();
     let mut rows_out = Vec::new();
     let mut rows = stmt.raw_query();
     while let Some(row) = rows.next()? {
+        if rows_out.len() >= 10_000 {
+            anyhow::bail!("D1 query returned more than 10,000 rows");
+        }
         let mut obj = serde_json::Map::new();
         for (i, col) in cols.iter().enumerate() {
             let v: serde_json::Value = match row.get_ref(i)? {
@@ -660,11 +890,7 @@ fn run_query(
         }
         rows_out.push(obj);
     }
-    Ok(ExecResult {
-        rows: Some(rows_out),
-        rows_affected: None,
-        leader_hint: None,
-    })
+    Ok(rows_out)
 }
 
 #[cfg(test)]
@@ -678,5 +904,93 @@ mod tests {
         assert!(is_read(&conn, "PRAGMA user_version").unwrap());
         assert!(!is_read(&conn, "PRAGMA user_version = 7").unwrap());
         assert!(!is_read(&conn, "CREATE TABLE t (id INTEGER)").unwrap());
+    }
+
+    #[test]
+    fn atomic_statement_sets_commit_together_or_roll_back_together() {
+        let connection = rusqlite::Connection::open_in_memory().unwrap();
+        connection
+            .execute_batch("CREATE TABLE items (id INTEGER PRIMARY KEY, name TEXT NOT NULL);")
+            .unwrap();
+        {
+            let transaction = connection.unchecked_transaction().unwrap();
+            let results = run_statements(
+                &transaction,
+                &[
+                    Statement {
+                        sql: "INSERT INTO items (id, name) VALUES (?1, ?2)".into(),
+                        params: vec![1.into(), "one".into()],
+                    },
+                    Statement {
+                        sql: "SELECT name FROM items WHERE id = ?1".into(),
+                        params: vec![1.into()],
+                    },
+                ],
+            )
+            .unwrap();
+            assert_eq!(results[0].rows_affected, Some(1));
+            assert_eq!(results[1].rows.as_ref().unwrap()[0]["name"], "one");
+            transaction.commit().unwrap();
+        }
+        {
+            let transaction = connection.unchecked_transaction().unwrap();
+            assert!(run_statements(
+                &transaction,
+                &[
+                    Statement {
+                        sql: "INSERT INTO items (id, name) VALUES (2, 'two')".into(),
+                        params: vec![],
+                    },
+                    Statement {
+                        sql: "INSERT INTO items (id, name) VALUES (1, 'duplicate')".into(),
+                        params: vec![],
+                    },
+                ],
+            )
+            .is_err());
+        }
+        let count: i64 = connection
+            .query_row("SELECT COUNT(*) FROM items", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(count, 1, "failed batch must roll back its earlier insert");
+    }
+
+    #[test]
+    fn portable_export_keeps_user_data_and_strips_raft_marker() {
+        let directory = std::env::temp_dir().join(format!(
+            "rf-d1-export-{}-{}",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        std::fs::create_dir_all(&directory).unwrap();
+        let source_path = directory.join("source.sqlite");
+        let export_path = directory.join("export.sqlite");
+        let source = rusqlite::Connection::open(&source_path).unwrap();
+        source
+            .execute_batch(
+                "CREATE TABLE _rf_applied (id INTEGER PRIMARY KEY, seq INTEGER NOT NULL);
+                 INSERT INTO _rf_applied VALUES (0, 9);
+                 CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT NOT NULL);
+                 INSERT INTO users VALUES (1, '安杰');",
+            )
+            .unwrap();
+        let bytes = portable_sqlite_backup(&source, &export_path).unwrap();
+        assert!(bytes.starts_with(b"SQLite format 3\0"));
+        let exported = rusqlite::Connection::open(&export_path).unwrap();
+        let name: String = exported
+            .query_row("SELECT name FROM users WHERE id = 1", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(name, "安杰");
+        let internal: i64 = exported
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_schema WHERE name = '_rf_applied'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(internal, 0);
+        drop(exported);
+        drop(source);
+        let _ = std::fs::remove_dir_all(directory);
     }
 }

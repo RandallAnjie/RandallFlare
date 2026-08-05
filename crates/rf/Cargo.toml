@@ -46,7 +46,7 @@ rustls-pemfile = "2.2.0"
 tokio-rustls = "0.26.3"
 webpki-roots = "1"
 instant-acme = "0.8.5"
-rusqlite = { version = "0.40.1", features = ["bundled"] }
+rusqlite = { version = "0.40.1", features = ["backup", "bundled"] }
 zstd = "0.13"
 flate2 = "1"
 tar = "0.4"

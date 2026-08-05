@@ -1342,6 +1342,71 @@ impl PeerClient {
         let body = serde_json::json!({ "sql": sql, "params": params })
             .to_string()
             .into_bytes();
+        self.d1_request(base, db, body).await
+    }
+
+    pub async fn d1_batch(
+        &self,
+        base: &str,
+        db: &str,
+        statements: &[crate::d1::Statement],
+    ) -> Result<serde_json::Value> {
+        if statements.is_empty() || statements.len() > 100 {
+            bail!("D1 atomic batch accepts 1..100 statements");
+        }
+        let body = serde_json::to_vec(&serde_json::json!({ "statements": statements }))?;
+        self.d1_request(base, db, body).await
+    }
+
+    pub async fn d1_export(&self, base: &str, db: &str) -> Result<Vec<u8>> {
+        let mut target = base.to_string();
+        let mut candidates = vec![target.clone()];
+        let mut candidate_cursor = 0usize;
+        let mut candidates_loaded = false;
+        for _ in 0..25 {
+            match self
+                .get(&target, &format!("/v1/d1/{}/export", component(db)))
+                .await
+            {
+                Ok(raw) => return Ok(raw),
+                Err(error) => {
+                    if let Some(http_error) = error.downcast_ref::<PeerHttpError>() {
+                        if http_error.status == 421 {
+                            if let Ok(value) =
+                                serde_json::from_str::<serde_json::Value>(&http_error.body)
+                            {
+                                if let Some(hint) = value["leader_hint"]
+                                    .as_str()
+                                    .filter(|hint| !hint.is_empty())
+                                {
+                                    target = hint.to_string();
+                                    tokio::time::sleep(Duration::from_millis(300)).await;
+                                    continue;
+                                }
+                            }
+                        }
+                        if http_error.status != 404 && http_error.status != 421 {
+                            return Err(error);
+                        }
+                    } else {
+                        return Err(error);
+                    }
+                    if !candidates_loaded {
+                        if let Ok(status) = self.status(base).await {
+                            candidates = peer_api_candidates(base, &status);
+                        }
+                        candidates_loaded = true;
+                    }
+                    candidate_cursor = (candidate_cursor + 1) % candidates.len();
+                    target = candidates[candidate_cursor].clone();
+                    tokio::time::sleep(Duration::from_millis(700)).await;
+                }
+            }
+        }
+        bail!("no leader found for D1 export {db} after retries")
+    }
+
+    async fn d1_request(&self, base: &str, db: &str, body: Vec<u8>) -> Result<serde_json::Value> {
         let mut target = base.to_string();
         let mut candidates = vec![target.clone()];
         let mut candidate_cursor = 0usize;

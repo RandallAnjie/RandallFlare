@@ -312,6 +312,38 @@ enum D1Cmd {
         #[arg(long, env = "RF_CLUSTER_SECRET")]
         secret: String,
     },
+    /// Execute 1..100 statements from a JSON array as one replicated
+    /// SQLite transaction.
+    Batch {
+        name: String,
+        #[arg(long)]
+        file: PathBuf,
+        #[arg(long, env = "RF_NODE")]
+        node: String,
+        #[arg(long, env = "RF_CLUSTER_SECRET")]
+        secret: String,
+    },
+    /// Import a SQLite SQL script in validated 100-statement atomic batches.
+    Import {
+        name: String,
+        file: PathBuf,
+        #[arg(long, env = "RF_NODE")]
+        node: String,
+        #[arg(long, env = "RF_CLUSTER_SECRET")]
+        secret: String,
+    },
+    /// Download a portable online SQLite snapshot from the current leader.
+    Export {
+        name: String,
+        #[arg(long)]
+        output: PathBuf,
+        #[arg(long)]
+        force: bool,
+        #[arg(long, env = "RF_NODE")]
+        node: String,
+        #[arg(long, env = "RF_CLUSTER_SECRET")]
+        secret: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -1726,6 +1758,90 @@ async fn async_main(cli: Cli) -> Result<()> {
                 let params: serde_json::Value = serde_json::from_str(&params)?;
                 let out = client.d1_exec(&node, &name, &sql, params).await?;
                 println!("{}", serde_json::to_string_pretty(&out)?);
+                Ok(())
+            }
+            D1Cmd::Batch {
+                name,
+                file,
+                node,
+                secret,
+            } => {
+                let raw = std::fs::read(&file)
+                    .with_context(|| format!("reading D1 batch {}", file.display()))?;
+                if raw.is_empty() || raw.len() > 64 * 1024 * 1024 {
+                    anyhow::bail!("D1 batch JSON must be 1 byte..64 MiB");
+                }
+                let value: serde_json::Value = serde_json::from_slice(&raw)?;
+                let statements: Vec<rf::d1::Statement> =
+                    serde_json::from_value(value.get("statements").cloned().unwrap_or(value))?;
+                if statements.is_empty() || statements.len() > 100 {
+                    anyhow::bail!("D1 batch must contain 1..100 statements");
+                }
+                let client = PeerClient::new(secret_bytes(&secret)?);
+                let output = client.d1_batch(&node, &name, &statements).await?;
+                println!("{}", serde_json::to_string_pretty(&output)?);
+                Ok(())
+            }
+            D1Cmd::Import {
+                name,
+                file,
+                node,
+                secret,
+            } => {
+                let raw = std::fs::read_to_string(&file)
+                    .with_context(|| format!("reading D1 SQL import {}", file.display()))?;
+                if raw.is_empty() || raw.len() > 64 * 1024 * 1024 {
+                    anyhow::bail!("D1 SQL import must be 1 byte..64 MiB");
+                }
+                let statements = rf::d1bind::import_statements(&raw)?;
+                if statements.is_empty() || statements.len() > 10_000 {
+                    anyhow::bail!("D1 SQL import must contain 1..10,000 statements");
+                }
+                if statements
+                    .iter()
+                    .any(|statement| statement.sql.len() > 1024 * 1024)
+                {
+                    anyhow::bail!("one D1 import statement exceeds 1 MiB");
+                }
+                let client = PeerClient::new(secret_bytes(&secret)?);
+                let mut changes = 0u64;
+                for chunk in statements.chunks(100) {
+                    let output = client.d1_batch(&node, &name, chunk).await?;
+                    changes = changes.saturating_add(output["rows_affected"].as_u64().unwrap_or(0));
+                }
+                println!(
+                    "imported {} statements in {} atomic batches ({} changes)",
+                    statements.len(),
+                    statements.len().div_ceil(100),
+                    changes
+                );
+                Ok(())
+            }
+            D1Cmd::Export {
+                name,
+                output,
+                force,
+                node,
+                secret,
+            } => {
+                if output.exists() && !force {
+                    anyhow::bail!(
+                        "refusing to overwrite {}; pass --force to replace it",
+                        output.display()
+                    );
+                }
+                let client = PeerClient::new(secret_bytes(&secret)?);
+                let bytes = client.d1_export(&node, &name).await?;
+                if !bytes.starts_with(b"SQLite format 3\0") {
+                    anyhow::bail!("node returned an invalid SQLite 3 snapshot");
+                }
+                std::fs::write(&output, &bytes)
+                    .with_context(|| format!("writing D1 snapshot {}", output.display()))?;
+                println!(
+                    "exported {name} to {} ({} bytes)",
+                    output.display(),
+                    bytes.len()
+                );
                 Ok(())
             }
         },

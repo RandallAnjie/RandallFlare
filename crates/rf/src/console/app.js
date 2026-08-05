@@ -18,6 +18,8 @@ const state = {
   kvCursorStack: [],
   kvNextCursor: null,
   kvEntries: new Map(),
+  d1Active: null,
+  d1Info: null,
   authChallenge: null,
   authTimer: null,
   approvalTimer: null,
@@ -4358,11 +4360,111 @@ async function createDatabase(event) {
   try {
     await api("/api/d1/create", { method: "POST", body: JSON.stringify({ name }) });
     $("#d1-name").value = name;
+    state.d1Active = name;
     $("#d1-create-name").value = "";
     toast(`已创建 D1 数据库 ${name}`);
     await loadOverview({ quiet: true });
+    await loadD1Info();
   } catch (error) {
     toast(error.message, true);
+  }
+}
+
+async function selectDatabase(name) {
+  state.d1Active = name;
+  $("#d1-name").value = name;
+  await loadD1Info();
+  $("#d1-sql").focus();
+}
+
+async function loadD1Info() {
+  const name = state.d1Active || $("#d1-name").value.trim();
+  if (!name) {
+    toast("请先选择 D1 数据库", true);
+    return;
+  }
+  state.d1Active = name;
+  try {
+    const data = await api(`/api/d1/info?${new URLSearchParams({ name })}`);
+    state.d1Info = data;
+    renderD1Info(data);
+  } catch (error) {
+    $("#d1-schema-title").textContent = name;
+    $("#d1-schema").classList.add("empty-state");
+    $("#d1-schema").textContent = error.message;
+    toast(error.message, true);
+  }
+}
+
+function renderD1Info(data) {
+  const summary = data.summary || {};
+  const tables = Array.isArray(data.tables) ? data.tables : [];
+  $("#d1-schema-title").textContent = data.name;
+  $("#d1-schema-count").textContent = `${tables.length} 张表`;
+  $("#d1-summary").textContent = `${Number(summary.row_count || 0).toLocaleString("zh-CN")} 行 · ${formatBytes(summary.size_bytes || 0)} · ${summary.journal_mode || "未知日志模式"} · user_version ${summary.user_version ?? 0}`;
+  const container = $("#d1-schema");
+  container.classList.toggle("empty-state", tables.length === 0);
+  container.innerHTML = tables.length ? tables.map((table, index) => {
+    const columns = Array.isArray(table.columns) ? table.columns : [];
+    const sample = Array.isArray(table.sample) ? table.sample : [];
+    const columnRows = columns.map((column) => `<tr><td>${column.pk ? "🔑 " : ""}${escapeHtml(column.name)}</td><td>${escapeHtml(column.type || "—")}</td><td>${column.not_null ? "NOT NULL" : ""}${column.dflt_value != null ? `${column.not_null ? " · " : ""}DEFAULT ${escapeHtml(column.dflt_value)}` : ""}</td></tr>`).join("");
+    return `<details class="history-item"${index === 0 ? " open" : ""}><summary><strong>${escapeHtml(table.name)}</strong><span>${Number(table.row_count || 0).toLocaleString("zh-CN")} 行 · ${columns.length} 列</span></summary><div class="table-wrap"><table><thead><tr><th>列</th><th>类型</th><th>约束</th></tr></thead><tbody>${columnRows || '<tr><td colspan="3">暂无列信息</td></tr>'}</tbody></table></div><p class="form-note">建表语句</p><pre class="result">${escapeHtml(table.sql || "—")}</pre><p class="form-note">最多 50 行样本</p><pre class="result">${escapeHtml(JSON.stringify(sample, null, 2))}</pre></details>`;
+  }).join("") : "此数据库尚无用户表。可在查询控制台执行 CREATE TABLE，或导入 .sql。";
+  $("#d1-transfer-status").textContent = `当前数据库：${data.name} · 在线 schema 已刷新`;
+}
+
+async function importD1() {
+  const file = $("#d1-import").files?.[0];
+  if (!file) return;
+  const name = state.d1Active || $("#d1-name").value.trim();
+  try {
+    if (!name) throw new Error("请先选择 D1 数据库");
+    if (file.size <= 0 || file.size > 64 * 1024 * 1024) throw new Error("D1 SQL 文件必须在 1 字节至 64 MiB 之间");
+    if (!window.confirm(`把 ${file.name} 导入 ${name}？每 100 条语句作为一个原子批次；已有对象或主键冲突会使当前批次整体回滚。`)) return;
+    $("#d1-transfer-status").textContent = `正在导入 ${file.name}…`;
+    const result = await api("/api/d1/import", {
+      method: "POST",
+      body: JSON.stringify({ name, sql: await file.text() }),
+    });
+    $("#d1-transfer-status").textContent = `已导入 ${result.statements} 条语句 · ${result.batches} 个原子批次 · ${result.duration_ms} ms`;
+    toast(`D1 数据库 ${name} 导入完成`);
+    await loadD1Info();
+  } catch (error) {
+    $("#d1-transfer-status").textContent = error.message;
+    toast(error.message, true);
+  } finally {
+    $("#d1-import").value = "";
+  }
+}
+
+async function exportD1() {
+  const name = state.d1Active || $("#d1-name").value.trim();
+  if (!name) {
+    toast("请先选择 D1 数据库", true);
+    return;
+  }
+  setBusy(true);
+  try {
+    const headers = new Headers();
+    if (consoleMode === "local") headers.set("x-rf-console-token", token);
+    const response = await fetch(`/api/d1/export?${new URLSearchParams({ name })}`, { headers });
+    if (!response.ok) {
+      const payload = await response.json().catch(() => ({}));
+      throw new Error(payload.error || `导出失败（HTTP ${response.status}）`);
+    }
+    const blob = await response.blob();
+    const link = document.createElement("a");
+    link.href = URL.createObjectURL(blob);
+    link.download = `${name}.sqlite`;
+    document.body.appendChild(link);
+    link.click();
+    link.remove();
+    setTimeout(() => URL.revokeObjectURL(link.href), 0);
+    toast(`已从主节点导出 ${name}.sqlite`);
+  } catch (error) {
+    toast(error.message, true);
+  } finally {
+    setBusy(false);
   }
 }
 
@@ -4388,6 +4490,8 @@ async function executeSql(event) {
     $("#d1-result").textContent = JSON.stringify(result, null, 2);
     $("#d1-result-meta").textContent = `${Math.round(performance.now() - started)} ms`;
     toast("SQL 执行成功");
+    state.d1Active = $("#d1-name").value.trim();
+    await loadD1Info();
   } catch (error) {
     $("#d1-result").textContent = error.message;
     $("#d1-result-meta").textContent = "执行失败";
@@ -4598,6 +4702,10 @@ $("#kv-import-picker").addEventListener("click", () => $("#kv-import").click());
 $("#kv-import").addEventListener("change", importKv);
 $("#d1-create-form").addEventListener("submit", createDatabase);
 $("#d1-exec-form").addEventListener("submit", executeSql);
+$("#d1-import-picker").addEventListener("click", () => $("#d1-import").click());
+$("#d1-import").addEventListener("change", importD1);
+$("#d1-export").addEventListener("click", exportD1);
+$("#d1-refresh").addEventListener("click", loadD1Info);
 $("#r2-bucket-form").addEventListener("submit", saveR2Bucket);
 $("#r2-bucket-name").addEventListener("input", updateR2DefaultDomainPreview);
 $("#r2-storage-backend").addEventListener("change", toggleR2StorageFields);
@@ -4713,8 +4821,7 @@ $("#kv-keys").addEventListener("click", (event) => {
 $("#database-list").addEventListener("click", (event) => {
   const button = event.target.closest("button[data-database]");
   if (!button) return;
-  $("#d1-name").value = button.dataset.database;
-  $("#d1-sql").focus();
+  selectDatabase(button.dataset.database);
 });
 $("#r2-bucket-list").addEventListener("click", (event) => {
   const button = event.target.closest("button[data-r2-bucket]");

@@ -68,7 +68,7 @@ surface yet.
 | Capability | State | Remaining acceptance work |
 | --- | --- | --- |
 | KV get/put/delete/list/TTL | done | metadata and bulk get are workerd-tested; the Chinese console supports binary values, TTL/metadata editing, cursor pagination, and bounded binary-safe JSON import/export |
-| D1 replicated SQL | partial | Worker prepare/bind/all/first/run/raw/exec/batch/withSession done; schema console, import/export, atomic batch and metrics remain |
+| D1 replicated SQL | partial | Worker prepare/bind/all/first/run/raw/exec/batch/withSession, Raft-atomic mixed read/write batch, Chinese schema/data/metrics browser, bounded SQL import and leader-consistent portable SQLite export are implemented; point-in-time scheduled backups and multi-VPS fault soak remain |
 | Durable Objects | partial | full CF API audit, alarm retry controls, websocket failover soak |
 | R2 objects | partial | native binding + get/head/put/delete/list, metadata, ranges, conditions and delimiter cursors done; streaming multi-GiB IO remains |
 | R2 multipart | partial | create/upload/complete/abort and ETags done; administrative upload listing remains |

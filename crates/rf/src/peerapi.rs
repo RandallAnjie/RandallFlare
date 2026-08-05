@@ -115,6 +115,7 @@ pub fn router(api: Api) -> Router {
         .route("/v1/quorum/{db}", post(quorum_msg))
         .route("/v1/d1/create", post(d1_create))
         .route("/v1/d1/{db}/exec", post(d1_exec))
+        .route("/v1/d1/{db}/export", get(d1_export))
         .route("/v1/queue/{queue}/messages", post(queue_send))
         .route("/v1/queue/{queue}/stats", get(queue_stats))
         .route("/v1/queue/{queue}/dead", get(queue_dead_letters))
@@ -1305,9 +1306,12 @@ async fn do_proxy(
 
 #[derive(serde::Deserialize)]
 struct D1ExecReq {
+    #[serde(default)]
     sql: String,
     #[serde(default)]
     params: Vec<serde_json::Value>,
+    #[serde(default)]
+    statements: Vec<crate::d1::Statement>,
 }
 
 async fn d1_exec(
@@ -1347,15 +1351,25 @@ async fn d1_exec(
         return (StatusCode::NOT_FOUND, "no such database").into_response();
     };
     let (resp_tx, resp_rx) = tokio::sync::oneshot::channel();
-    if tx
-        .send(crate::d1::DriverCmd::Exec {
+    let command = if req.statements.is_empty() {
+        crate::d1::DriverCmd::Exec {
             sql: req.sql,
             params: req.params,
             resp: resp_tx,
-        })
-        .await
-        .is_err()
-    {
+        }
+    } else if req.sql.is_empty() && req.params.is_empty() {
+        crate::d1::DriverCmd::Batch {
+            statements: req.statements,
+            resp: resp_tx,
+        }
+    } else {
+        return (
+            StatusCode::BAD_REQUEST,
+            "send either one SQL statement or an atomic batch",
+        )
+            .into_response();
+    };
+    if tx.send(command).await.is_err() {
         return (StatusCode::SERVICE_UNAVAILABLE, "driver gone").into_response();
     }
     match tokio::time::timeout(std::time::Duration::from_secs(15), resp_rx).await {
@@ -1372,6 +1386,7 @@ async fn d1_exec(
                 axum::Json(serde_json::json!({
                     "rows": result.rows,
                     "rows_affected": result.rows_affected,
+                    "batch": result.batch,
                 }))
                 .into_response()
             }
@@ -1380,6 +1395,72 @@ async fn d1_exec(
         Ok(Err(_)) => (StatusCode::SERVICE_UNAVAILABLE, "driver dropped").into_response(),
         Err(_) => (StatusCode::GATEWAY_TIMEOUT, "commit timed out").into_response(),
     }
+}
+
+async fn d1_export(
+    State(api): State<Api>,
+    ConnectInfo(remote): ConnectInfo<SocketAddr>,
+    Path(db): Path<String>,
+    method: Method,
+    uri: Uri,
+    headers: HeaderMap,
+) -> Response {
+    if let Err(response) = check(&api, &remote, &headers, &method, &uri, b"") {
+        return response.into_response();
+    }
+    let tx = api.d1.lock().unwrap().get(&db).cloned();
+    let Some(tx) = tx else {
+        return d1_group_hint_response(&api, &db);
+    };
+    let (response_tx, response_rx) = tokio::sync::oneshot::channel();
+    if tx
+        .send(crate::d1::DriverCmd::Snapshot { resp: response_tx })
+        .await
+        .is_err()
+    {
+        return (StatusCode::SERVICE_UNAVAILABLE, "driver gone").into_response();
+    }
+    match tokio::time::timeout(std::time::Duration::from_secs(120), response_rx).await {
+        Ok(Ok(Ok(result))) => match result.data {
+            Some(data) => (
+                [(axum::http::header::CONTENT_TYPE, "application/vnd.sqlite3")],
+                data,
+            )
+                .into_response(),
+            None => (
+                StatusCode::MISDIRECTED_REQUEST,
+                axum::Json(serde_json::json!({ "leader_hint": result.leader_hint })),
+            )
+                .into_response(),
+        },
+        Ok(Ok(Err(error))) => (StatusCode::UNPROCESSABLE_ENTITY, error.to_string()).into_response(),
+        Ok(Err(_)) => (StatusCode::SERVICE_UNAVAILABLE, "driver dropped").into_response(),
+        Err(_) => (StatusCode::GATEWAY_TIMEOUT, "snapshot timed out").into_response(),
+    }
+}
+
+fn d1_group_hint_response(api: &Api, db: &str) -> Response {
+    if let Some(raw) = api.node.kv_get(crate::acme::NS, &crate::d1::kv_key(db)) {
+        if let Ok(meta) = serde_json::from_slice::<crate::d1::DbMeta>(&raw) {
+            let peers = api.node.peers();
+            let hint = meta.group.iter().find_map(|member| {
+                if member == &api.node.id() {
+                    Some(api.node.cfg.peer_api_advertise().to_string())
+                } else {
+                    peers
+                        .get(&member.to_string())
+                        .and_then(|peer| peer.api_addr)
+                        .map(|address| address.to_string())
+                }
+            });
+            return (
+                StatusCode::MISDIRECTED_REQUEST,
+                axum::Json(serde_json::json!({ "leader_hint": hint })),
+            )
+                .into_response();
+        }
+    }
+    (StatusCode::NOT_FOUND, "no such database").into_response()
 }
 
 #[derive(serde::Deserialize)]

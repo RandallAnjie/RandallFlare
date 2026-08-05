@@ -1023,6 +1023,15 @@ Content-Type: text/plain; charset=utf-8
               <div class="divider"></div>
               <h3>已知数据库</h3>
               <div id="database-list" class="database-list empty-state">暂无数据库。</div>
+              <div class="divider"></div>
+              <h3>迁移与快照</h3>
+              <div class="button-row">
+                <button id="d1-import-picker" class="secondary compact" type="button">导入 .sql</button>
+                <button id="d1-export" class="secondary compact" type="button">导出 .sqlite</button>
+                <button id="d1-refresh" class="secondary compact" type="button">刷新概览</button>
+                <input id="d1-import" type="file" accept=".sql,.txt,application/sql,text/plain" hidden>
+              </div>
+              <p id="d1-transfer-status" class="form-note">先从上方选择数据库。SQL 导入按每 100 条组成原子批次；SQLite 快照由当前主节点在线备份。</p>
             </article>
             <article class="panel sql-panel">
               <div class="panel-head"><div><p class="eyebrow">查询控制台</p><h2>执行 SQL</h2></div><span class="badge">自动路由至主节点</span></div>
@@ -1039,6 +1048,10 @@ Content-Type: text/plain; charset=utf-8
               <pre id="d1-result" class="result">执行一条语句后，结果会显示在这里。</pre>
             </article>
           </div>
+          <article class="panel">
+            <div class="panel-head"><div><p class="eyebrow">Schema 与数据概览</p><h2 id="d1-schema-title">请选择数据库</h2><p id="d1-summary" class="muted">表、行数、列约束、样本和文件页统计都会从当前 D1 主节点读取。</p></div><span id="d1-schema-count" class="badge">0 张表</span></div>
+            <div id="d1-schema" class="build-list empty-state">选择数据库后即可浏览 schema。</div>
+          </article>
         </section>
 
         <section id="view-binaries" class="view" aria-labelledby="section-title">

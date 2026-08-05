@@ -125,13 +125,24 @@ async fn execute_inner(
             if request.statements.is_empty() || request.statements.len() > 100 {
                 bail!("D1 batch 必须包含 1 至 100 条语句");
             }
-            let mut results = Vec::with_capacity(request.statements.len());
-            for statement in request.statements {
-                results.push(
-                    execute_statement(&client, &base, database, &statement.sql, statement.params)
-                        .await?,
-                );
-            }
+            let started = Instant::now();
+            let count = request.statements.len();
+            let statements = request
+                .statements
+                .into_iter()
+                .map(|statement| crate::d1::Statement {
+                    sql: statement.sql,
+                    params: statement.params,
+                })
+                .collect::<Vec<_>>();
+            let output = client.d1_batch(&base, database, &statements).await?;
+            let duration = started.elapsed().as_secs_f64() * 1000.0 / count as f64;
+            let results = output["batch"]
+                .as_array()
+                .context("D1 batch response is missing results")?
+                .iter()
+                .map(|result| d1_result_value(result, duration))
+                .collect::<Vec<_>>();
             Ok(Value::Array(results))
         }
         _ => bail!("D1 binding mode 无效"),
@@ -152,13 +163,20 @@ async fn execute_statement(
     let result = client
         .d1_exec(base, database, sql, Value::Array(params))
         .await?;
+    Ok(d1_result_value(
+        &result,
+        started.elapsed().as_secs_f64() * 1000.0,
+    ))
+}
+
+fn d1_result_value(result: &Value, duration_ms: f64) -> Value {
     let rows = result["rows"].as_array().cloned().unwrap_or_default();
     let changes = result["rows_affected"].as_u64().unwrap_or(0);
-    Ok(json!({
+    json!({
         "success": true,
         "results": rows,
         "meta": {
-            "duration": started.elapsed().as_secs_f64() * 1000.0,
+            "duration": duration_ms,
             "changes": changes,
             "rows_read": rows.len(),
             "rows_written": changes,
@@ -166,10 +184,10 @@ async fn execute_statement(
             "changed_db": changes > 0,
             "size_after": 0,
         }
-    }))
+    })
 }
 
-fn split_sql_script(script: &str) -> Result<Vec<String>> {
+pub fn split_sql_script(script: &str) -> Result<Vec<String>> {
     let mut statements = Vec::new();
     let mut current = String::new();
     for character in script.chars() {
@@ -185,6 +203,30 @@ fn split_sql_script(script: &str) -> Result<Vec<String>> {
         bail!("D1 SQL 脚本为空");
     }
     Ok(statements)
+}
+
+pub fn import_statements(script: &str) -> Result<Vec<crate::d1::Statement>> {
+    Ok(split_sql_script(script)?
+        .into_iter()
+        .filter(|sql| !transaction_control(sql))
+        .map(|sql| crate::d1::Statement {
+            sql,
+            params: vec![],
+        })
+        .collect())
+}
+
+pub fn transaction_control(sql: &str) -> bool {
+    let normalized = sql.trim().trim_end_matches(';').trim().to_ascii_uppercase();
+    normalized == "BEGIN"
+        || normalized == "BEGIN TRANSACTION"
+        || normalized == "BEGIN DEFERRED"
+        || normalized == "BEGIN IMMEDIATE"
+        || normalized == "BEGIN EXCLUSIVE"
+        || normalized == "COMMIT"
+        || normalized == "END"
+        || normalized == "END TRANSACTION"
+        || normalized == "ROLLBACK"
 }
 
 fn sqlite_statement_complete(sql: &str) -> Result<bool> {
@@ -205,5 +247,11 @@ mod tests {
             vec!["INSERT INTO t VALUES ('a;b');", " UPDATE t SET v='c';"]
         );
         assert_eq!(split_sql_script("SELECT 1").unwrap(), vec!["SELECT 1"]);
+        let imported = import_statements(
+            "BEGIN TRANSACTION; CREATE TABLE t (id INTEGER); INSERT INTO t VALUES (1); COMMIT;",
+        )
+        .unwrap();
+        assert_eq!(imported.len(), 2);
+        assert!(imported[0].sql.contains("CREATE TABLE"));
     }
 }

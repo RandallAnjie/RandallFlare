@@ -46,6 +46,8 @@ const MAX_EDITOR_READ: usize = 5 * 1024 * 1024;
 const MAX_KV_VALUE: usize = 25 * 1024 * 1024;
 const MAX_KV_TRANSFER: usize = 64 * 1024 * 1024;
 const MAX_KV_TRANSFER_ENTRIES: usize = 10_000;
+const MAX_D1_IMPORT: usize = 64 * 1024 * 1024;
+const MAX_D1_IMPORT_STATEMENTS: usize = 10_000;
 
 #[derive(Clone)]
 enum ConsoleMode {
@@ -255,6 +257,7 @@ pub fn router(state: ConsoleState) -> Router {
         .route("/api/v1/d1", get(public_api_d1_list))
         .route("/api/v1/d1/{database}/query", post(public_api_d1_query))
         .route("/api/v1/d1/{database}/exec", post(public_api_d1_exec))
+        .route("/api/v1/d1/{database}/batch", post(public_api_d1_batch))
         .route("/api/v1/queues", get(public_api_queues))
         .route(
             "/api/v1/queues/{queue}",
@@ -401,6 +404,10 @@ pub fn router(state: ConsoleState) -> Router {
         .route("/api/kv/import", post(kv_import))
         .route("/api/d1/create", post(d1_create))
         .route("/api/d1/exec", post(d1_exec))
+        .route("/api/d1/batch", post(d1_batch))
+        .route("/api/d1/info", get(d1_info))
+        .route("/api/d1/import", post(d1_import))
+        .route("/api/d1/export", get(d1_export))
         .route("/api/r2/buckets", get(r2_bucket_list).post(r2_bucket_apply))
         .route("/api/storage", get(storage_get).post(storage_apply))
         .route("/api/storage/probe", post(storage_probe))
@@ -1471,6 +1478,12 @@ struct PublicD1Request {
     params: Value,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PublicD1BatchRequest {
+    statements: Vec<crate::d1::Statement>,
+}
+
 fn empty_json_array() -> Value {
     json!([])
 }
@@ -1508,6 +1521,40 @@ async fn public_api_d1_exec(
         .d1_exec(&state.node, &database, &request.sql, request.params)
         .await?;
     Ok(Json(result))
+}
+
+async fn public_api_d1_batch(
+    State(state): State<ConsoleState>,
+    Extension(principal): Extension<crate::access::AccessPrincipal>,
+    Path(database): Path<String>,
+    Json(request): Json<PublicD1BatchRequest>,
+) -> ApiResult<Json<Value>> {
+    require_api_scope(&principal, "d1:write")?;
+    validate_d1_batch(&database, &request.statements)?;
+    let result = state
+        .client
+        .d1_batch(&state.node, &database, &request.statements)
+        .await?;
+    Ok(Json(result))
+}
+
+fn validate_d1_batch(database: &str, statements: &[crate::d1::Statement]) -> ApiResult<()> {
+    if !valid_name(database) {
+        return Err(ApiError::bad_request("数据库名称无效"));
+    }
+    if statements.is_empty() || statements.len() > 100 {
+        return Err(ApiError::bad_request(
+            "D1 原子批处理必须包含 1 至 100 条语句",
+        ));
+    }
+    for statement in statements {
+        let request = PublicD1Request {
+            sql: statement.sql.clone(),
+            params: Value::Array(statement.params.clone()),
+        };
+        validate_public_d1_request(database, &request)?;
+    }
+    Ok(())
 }
 
 fn validate_public_d1_request(database: &str, request: &PublicD1Request) -> ApiResult<()> {
@@ -5769,6 +5816,25 @@ struct D1ExecRequest {
     params: Value,
 }
 
+#[derive(Deserialize)]
+struct D1InfoQuery {
+    name: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct D1BatchRequest {
+    name: String,
+    statements: Vec<crate::d1::Statement>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct D1ImportRequest {
+    name: String,
+    sql: String,
+}
+
 fn empty_array() -> Value {
     json!([])
 }
@@ -5815,6 +5881,235 @@ async fn d1_exec(
         .d1_exec(&state.node, &request.name, &request.sql, request.params)
         .await?;
     Ok(Json(result))
+}
+
+async fn d1_batch(
+    State(state): State<ConsoleState>,
+    Json(request): Json<D1BatchRequest>,
+) -> ApiResult<Json<Value>> {
+    state.require_mutation()?;
+    validate_d1_batch(&request.name, &request.statements)?;
+    let result = state
+        .client
+        .d1_batch(&state.node, &request.name, &request.statements)
+        .await?;
+    Ok(Json(result))
+}
+
+async fn d1_info(
+    State(state): State<ConsoleState>,
+    Query(query): Query<D1InfoQuery>,
+) -> ApiResult<Json<Value>> {
+    if !valid_name(&query.name) {
+        return Err(ApiError::bad_request("数据库名称无效"));
+    }
+    let tables_result = state
+        .client
+        .d1_exec(
+            &state.node,
+            &query.name,
+            "SELECT name, sql FROM sqlite_schema WHERE type = 'table' AND name NOT LIKE 'sqlite_%' AND name != '_rf_applied' ORDER BY name COLLATE NOCASE LIMIT 201",
+            json!([]),
+        )
+        .await?;
+    let table_rows = tables_result["rows"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    if table_rows.len() > 200 {
+        return Err(ApiError::bad_request("D1 schema 浏览最多显示 200 张表"));
+    }
+    let mut statements = Vec::with_capacity(table_rows.len() * 3);
+    let mut names = Vec::with_capacity(table_rows.len());
+    for row in &table_rows {
+        let name = row
+            .get("name")
+            .and_then(Value::as_str)
+            .ok_or_else(|| ApiError::upstream("D1 schema 返回了无效表名"))?
+            .to_string();
+        if name.len() > 1000 || name.as_bytes().contains(&0) {
+            return Err(ApiError::upstream("D1 schema 包含无效表名"));
+        }
+        let quoted = quote_sql_identifier(&name);
+        names.push(name);
+        statements.push(crate::d1::Statement {
+            sql: "SELECT cid, name, type, \"notnull\" AS not_null, dflt_value, pk FROM pragma_table_info(?1) ORDER BY cid".into(),
+            params: vec![names.last().cloned().unwrap_or_default().into()],
+        });
+        statements.push(crate::d1::Statement {
+            sql: format!("SELECT COUNT(*) AS count FROM {quoted}"),
+            params: vec![],
+        });
+        statements.push(crate::d1::Statement {
+            sql: format!("SELECT * FROM {quoted} LIMIT 50"),
+            params: vec![],
+        });
+    }
+    let mut details = Vec::with_capacity(names.len());
+    let mut cursor = 0usize;
+    let mut flat_results = Vec::with_capacity(statements.len());
+    for chunk in statements.chunks(99) {
+        let output = state
+            .client
+            .d1_batch(&state.node, &query.name, chunk)
+            .await?;
+        let results = output["batch"]
+            .as_array()
+            .ok_or_else(|| ApiError::upstream("D1 schema 批处理缺少结果"))?;
+        flat_results.extend(results.iter().cloned());
+    }
+    let mut total_rows = 0u64;
+    for (index, name) in names.into_iter().enumerate() {
+        let columns = flat_results
+            .get(cursor)
+            .and_then(|result| result["rows"].as_array())
+            .cloned()
+            .unwrap_or_default();
+        let count = flat_results
+            .get(cursor + 1)
+            .and_then(|result| result["rows"].as_array())
+            .and_then(|rows| rows.first())
+            .and_then(|row| row.get("count"))
+            .and_then(Value::as_u64)
+            .unwrap_or(0);
+        let sample = flat_results
+            .get(cursor + 2)
+            .and_then(|result| result["rows"].as_array())
+            .cloned()
+            .unwrap_or_default();
+        cursor += 3;
+        total_rows = total_rows.saturating_add(count);
+        details.push(json!({
+            "name": name,
+            "sql": table_rows.get(index).and_then(|row| row.get("sql")).cloned(),
+            "columns": columns,
+            "row_count": count,
+            "sample": sample,
+        }));
+    }
+    let metric_statements = [
+        "PRAGMA page_count",
+        "PRAGMA page_size",
+        "PRAGMA freelist_count",
+        "PRAGMA journal_mode",
+        "PRAGMA user_version",
+    ]
+    .into_iter()
+    .map(|sql| crate::d1::Statement {
+        sql: sql.into(),
+        params: vec![],
+    })
+    .collect::<Vec<_>>();
+    let metric_output = state
+        .client
+        .d1_batch(&state.node, &query.name, &metric_statements)
+        .await?;
+    let metrics = metric_output["batch"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    let metric = |index: usize, field: &str| {
+        metrics
+            .get(index)
+            .and_then(|result| result["rows"].as_array())
+            .and_then(|rows| rows.first())
+            .and_then(|row| row.get(field))
+            .cloned()
+            .unwrap_or(Value::Null)
+    };
+    let page_count = metric(0, "page_count").as_u64().unwrap_or(0);
+    let page_size = metric(1, "page_size").as_u64().unwrap_or(0);
+    let table_count = details.len();
+    Ok(Json(json!({
+        "name": query.name,
+        "tables": details,
+        "summary": {
+            "table_count": table_count,
+            "row_count": total_rows,
+            "page_count": page_count,
+            "page_size": page_size,
+            "size_bytes": page_count.saturating_mul(page_size),
+            "freelist_count": metric(2, "freelist_count"),
+            "journal_mode": metric(3, "journal_mode"),
+            "user_version": metric(4, "user_version"),
+        }
+    })))
+}
+
+fn quote_sql_identifier(name: &str) -> String {
+    format!("\"{}\"", name.replace('"', "\"\""))
+}
+
+async fn d1_import(
+    State(state): State<ConsoleState>,
+    Json(request): Json<D1ImportRequest>,
+) -> ApiResult<Json<Value>> {
+    state.require_mutation()?;
+    if !valid_name(&request.name) {
+        return Err(ApiError::bad_request("数据库名称无效"));
+    }
+    if request.sql.trim().is_empty() || request.sql.len() > MAX_D1_IMPORT {
+        return Err(ApiError::bad_request(
+            "D1 SQL 导入必须介于 1 字节和 64 MiB 之间",
+        ));
+    }
+    let mut statements = crate::d1bind::import_statements(&request.sql)
+        .map_err(|error| ApiError::bad_request(format!("无法解析 D1 SQL：{error}")))?;
+    if statements.is_empty() || statements.len() > MAX_D1_IMPORT_STATEMENTS {
+        return Err(ApiError::bad_request(
+            "D1 导入必须包含 1 至 10,000 条非事务控制语句",
+        ));
+    }
+    for statement in &statements {
+        if statement.sql.len() > MAX_CONSOLE_VALUE {
+            return Err(ApiError::bad_request("D1 导入的单条 SQL 最大为 1 MiB"));
+        }
+    }
+    let started = Instant::now();
+    let mut changes = 0u64;
+    let batch_count = statements.len().div_ceil(100);
+    for chunk in statements.chunks_mut(100) {
+        let output = state
+            .client
+            .d1_batch(&state.node, &request.name, chunk)
+            .await?;
+        changes = changes.saturating_add(output["rows_affected"].as_u64().unwrap_or(0));
+    }
+    Ok(Json(json!({
+        "ok": true,
+        "name": request.name,
+        "statements": statements.len(),
+        "batches": batch_count,
+        "changes": changes,
+        "duration_ms": started.elapsed().as_millis(),
+    })))
+}
+
+async fn d1_export(
+    State(state): State<ConsoleState>,
+    Query(query): Query<D1InfoQuery>,
+) -> ApiResult<Response> {
+    if !valid_name(&query.name) {
+        return Err(ApiError::bad_request("数据库名称无效"));
+    }
+    let bytes = state.client.d1_export(&state.node, &query.name).await?;
+    if !bytes.starts_with(b"SQLite format 3\0") {
+        return Err(ApiError::upstream("D1 主节点返回的快照不是 SQLite 3 文件"));
+    }
+    let mut response = bytes.into_response();
+    response.headers_mut().insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("application/vnd.sqlite3"),
+    );
+    response.headers_mut().insert(
+        header::CONTENT_DISPOSITION,
+        HeaderValue::from_str(&format!("attachment; filename=\"{}.sqlite\"", query.name))
+            .map_err(|_| ApiError::upstream("D1 导出文件名无效"))?,
+    );
+    response
+        .headers_mut()
+        .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    Ok(response)
 }
 
 #[derive(Deserialize)]
@@ -8587,6 +8882,28 @@ mod tests {
         ] {
             assert!(!public_sql_is_read_only(sql), "expected rejected: {sql}");
         }
+    }
+
+    #[test]
+    fn d1_import_strips_only_transaction_wrappers_and_quotes_schema_names() {
+        for sql in [
+            "BEGIN;",
+            "BEGIN TRANSACTION;",
+            "BEGIN IMMEDIATE;",
+            "COMMIT;",
+            "END TRANSACTION;",
+            "ROLLBACK;",
+        ] {
+            assert!(crate::d1bind::transaction_control(sql), "{sql}");
+        }
+        for sql in [
+            "CREATE TABLE begin (id INTEGER);",
+            "ROLLBACK TO savepoint_name;",
+            "SELECT 'COMMIT';",
+        ] {
+            assert!(!crate::d1bind::transaction_control(sql), "{sql}");
+        }
+        assert_eq!(quote_sql_identifier("odd\"table"), "\"odd\"\"table\"");
     }
 
     #[test]

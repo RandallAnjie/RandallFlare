@@ -168,13 +168,15 @@ one node wins, orders via DNS-01 (Cloudflare TXT), and the issued cert
 replicates cluster-wide through KV (verified end-to-end against
 Let's Encrypt's pebble test server).
 
-**D1 (v0.3 phase 1)**: replicated SQLite over per-database
+**D1**: replicated SQLite over per-database
 micro-quorums. Each database gets a rendezvous-hashed 3-node Raft
 group — consensus is sharded per object, no node is special. Writes
 commit through a majority; killing the leader loses nothing
 (e2e-verified). `rf d1 create mydb`, `rf d1 exec mydb "INSERT …"
 --params '[…]'` against any node — requests chase the leader
-automatically.
+automatically. Mixed read/write batches are one replicated SQLite transaction;
+the Chinese console browses schema/rows/metrics, imports bounded SQL files and
+downloads a portable online-backup snapshot from the current leader.
 
 Worker manifests can bind a database with `"d1": {"DB":"mydb"}`.
 The runtime exposes the familiar `env.DB.prepare(...).bind(...).all()/first()/run()/raw()`,
@@ -441,6 +443,8 @@ rf status
 rf kv put ns1 greeting hello
 rf kv list ns1 --prefix greet
 rf kv delete ns1 greeting
+rf d1 import mydb ./dump.sql
+rf d1 export mydb --output ./mydb.sqlite
 rf cron list site
 rf cron fire site --expression '*/5 * * * *'
 rf cron list site --dlq
@@ -474,6 +478,8 @@ Use HTTPS for the public console; the UI disables Secret writes on public HTTP.
 See [Worker bindings and encrypted Secrets](./docs/WORKERS.md).
 KV consistency, metadata, paging and migration are documented in
 [去中心化 KV](./docs/KV.md).
+D1 quorum consistency, atomic batches, schema inspection, SQL import and
+portable SQLite snapshots are documented in [去中心化 D1](./docs/D1.md).
 
 Binary Deliver definitions are signed and hash chained while their bytes are
 content addressed on local replicas or an operator-selected rclone remote.

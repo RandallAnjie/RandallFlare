@@ -66,7 +66,7 @@ flow.
 | Workers | `GET /api/v1/workers`, `GET/POST /api/v1/workers/{name}` |
 | Signed resources | `GET/POST /api/v1/resources`, `GET /api/v1/resources/{kind}/{name}` |
 | KV | `GET /api/v1/kv/{namespace}`, `GET/PUT/DELETE /api/v1/kv/{namespace}/{key}` |
-| D1 | `GET /api/v1/d1`, `POST /api/v1/d1/{database}/query`, `POST /api/v1/d1/{database}/exec` |
+| D1 | `GET /api/v1/d1`, `POST /api/v1/d1/{database}/query`, `POST /api/v1/d1/{database}/exec`, `POST /api/v1/d1/{database}/batch` |
 | R2 | `GET /api/v1/r2`, `GET /api/v1/r2/{bucket}`, `GET/PUT/DELETE /api/v1/r2/{bucket}/{key}` |
 | Queues and Analytics | `/api/v1/queues/…`, `/api/v1/analytics/…` |
 | Pipelines | `/api/v1/pipelines/…` including ingest, status, batches, and flush |
@@ -85,6 +85,11 @@ KV list responses include `entries`, `list_complete` and `cursor`; the legacy
 bounded by the node. Browser-admin JSON import/export is documented in
 [去中心化 KV](./KV.md) and is not exposed to bearer tokens as an unbounded
 bulk bypass.
+
+D1 batch accepts 1–100 statements and requires `d1:write`; the entire batch
+is one replicated SQLite transaction. Schema browsing, SQL-file import, and
+SQLite snapshot download stay behind the interactive administrator session.
+See [去中心化 D1](./D1.md).
 
 ## S3-compatible R2 credentials
 
