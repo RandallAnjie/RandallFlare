@@ -11,10 +11,69 @@ use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
 use std::process::Stdio;
 use std::time::Duration;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 use tokio::process::Command;
+
+pub type ObjectByteStream = Pin<
+    Box<
+        dyn futures_util::Stream<Item = std::result::Result<axum::body::Bytes, std::io::Error>>
+            + Send,
+    >,
+>;
+
+pub struct VerifiedObjectFile {
+    path: PathBuf,
+    remove_on_drop: bool,
+    size: u64,
+}
+
+impl VerifiedObjectFile {
+    pub fn size(&self) -> u64 {
+        self.size
+    }
+
+    pub async fn stream(self, offset: u64, length: u64) -> Result<ObjectByteStream> {
+        if offset > self.size || length > self.size.saturating_sub(offset) {
+            bail!("对象流范围超出文件边界");
+        }
+        let mut file = tokio::fs::File::open(&self.path).await?;
+        file.seek(std::io::SeekFrom::Start(offset)).await?;
+        let stream = futures_util::stream::try_unfold(
+            (file, length, self),
+            |(mut file, remaining, guard)| async move {
+                if remaining == 0 {
+                    return Ok(None);
+                }
+                let capacity = remaining.min(1024 * 1024) as usize;
+                let mut buffer = vec![0u8; capacity];
+                let read = file.read(&mut buffer).await?;
+                if read == 0 {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::UnexpectedEof,
+                        "verified object file was truncated while streaming",
+                    ));
+                }
+                buffer.truncate(read);
+                Ok(Some((
+                    axum::body::Bytes::from(buffer),
+                    (file, remaining - read as u64, guard),
+                )))
+            },
+        );
+        Ok(Box::pin(stream))
+    }
+}
+
+impl Drop for VerifiedObjectFile {
+    fn drop(&mut self) {
+        if self.remove_on_drop {
+            let _ = std::fs::remove_file(&self.path);
+        }
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
@@ -272,6 +331,70 @@ impl ObjectStore {
         Ok(bytes)
     }
 
+    /// Materialize a fully verified file suitable for bounded-memory HTTP
+    /// streaming. Remote data is spooled and authenticated before callers can
+    /// construct a response, preserving fail-closed content integrity.
+    pub async fn materialize_verified(
+        &self,
+        location: &StorageLocation,
+        sha: &[u8; 32],
+    ) -> Result<VerifiedObjectFile> {
+        location.validate()?;
+        match location {
+            StorageLocation::Local => {
+                let path = self.local_path(sha);
+                let (actual, size) = hash_file(&path)
+                    .await
+                    .with_context(|| format!("object {} not on local disk", hex::encode(sha)))?;
+                if actual != *sha {
+                    bail!(
+                        "对象内容摘要校验失败：期望 {}，实际 {}",
+                        hex::encode(sha),
+                        hex::encode(actual)
+                    );
+                }
+                Ok(VerifiedObjectFile {
+                    path,
+                    remove_on_drop: false,
+                    size,
+                })
+            }
+            StorageLocation::Rclone { remote, prefix } => {
+                self.materialize_rclone(rclone_target(remote, prefix, sha), sha)
+                    .await
+            }
+            StorageLocation::RcloneShard { remote, prefix } => {
+                self.materialize_rclone(rclone_shard_target(remote, prefix, sha), sha)
+                    .await
+            }
+        }
+    }
+
+    pub async fn materialize_bytes_verified(
+        &self,
+        expected: &[u8; 32],
+        bytes: &[u8],
+    ) -> Result<VerifiedObjectFile> {
+        let actual: [u8; 32] = Sha256::digest(bytes).into();
+        if actual != *expected {
+            bail!("对象内容摘要校验失败");
+        }
+        let spool_dir = self.local_root.join(".read-spool");
+        tokio::fs::create_dir_all(&spool_dir).await?;
+        let path = spool_dir.join(format!(
+            "{}-{}-{}.tmp",
+            hex::encode(expected),
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        tokio::fs::write(&path, bytes).await?;
+        Ok(VerifiedObjectFile {
+            path,
+            remove_on_drop: true,
+            size: bytes.len() as u64,
+        })
+    }
+
     pub async fn exists(&self, location: &StorageLocation, sha: &[u8; 32]) -> Result<bool> {
         location.validate()?;
         match location {
@@ -420,6 +543,80 @@ impl ObjectStore {
         command_ok("rclone rcat", output)
     }
 
+    async fn materialize_rclone(
+        &self,
+        target: String,
+        expected: &[u8; 32],
+    ) -> Result<VerifiedObjectFile> {
+        let runtime = self.rclone()?;
+        let spool_dir = self.local_root.join(".read-spool");
+        tokio::fs::create_dir_all(&spool_dir).await?;
+        let path = spool_dir.join(format!(
+            "{}-{}-{}.tmp",
+            hex::encode(expected),
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        let transfer = async {
+            let mut child = runtime
+                .command("cat")
+                .arg(&target)
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .context("启动 rclone 流式读取")?;
+            let mut stdout = child.stdout.take().context("打开 rclone 标准输出")?;
+            let mut file = tokio::fs::OpenOptions::new()
+                .create_new(true)
+                .write(true)
+                .open(&path)
+                .await?;
+            let mut hasher = Sha256::new();
+            let mut size = 0u64;
+            let mut buffer = vec![0u8; 1024 * 1024];
+            loop {
+                let read = stdout.read(&mut buffer).await?;
+                if read == 0 {
+                    break;
+                }
+                hasher.update(&buffer[..read]);
+                file.write_all(&buffer[..read]).await?;
+                size = size.checked_add(read as u64).context("rclone 对象过大")?;
+            }
+            file.flush().await?;
+            file.sync_data().await?;
+            drop(file);
+            let output = child.wait_with_output().await?;
+            command_ok("rclone cat", output)?;
+            Ok::<_, anyhow::Error>((hasher.finalize().into(), size))
+        };
+        let result = tokio::time::timeout(runtime.timeout, transfer).await;
+        let (actual, size): ([u8; 32], u64) = match result {
+            Ok(Ok(result)) => result,
+            Ok(Err(error)) => {
+                let _ = tokio::fs::remove_file(&path).await;
+                return Err(error);
+            }
+            Err(_) => {
+                let _ = tokio::fs::remove_file(&path).await;
+                bail!("rclone 流式读取超时");
+            }
+        };
+        if actual != *expected {
+            let _ = tokio::fs::remove_file(&path).await;
+            bail!(
+                "对象内容摘要校验失败：期望 {}，实际 {}",
+                hex::encode(expected),
+                hex::encode(actual)
+            );
+        }
+        Ok(VerifiedObjectFile {
+            path,
+            remove_on_drop: true,
+            size,
+        })
+    }
+
     fn put_local(&self, sha: &[u8; 32], bytes: &[u8]) -> Result<()> {
         let path = self.local_path(sha);
         if path.exists() {
@@ -446,6 +643,22 @@ impl ObjectStore {
             .as_ref()
             .context("当前节点未配置 rclone，不能访问该存储后端")
     }
+}
+
+async fn hash_file(path: &Path) -> Result<([u8; 32], u64)> {
+    let mut file = tokio::fs::File::open(path).await?;
+    let mut hasher = Sha256::new();
+    let mut size = 0u64;
+    let mut buffer = vec![0u8; 1024 * 1024];
+    loop {
+        let read = file.read(&mut buffer).await?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+        size = size.checked_add(read as u64).context("对象文件大小溢出")?;
+    }
+    Ok((hasher.finalize().into(), size))
 }
 
 impl RcloneRuntime {
@@ -558,6 +771,7 @@ fn command_error(label: &str, stderr: &[u8]) -> anyhow::Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use futures_util::TryStreamExt;
 
     fn store() -> (ObjectStore, PathBuf) {
         let root = std::env::temp_dir().join(format!(
@@ -611,6 +825,22 @@ mod tests {
             .put_file_verified(&StorageLocation::Local, &[0; 32], &source)
             .await
             .is_err());
+        let verified = store
+            .materialize_verified(&StorageLocation::Local, &streamed_sha)
+            .await
+            .unwrap();
+        assert!(!verified.remove_on_drop);
+        let chunks = verified
+            .stream(1024, 4096)
+            .await
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        assert_eq!(
+            chunks.into_iter().flatten().collect::<Vec<_>>(),
+            streamed[1024..5120]
+        );
         store.delete(&StorageLocation::Local, &sha).await.unwrap();
         assert!(!store.exists(&StorageLocation::Local, &sha).await.unwrap());
         std::fs::remove_dir_all(root).unwrap();
@@ -672,6 +902,24 @@ mod tests {
             streamed.len() as u64
         );
         assert_eq!(store.get(&location, &streamed_sha).await.unwrap(), streamed);
+        let verified = store
+            .materialize_verified(&location, &streamed_sha)
+            .await
+            .unwrap();
+        let spool = verified.path.clone();
+        assert!(verified.remove_on_drop);
+        let chunks = verified
+            .stream(17, 8192)
+            .await
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        assert_eq!(
+            chunks.into_iter().flatten().collect::<Vec<_>>(),
+            streamed[17..17 + 8192]
+        );
+        assert!(!spool.exists());
         store.delete(&location, &streamed_sha).await.unwrap();
 
         let shard = StorageLocation::RcloneShard {

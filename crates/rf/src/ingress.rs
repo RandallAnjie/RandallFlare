@@ -62,15 +62,24 @@ pub async fn serve(
     durable: crate::durable::Coordinator,
     listen: SocketAddr,
 ) -> Result<SocketAddr> {
+    let (address, _server) = serve_managed(node, durable, listen).await?;
+    Ok(address)
+}
+
+pub async fn serve_managed(
+    node: Arc<Node>,
+    durable: crate::durable::Coordinator,
+    listen: SocketAddr,
+) -> Result<(SocketAddr, tokio::task::JoinHandle<()>)> {
     let app = app(node, durable, false)?;
     let listener = tokio::net::TcpListener::bind(listen).await?;
     let addr = listener.local_addr()?;
-    tokio::spawn(async move {
+    let server = tokio::spawn(async move {
         if let Err(e) = axum::serve(listener, app).await {
             tracing::error!("ingress server died: {e}");
         }
     });
-    Ok(addr)
+    Ok((addr, server))
 }
 
 /// HTTPS ingress: SNI cert store from <data>/certs (hot-reloaded),
@@ -1044,15 +1053,14 @@ async fn serve_public_r2(
         _ => return (StatusCode::BAD_REQUEST, "invalid object key\n").into_response(),
     };
     let origin_headers = req.headers().clone();
-    let object = match crate::r2::get_object(node, bucket, &key).await {
-        Ok(Some(object)) => object,
+    let metadata = match crate::r2::head_object(node, bucket, &key).await {
+        Ok(Some(metadata)) => metadata,
         Ok(None) => return StatusCode::NOT_FOUND.into_response(),
         Err(error) => {
             tracing::warn!("public R2 read {bucket}/{key}: {error:#}");
             return StatusCode::SERVICE_UNAVAILABLE.into_response();
         }
     };
-    let (metadata, bytes) = object;
     if req
         .headers()
         .get(axum::http::header::IF_NONE_MATCH)
@@ -1073,16 +1081,17 @@ async fn serve_public_r2(
         .headers()
         .get(axum::http::header::RANGE)
         .and_then(|value| value.to_str().ok())
-        .map(|header| public_byte_range(header, bytes.len()));
-    let (status, body, content_range) = match range {
+        .map(|header| public_byte_range(header, metadata.size));
+    let (status, start, length, content_range) = match range {
         Some(Ok((start, end))) => (
             StatusCode::PARTIAL_CONTENT,
-            &bytes[start..=end],
-            Some(format!("bytes {start}-{end}/{}", bytes.len())),
+            start,
+            end - start + 1,
+            Some(format!("bytes {start}-{end}/{}", metadata.size)),
         ),
         Some(Err(())) => {
             let mut response = StatusCode::RANGE_NOT_SATISFIABLE.into_response();
-            if let Ok(value) = HeaderValue::from_str(&format!("bytes */{}", bytes.len())) {
+            if let Ok(value) = HeaderValue::from_str(&format!("bytes */{}", metadata.size)) {
                 response
                     .headers_mut()
                     .insert(axum::http::header::CONTENT_RANGE, value);
@@ -1090,12 +1099,31 @@ async fn serve_public_r2(
             apply_r2_cors(&origin_headers, spec, &mut response);
             return response;
         }
-        None => (StatusCode::OK, bytes.as_slice(), None),
+        None => (StatusCode::OK, 0, metadata.size, None),
     };
     let mut response = if req.method() == Method::HEAD {
         status.into_response()
     } else {
-        (status, body.to_vec()).into_response()
+        let file = match crate::r2::materialize_object(node, bucket, &key).await {
+            Ok(Some((current, file))) if current.sha256 == metadata.sha256 => file,
+            Ok(Some(_)) => return StatusCode::CONFLICT.into_response(),
+            Ok(None) => return StatusCode::NOT_FOUND.into_response(),
+            Err(error) => {
+                tracing::warn!("public R2 stream {bucket}/{key}: {error:#}");
+                return StatusCode::SERVICE_UNAVAILABLE.into_response();
+            }
+        };
+        let stream = match file.stream(start, length).await {
+            Ok(stream) => stream,
+            Err(error) => {
+                tracing::warn!("public R2 stream range {bucket}/{key}: {error:#}");
+                return StatusCode::SERVICE_UNAVAILABLE.into_response();
+            }
+        };
+        Response::builder()
+            .status(status)
+            .body(Body::from_stream(stream))
+            .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
     };
     add_r2_object_headers(&metadata, &mut response);
     response.headers_mut().insert(
@@ -1104,7 +1132,7 @@ async fn serve_public_r2(
     );
     response.headers_mut().insert(
         axum::http::header::CONTENT_LENGTH,
-        HeaderValue::from_str(&body.len().to_string()).unwrap(),
+        HeaderValue::from_str(&length.to_string()).unwrap(),
     );
     if let Some(content_range) = content_range {
         if let Ok(value) = HeaderValue::from_str(&content_range) {
@@ -1185,24 +1213,24 @@ fn apply_r2_cors(
     }
 }
 
-fn public_byte_range(header: &str, size: usize) -> std::result::Result<(usize, usize), ()> {
+fn public_byte_range(header: &str, size: u64) -> std::result::Result<(u64, u64), ()> {
     let value = header.strip_prefix("bytes=").ok_or(())?;
     if size == 0 || value.contains(',') {
         return Err(());
     }
     let (start, end) = value.split_once('-').ok_or(())?;
     if start.is_empty() {
-        let suffix = end.parse::<usize>().map_err(|_| ())?;
+        let suffix = end.parse::<u64>().map_err(|_| ())?;
         if suffix == 0 {
             return Err(());
         }
         return Ok((size.saturating_sub(suffix), size - 1));
     }
-    let start = start.parse::<usize>().map_err(|_| ())?;
+    let start = start.parse::<u64>().map_err(|_| ())?;
     let end = if end.is_empty() {
         size - 1
     } else {
-        end.parse::<usize>().map_err(|_| ())?.min(size - 1)
+        end.parse::<u64>().map_err(|_| ())?.min(size - 1)
     };
     if start >= size || start > end {
         return Err(());

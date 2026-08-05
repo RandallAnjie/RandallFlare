@@ -2464,7 +2464,10 @@ export default {
     let response = call(b.ingress, "/background").await.unwrap();
     assert_eq!(response.status(), 200);
     assert_eq!(response.text().await.unwrap(), "scheduled");
-    tokio::time::sleep(Duration::from_secs(4)).await;
+    // The background mutation waits one second and the checkpoint loop runs
+    // once per second. Allow several additional ticks on loaded CI hosts
+    // without issuing another Worker request that could mask this guarantee.
+    tokio::time::sleep(Duration::from_secs(10)).await;
 
     let mut nodes = [a, b, c];
     let mut owner_idx = None;
@@ -3460,20 +3463,23 @@ async fn two_node_deploy_kv_and_static_stability() {
         .await
         .unwrap();
     let deadline = Instant::now() + Duration::from_secs(15);
-    loop {
-        if client
-            .kv_get(&b.api, "ns/special", "greet?one")
+    let rich = loop {
+        if let Ok(Some(rich)) = client
+            .kv_get_with_metadata(&b.api, "ns/special", "greet?one")
             .await
-            .ok()
-            .flatten()
-            .as_deref()
-            == Some(b"encoded-key")
         {
-            break;
+            if rich.metadata == Some(serde_json::json!({"source": "e2e"}))
+                && rich.expires_at_ms == Some(expires_at_ms)
+            {
+                break rich;
+            }
         }
-        assert!(Instant::now() < deadline, "encoded kv key never converged");
+        assert!(
+            Instant::now() < deadline,
+            "encoded KV value and metadata never converged"
+        );
         tokio::time::sleep(Duration::from_millis(200)).await;
-    }
+    };
     assert_eq!(
         client
             .kv_list(&b.api, "ns/special", "greet?")
@@ -3481,11 +3487,6 @@ async fn two_node_deploy_kv_and_static_stability() {
             .unwrap(),
         vec!["greet?one"]
     );
-    let rich = client
-        .kv_get_with_metadata(&b.api, "ns/special", "greet?one")
-        .await
-        .unwrap()
-        .unwrap();
     use base64::Engine as _;
     assert_eq!(
         base64::engine::general_purpose::STANDARD

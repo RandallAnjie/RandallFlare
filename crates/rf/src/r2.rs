@@ -1042,6 +1042,43 @@ pub async fn get_object(
     Ok(Some((meta, bytes)))
 }
 
+pub async fn materialize_object(
+    node: &Node,
+    bucket: &str,
+    key: &str,
+) -> Result<Option<(ObjectMeta, crate::objectstore::VerifiedObjectFile)>> {
+    let Some(meta) = head_object(node, bucket, key).await? else {
+        return Ok(None);
+    };
+    let sha: [u8; 32] = hex::decode(&meta.sha256)?
+        .try_into()
+        .map_err(|_| anyhow::anyhow!("R2 对象摘要长度无效"))?;
+    let file = match node.objects.materialize_verified(&meta.storage, &sha).await {
+        Ok(file) => file,
+        Err(local_error) if meta.storage == StorageLocation::Local => {
+            repair_local_blob(node, bucket, &sha)
+                .await
+                .with_context(|| {
+                    format!("本地 R2 对象缺失，且集群修复失败；原始错误：{local_error:#}")
+                })?;
+            node.objects
+                .materialize_verified(&StorageLocation::Local, &sha)
+                .await?
+        }
+        Err(remote_error) if !node.objects.supports(&meta.storage) => {
+            let bytes = repair_remote_blob(node, bucket, key, &meta, remote_error).await?;
+            node.objects
+                .materialize_bytes_verified(&sha, &bytes)
+                .await?
+        }
+        Err(error) => return Err(error),
+    };
+    if file.size() != meta.size {
+        bail!("R2 对象大小与多数派元数据不一致");
+    }
+    Ok(Some((meta, file)))
+}
+
 async fn forward_put_to_storage_peer(
     node: &Node,
     bucket: &str,
@@ -1430,6 +1467,7 @@ pub struct SweepResult {
     pub collected_blobs: u64,
     pub retained_blobs: u64,
     pub stale_assembly_files: u64,
+    pub stale_read_spool_files: u64,
 }
 
 /// Apply bucket lifecycle rules, expire abandoned multipart uploads and safely
@@ -1560,6 +1598,24 @@ pub async fn sweep_lifecycle(node: &Node) -> Result<SweepResult> {
                 && tokio::fs::remove_file(path).await.is_ok()
             {
                 outcome.stale_assembly_files += 1;
+            }
+        }
+    }
+    let read_spool = node.objects.local_root().join(".read-spool");
+    if let Ok(mut entries) = tokio::fs::read_dir(&read_spool).await {
+        while let Some(entry) = entries.next_entry().await? {
+            let path = entry.path();
+            if path.extension().and_then(|value| value.to_str()) != Some("tmp") {
+                continue;
+            }
+            let modified = entry.metadata().await?.modified()?;
+            let age = std::time::SystemTime::now()
+                .duration_since(modified)
+                .unwrap_or_default();
+            if age.as_millis() >= MULTIPART_TTL_MS as u128
+                && tokio::fs::remove_file(path).await.is_ok()
+            {
+                outcome.stale_read_spool_files += 1;
             }
         }
     }
@@ -2497,7 +2553,7 @@ mod tests {
         let public_record =
             prepare_bucket_after("e2e-bucket", public_spec, false, Some(&current)).unwrap();
         resource::ingest(&node, &Envelope::seal_any(&public_record, &operator)).unwrap();
-        let ingress_address = crate::ingress::serve(
+        let (ingress_address, ingress_server) = crate::ingress::serve_managed(
             node.clone(),
             durable.clone(),
             "127.0.0.1:0".parse().unwrap(),
@@ -2553,6 +2609,7 @@ mod tests {
             .unwrap()
             .is_none());
 
+        ingress_server.abort();
         server.abort();
         manager.abort();
         drop(client);

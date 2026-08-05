@@ -4887,7 +4887,8 @@ async fn run(config_path: PathBuf) -> Result<()> {
                         if result.expired_objects > 0
                             || result.expired_uploads > 0
                             || result.collected_blobs > 0
-                            || result.stale_assembly_files > 0 =>
+                            || result.stale_assembly_files > 0
+                            || result.stale_read_spool_files > 0 =>
                     {
                         tracing::info!(
                             expired_objects = result.expired_objects,
@@ -4895,6 +4896,7 @@ async fn run(config_path: PathBuf) -> Result<()> {
                             collected_blobs = result.collected_blobs,
                             retained_blobs = result.retained_blobs,
                             stale_assembly_files = result.stale_assembly_files,
+                            stale_read_spool_files = result.stale_read_spool_files,
                             "R2 lifecycle sweep complete"
                         );
                     }

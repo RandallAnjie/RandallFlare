@@ -1029,7 +1029,7 @@ async fn get_object_response(
     head_only: bool,
     request_headers: &HeaderMap,
 ) -> Result<Response> {
-    let Some((metadata, bytes)) = crate::r2::get_object(node, bucket, key).await? else {
+    let Some(metadata) = crate::r2::head_object(node, bucket, key).await? else {
         return Ok(s3_error(
             StatusCode::NOT_FOUND,
             "NoSuchKey",
@@ -1065,12 +1065,13 @@ async fn get_object_response(
     let range = request_headers
         .get(header::RANGE)
         .and_then(|value| value.to_str().ok())
-        .map(|value| byte_range(value, bytes.len()));
-    let (status, body, content_range) = match range {
+        .map(|value| byte_range(value, metadata.size));
+    let (status, start, length, content_range) = match range {
         Some(Ok((start, end))) => (
             StatusCode::PARTIAL_CONTENT,
-            &bytes[start..=end],
-            Some(format!("bytes {start}-{end}/{}", bytes.len())),
+            start,
+            end - start + 1,
+            Some(format!("bytes {start}-{end}/{}", metadata.size)),
         ),
         Some(Err(())) => {
             let mut response = s3_error(
@@ -1081,20 +1082,38 @@ async fn get_object_response(
             );
             response.headers_mut().insert(
                 header::CONTENT_RANGE,
-                HeaderValue::from_str(&format!("bytes */{}", bytes.len()))?,
+                HeaderValue::from_str(&format!("bytes */{}", metadata.size))?,
             );
             return Ok(response);
         }
-        None => (StatusCode::OK, bytes.as_slice(), None),
+        None => (StatusCode::OK, 0, metadata.size, None),
     };
     let mut response = if head_only {
         status.into_response()
     } else {
-        (status, body.to_vec()).into_response()
+        let Some((current, file)) = crate::r2::materialize_object(node, bucket, key).await? else {
+            return Ok(s3_error(
+                StatusCode::NOT_FOUND,
+                "NoSuchKey",
+                "对象不存在",
+                Some(key),
+            ));
+        };
+        if current.sha256 != metadata.sha256 {
+            return Ok(s3_error(
+                StatusCode::CONFLICT,
+                "OperationAborted",
+                "对象在读取期间发生变化，请重试",
+                Some(key),
+            ));
+        }
+        Response::builder()
+            .status(status)
+            .body(Body::from_stream(file.stream(start, length).await?))?
     };
     response.headers_mut().insert(
         header::CONTENT_LENGTH,
-        HeaderValue::from_str(&body.len().to_string())?,
+        HeaderValue::from_str(&length.to_string())?,
     );
     response.headers_mut().insert(
         header::ETAG,
@@ -1140,24 +1159,24 @@ fn etag_header_matches(header: &str, etag: &str) -> bool {
     })
 }
 
-fn byte_range(header: &str, size: usize) -> std::result::Result<(usize, usize), ()> {
+fn byte_range(header: &str, size: u64) -> std::result::Result<(u64, u64), ()> {
     let value = header.strip_prefix("bytes=").ok_or(())?;
     if size == 0 || value.contains(',') {
         return Err(());
     }
     let (start, end) = value.split_once('-').ok_or(())?;
     if start.is_empty() {
-        let suffix = end.parse::<usize>().map_err(|_| ())?;
+        let suffix = end.parse::<u64>().map_err(|_| ())?;
         if suffix == 0 {
             return Err(());
         }
         return Ok((size.saturating_sub(suffix), size - 1));
     }
-    let start = start.parse::<usize>().map_err(|_| ())?;
+    let start = start.parse::<u64>().map_err(|_| ())?;
     let end = if end.is_empty() {
         size - 1
     } else {
-        end.parse::<usize>().map_err(|_| ())?.min(size - 1)
+        end.parse::<u64>().map_err(|_| ())?.min(size - 1)
     };
     if start >= size || start > end {
         return Err(());
