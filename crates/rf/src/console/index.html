@@ -807,7 +807,7 @@
                     <label><span>显示名称</span><input id="flow-node-label" maxlength="128"></label>
                     <label><span>失败处理</span><select id="flow-node-error"><option value="stop">停止 Flow</option><option value="continue">记录失败并继续</option><option value="branch">走 error 分支</option></select></label>
                     <label><span>节点配置（JSON）</span><textarea id="flow-node-config" class="code-input" rows="8">{}</textarea></label>
-                    <p class="form-note">可使用 <code>{{ input.orderId }}</code>、<code>{{ nodes.lookup }}</code> 等模板。凭据只能填写 <code>credentialEnv</code>，且变量名必须以 <code>RF_FLOW_CREDENTIAL_</code> 开头。</p>
+                    <p class="form-note">表达式使用完整 JSONata，可引用 <code>$input</code>、<code>$trigger</code>、<code>$nodes.lookup</code>、<code>$item</code> 与 <code>$now</code>；例如 <code>{{ $input.orders[price &gt; 10].sku }}</code>。整字段表达式保留 JSON 类型，混合文本执行安全插值。凭据只能填写 <code>credentialEnv</code>，且变量名必须以 <code>RF_FLOW_CREDENTIAL_</code> 开头。</p>
                     <div class="button-row"><button class="primary" type="submit">应用节点配置</button><button id="flow-node-remove" class="danger ghost" type="button">移除节点</button></div>
                   </form>
                   <p id="flow-node-empty" class="empty-state">在画布中选择一个节点进行编辑。</p>

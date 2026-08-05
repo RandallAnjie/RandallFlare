@@ -2760,12 +2760,12 @@ const flowNodeLabels = {
 const flowNodeDefaults = {
   trigger: {}, worker: { worker: "", method: "POST", path: "/" },
   http: { url: "https://api.example.com", method: "POST" },
-  branch: { condition: "input.ok == true" }, transform: { expression: "input" },
-  loop: { items: "input.items" }, kv: { namespace: "", action: "get", key: "{{ input.key }}" },
-  d1: { database: "", sql: "SELECT 1", params: [] }, r2: { bucket: "", action: "get", key: "{{ input.key }}" },
-  queue: { queue: "", body: "{{ input }}" }, analytics: { dataset: "", points: "{{ input }}" },
-  pipeline: { pipeline: "", events: "{{ input }}" }, workflow: { workflow: "", input: "{{ input }}" },
-  subflow: { flow: "", input: "{{ input }}" }, email: {},
+  branch: { condition: "$input.ok = true" }, transform: { expression: "$input" },
+  loop: { items: "$input.items" }, kv: { namespace: "", action: "get", key: "{{ $input.key }}" },
+  d1: { database: "", sql: "SELECT 1", params: [] }, r2: { bucket: "", action: "get", key: "{{ $input.key }}" },
+  queue: { queue: "", body: "{{ $input }}" }, analytics: { dataset: "", points: "{{ $input }}" },
+  pipeline: { pipeline: "", events: "{{ $input }}" }, workflow: { workflow: "", input: "{{ $input }}" },
+  subflow: { flow: "", input: "{{ $input }}" }, email: {},
 };
 
 function cloneJson(value) { return JSON.parse(JSON.stringify(value)); }

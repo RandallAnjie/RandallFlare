@@ -61,39 +61,48 @@ curl -X POST 'https://flow-order-sync.example.com/v1/run?wait=1' \
 封装模块内联运行，父节点得到子 Flow 的最终输出；最多嵌套三层。与参考实现
 一致，子 Flow 内的循环节点会被跳过，应把耐久循环放在顶层 Flow。
 
-## 模板表达式
+## JSONata 与模板表达式
 
 节点配置中的字符串可使用 `{{ … }}`。如果整个字段只有一个表达式，返回值会
-保留 JSON 类型；混合文本则插值为字符串。可用根对象如下：
+保留 JSON 类型；混合文本则插值为字符串。Transform、Branch 和 Loop 节点的
+`expression`、`condition`、`items` 字段也直接执行 JSONata。可用绑定如下：
 
 | 表达式 | 含义 |
 | --- | --- |
-| `input` / `json` / `$` | 当前节点输入 |
-| `trigger` | 本次运行最初的完整触发输入 |
-| `nodes.<节点 ID>` | 任意已完成节点的输出 |
-| `nodes.<节点标签>` | 按非空标签读取节点输出 |
-| `item` | 当前循环项目，循环外为 `null` |
-| `now` / `$now` | 当前 UTC RFC 3339 时间 |
+| `$` / `$input` / `$json` | 当前节点输入；`$` 是 JSONata 根值 |
+| `$trigger` | 本次运行最初的完整触发输入 |
+| `$nodes.<节点 ID>` | 任意已完成节点的输出 |
+| `$nodes.<节点标签>` | 按非空标签读取节点输出；`$node` 是同义绑定 |
+| `$item` | 当前循环项目，循环外为 `null` |
+| `$now` | 当前 UTC RFC 3339 时间字符串 |
 
-支持点号、数组下标和方括号路径；条件表达式支持 `==`、`!=`、`>=`、`<=`、
-`>`、`<`。条件节点还可配置 `truthy`、`eq`、`ne`、`gt`、`lt`、`contains`。
+除路径和过滤器外，还支持 JSONata 的投影、对象构造、算术与布尔表达式、变量、
+函数、聚合、map/filter/reduce 和管道运算。旧图中的 `input.order`、
+`nodes.lookup`、`item.sku` 等安全路径继续兼容；新图建议使用带 `$` 的标准
+JSONata 绑定。条件节点仍可使用 `truthy`、`eq`、`ne`、`gt`、`lt`、`contains`
+快捷配置。
 
 ```json
 {
   "template": {
-    "orderId": "{{ trigger.order.id }}",
-    "risk": "{{ nodes.risk_lookup.score }}",
-    "message": "order={{ input.id }} at {{ now }}"
+    "orderId": "{{ $trigger.order.id }}",
+    "risk": "{{ $nodes.risk_lookup.score }}",
+    "lines": "{{ $input.lines[price > 10].{\"sku\": sku, \"total\": price * qty} }}",
+    "message": "order={{ $input.id }} at {{ $now }}"
   }
 }
 ```
+
+表达式文本最多 16 KiB；每次求值最多 200 毫秒、128 层求值栈和 10,000 项结果
+序列，节点最终输出仍受 4 MiB 上限约束。它没有文件、网络或进程 API。超限和
+语法错误作为普通节点失败进入既有的停止、继续或错误分支流程。
 
 ## 内置节点
 
 | 节点 | 主要能力 |
 | --- | --- |
 | Trigger | 手动、Webhook 或 Cron 入口 |
-| Transform | 类型保持的模板或安全路径表达式 |
+| Transform | 类型保持的模板或完整 JSONata 转换 |
 | Branch | 条件路由 |
 | Loop | 耐久逐项子图和完成分支 |
 | Worker | 调用已部署 Worker |

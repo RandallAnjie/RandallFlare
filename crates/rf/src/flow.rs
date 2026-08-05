@@ -13,6 +13,11 @@ use crate::resource::{self, ResourceRecord, ResourceView};
 use anyhow::{bail, Context, Result};
 use base64::Engine as _;
 use futures_util::future::BoxFuture;
+use jsonata_core::evaluator::{
+    Context as JsonataContext, Evaluator as JsonataEvaluator,
+    EvaluatorOptions as JsonataEvaluatorOptions,
+};
+use jsonata_core::{parser as jsonata_parser, value::JValue};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 use sha2::{Digest, Sha256};
@@ -28,6 +33,10 @@ pub const MAX_NODE_RESULT_BYTES: usize = 4 * 1024 * 1024;
 pub const MAX_NODES: usize = 500;
 pub const MAX_EDGES: usize = 2_000;
 pub const MAX_LOOP_ITEMS: usize = 1_000;
+pub const MAX_JSONATA_EXPRESSION_BYTES: usize = 16 * 1024;
+const MAX_JSONATA_SEQUENCE_ITEMS: usize = 10_000;
+const JSONATA_TIMEOUT_MS: u64 = 200;
+const JSONATA_MAX_STACK_DEPTH: usize = 128;
 const LEASE_MS: u64 = 5 * 60 * 1_000;
 const DRIVER_INTERVAL_MS: u64 = 250;
 const MAX_CONCURRENT_RUNS: usize = 24;
@@ -2434,6 +2443,9 @@ fn eval_expression(source: &str, context: &ExecContext) -> Result<Value> {
     if let Ok(value) = serde_json::from_str::<Value>(source) {
         return Ok(value);
     }
+    if !legacy_path_expression(source) {
+        return eval_jsonata_expression(source, context);
+    }
     let normalized = source
         .replace("[\"", ".")
         .replace("['", ".")
@@ -2476,12 +2488,74 @@ fn eval_expression(source: &str, context: &ExecContext) -> Result<Value> {
 fn eval_condition(source: &str, context: &ExecContext) -> Result<bool> {
     for operator in ["==", "!=", ">=", "<=", ">", "<"] {
         if let Some((left, right)) = source.split_once(operator) {
-            let left = eval_expression(left, context)?;
-            let right = eval_expression(right, context)?;
-            return compare_values(&left, &right, operator);
+            if legacy_expression_operand(left) && legacy_expression_operand(right) {
+                let left = eval_expression(left, context)?;
+                let right = eval_expression(right, context)?;
+                return compare_values(&left, &right, operator);
+            }
         }
     }
-    Ok(truthy(&eval_expression(source, context)?))
+    Ok(truthy(&eval_jsonata_expression(source, context)?))
+}
+
+fn legacy_expression_operand(source: &str) -> bool {
+    let source = source.trim();
+    serde_json::from_str::<Value>(source).is_ok() || legacy_path_expression(source)
+}
+
+fn legacy_path_expression(source: &str) -> bool {
+    source
+        .bytes()
+        .next()
+        .is_some_and(|byte| byte.is_ascii_alphabetic() || matches!(byte, b'_' | b'$'))
+        && source.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric()
+                || matches!(byte, b'_' | b'$' | b'.' | b'[' | b']' | b'\'' | b'"' | b'-')
+        })
+}
+
+fn eval_jsonata_expression(source: &str, context: &ExecContext) -> Result<Value> {
+    if source.len() > MAX_JSONATA_EXPRESSION_BYTES {
+        bail!(
+            "Flow JSONata 表达式不得超过 {} KiB",
+            MAX_JSONATA_EXPRESSION_BYTES / 1024
+        );
+    }
+    let ast = jsonata_parser::parse(source)
+        .map_err(|error| anyhow::anyhow!("Flow JSONata 语法错误：{error}"))?;
+    let mut bindings = JsonataContext::new();
+    bindings.bind("json".into(), JValue::from(context.input.clone()));
+    bindings.bind("input".into(), JValue::from(context.input.clone()));
+    bindings.bind(
+        "node".into(),
+        JValue::from(Value::Object(context.nodes.clone().into_iter().collect())),
+    );
+    bindings.bind(
+        "nodes".into(),
+        JValue::from(Value::Object(context.nodes.clone().into_iter().collect())),
+    );
+    bindings.bind("trigger".into(), JValue::from(context.trigger.clone()));
+    bindings.bind(
+        "item".into(),
+        JValue::from(context.item.clone().unwrap_or(Value::Null)),
+    );
+    let now =
+        time::OffsetDateTime::now_utc().format(&time::format_description::well_known::Rfc3339)?;
+    bindings.bind("now".into(), JValue::from(Value::String(now)));
+
+    let mut evaluator = JsonataEvaluator::with_options(
+        bindings,
+        JsonataEvaluatorOptions {
+            timeout_ms: Some(JSONATA_TIMEOUT_MS),
+            max_stack_depth: Some(JSONATA_MAX_STACK_DEPTH),
+            max_sequence_length: Some(MAX_JSONATA_SEQUENCE_ITEMS),
+        },
+    );
+    let input = JValue::from(context.input.clone());
+    let output = evaluator
+        .evaluate(&ast, &input)
+        .map_err(|error| anyhow::anyhow!("Flow JSONata 执行失败：{error}"))?;
+    Ok(Value::from(&output))
 }
 
 fn eval_reference_branch(
@@ -2856,6 +2930,21 @@ fn validate_node_config(node: &FlowNode) -> Result<()> {
     if let Some(Value::String(name)) = node.data.config.get("credentialEnv") {
         validate_secret_env(name)?;
     }
+    for field in ["expression", "condition", "items", "itemsPath"] {
+        if node
+            .data
+            .config
+            .get(field)
+            .and_then(Value::as_str)
+            .is_some_and(|source| source.len() > MAX_JSONATA_EXPRESSION_BYTES)
+        {
+            bail!(
+                "Flow 节点 {} 的 {field} 表达式不得超过 {} KiB",
+                node.id,
+                MAX_JSONATA_EXPRESSION_BYTES / 1024
+            );
+        }
+    }
     Ok(())
 }
 
@@ -3036,6 +3125,61 @@ mod tests {
         assert_eq!(
             render_string("{{ trigger.requestId }}", &context).unwrap(),
             json!("req-1")
+        );
+    }
+
+    #[test]
+    fn jsonata_transforms_use_full_run_context_and_resource_limits() {
+        let context = ExecContext {
+            input: json!({
+                "orders": [
+                    { "sku": "A-1", "price": 12.5, "qty": 2 },
+                    { "sku": "B-2", "price": 4, "qty": 3 }
+                ]
+            }),
+            trigger: json!({ "requestId": "req-jsonata" }),
+            nodes: BTreeMap::from([("lookup".into(), json!({ "risk": 7 }))]),
+            item: Some(json!({ "sku": "A-1" })),
+            depth: 0,
+        };
+
+        assert_eq!(
+            eval_expression(
+                r#"$input.orders[price >= 10].{"sku": sku, "total": price * qty}"#,
+                &context,
+            )
+            .unwrap(),
+            json!({ "sku": "A-1", "total": 25.0 })
+        );
+        assert_eq!(
+            eval_expression(r#"$sum($input.orders.(price * qty))"#, &context).unwrap(),
+            json!(37.0)
+        );
+        let enriched = eval_expression(
+            r#"{"request": $trigger.requestId, "risk": $nodes.lookup.risk, "sku": $item.sku, "at": $now}"#,
+            &context,
+        )
+        .unwrap();
+        assert_eq!(enriched["request"], "req-jsonata");
+        assert_eq!(enriched["risk"], 7.0);
+        assert_eq!(enriched["sku"], "A-1");
+        assert!(enriched["at"]
+            .as_str()
+            .is_some_and(|value| value.ends_with('Z')));
+        assert!(eval_condition(
+            r#"$sum($input.orders.price) >= 16 and $contains($item.sku, "A-")"#,
+            &context,
+        )
+        .unwrap());
+
+        let oversized = "x".repeat(MAX_JSONATA_EXPRESSION_BYTES + 1);
+        assert!(eval_expression(&format!("$uppercase(\"{oversized}\")"), &context).is_err());
+        let sequence_error = eval_expression("[1..20000]", &context).unwrap_err();
+        assert!(
+            sequence_error
+                .to_string()
+                .contains("maximum sequence length"),
+            "unexpected JSONata sequence guard error: {sequence_error}"
         );
     }
 

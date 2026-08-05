@@ -147,7 +147,9 @@ Working today, verified by multi-process fault-injection e2e tests:
   leases, recovery, idempotency, cancellation, retry, retention and durable
   loop iterations. Worker, HTTP, KV, D1, R2, Queue, Analytics, Pipeline,
   Workflow and inline sub-Flow nodes share typed templates and cross-node
-  outputs. Public Flow domains support asynchronous 202 responses or
+  outputs. Transform, branch, loop and template fields use full, resource-
+  bounded JSONata with `$input`, `$trigger`, `$nodes`, `$item` and `$now`
+  bindings. Public Flow domains support asynchronous 202 responses or
   request/response mode with `?wait=1`; credentials remain node-local and
   outbound HTTP is protected against SSRF. See [the Flow guide](./docs/FLOWS.md).
 - **Optional decentralized Email**: operator-signed domains define exact,
