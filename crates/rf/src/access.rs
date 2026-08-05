@@ -161,15 +161,28 @@ pub fn mint(
     scopes: Vec<String>,
     expires_at_ms: Option<u64>,
 ) -> Result<(ResourceRecord, String)> {
+    let (record, raw) = mint_record(label, scopes, expires_at_ms)?;
+    if resource::head(node, TOKEN_KIND, &record.name).is_some() {
+        bail!("API 访问令牌随机标识碰撞，请重试");
+    }
+    Ok((record, raw))
+}
+
+/// Mint a standalone signed-resource payload for remote operator CLIs. The
+/// caller must verify the generated random id is absent on its target node
+/// before publishing the record.
+pub fn mint_record(
+    label: String,
+    mut scopes: Vec<String>,
+    expires_at_ms: Option<u64>,
+) -> Result<(ResourceRecord, String)> {
     let raw = format!(
         "{TOKEN_PREFIX}{}",
         base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(rand::random::<[u8; 32]>())
     );
     let digest = hex::encode(Sha256::digest(raw.as_bytes()));
     let name = format!("pat-{}", &digest[..20]);
-    if resource::head(node, TOKEN_KIND, &name).is_some() {
-        bail!("API 访问令牌随机标识碰撞，请重试");
-    }
+    scopes.sort();
     let spec = AccessTokenSpec {
         schema: TOKEN_SCHEMA,
         label: label.trim().to_string(),
@@ -189,6 +202,11 @@ pub fn mint(
 pub fn revoke(node: &Node, id: &str) -> Result<ResourceRecord> {
     let head = resource::head(node, TOKEN_KIND, id)
         .ok_or_else(|| anyhow::anyhow!("API 访问令牌不存在"))?;
+    revoke_after(&head)
+}
+
+/// Prepare a revocation from a verified remote resource head.
+pub fn revoke_after(head: &resource::ResourceView) -> Result<ResourceRecord> {
     if head.resource.deleted {
         bail!("API 访问令牌不存在");
     }
@@ -199,10 +217,10 @@ pub fn revoke(node: &Node, id: &str) -> Result<ResourceRecord> {
     spec.revoked_at_ms = Some(now_ms());
     resource::prepare_after(
         TOKEN_KIND,
-        id,
+        &head.resource.name,
         serde_json::to_value(spec)?,
         false,
-        Some(&head),
+        Some(head),
     )
 }
 

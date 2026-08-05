@@ -92,6 +92,11 @@ enum Cmd {
         #[arg(long, env = "RF_CLUSTER_SECRET")]
         secret: String,
     },
+    /// 去中心化 API 访问令牌的创建、查看与撤销。
+    Access {
+        #[command(subcommand)]
+        cmd: AccessCmd,
+    },
     /// Delete (tombstone) a worker.
     WorkerDelete {
         name: String,
@@ -212,6 +217,43 @@ enum Cmd {
         operator: Option<String>,
         #[arg(long, env = "RF_OPERATOR_KEY")]
         key: Option<PathBuf>,
+    },
+}
+
+#[derive(Subcommand)]
+enum AccessCmd {
+    /// 列出签名令牌元数据；永不返回明文或 SHA-256 摘要。
+    List {
+        #[arg(long, env = "RF_NODE")]
+        node: String,
+        #[arg(long, env = "RF_CLUSTER_SECRET")]
+        secret: String,
+    },
+    /// 创建访问令牌；明文只在发布成功后显示一次。
+    Create {
+        #[arg(long)]
+        label: String,
+        /// 精确作用域，可重复；全部权限请单独使用 `--scope '*'`。
+        #[arg(long = "scope", required = true)]
+        scopes: Vec<String>,
+        #[arg(long)]
+        expires_in_days: Option<u32>,
+        #[arg(long, env = "RF_NODE")]
+        node: String,
+        #[arg(long, env = "RF_OPERATOR_KEY")]
+        key: Option<PathBuf>,
+        #[arg(long, env = "RF_CLUSTER_SECRET")]
+        secret: String,
+    },
+    /// 立即撤销一个访问令牌。
+    Revoke {
+        id: String,
+        #[arg(long, env = "RF_NODE")]
+        node: String,
+        #[arg(long, env = "RF_OPERATOR_KEY")]
+        key: Option<PathBuf>,
+        #[arg(long, env = "RF_CLUSTER_SECRET")]
+        secret: String,
     },
 }
 
@@ -1555,6 +1597,23 @@ fn device_expiry(days: Option<u32>) -> Result<Option<u64>> {
     ))
 }
 
+fn access_expiry(days: Option<u32>) -> Result<Option<u64>> {
+    let Some(days) = days else {
+        return Ok(None);
+    };
+    if !(1..=3_650).contains(&days) {
+        anyhow::bail!("API 访问令牌有效期必须介于 1 天和 3650 天之间");
+    }
+    let duration = u64::from(days)
+        .checked_mul(24 * 60 * 60 * 1_000)
+        .context("API 访问令牌有效期溢出")?;
+    Ok(Some(
+        rf::node::now_ms()
+            .checked_add(duration)
+            .context("API 访问令牌到期时间溢出")?,
+    ))
+}
+
 fn operator_key(path: Option<PathBuf>) -> Result<rf_core::identity::AnyKeypair> {
     let path = path.unwrap_or_else(default_operator_key_path);
     rf::keys::load_any(&path)
@@ -1695,6 +1754,89 @@ async fn async_main(cli: Cli) -> Result<()> {
             println!("{}", serde_json::to_string_pretty(&status)?);
             Ok(())
         }
+        Cmd::Access { cmd } => match cmd {
+            AccessCmd::List { node, secret } => {
+                let now = rf::node::now_ms();
+                let client = PeerClient::new(secret_bytes(&secret)?);
+                let mut tokens = client
+                    .resource_heads(&node, Some(rf::access::TOKEN_KIND))
+                    .await?
+                    .into_iter()
+                    .filter(|view| !view.resource.deleted)
+                    .map(|view| {
+                        let spec = rf::access::token_spec(&view.resource)?;
+                        Ok(serde_json::json!({
+                            "id": view.resource.name,
+                            "version": view.resource.version,
+                            "label": spec.label,
+                            "prefix": spec.prefix,
+                            "scopes": spec.scopes,
+                            "created_at_ms": spec.created_at_ms,
+                            "expires_at_ms": spec.expires_at_ms,
+                            "revoked_at_ms": spec.revoked_at_ms,
+                            "active": spec.active(now),
+                        }))
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                tokens.sort_by_key(|token| {
+                    std::cmp::Reverse(token["created_at_ms"].as_u64().unwrap_or(0))
+                });
+                println!("{}", serde_json::to_string_pretty(&tokens)?);
+                Ok(())
+            }
+            AccessCmd::Create {
+                label,
+                scopes,
+                expires_in_days,
+                node,
+                key,
+                secret,
+            } => {
+                let expires_at_ms = access_expiry(expires_in_days)?;
+                let client = PeerClient::new(secret_bytes(&secret)?);
+                let (record, token) = rf::access::mint_record(label, scopes, expires_at_ms)?;
+                if client
+                    .resource_head(&node, rf::access::TOKEN_KIND, &record.name)
+                    .await?
+                    .is_some()
+                {
+                    anyhow::bail!("API 访问令牌随机标识碰撞，请重试");
+                }
+                let token = Zeroizing::new(token);
+                client
+                    .post_resource(
+                        &node,
+                        &rf_core::envelope::Envelope::seal_any(&record, &operator_key(key)?),
+                    )
+                    .await?;
+                println!("API 访问令牌 {} 已发布至 v{}", record.name, record.version);
+                println!("一次性令牌（请立即保存，无法找回）：");
+                println!("{}", token.as_str());
+                Ok(())
+            }
+            AccessCmd::Revoke {
+                id,
+                node,
+                key,
+                secret,
+            } => {
+                let client = PeerClient::new(secret_bytes(&secret)?);
+                let head = client
+                    .resource_head(&node, rf::access::TOKEN_KIND, &id)
+                    .await?
+                    .filter(|view| !view.resource.deleted)
+                    .with_context(|| format!("API 访问令牌 {id} 不存在"))?;
+                let record = rf::access::revoke_after(&head)?;
+                client
+                    .post_resource(
+                        &node,
+                        &rf_core::envelope::Envelope::seal_any(&record, &operator_key(key)?),
+                    )
+                    .await?;
+                println!("API 访问令牌 {id} 已撤销（v{}）", record.version);
+                Ok(())
+            }
+        },
         Cmd::WorkerDelete {
             name,
             node,
@@ -4925,7 +5067,8 @@ async fn run(config_path: PathBuf) -> Result<()> {
 
 #[cfg(test)]
 mod cli_tests {
-    use super::{describe_approval, parse_ping};
+    use super::{describe_approval, parse_ping, AccessCmd, Cli, Cmd};
+    use clap::Parser as _;
     use rf::management::{ApprovalKind, ConsoleGrant, CONSOLE_GRANT_VERSION};
 
     #[test]
@@ -4938,6 +5081,43 @@ mod cli_tests {
     fn rejects_invalid_health_response() {
         assert!(parse_ping("ok").is_err());
         assert!(parse_ping("rf not-an-id").is_err());
+    }
+
+    #[test]
+    fn access_create_parses_repeated_exact_scopes() {
+        let cli = Cli::try_parse_from([
+            "rf",
+            "access",
+            "create",
+            "--label",
+            "监控",
+            "--scope",
+            "node:read",
+            "--scope",
+            "audit:read",
+            "--expires-in-days",
+            "90",
+            "--node",
+            "127.0.0.1:7382",
+            "--secret",
+            "not-validated-by-clap",
+        ])
+        .unwrap();
+        let Cmd::Access {
+            cmd:
+                AccessCmd::Create {
+                    label,
+                    scopes,
+                    expires_in_days,
+                    ..
+                },
+        } = cli.cmd
+        else {
+            panic!("access create did not parse into its command variant");
+        };
+        assert_eq!(label, "监控");
+        assert_eq!(scopes, ["node:read", "audit:read"]);
+        assert_eq!(expires_in_days, Some(90));
     }
 
     #[test]

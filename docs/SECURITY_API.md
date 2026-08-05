@@ -38,6 +38,20 @@ only its SHA-256 digest and a safe display prefix enter the signed resource
 history. Revocation is another signed version and therefore converges to every
 node.
 
+也可以完全通过操作员 CLI 管理，不需要中心账户数据库。创建命令只会在签名资源
+成功发布后显示一次明文；`list` 只返回安全前缀、作用域与生命周期：
+
+```bash
+rf access create --label "只读监控" \
+  --scope node:read --scope audit:read \
+  --expires-in-days 90
+rf access list
+rf access revoke pat-xxxxxxxxxxxxxxxxxxxx
+```
+
+节点地址、集群密钥和操作员密钥仍分别使用 `RF_NODE`、`RF_CLUSTER_SECRET` 与
+`RF_OPERATOR_KEY`；不要把这些值或命令输出的一次性令牌写进 Git。
+
 The API accepts only an Authorization bearer token. A browser session cookie
 cannot substitute for it:
 
