@@ -132,6 +132,7 @@ pub fn validate_manifest_admission(node: &Node, manifest: &WorkerManifest) -> Re
     if manifest.deleted {
         return Ok(());
     }
+    crate::deploy::validate_service_binding_graph(node, manifest)?;
     let quota = policy(node).context("集群配额策略无效；为安全起见拒绝部署")?;
     let bytes = worker_bytes(manifest);
     if bytes > quota.max_worker_bytes {

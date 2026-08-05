@@ -108,6 +108,79 @@ pub fn service_bindings(m: &WorkerManifest) -> BTreeMap<String, String> {
         .unwrap_or_default()
 }
 
+/// Return deterministic Worker Service cycles. Missing targets are allowed so
+/// services may be deployed in either order; as soon as the target exists its
+/// outgoing edges participate in cycle detection.
+pub fn service_binding_cycles(manifests: &[WorkerManifest]) -> Vec<Vec<String>> {
+    let graph = manifests
+        .iter()
+        .filter(|manifest| !manifest.deleted)
+        .map(|manifest| {
+            (
+                manifest.name.clone(),
+                service_bindings(manifest).into_values().collect::<Vec<_>>(),
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
+    cycles_in_service_graph(&graph)
+}
+
+pub fn validate_service_binding_graph(node: &Node, replacement: &WorkerManifest) -> Result<()> {
+    if replacement.deleted {
+        return Ok(());
+    }
+    let mut manifests = node
+        .live_manifests()
+        .into_iter()
+        .filter(|manifest| manifest.name != replacement.name)
+        .collect::<Vec<_>>();
+    manifests.push(replacement.clone());
+    if let Some(cycle) = service_binding_cycles(&manifests).first() {
+        bail!("Worker Service 绑定存在循环：{}", cycle.join(" → "));
+    }
+    Ok(())
+}
+
+fn cycles_in_service_graph(graph: &BTreeMap<String, Vec<String>>) -> Vec<Vec<String>> {
+    fn visit(
+        worker: &str,
+        graph: &BTreeMap<String, Vec<String>>,
+        states: &mut BTreeMap<String, u8>,
+        stack: &mut Vec<String>,
+        cycles: &mut Vec<Vec<String>>,
+    ) {
+        match states.get(worker).copied().unwrap_or(0) {
+            2 => return,
+            1 => {
+                if let Some(start) = stack.iter().position(|item| item == worker) {
+                    let mut cycle = stack[start..].to_vec();
+                    cycle.push(worker.to_string());
+                    cycles.push(cycle);
+                }
+                return;
+            }
+            _ => {}
+        }
+        states.insert(worker.to_string(), 1);
+        stack.push(worker.to_string());
+        if let Some(targets) = graph.get(worker) {
+            for target in targets {
+                visit(target, graph, states, stack, cycles);
+            }
+        }
+        stack.pop();
+        states.insert(worker.to_string(), 2);
+    }
+
+    let mut states = BTreeMap::new();
+    let mut stack = Vec::new();
+    let mut cycles = Vec::new();
+    for worker in graph.keys() {
+        visit(worker, graph, &mut states, &mut stack, &mut cycles);
+    }
+    cycles
+}
+
 pub fn binary_bindings(m: &WorkerManifest) -> BTreeMap<String, String> {
     m.env
         .get(BINARY_METADATA_ENV)
@@ -1283,6 +1356,25 @@ mod tests {
         );
         assert!(read_bundle(&dir).is_err());
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn worker_service_graph_reports_complete_cycle_path() {
+        let graph = BTreeMap::from([
+            ("api".into(), vec!["billing".into(), "missing".into()]),
+            ("billing".into(), vec!["mailer".into()]),
+            ("mailer".into(), vec!["api".into()]),
+            ("independent".into(), vec!["missing".into()]),
+        ]);
+        assert_eq!(
+            cycles_in_service_graph(&graph),
+            vec![vec![
+                "api".to_string(),
+                "billing".to_string(),
+                "mailer".to_string(),
+                "api".to_string(),
+            ]]
+        );
     }
 
     #[test]

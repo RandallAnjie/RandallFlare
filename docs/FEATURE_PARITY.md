@@ -60,7 +60,7 @@ surface yet.
 | compatibility date and flags | done | compatibility date plus validated, signed workerd compatibility flags are done; the supported-flag catalogue must track the pinned workerd release |
 | runtime/build/request logs and cluster distribution | done | runtime output and 7-day request history aggregate across live nodes; longer archival/export is optional future work |
 | previews and pull-request deployments | partial | deterministic version/PR domains, isolated runtimes and DO disks, signed approval/tombstones, automatic expiry, ACME/blob repair, request observability and Chinese UI are implemented; GitHub check/comment reporting and multi-node fault soak remain |
-| service bindings and placement tags | partial | signed node-local dynamic Service router, native `env.SERVICE.fetch()`, placement requirements and encrypted mesh fallback are done; multi-service cycle diagnostics remain |
+| service bindings and placement tags | partial | signed node-local dynamic Service router, native `env.SERVICE.fetch()`, placement requirements, encrypted mesh fallback and deterministic whole-cluster cycle-path admission diagnostics are done; multi-node service fault soak remains |
 | R2, D1, Queue, Analytics, Pipeline, Workflow, Email, Binary bindings | partial | native bindings and Chinese editors are implemented for every listed service, including per-call signed Binary authorization and R2 output publication; cross-service fault soak remains |
 
 ### Data and storage
