@@ -296,6 +296,13 @@ impl Runtime {
         };
         self.node
             .set_runtime_status(runtime_id, revision, "starting", "正在准备 Worker 运行文件");
+        tracing::info!(
+            worker = %runtime_id,
+            revision,
+            modules = m.modules.len(),
+            assets = m.assets.len(),
+            "正在准备 Worker 运行实例"
+        );
         let port = self
             .running
             .get(runtime_id)
@@ -336,6 +343,12 @@ impl Runtime {
         for database in d1_bindings.values() {
             crate::d1::ensure_database(&self.node, database)?;
         }
+        tracing::debug!(
+            worker = %runtime_id,
+            revision,
+            d1_bindings = d1_bindings.len(),
+            "Worker 运行内容与 D1 元数据已就绪"
+        );
         let event_token = hex::encode(rand::random::<[u8; 32]>());
         std::fs::write(
             src.join("__rf_entry.js"),
@@ -403,6 +416,12 @@ impl Runtime {
         }
         let _secret_config_cleanup =
             SecretConfigCleanup((!secret_bindings.is_empty()).then_some(config_path.clone()));
+        tracing::debug!(
+            worker = %runtime_id,
+            revision,
+            port,
+            "Worker workerd 配置已生成"
+        );
 
         let mut cmd = Command::new(workerd);
         cmd.arg("serve");
@@ -426,6 +445,12 @@ impl Runtime {
         let mut child = cmd
             .spawn()
             .with_context(|| format!("为 Worker 运行实例 {runtime_id} 启动 workerd"))?;
+        tracing::debug!(
+            worker = %runtime_id,
+            revision,
+            pid = child.id(),
+            "Worker workerd 子进程已创建，正在等待监听端口"
+        );
         if let Some(stdout) = child.stdout.take() {
             spawn_log_reader(
                 self.node.clone(),

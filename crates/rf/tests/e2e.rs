@@ -708,12 +708,48 @@ fn spawn_node(dir: &Path, config: &Path) -> TestChild {
             .arg("run")
             .arg("--config")
             .arg(config)
-            .env("RUST_LOG", "info")
+            .env("RUST_LOG", "info,rf::runtime=debug")
             .stdout(Stdio::from(log))
             .stderr(Stdio::from(log2))
             .spawn()
             .expect("spawn rf"),
     )
+}
+
+async fn dump_worker_diagnostics(client: &PeerClient, node: &mut TestNode, worker: &str) {
+    match node.child.try_wait() {
+        Ok(Some(status)) => eprintln!("node process exited before {worker} became ready: {status}"),
+        Ok(None) => eprintln!("node process is still running while {worker} is not ready"),
+        Err(error) => eprintln!("could not inspect node process for {worker}: {error}"),
+    }
+    match tokio::time::timeout(Duration::from_secs(5), client.status(&node.api)).await {
+        Ok(Ok(status)) => {
+            let worker_status = status["workers"]
+                .as_array()
+                .and_then(|workers| workers.iter().find(|item| item["name"] == worker));
+            eprintln!(
+                "peer status for {worker}: {}",
+                worker_status
+                    .map(serde_json::Value::to_string)
+                    .unwrap_or_else(|| "manifest absent from live worker set".into())
+            );
+        }
+        Ok(Err(error)) => eprintln!("could not read peer status for {worker}: {error:#}"),
+        Err(_) => eprintln!("peer status request for {worker} timed out"),
+    }
+    match tokio::time::timeout(Duration::from_secs(5), client.worker_log(&node.api, worker)).await {
+        Ok(Ok(envelopes)) => eprintln!(
+            "signed manifest log for {worker}: {} envelope(s), digests [{}]",
+            envelopes.len(),
+            envelopes
+                .iter()
+                .map(|envelope| hex::encode(envelope.digest()))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+        Ok(Err(error)) => eprintln!("could not read manifest log for {worker}: {error:#}"),
+        Err(_) => eprintln!("manifest log request for {worker} timed out"),
+    }
 }
 
 async fn wait_ping(api: &str, budget: Duration) {
@@ -1336,6 +1372,7 @@ export default {
             break;
         }
         if Instant::now() >= deadline {
+            dump_worker_diagnostics(&client, &mut n, "api").await;
             dump_node_logs(&[&n]);
             panic!("module worker never came up via ingress");
         }
