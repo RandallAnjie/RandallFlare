@@ -2387,8 +2387,21 @@ function fillWorkflowForm(workflow) {
   $("#workflow-retention").value = spec.retention_days || 30;
   $("#workflow-retries").value = spec.instance_retries ?? 3;
   $("#workflow-timeout").value = spec.instance_timeout_seconds || 1500;
+  $("#workflow-concurrency").value = spec.max_concurrent_instances ?? 32;
+  $("#workflow-cron").value = spec.cron || "";
+  $("#workflow-webhook-enabled").checked = Boolean(spec.webhook_enabled);
+  $("#workflow-hostnames").value = (spec.hostnames || []).join("\n");
   $("#workflow-suspended").checked = Boolean(spec.suspended);
   $("#workflow-suspend-reason").value = spec.suspend_reason || "";
+}
+
+function renderWorkflowTokens(workflow) {
+  const tokens = workflow?.spec?.tokens || [];
+  const list = $("#workflow-token-list");
+  list.classList.toggle("empty-state", tokens.length === 0);
+  list.innerHTML = tokens.length
+    ? tokens.map((token) => `<article class="build-row"><span class="pipeline-state success"></span><div><strong>${escapeHtml(token.label || "未命名令牌")}</strong><small>尾号 ${escapeHtml(token.last_four)} · ${escapeHtml(new Date(token.created_at_ms).toLocaleString("zh-CN"))}</small><code>${escapeHtml(token.id)}</code></div><button class="mini-button danger" type="button" data-workflow-token-revoke="${escapeHtml(token.id)}">撤销</button></article>`).join("")
+    : "暂无 Webhook 令牌。";
 }
 
 function renderWorkflows() {
@@ -2418,6 +2431,7 @@ async function loadWorkflows({ quiet = false } = {}) {
       state.workflowInstanceActive = null;
       $("#workflow-active-name").textContent = "请选择 Workflow";
       $("#workflow-trigger-form").classList.add("hidden");
+      $("#workflow-token-form").classList.add("hidden");
       $("#workflow-delete").classList.add("hidden");
       $("#workflow-instance-panel").classList.add("hidden");
     }
@@ -2446,8 +2460,13 @@ async function selectWorkflow(name) {
   fillWorkflowForm(workflow);
   renderWorkflows();
   $("#workflow-active-name").textContent = name;
-  $("#workflow-summary").textContent = `${workflow.spec.worker} · ${workflow.spec.entrypoint} · 定义 v${workflow.version}`;
+  const triggerSummary = [
+    workflow.spec.cron ? `Cron ${workflow.spec.cron}（UTC）` : null,
+    workflow.spec.webhook_enabled ? `Webhook https://${workflow.default_hostname || workflow.spec.hostnames?.[0] || "未配置域名"}/hook` : null,
+  ].filter(Boolean).join(" · ");
+  $("#workflow-summary").textContent = `${workflow.spec.worker} · ${workflow.spec.entrypoint} · 定义 v${workflow.version}${triggerSummary ? ` · ${triggerSummary}` : ""}`;
   $("#workflow-trigger-form").classList.remove("hidden");
+  $("#workflow-token-form").classList.remove("hidden");
   $("#workflow-delete").classList.remove("hidden");
   if (workflowChanged) $("#workflow-instance-panel").classList.add("hidden");
   const stats = workflow.stats || {};
@@ -2455,6 +2474,7 @@ async function selectWorkflow(name) {
   $("#workflow-waiting-count").textContent = String(stats.waiting || 0);
   $("#workflow-complete-count").textContent = String(stats.complete || 0);
   $("#workflow-failed-count").textContent = String(stats.failed || 0);
+  renderWorkflowTokens(workflow);
   await loadWorkflowInstances();
 }
 
@@ -2505,7 +2525,7 @@ async function openWorkflowInstance(id) {
     $("#workflow-instance-panel").classList.remove("hidden");
     $("#workflow-instance-title").textContent = instance.instance_key || shortId(instance.id, 28);
     $("#workflow-instance-status").textContent = workflowStatusLabel(instance.status);
-    $("#workflow-instance-meta").textContent = `${instance.id} · ${new Date(instance.started_at_ms).toLocaleString("zh-CN")}${instance.last_error ? ` · ${instance.last_error}` : ""}`;
+    $("#workflow-instance-meta").textContent = `${instance.id} · 定义 v${instance.definition_version} · ${instance.entrypoint} · ${new Date(instance.started_at_ms).toLocaleString("zh-CN")}${instance.last_error ? ` · ${instance.last_error}` : ""}`;
     const actions = [];
     if (["queued", "running", "waiting"].includes(instance.status)) actions.push(["pause", "暂停"], ["terminate", "终止"]);
     if (instance.status === "paused") actions.push(["resume", "恢复"], ["terminate", "终止"]);
@@ -2526,13 +2546,40 @@ async function saveWorkflow(event) {
     entrypoint: $("#workflow-entrypoint").value.trim(), description: $("#workflow-description").value.trim(),
     retention_days: Number($("#workflow-retention").value), instance_retries: Number($("#workflow-retries").value),
     instance_timeout_seconds: Number($("#workflow-timeout").value), suspended: $("#workflow-suspended").checked,
-    suspend_reason: $("#workflow-suspend-reason").value.trim(),
+    suspend_reason: $("#workflow-suspend-reason").value.trim(), cron: $("#workflow-cron").value.trim() || null,
+    webhook_enabled: $("#workflow-webhook-enabled").checked,
+    hostnames: $("#workflow-hostnames").value.split(/\r?\n/).map((value) => value.trim().toLowerCase()).filter(Boolean),
+    max_concurrent_instances: Number($("#workflow-concurrency").value),
   };
   try {
     const result = await api("/api/workflows", { method: "POST", body: JSON.stringify(payload) });
     const complete = async () => { await loadWorkflows({ quiet: true }); await selectWorkflow(payload.name); };
     if (result.pending_approval) showApproval(result, `批准后，Workflow ${payload.name} 的签名定义将传播到集群。`, complete);
     else { toast(`Workflow ${payload.name} 已保存`); await complete(); }
+  } catch (error) { toast(error.message, true); }
+}
+
+async function mintWorkflowToken(event) {
+  event.preventDefault();
+  if (!state.workflowActive) return;
+  try {
+    const name = state.workflowActive;
+    const result = await api(`/api/workflows/${encodeURIComponent(name)}/tokens`, { method: "POST", body: JSON.stringify({ label: $("#workflow-token-label").value.trim() }) });
+    $("#workflow-new-token").textContent = result.token;
+    $("#workflow-token-reveal").classList.remove("hidden");
+    $("#workflow-token-label").value = "";
+    const complete = async () => { await loadWorkflows({ quiet: true }); await selectWorkflow(name); };
+    if (result.pending_approval) showApproval(result, "批准后，新令牌的哈希将写入签名 Workflow 定义。", complete); else await complete();
+  } catch (error) { toast(error.message, true); }
+}
+
+async function revokeWorkflowToken(id) {
+  if (!state.workflowActive || !window.confirm("要撤销此 Workflow Webhook 令牌吗？使用它的调用方会立即失去访问权限。")) return;
+  try {
+    const name = state.workflowActive;
+    const result = await api(`/api/workflows/${encodeURIComponent(name)}/tokens/${encodeURIComponent(id)}`, { method: "DELETE" });
+    const complete = async () => { await loadWorkflows({ quiet: true }); await selectWorkflow(name); };
+    if (result.pending_approval) showApproval(result, "批准后，令牌哈希将从签名 Workflow 定义移除。", complete); else await complete();
   } catch (error) { toast(error.message, true); }
 }
 
@@ -4577,7 +4624,7 @@ async function boot() {
     $("#security-copy").innerHTML = consoleMode === "public"
       ? "此节点不保存<br>任何私钥。"
       : "密钥仅保留在本地<br>控制台进程中。";
-    $$("#deploy-form button, #source-form button, #kv-editor-form button, #d1-create-form button, #d1-exec-form button, #r2-bucket-form button, #r2-upload-form button, #r2-delete-bucket, #storage-form button, #storage-probe, #queue-form button, #queue-send-form button, #queue-delete, #analytics-form button, #analytics-write-form button, #analytics-delete, #pipeline-form button, #pipeline-token-form button, #pipeline-ingest-form button, #pipeline-flush, #pipeline-delete, #workflow-form button, #workflow-trigger-form button, #workflow-signal-form button, #workflow-delete, #flow-form button, #flow-token-form button, #flow-trigger-form button, #flow-delete, #network-rule-form button, #network-device-form button, #email-domain-form button, #email-route-form button, #email-send-form button, #email-delete, #email-verify, #binary-form button, #binary-new, #project-domain-add-form button, #project-bindings-form button, #project-secret-form button, #project-file-form button, #project-file-new, #project-triggers-form button, #project-cron-fire-form button, #project-cron-dlq button, #project-settings-form button, #project-preview-form button, #project-preview-list button, #project-source-form button, #project-redeploy, #project-delete, #quota-form button, #access-token-form button, #s3-credential-form button")
+    $$("#deploy-form button, #source-form button, #kv-editor-form button, #d1-create-form button, #d1-exec-form button, #r2-bucket-form button, #r2-upload-form button, #r2-delete-bucket, #storage-form button, #storage-probe, #queue-form button, #queue-send-form button, #queue-delete, #analytics-form button, #analytics-write-form button, #analytics-delete, #pipeline-form button, #pipeline-token-form button, #pipeline-ingest-form button, #pipeline-flush, #pipeline-delete, #workflow-form button, #workflow-token-form button, #workflow-trigger-form button, #workflow-signal-form button, #workflow-delete, #flow-form button, #flow-token-form button, #flow-trigger-form button, #flow-delete, #network-rule-form button, #network-device-form button, #email-domain-form button, #email-route-form button, #email-send-form button, #email-delete, #email-verify, #binary-form button, #binary-new, #project-domain-add-form button, #project-bindings-form button, #project-secret-form button, #project-file-form button, #project-file-new, #project-triggers-form button, #project-cron-fire-form button, #project-cron-dlq button, #project-settings-form button, #project-preview-form button, #project-preview-list button, #project-source-form button, #project-redeploy, #project-delete, #quota-form button, #access-token-form button, #s3-credential-form button")
       .forEach((button) => { button.disabled = state.session.read_only; });
     $("#network-device-transport-warning").classList.toggle("hidden", consoleMode === "local" || credentialWritesAllowed());
     $("#node-policy-form button").disabled = state.session.read_only;
@@ -4788,6 +4835,8 @@ $("#pipeline-refresh").addEventListener("click", () => state.pipelineActive && s
 $("#pipeline-delete").addEventListener("click", deletePipeline);
 $("#pipeline-copy-token").addEventListener("click", () => copyText($("#pipeline-new-token").textContent, $("#pipeline-copy-token")));
 $("#workflow-form").addEventListener("submit", saveWorkflow);
+$("#workflow-token-form").addEventListener("submit", mintWorkflowToken);
+$("#workflow-copy-token").addEventListener("click", () => copyText($("#workflow-new-token").textContent, $("#workflow-copy-token")));
 $("#workflow-trigger-form").addEventListener("submit", triggerWorkflow);
 $("#workflow-signal-form").addEventListener("submit", sendWorkflowSignal);
 $("#workflow-refresh").addEventListener("click", loadWorkflowInstances);
@@ -4922,6 +4971,10 @@ $("#workflow-instances").addEventListener("click", (event) => {
 $("#workflow-instance-actions").addEventListener("click", (event) => {
   const button = event.target.closest("button[data-workflow-action]");
   if (button) runWorkflowAction(button.dataset.workflowAction);
+});
+$("#workflow-token-list").addEventListener("click", (event) => {
+  const button = event.target.closest("[data-workflow-token-revoke]");
+  if (button) revokeWorkflowToken(button.dataset.workflowTokenRevoke);
 });
 $("#flow-list").addEventListener("click", (event) => { const button = event.target.closest("[data-flow]"); if (button) selectFlow(button.dataset.flow); });
 $("#flow-edge-list").addEventListener("click", (event) => { const button = event.target.closest("[data-flow-edge-remove]"); if (!button) return; state.flowGraph.edges = state.flowGraph.edges.filter((edge) => edge.id !== button.dataset.flowEdgeRemove); renderFlowCanvas(); });

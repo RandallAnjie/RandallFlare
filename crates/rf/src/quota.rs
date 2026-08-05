@@ -198,7 +198,10 @@ pub fn validate_resource_admission(node: &Node, record: &ResourceRecord) -> Resu
     let quota = policy(node).context("集群配额策略无效；为安全起见拒绝资源变更")?;
     if matches!(
         record.kind.as_str(),
-        crate::r2::BUCKET_KIND | crate::pipeline::PIPELINE_KIND | crate::flow::FLOW_KIND
+        crate::r2::BUCKET_KIND
+            | crate::pipeline::PIPELINE_KIND
+            | crate::flow::FLOW_KIND
+            | crate::workflow::WORKFLOW_KIND
     ) {
         let hostnames = prospective_custom_hostnames(node, None, Some(record))?;
         if hostnames.len() as u64 > quota.max_custom_hostnames as u64 {
@@ -260,6 +263,9 @@ fn extend_resource_hostnames(
         }
         crate::flow::FLOW_KIND => {
             hostnames.extend(crate::flow::flow_spec(record)?.hostnames);
+        }
+        crate::workflow::WORKFLOW_KIND => {
+            hostnames.extend(crate::workflow::workflow_spec(record)?.hostnames);
         }
         _ => {}
     }

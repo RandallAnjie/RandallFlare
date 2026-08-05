@@ -211,6 +211,41 @@ pub fn spawn_renewer(node: Arc<Node>, cfg: AcmeConfig, dns: DnsApi) {
                             }
                         }
                     }
+                    for (view, spec) in crate::flow::flow_records(&node) {
+                        for hostname in node.effective_flow_hostnames(&view.resource.name, &spec) {
+                            let hostname =
+                                hostname.trim().trim_end_matches('.').to_ascii_lowercase();
+                            if hostname == zone || hostname.ends_with(&format!(".{zone}")) {
+                                let covered_by_configured_wildcard = hostname
+                                    .split_once('.')
+                                    .map(|(_, suffix)| format!("*.{suffix}"))
+                                    .is_some_and(|wildcard| configured.contains(&wildcard));
+                                if !covered_by_configured_wildcard {
+                                    hostnames.insert(hostname);
+                                }
+                            }
+                        }
+                    }
+                    for (view, spec) in crate::workflow::workflow_records(&node) {
+                        if !spec.webhook_enabled {
+                            continue;
+                        }
+                        for hostname in
+                            node.effective_workflow_hostnames(&view.resource.name, &spec)
+                        {
+                            let hostname =
+                                hostname.trim().trim_end_matches('.').to_ascii_lowercase();
+                            if hostname == zone || hostname.ends_with(&format!(".{zone}")) {
+                                let covered_by_configured_wildcard = hostname
+                                    .split_once('.')
+                                    .map(|(_, suffix)| format!("*.{suffix}"))
+                                    .is_some_and(|wildcard| configured.contains(&wildcard));
+                                if !covered_by_configured_wildcard {
+                                    hostnames.insert(hostname);
+                                }
+                            }
+                        }
+                    }
                 }
             }
             for hostname in hostnames {

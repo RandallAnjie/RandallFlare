@@ -670,6 +670,29 @@ impl Node {
             .map(|domain| format!("flow-{flow}.{domain}"))
     }
 
+    pub fn default_workflow_hostname(&self, workflow: &str) -> Option<String> {
+        self.cfg
+            .default_worker_domain()
+            .map(|domain| format!("workflow-{workflow}.{domain}"))
+    }
+
+    pub fn effective_workflow_hostnames(
+        &self,
+        workflow: &str,
+        spec: &crate::workflow::WorkflowSpec,
+    ) -> Vec<String> {
+        let mut hostnames = Vec::with_capacity(spec.hostnames.len() + 1);
+        if let Some(default) = self.default_workflow_hostname(workflow) {
+            hostnames.push(default);
+        }
+        for hostname in &spec.hostnames {
+            if !hostnames.contains(hostname) {
+                hostnames.push(hostname.clone());
+            }
+        }
+        hostnames
+    }
+
     pub fn effective_flow_hostnames(
         &self,
         flow: &str,

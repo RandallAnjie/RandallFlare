@@ -126,9 +126,10 @@ Working today, verified by multi-process fault-injection e2e tests:
   `step.do()` commits JSON results exactly once across replays, while
   `sleep()` / `sleepUntil()` and `waitForSignal()` park without occupying a
   process. Fenced five-minute leases, minute heartbeats, bounded system retry,
-  pause/resume/terminate/restart, retention GC, Worker bindings, encrypted API,
-  CLI and the Chinese instance/step timeline are exercised against real
-  workerd.
+  pause/resume/terminate/restart, retention GC, definition-pinned instances,
+  atomic concurrency caps, UTC Cron and token-authenticated Webhook triggers,
+  Worker bindings, encrypted API, CLI and the Chinese instance/step timeline
+  are exercised against real workerd. See [Workflow guide](./docs/WORKFLOWS.md).
 - **Visual durable Flows**: a dedicated Chinese management page combines a
   draggable DAG canvas, node inspector, signed settings, one-time Webhook
   tokens and run/step/audit views. Manual, Cron and public Webhook triggers
@@ -519,6 +520,16 @@ rf workflow create order-flow --worker site --entrypoint OrderWorkflow
 rf workflow trigger order-flow --idempotency-key order-1001 --input '{"orderId":"1001"}'
 rf workflow instances order-flow
 rf workflow signal order-flow <instance-id> paid --payload '{"method":"card"}'
+```
+
+Webhook plaintext is shown only once and only its SHA-256 verifier enters the
+signed definition. The deterministic default endpoint is
+`https://workflow-order-flow.<default-domain>/hook`:
+
+```bash
+rf workflow token-create order-flow --label production
+rf workflow create order-flow --worker site --entrypoint OrderWorkflow \
+  --webhook --cron '0 * * * *' --max-concurrent-instances 16
 ```
 
 Durable Object bindings use the exported class name; `unique_key` is

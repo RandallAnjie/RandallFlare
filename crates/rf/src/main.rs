@@ -1062,9 +1062,40 @@ enum WorkflowCmd {
         #[arg(long, default_value_t = 1500)]
         instance_timeout_seconds: u64,
         #[arg(long)]
+        cron: Option<String>,
+        #[arg(long)]
+        webhook: bool,
+        #[arg(long = "hostname")]
+        hostnames: Vec<String>,
+        #[arg(long, default_value_t = 32)]
+        max_concurrent_instances: u16,
+        #[arg(long)]
         suspended: bool,
         #[arg(long, default_value = "")]
         suspend_reason: String,
+        #[arg(long, env = "RF_NODE")]
+        node: String,
+        #[arg(long, env = "RF_OPERATOR_KEY")]
+        key: Option<PathBuf>,
+        #[arg(long, env = "RF_CLUSTER_SECRET")]
+        secret: String,
+    },
+    /// Mint a Workflow webhook token. Its plaintext is printed once.
+    TokenCreate {
+        name: String,
+        #[arg(long, default_value = "")]
+        label: String,
+        #[arg(long, env = "RF_NODE")]
+        node: String,
+        #[arg(long, env = "RF_OPERATOR_KEY")]
+        key: Option<PathBuf>,
+        #[arg(long, env = "RF_CLUSTER_SECRET")]
+        secret: String,
+    },
+    /// Revoke a Workflow webhook token by public id.
+    TokenRevoke {
+        name: String,
+        id: String,
         #[arg(long, env = "RF_NODE")]
         node: String,
         #[arg(long, env = "RF_OPERATOR_KEY")]
@@ -3126,6 +3157,10 @@ async fn async_main(cli: Cli) -> Result<()> {
                 retention_days,
                 instance_retries,
                 instance_timeout_seconds,
+                cron,
+                webhook,
+                hostnames,
+                max_concurrent_instances,
                 suspended,
                 suspend_reason,
                 node,
@@ -3136,6 +3171,11 @@ async fn async_main(cli: Cli) -> Result<()> {
                 let head = client
                     .resource_head(&node, rf::workflow::WORKFLOW_KIND, &name)
                     .await?;
+                let tokens = head
+                    .as_ref()
+                    .and_then(|head| rf::workflow::workflow_spec(&head.resource).ok())
+                    .map(|spec| spec.tokens)
+                    .unwrap_or_default();
                 let spec = rf::workflow::WorkflowSpec {
                     description,
                     worker,
@@ -3145,12 +3185,68 @@ async fn async_main(cli: Cli) -> Result<()> {
                     retention_days,
                     instance_retries,
                     instance_timeout_seconds,
+                    cron,
+                    webhook_enabled: webhook,
+                    hostnames,
+                    tokens,
+                    max_concurrent_instances,
                 };
                 let record =
                     rf::workflow::prepare_workflow_after(&name, spec, false, head.as_ref())?;
                 let envelope = rf_core::envelope::Envelope::seal_any(&record, &operator_key(key)?);
                 client.post_resource(&node, &envelope).await?;
                 println!("Workflow {} 已更新至 v{}", record.name, record.version);
+                Ok(())
+            }
+            WorkflowCmd::TokenCreate {
+                name,
+                label,
+                node,
+                key,
+                secret,
+            } => {
+                let client = PeerClient::new(secret_bytes(&secret)?);
+                let head = client
+                    .resource_head(&node, rf::workflow::WORKFLOW_KIND, &name)
+                    .await?
+                    .filter(|view| !view.resource.deleted)
+                    .with_context(|| format!("Workflow {name} 不存在"))?;
+                let mut spec = rf::workflow::workflow_spec(&head.resource)?;
+                let (token, plaintext) = rf::workflow::mint_token(label)?;
+                let id = token.id.clone();
+                spec.tokens.push(token);
+                let record = rf::workflow::prepare_workflow_after(&name, spec, false, Some(&head))?;
+                let envelope = rf_core::envelope::Envelope::seal_any(&record, &operator_key(key)?);
+                client.post_resource(&node, &envelope).await?;
+                println!("token_id={id}\ntoken={plaintext}");
+                Ok(())
+            }
+            WorkflowCmd::TokenRevoke {
+                name,
+                id,
+                node,
+                key,
+                secret,
+            } => {
+                let client = PeerClient::new(secret_bytes(&secret)?);
+                let head = client
+                    .resource_head(&node, rf::workflow::WORKFLOW_KIND, &name)
+                    .await?
+                    .filter(|view| !view.resource.deleted)
+                    .with_context(|| format!("Workflow {name} 不存在"))?;
+                let mut spec = rf::workflow::workflow_spec(&head.resource)?;
+                let before = spec.tokens.len();
+                spec.tokens.retain(|token| token.id != id);
+                if before == spec.tokens.len() {
+                    anyhow::bail!("Workflow Webhook 令牌不存在：{id}");
+                }
+                if spec.webhook_enabled && spec.tokens.is_empty() {
+                    spec.webhook_enabled = false;
+                }
+                let record = rf::workflow::prepare_workflow_after(&name, spec, false, Some(&head))?;
+                let envelope = rf_core::envelope::Envelope::seal_any(&record, &operator_key(key)?);
+                client.post_resource(&node, &envelope).await?;
+                println!("Workflow {name} Webhook 令牌 {id} 已撤销");
                 Ok(())
             }
             WorkflowCmd::Delete {

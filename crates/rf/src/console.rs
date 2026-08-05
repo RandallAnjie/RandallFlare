@@ -453,6 +453,11 @@ pub fn router(state: ConsoleState) -> Router {
         .route("/api/pipelines/{name}/flush", post(pipeline_flush))
         .route("/api/workflows", get(workflow_list).post(workflow_apply))
         .route("/api/workflows/{name}", delete(workflow_delete))
+        .route("/api/workflows/{name}/tokens", post(workflow_token_mint))
+        .route(
+            "/api/workflows/{name}/tokens/{id}",
+            delete(workflow_token_revoke),
+        )
         .route(
             "/api/workflows/{name}/instances",
             get(workflow_instances).post(workflow_trigger),
@@ -1892,9 +1897,21 @@ async fn public_api_workflows(
     require_api_scope(&principal, "workflow:read")?;
     let workflows = crate::workflow::workflow_records(state.public_node()?)
         .into_iter()
-        .map(|(view, spec)| json!({ "name": view.resource.name, "version": view.resource.version, "spec": spec }))
+        .map(|(view, spec)| json!({ "name": view.resource.name, "version": view.resource.version, "spec": public_workflow_spec(&spec) }))
         .collect::<Vec<_>>();
     Ok(Json(json!({ "workflows": workflows })))
+}
+
+fn public_workflow_spec(spec: &crate::workflow::WorkflowSpec) -> Value {
+    let mut value = serde_json::to_value(spec).unwrap_or(Value::Null);
+    if let Some(tokens) = value.get_mut("tokens").and_then(Value::as_array_mut) {
+        for token in tokens {
+            if let Some(object) = token.as_object_mut() {
+                object.remove("sha256");
+            }
+        }
+    }
+    value
 }
 
 async fn public_api_workflow_instances(
@@ -7455,6 +7472,14 @@ struct WorkflowRequest {
     suspended: bool,
     #[serde(default)]
     suspend_reason: String,
+    #[serde(default)]
+    cron: Option<String>,
+    #[serde(default)]
+    webhook_enabled: bool,
+    #[serde(default)]
+    hostnames: Vec<String>,
+    #[serde(default = "workflow_default_concurrency")]
+    max_concurrent_instances: u16,
 }
 
 fn workflow_default_entrypoint() -> String {
@@ -7471,6 +7496,17 @@ fn workflow_default_retries() -> u16 {
 
 fn workflow_default_timeout() -> u64 {
     25 * 60
+}
+
+fn workflow_default_concurrency() -> u16 {
+    32
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WorkflowTokenRequest {
+    #[serde(default)]
+    label: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -7508,12 +7544,17 @@ async fn workflow_list(State(state): State<ConsoleState>) -> ApiResult<Json<Valu
             .workflow_stats(&state.node, &view.resource.name)
             .await
             .ok();
+        let default_hostname = match &state.mode {
+            ConsoleMode::Public { node, .. } => node.default_workflow_hostname(&view.resource.name),
+            ConsoleMode::Local { .. } => None,
+        };
         workflows.push(json!({
             "name": view.resource.name,
             "version": view.resource.version,
             "digest": view.digest,
-            "spec": spec,
+            "spec": public_workflow_spec(&spec),
             "stats": stats,
+            "default_hostname": default_hostname,
         }));
     }
     Ok(Json(json!({ "workflows": workflows })))
@@ -7532,6 +7573,11 @@ async fn workflow_apply(
         .client
         .resource_head(&state.node, crate::workflow::WORKFLOW_KIND, &request.name)
         .await?;
+    let tokens = head
+        .as_ref()
+        .and_then(|head| crate::workflow::workflow_spec(&head.resource).ok())
+        .map(|spec| spec.tokens)
+        .unwrap_or_default();
     let spec = crate::workflow::WorkflowSpec {
         description: request.description,
         worker: request.worker,
@@ -7541,6 +7587,11 @@ async fn workflow_apply(
         retention_days: request.retention_days,
         instance_retries: request.instance_retries,
         instance_timeout_seconds: request.instance_timeout_seconds,
+        cron: request.cron,
+        webhook_enabled: request.webhook_enabled,
+        hostnames: request.hostnames,
+        tokens,
+        max_concurrent_instances: request.max_concurrent_instances,
     };
     let record =
         crate::workflow::prepare_workflow_after(&request.name, spec, false, head.as_ref())?;
@@ -7549,6 +7600,68 @@ async fn workflow_apply(
         &principal,
         record,
         format!("创建或更新 Workflow {}", request.name),
+    )
+    .await
+}
+
+async fn workflow_token_mint(
+    State(state): State<ConsoleState>,
+    Extension(principal): Extension<ConsolePrincipal>,
+    Path(name): Path<String>,
+    Json(request): Json<WorkflowTokenRequest>,
+) -> ApiResult<Json<Value>> {
+    state.require_mutation()?;
+    let head = state
+        .client
+        .resource_head(&state.node, crate::workflow::WORKFLOW_KIND, &name)
+        .await?
+        .filter(|view| !view.resource.deleted)
+        .ok_or_else(|| ApiError::not_found("Workflow 不存在"))?;
+    let mut spec = crate::workflow::workflow_spec(&head.resource)?;
+    let (token, plaintext) = crate::workflow::mint_token(request.label)?;
+    let token_id = token.id.clone();
+    spec.tokens.push(token);
+    let record = crate::workflow::prepare_workflow_after(&name, spec, false, Some(&head))?;
+    let mut response = submit_workflow_resource(
+        &state,
+        &principal,
+        record,
+        format!("为 Workflow {name} 签发 Webhook 令牌"),
+    )
+    .await?
+    .0;
+    response["token"] = Value::String(plaintext);
+    response["token_id"] = Value::String(token_id);
+    Ok(Json(response))
+}
+
+async fn workflow_token_revoke(
+    State(state): State<ConsoleState>,
+    Extension(principal): Extension<ConsolePrincipal>,
+    Path((name, id)): Path<(String, String)>,
+) -> ApiResult<Json<Value>> {
+    state.require_mutation()?;
+    let head = state
+        .client
+        .resource_head(&state.node, crate::workflow::WORKFLOW_KIND, &name)
+        .await?
+        .filter(|view| !view.resource.deleted)
+        .ok_or_else(|| ApiError::not_found("Workflow 不存在"))?;
+    let mut spec = crate::workflow::workflow_spec(&head.resource)?;
+    let before = spec.tokens.len();
+    spec.tokens.retain(|token| token.id != id);
+    if before == spec.tokens.len() {
+        return Err(ApiError::not_found("Workflow Webhook 令牌不存在"));
+    }
+    if spec.webhook_enabled && spec.tokens.is_empty() {
+        spec.webhook_enabled = false;
+    }
+    let record = crate::workflow::prepare_workflow_after(&name, spec, false, Some(&head))?;
+    submit_workflow_resource(
+        &state,
+        &principal,
+        record,
+        format!("撤销 Workflow {name} 的 Webhook 令牌 {id}"),
     )
     .await
 }

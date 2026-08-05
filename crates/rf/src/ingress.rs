@@ -124,6 +124,20 @@ async fn handle(State(ingress): State<Ingress>, req: Request) -> Response {
         .await;
     }
 
+    if let Some((workflow, spec)) = crate::workflow::workflow_records(&ingress.node)
+        .into_iter()
+        .find_map(|(view, spec)| {
+            ingress
+                .node
+                .effective_workflow_hostnames(&view.resource.name, &spec)
+                .iter()
+                .any(|candidate| candidate == &host)
+                .then_some((view.resource.name, spec))
+        })
+    {
+        return serve_workflow_ingress(&ingress.node, req, &workflow, &spec).await;
+    }
+
     if let Some((flow, spec)) = crate::flow::flow_records(&ingress.node)
         .into_iter()
         .find_map(|(view, spec)| {
@@ -527,6 +541,81 @@ async fn serve_flow_ingress(
         )
             .into_response(),
         Err(error) => (StatusCode::SERVICE_UNAVAILABLE, error.to_string()).into_response(),
+    }
+}
+
+async fn serve_workflow_ingress(
+    node: &Node,
+    req: Request,
+    workflow: &str,
+    spec: &crate::workflow::WorkflowSpec,
+) -> Response {
+    if !spec.webhook_enabled {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+    if req.method() != Method::POST || !matches!(req.uri().path(), "/" | "/hook" | "/v1/run") {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+    let token = req
+        .headers()
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.strip_prefix("Bearer "))
+        .or_else(|| {
+            req.headers()
+                .get("x-workflow-token")
+                .and_then(|value| value.to_str().ok())
+        });
+    if !token.is_some_and(|token| crate::workflow::token_matches(spec, token.trim())) {
+        let mut response =
+            (StatusCode::UNAUTHORIZED, "Workflow Webhook 令牌无效\n").into_response();
+        response.headers_mut().insert(
+            axum::http::header::WWW_AUTHENTICATE,
+            HeaderValue::from_static("Bearer realm=\"RandallFlare Workflow\""),
+        );
+        return response;
+    }
+    let instance_key = req
+        .headers()
+        .get("idempotency-key")
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_string);
+    let body = match axum::body::to_bytes(req.into_body(), crate::workflow::MAX_INPUT_BYTES).await {
+        Ok(body) => body,
+        Err(_) => {
+            return (
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "Workflow 输入不得超过 4 MiB\n",
+            )
+                .into_response()
+        }
+    };
+    let input = if body.is_empty() {
+        serde_json::Value::Null
+    } else {
+        match serde_json::from_slice(&body) {
+            Ok(input) => input,
+            Err(error) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    format!("Workflow 输入必须是 JSON：{error}\n"),
+                )
+                    .into_response()
+            }
+        }
+    };
+    match crate::workflow::create_instance(node, workflow, instance_key.as_deref(), input).await {
+        Ok(instance) => (
+            StatusCode::ACCEPTED,
+            axum::Json(serde_json::json!({
+                "id": instance.id,
+                "status": instance.status,
+                "definitionVersion": instance.definition_version,
+                "startedAtMs": instance.started_at_ms,
+            })),
+        )
+            .into_response(),
+        Err(error) => (StatusCode::UNPROCESSABLE_ENTITY, error.to_string()).into_response(),
     }
 }
 

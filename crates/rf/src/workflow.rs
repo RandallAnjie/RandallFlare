@@ -16,6 +16,7 @@ use base64::Engine as _;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
+use std::collections::BTreeSet;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -41,6 +42,20 @@ fn default_instance_timeout_seconds() -> u64 {
     25 * 60
 }
 
+fn default_max_concurrent_instances() -> u16 {
+    32
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkflowToken {
+    pub id: String,
+    pub label: String,
+    pub sha256: String,
+    pub last_four: String,
+    pub created_at_ms: u64,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct WorkflowSpec {
@@ -59,6 +74,19 @@ pub struct WorkflowSpec {
     pub instance_retries: u16,
     #[serde(default = "default_instance_timeout_seconds")]
     pub instance_timeout_seconds: u64,
+    /// Optional UTC five-field cron expression. Each minute is protected by a
+    /// deterministic D1 idempotency key, so every node may evaluate it.
+    #[serde(default)]
+    pub cron: Option<String>,
+    #[serde(default)]
+    pub webhook_enabled: bool,
+    #[serde(default)]
+    pub hostnames: Vec<String>,
+    /// Webhook plaintext is never stored; only SHA-256 verifiers are signed.
+    #[serde(default)]
+    pub tokens: Vec<WorkflowToken>,
+    #[serde(default = "default_max_concurrent_instances")]
+    pub max_concurrent_instances: u16,
 }
 
 fn default_entrypoint() -> String {
@@ -85,6 +113,40 @@ impl WorkflowSpec {
         if !(30..=12 * 60 * 60).contains(&self.instance_timeout_seconds) {
             bail!("Workflow 单次推进超时必须介于 30 秒和 12 小时之间");
         }
+        if let Some(expression) = self.cron.as_deref() {
+            rf_core::cron::CronExpr::parse(expression)
+                .map_err(|error| anyhow::anyhow!("Workflow Cron 表达式无效：{error}"))?;
+        }
+        if self.max_concurrent_instances > 1_000 {
+            bail!("Workflow 最大并发实例数不得超过 1000；0 表示不额外限制");
+        }
+        if self.hostnames.len() > 64 {
+            bail!("Workflow 自定义域名不得超过 64 个");
+        }
+        for hostname in &self.hostnames {
+            if !rf_core::manifest::valid_hostname(hostname) {
+                bail!("Workflow 自定义域名无效：{hostname}");
+            }
+        }
+        if self.tokens.len() > 64 {
+            bail!("一个 Workflow 最多允许 64 个 Webhook 令牌");
+        }
+        let mut token_ids = BTreeSet::new();
+        for token in &self.tokens {
+            if token.id.len() != 16
+                || !token.id.bytes().all(|byte| byte.is_ascii_hexdigit())
+                || token.sha256.len() != 64
+                || !token.sha256.bytes().all(|byte| byte.is_ascii_hexdigit())
+                || token.last_four.len() != 4
+                || token.label.len() > 128
+                || !token_ids.insert(&token.id)
+            {
+                bail!("Workflow Webhook 令牌元数据无效");
+            }
+        }
+        if self.webhook_enabled && self.tokens.is_empty() {
+            bail!("启用 Workflow Webhook 前至少需要一个只保存哈希的令牌");
+        }
         Ok(())
     }
 }
@@ -100,6 +162,11 @@ impl Default for WorkflowSpec {
             retention_days: default_retention_days(),
             instance_retries: default_instance_retries(),
             instance_timeout_seconds: default_instance_timeout_seconds(),
+            cron: None,
+            webhook_enabled: false,
+            hostnames: vec![],
+            tokens: vec![],
+            max_concurrent_instances: default_max_concurrent_instances(),
         }
     }
 }
@@ -118,6 +185,10 @@ pub struct WorkflowInstance {
     pub started_at_ms: u64,
     pub finished_at_ms: Option<u64>,
     pub updated_at_ms: u64,
+    pub definition_version: u64,
+    pub entrypoint: String,
+    pub instance_retries: u16,
+    pub instance_timeout_seconds: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -232,13 +303,62 @@ pub fn database_name(workflow: &str) -> String {
     format!("workflow-{}", &digest[..32])
 }
 
+pub fn mint_token(label: impl Into<String>) -> Result<(WorkflowToken, String)> {
+    let label = label.into();
+    if label.len() > 128 {
+        bail!("Workflow Webhook 令牌标签不得超过 128 个字符");
+    }
+    let plaintext = format!(
+        "rfw_{}",
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(rand::random::<[u8; 32]>())
+    );
+    let id = hex::encode(rand::random::<[u8; 8]>());
+    let last_four = plaintext
+        .chars()
+        .rev()
+        .take(4)
+        .collect::<String>()
+        .chars()
+        .rev()
+        .collect();
+    Ok((
+        WorkflowToken {
+            id,
+            label,
+            sha256: hex::encode(Sha256::digest(plaintext.as_bytes())),
+            last_four,
+            created_at_ms: now_ms(),
+        },
+        plaintext,
+    ))
+}
+
+pub fn token_matches(spec: &WorkflowSpec, plaintext: &str) -> bool {
+    let actual = Sha256::digest(plaintext.as_bytes());
+    spec.tokens.iter().any(|token| {
+        hex::decode(&token.sha256)
+            .ok()
+            .is_some_and(|expected| constant_time_eq(&actual, &expected))
+    })
+}
+
+fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
+    if left.len() != right.len() {
+        return false;
+    }
+    left.iter()
+        .zip(right)
+        .fold(0u8, |difference, (left, right)| difference | (left ^ right))
+        == 0
+}
+
 pub async fn create_instance(
     node: &Node,
     workflow: &str,
     instance_key: Option<&str>,
     input: Value,
 ) -> Result<WorkflowInstance> {
-    let (_, spec) = workflow_record(node, workflow).context("Workflow 不存在")?;
+    let (view, spec) = workflow_record(node, workflow).context("Workflow 不存在")?;
     if spec.suspended {
         bail!("Workflow 已暂停：{}", spec.suspend_reason);
     }
@@ -258,9 +378,19 @@ pub async fn create_instance(
         workflow,
         r#"INSERT OR IGNORE INTO workflow_instances
            (id, instance_key, input_json, status, sleep_until_ms, retry_count,
-            started_at_ms, updated_at_ms)
-           VALUES (?1,?2,?3,'queued',?4,0,?4,?4)"#,
-        json!([id, instance_key, input_json, now]),
+            started_at_ms, updated_at_ms, definition_version, entrypoint,
+            instance_retries, instance_timeout_seconds)
+           VALUES (?1,?2,?3,'queued',?4,0,?4,?4,?5,?6,?7,?8)"#,
+        json!([
+            id,
+            instance_key,
+            input_json,
+            now,
+            view.resource.version,
+            spec.entrypoint,
+            spec.instance_retries,
+            spec.instance_timeout_seconds,
+        ]),
     )
     .await?["rows_affected"]
         .as_u64()
@@ -971,7 +1101,11 @@ async fn park(
         == 1)
 }
 
-async fn claim_one(node: &Node, workflow: &str) -> Result<Option<Claim>> {
+async fn claim_one(
+    node: &Node,
+    workflow: &str,
+    max_concurrent_instances: u16,
+) -> Result<Option<Claim>> {
     ensure_schema(node, workflow).await?;
     let now = now_ms();
     // An expired runner is safe to replay because every completed step is
@@ -1010,8 +1144,15 @@ async fn claim_one(node: &Node, workflow: &str) -> Result<Option<Claim>> {
         r#"UPDATE workflow_instances SET status='running', waiting_for=NULL,
            lease_token=?2, lease_until_ms=?3, updated_at_ms=?4
            WHERE id=?1 AND status IN ('queued','waiting')
-             AND sleep_until_ms IS NOT NULL AND sleep_until_ms<=?4"#,
-        json!([id, lease, now.saturating_add(LEASE_MS), now]),
+             AND sleep_until_ms IS NOT NULL AND sleep_until_ms<=?4
+             AND (?5=0 OR (SELECT COUNT(*) FROM workflow_instances WHERE status='running')<?5)"#,
+        json!([
+            id,
+            lease,
+            now.saturating_add(LEASE_MS),
+            now,
+            max_concurrent_instances,
+        ]),
     )
     .await?["rows_affected"]
         .as_u64()
@@ -1098,7 +1239,7 @@ async fn fail_terminal(
 async fn fail_system(
     node: &Node,
     workflow: &str,
-    spec: &WorkflowSpec,
+    max_retries: u16,
     id: &str,
     lease: &str,
     error: &str,
@@ -1108,7 +1249,7 @@ async fn fail_system(
         .context("Workflow 实例不存在")?;
     let error = truncate_error(error);
     let now = now_ms();
-    if current.retry_count < spec.instance_retries {
+    if current.retry_count < max_retries {
         let retry_count = current.retry_count + 1;
         let backoff = (1u64 << retry_count.min(8)) * 1_000;
         let changed = exec(
@@ -1171,7 +1312,7 @@ async fn advance(node: Arc<Node>, workflow: String, spec: WorkflowSpec, claim: C
                 let _ = fail_system(
                     &node,
                     &workflow,
-                    &spec,
+                    claim.instance.instance_retries,
                     &claim.instance.id,
                     &claim.lease,
                     "Workflow 返回 parked，但没有持久化等待边界",
@@ -1186,7 +1327,7 @@ async fn advance(node: Arc<Node>, workflow: String, spec: WorkflowSpec, claim: C
             let _ = fail_system(
                 &node,
                 &workflow,
-                &spec,
+                claim.instance.instance_retries,
                 &claim.instance.id,
                 &claim.lease,
                 &format!("{error:#}"),
@@ -1212,10 +1353,10 @@ async fn dispatch(
         workflow: workflow.into(),
         instance_id: claim.instance.id.clone(),
         input: claim.instance.input.clone(),
-        entrypoint: spec.entrypoint.clone(),
+        entrypoint: claim.instance.entrypoint.clone(),
         lease: claim.lease.clone(),
     };
-    let timeout = Duration::from_secs(spec.instance_timeout_seconds);
+    let timeout = Duration::from_secs(claim.instance.instance_timeout_seconds);
     let client = reqwest::Client::builder().timeout(timeout).build()?;
     let (done_tx, mut done_rx) = tokio::sync::watch::channel(false);
     let heartbeat_node = node.clone();
@@ -1275,15 +1416,46 @@ pub fn spawn_driver(node: Arc<Node>) {
     tokio::spawn(async move {
         let advances = Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_ADVANCES));
         let mut last_gc = 0u64;
+        let mut last_cron_minute = u64::MAX;
         loop {
+            let cron_minute = now_ms() / 60_000;
+            let evaluate_cron = cron_minute != last_cron_minute;
             for (view, spec) in workflow_records(&node) {
-                if spec.suspended || node.worker_port(&spec.worker).is_none() {
+                if spec.suspended {
+                    continue;
+                }
+                if evaluate_cron {
+                    if let Some(expression) = spec.cron.as_deref() {
+                        if rf_core::cron::CronExpr::parse(expression)
+                            .is_ok_and(|cron| cron.matches(cron_minute * 60))
+                        {
+                            let key = format!("cron:v{}:{cron_minute}", view.resource.version);
+                            if let Err(error) = create_instance(
+                                &node,
+                                &view.resource.name,
+                                Some(&key),
+                                json!({
+                                    "scheduledAtMs": cron_minute * 60_000,
+                                    "cron": expression,
+                                }),
+                            )
+                            .await
+                            {
+                                tracing::debug!(
+                                    "创建 Workflow {} Cron 实例失败：{error:#}",
+                                    view.resource.name
+                                );
+                            }
+                        }
+                    }
+                }
+                if node.worker_port(&spec.worker).is_none() {
                     continue;
                 }
                 let Ok(permit) = advances.clone().try_acquire_owned() else {
                     break;
                 };
-                match claim_one(&node, &view.resource.name).await {
+                match claim_one(&node, &view.resource.name, spec.max_concurrent_instances).await {
                     Ok(Some(claim)) => {
                         let node = node.clone();
                         let workflow = view.resource.name;
@@ -1298,6 +1470,9 @@ pub fn spawn_driver(node: Arc<Node>) {
                         tracing::debug!("认领 Workflow {} 失败：{error:#}", view.resource.name);
                     }
                 }
+            }
+            if evaluate_cron {
+                last_cron_minute = cron_minute;
             }
             if now_ms().saturating_sub(last_gc) >= 60 * 60 * 1_000 {
                 last_gc = now_ms();
@@ -1360,7 +1535,11 @@ async fn ensure_schema(node: &Node, workflow: &str) -> Result<()> {
              retry_count INTEGER NOT NULL DEFAULT 0,
              started_at_ms INTEGER NOT NULL,
              finished_at_ms INTEGER,
-             updated_at_ms INTEGER NOT NULL
+             updated_at_ms INTEGER NOT NULL,
+             definition_version INTEGER NOT NULL DEFAULT 0,
+             entrypoint TEXT NOT NULL DEFAULT 'MyWorkflow',
+             instance_retries INTEGER NOT NULL DEFAULT 3,
+             instance_timeout_seconds INTEGER NOT NULL DEFAULT 1500
            )"#,
         "CREATE INDEX IF NOT EXISTS workflow_instances_due ON workflow_instances(status,sleep_until_ms,started_at_ms)",
         "CREATE INDEX IF NOT EXISTS workflow_instances_started ON workflow_instances(started_at_ms DESC)",
@@ -1403,7 +1582,85 @@ async fn ensure_schema(node: &Node, workflow: &str) -> Result<()> {
     ] {
         exec_database(node, &database, sql, json!([])).await?;
     }
+    ensure_column(
+        node,
+        &database,
+        "workflow_instances",
+        "definition_version",
+        "INTEGER NOT NULL DEFAULT 0",
+    )
+    .await?;
+    ensure_column(
+        node,
+        &database,
+        "workflow_instances",
+        "entrypoint",
+        "TEXT NOT NULL DEFAULT 'MyWorkflow'",
+    )
+    .await?;
+    ensure_column(
+        node,
+        &database,
+        "workflow_instances",
+        "instance_retries",
+        "INTEGER NOT NULL DEFAULT 3",
+    )
+    .await?;
+    ensure_column(
+        node,
+        &database,
+        "workflow_instances",
+        "instance_timeout_seconds",
+        "INTEGER NOT NULL DEFAULT 1500",
+    )
+    .await?;
+    if let Some((view, spec)) = workflow_record(node, workflow) {
+        exec_database(
+            node,
+            &database,
+            r#"UPDATE workflow_instances SET definition_version=?1, entrypoint=?2,
+               instance_retries=?3, instance_timeout_seconds=?4
+               WHERE definition_version=0"#,
+            json!([
+                view.resource.version,
+                spec.entrypoint,
+                spec.instance_retries,
+                spec.instance_timeout_seconds,
+            ]),
+        )
+        .await?;
+    }
     node.mark_workflow_schema_ready(database);
+    Ok(())
+}
+
+async fn ensure_column(
+    node: &Node,
+    database: &str,
+    table: &str,
+    column: &str,
+    definition: &str,
+) -> Result<()> {
+    let info = exec_database(
+        node,
+        database,
+        &format!("PRAGMA table_info({table})"),
+        json!([]),
+    )
+    .await?;
+    if rows(info)
+        .iter()
+        .any(|row| row.get("name").and_then(Value::as_str) == Some(column))
+    {
+        return Ok(());
+    }
+    exec_database(
+        node,
+        database,
+        &format!("ALTER TABLE {table} ADD COLUMN {column} {definition}"),
+        json!([]),
+    )
+    .await?;
     Ok(())
 }
 
@@ -1422,7 +1679,7 @@ async fn exec_database(node: &Node, database: &str, sql: &str, params: Value) ->
     client.d1_exec(&base, database, sql, params).await
 }
 
-const INSTANCE_FIELDS: &str = "id,instance_key,input_json,output_json,status,waiting_for,sleep_until_ms,last_error,retry_count,started_at_ms,finished_at_ms,updated_at_ms";
+const INSTANCE_FIELDS: &str = "id,instance_key,input_json,output_json,status,waiting_for,sleep_until_ms,last_error,retry_count,started_at_ms,finished_at_ms,updated_at_ms,definition_version,entrypoint,instance_retries,instance_timeout_seconds";
 
 fn rows(result: Value) -> Vec<Value> {
     result["rows"].as_array().cloned().unwrap_or_default()
@@ -1442,6 +1699,10 @@ fn row_to_instance(row: &Value) -> Result<WorkflowInstance> {
         started_at_ms: u64_field(row, "started_at_ms"),
         finished_at_ms: optional_u64_field(row, "finished_at_ms"),
         updated_at_ms: u64_field(row, "updated_at_ms"),
+        definition_version: u64_field(row, "definition_version"),
+        entrypoint: string_field(row, "entrypoint")?.into(),
+        instance_retries: u64_field(row, "instance_retries") as u16,
+        instance_timeout_seconds: u64_field(row, "instance_timeout_seconds"),
     })
 }
 
@@ -1574,6 +1835,32 @@ mod tests {
         bad = good;
         bad.instance_timeout_seconds = 1;
         assert!(bad.validate().is_err());
+
+        let mut scheduled = WorkflowSpec {
+            worker: "orders-worker".into(),
+            cron: Some("*/5 * * * *".into()),
+            ..Default::default()
+        };
+        assert!(scheduled.validate().is_ok());
+        scheduled.cron = Some("not a cron".into());
+        assert!(scheduled.validate().is_err());
+    }
+
+    #[test]
+    fn webhook_tokens_are_one_way_and_required_when_enabled() {
+        let (token, plaintext) = mint_token("生产系统").unwrap();
+        assert!(!token.sha256.contains(&plaintext));
+        let mut spec = WorkflowSpec {
+            worker: "orders-worker".into(),
+            webhook_enabled: true,
+            tokens: vec![token],
+            ..Default::default()
+        };
+        assert!(spec.validate().is_ok());
+        assert!(token_matches(&spec, &plaintext));
+        assert!(!token_matches(&spec, "rfw_wrong"));
+        spec.tokens.clear();
+        assert!(spec.validate().is_err());
     }
 
     #[test]

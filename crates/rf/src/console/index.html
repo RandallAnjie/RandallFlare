@@ -681,6 +681,10 @@
                     <label><span>系统重试次数</span><input id="workflow-retries" type="number" min="0" max="100" value="3" required></label>
                   </div>
                   <label><span>单次推进超时（秒）</span><input id="workflow-timeout" type="number" min="30" max="43200" value="1500" required></label>
+                  <label><span>最大并发实例 <em>0 表示不限</em></span><input id="workflow-concurrency" type="number" min="0" max="1000" value="32" required></label>
+                  <label><span>Cron（UTC，可选）</span><input id="workflow-cron" class="code-input" placeholder="0 * * * *"></label>
+                  <label class="check-label"><input id="workflow-webhook-enabled" type="checkbox"><span>启用带令牌的 Webhook 触发</span></label>
+                  <label><span>Webhook 自定义域名 <em>每行一个；自动包含 workflow-&lt;name&gt; 默认域名</em></span><textarea id="workflow-hostnames" class="code-input" rows="3" placeholder="workflow.example.com"></textarea></label>
                   <label class="check-label"><input id="workflow-suspended" type="checkbox"><span>暂停新实例与自动推进</span></label>
                   <label><span>暂停原因</span><input id="workflow-suspend-reason" placeholder="维护窗口"></label>
                   <button class="primary" type="submit">保存 Workflow</button>
@@ -700,6 +704,12 @@
                   <article class="metric"><span>已完成</span><strong id="workflow-complete-count">—</strong></article>
                   <article class="metric"><span>失败</span><strong id="workflow-failed-count">—</strong></article>
                 </div>
+              </article>
+              <article class="panel">
+                <div class="panel-head"><div><p class="eyebrow">Webhook 凭据</p><h2>接收令牌</h2><p class="muted compact-copy">签名定义只保存 SHA-256；明文仅显示一次。先签发令牌，再启用 Webhook。</p></div></div>
+                <form id="workflow-token-form" class="inline-form hidden"><label><span>标签</span><input id="workflow-token-label" placeholder="生产系统"></label><span></span><button class="secondary" type="submit">签发令牌</button></form>
+                <div id="workflow-token-reveal" class="hidden"><p class="banner warning">请立即复制并安全保存，此令牌不会再次显示。</p><pre id="workflow-new-token" class="result"></pre><button id="workflow-copy-token" class="secondary compact" type="button">复制令牌</button></div>
+                <div id="workflow-token-list" class="build-list empty-state">暂无 Webhook 令牌。</div>
               </article>
               <article class="panel">
                 <div class="panel-head"><div><p class="eyebrow">调试触发</p><h2>创建实例</h2><p class="muted compact-copy">幂等键可安全重试；同一 Workflow 下重复键只返回原实例。</p></div></div>

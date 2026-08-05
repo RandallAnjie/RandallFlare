@@ -1135,6 +1135,8 @@ export default {
         )
         .await
         .unwrap();
+    let (workflow_token, workflow_plaintext) =
+        rf::workflow::mint_token("module worker e2e").unwrap();
     let workflow_record = rf::workflow::prepare_workflow_after(
         "order-flow",
         rf::workflow::WorkflowSpec {
@@ -1146,6 +1148,9 @@ export default {
             retention_days: 30,
             instance_retries: 3,
             instance_timeout_seconds: 120,
+            webhook_enabled: true,
+            tokens: vec![workflow_token],
+            ..Default::default()
         },
         false,
         None,
@@ -1358,6 +1363,31 @@ export default {
         .await
         .unwrap();
     assert_eq!(workflow_retry["id"], workflow_instance);
+    assert_eq!(
+        http.post(format!("http://127.0.0.1:{}/hook", n.ingress))
+            .header("host", "workflow-order-flow.workers.test")
+            .json(&serde_json::json!({}))
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        reqwest::StatusCode::UNAUTHORIZED
+    );
+    let webhook_trigger: serde_json::Value = http
+        .post(format!("http://127.0.0.1:{}/hook", n.ingress))
+        .header("host", "workflow-order-flow.workers.test")
+        .bearer_auth(&workflow_plaintext)
+        .header("idempotency-key", "order-e2e")
+        .json(&serde_json::json!({ "orderId": "ignored-by-idempotency" }))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(webhook_trigger["id"], workflow_instance);
     let deadline = Instant::now() + Duration::from_secs(20);
     loop {
         let detail = client
@@ -1366,6 +1396,10 @@ export default {
             .unwrap();
         if detail["instance"]["status"] == "waiting" && detail["instance"]["waiting_for"] == "paid"
         {
+            assert_eq!(detail["instance"]["definition_version"], 1);
+            assert_eq!(detail["instance"]["entrypoint"], "OrderWorkflow");
+            assert_eq!(detail["instance"]["instance_retries"], 3);
+            assert_eq!(detail["instance"]["instance_timeout_seconds"], 120);
             assert_eq!(
                 client
                     .kv_get(&n.api, "ns1", "workflow-prepare-count")
