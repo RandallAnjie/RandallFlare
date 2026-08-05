@@ -56,6 +56,9 @@
           <button class="nav-item" data-view="r2">
             <span class="nav-glyph" aria-hidden="true">⬡</span><span>R2 对象存储</span><span id="r2-nav-count" class="count">0</span>
           </button>
+          <button class="nav-item" data-view="storage">
+            <span class="nav-glyph" aria-hidden="true">▦</span><span>存储策略</span><span id="storage-nav-count" class="count">0</span>
+          </button>
           <button class="nav-item" data-view="d1">
             <span class="nav-glyph" aria-hidden="true">◫</span><span>D1 数据库</span>
           </button>
@@ -419,7 +422,7 @@
                 <form id="r2-bucket-form" class="stack-form">
                   <label><span>bucket 名称</span><input id="r2-bucket-name" pattern="[a-z0-9-]{1,63}" placeholder="assets" required></label>
                   <label><span>说明</span><input id="r2-bucket-description" placeholder="生产静态资源"></label>
-                  <label><span>存储后端</span><select id="r2-storage-backend"><option value="local">集群本地副本</option><option value="rclone">rclone remote</option></select></label>
+                  <label><span>存储后端</span><select id="r2-storage-backend"><option value="local">集群本地副本</option><option value="policy">签名 rclone 分片策略</option><option value="rclone">固定 rclone remote</option></select></label>
                   <div id="r2-rclone-fields" class="form-grid hidden">
                     <label><span>remote 名称</span><input id="r2-rclone-remote" placeholder="s3-primary"></label>
                     <label><span>对象前缀</span><input id="r2-rclone-prefix" placeholder="randallflare/assets"></label>
@@ -894,6 +897,35 @@ Content-Type: text/plain; charset=utf-8
               </article>
             </div>
           </div>
+        </section>
+
+        <section id="view-storage" class="view" aria-labelledby="section-title">
+          <div class="projects-header">
+            <div><p class="eyebrow">签名全局默认值</p><h2>存储策略与 rclone 分片</h2><p class="muted">新建 bucket 可继承策略；新对象按 SHA-256 稳定选盘，实际 remote 和前缀逐对象固定，因此扩容不会移动或丢失既有数据。</p></div>
+            <button id="storage-refresh" class="secondary" type="button">刷新分布</button>
+          </div>
+          <div class="metrics compact-metrics">
+            <article class="metric"><span>策略版本</span><strong id="storage-version">内置</strong><small id="storage-digest">安全本地默认值</small></article>
+            <article class="metric"><span>分片盘</span><strong id="storage-remote-count">0</strong><small>每个 remote 独立配置凭据</small></article>
+            <article class="metric"><span>已固定对象</span><strong id="storage-object-count">0</strong><small id="storage-byte-count">0 B</small></article>
+            <article class="metric"><span>新 bucket 后端</span><strong id="storage-default-backend">本地</strong><small>只影响新创建的 bucket</small></article>
+          </div>
+          <div class="grid one-one storage-grid">
+            <article class="panel settings-panel storage-policy-panel">
+              <div class="settings-copy"><p class="eyebrow">策略定义</p><h2>默认后端与分片盘</h2><p class="muted">列表顺序参与稳定分片。添加、重排或改前缀只影响后续写入；旧对象继续按元数据中的具体位置读取。仍保存对象或 multipart 分片的 remote 会被拒绝移除。</p></div>
+              <form id="storage-form" class="settings-form">
+                <label><span>新 bucket 默认后端</span><select id="storage-default"><option value="local">集群本地多数派副本</option><option value="rclone_sharded">rclone 内容分片</option></select></label>
+                <label><span>有序 rclone remote <em>每行一个，最多 256 个</em></span><textarea id="storage-remotes" class="code-input" rows="10" placeholder="drive-00&#10;drive-01&#10;drive-02"></textarea><small>名称必须对应各节点私有 rclone.conf 中的 section；配置与凭据绝不会写入资源链。</small></label>
+                <label><span>盘内平铺前缀</span><input id="storage-prefix" placeholder="randallflare/shards"><small>实际 key 为 &lt;前缀&gt;/&lt;sha256&gt;，不创建哈希目录。</small></label>
+                <div class="button-row"><button class="primary" type="submit">提交签名存储策略</button><button id="storage-probe" class="secondary" type="button">探测所有节点</button></div>
+              </form>
+            </article>
+            <div class="r2-sidebar-stack">
+              <article class="panel"><div class="panel-head"><div><p class="eyebrow">节点可达性</p><h2>remote 探测</h2></div><span class="badge">不读取凭据</span></div><div id="storage-probes" class="database-list empty-state">点击“探测所有节点”检查 remote。</div></article>
+              <article class="panel"><div class="panel-head"><div><p class="eyebrow">实际固定位置</p><h2>对象引用分布</h2></div><span class="badge">逐对象固定</span></div><div id="storage-distribution" class="database-list empty-state">暂无已索引对象。</div></article>
+            </div>
+          </div>
+          <article class="panel"><p class="eyebrow">扩容语义</p><h2>零迁移扩容</h2><p class="muted">每次写入先计算 SHA-256，再用摘要前 32 位对当前有序 remote 集合取模。元数据提交的是选中的具体 <code>rclone_shard</code> 位置；随后增盘不会重解释旧对象。相同摘要在同一策略时天然去重，生命周期回收也按被固定的位置执行。</p></article>
         </section>
 
         <section id="view-d1" class="view" aria-labelledby="section-title">

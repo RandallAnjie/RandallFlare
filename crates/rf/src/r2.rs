@@ -15,7 +15,7 @@ use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 
 pub const BUCKET_KIND: &str = "r2_bucket";
 pub const MAX_OBJECT_KEY_BYTES: usize = 1024;
@@ -36,6 +36,11 @@ pub struct BucketSpec {
     #[serde(default)]
     pub public_access: bool,
     pub storage: StorageLocation,
+    /// Opt into a signed dynamic shard set. `storage` remains `local` as a
+    /// backwards-compatible placeholder; every new blob is resolved to and
+    /// recorded with one concrete `rclone_shard` location.
+    #[serde(default)]
+    pub storage_policy: Option<String>,
     #[serde(default)]
     pub max_bytes: Option<u64>,
     #[serde(default)]
@@ -57,6 +62,17 @@ impl BucketSpec {
             bail!("R2 bucket 描述不得超过 2000 个字符");
         }
         self.storage.validate()?;
+        if matches!(self.storage, StorageLocation::RcloneShard { .. }) {
+            bail!("R2 bucket 不能直接指定内部 rclone_shard 位置；请使用签名存储策略");
+        }
+        if let Some(policy) = &self.storage_policy {
+            if policy != crate::storage_policy::DEFAULT_POLICY_NAME {
+                bail!("R2 bucket 引用了未知存储策略：{policy}");
+            }
+            if self.storage != StorageLocation::Local {
+                bail!("使用存储策略的 bucket 不能同时指定固定 rclone remote");
+            }
+        }
         if self.max_bytes == Some(0) || self.max_objects == Some(0) {
             bail!("R2 bucket 配额必须大于零；不限制时请留空");
         }
@@ -86,6 +102,10 @@ impl BucketSpec {
             }
         }
         Ok(())
+    }
+
+    pub fn uses_local_storage(&self) -> bool {
+        self.storage_policy.is_none() && self.storage == StorageLocation::Local
     }
 }
 
@@ -125,6 +145,14 @@ pub struct ObjectList {
 pub struct BucketUsage {
     pub bytes: u64,
     pub objects: u64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct StorageUsage {
+    pub storage: StorageLocation,
+    pub bytes: u64,
+    pub objects: u64,
+    pub buckets: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -205,9 +233,53 @@ pub fn bucket_spec(resource: &ResourceRecord) -> Result<BucketSpec> {
     Ok(spec)
 }
 
+pub fn validate_bucket_admission(node: &Node, resource: &ResourceRecord) -> Result<()> {
+    let spec = bucket_spec(resource)?;
+    if let Some(policy) = &spec.storage_policy {
+        crate::storage_policy::resolve(node, policy, &[0u8; 32])?;
+    }
+    Ok(())
+}
+
 pub fn metadata_database(bucket: &str) -> String {
     let digest = hex::encode(Sha256::digest(format!("r2/{bucket}").as_bytes()));
     format!("r2-{}", &digest[..32])
+}
+
+fn resolve_write_storage(
+    node: &Node,
+    spec: &BucketSpec,
+    sha: &[u8; 32],
+) -> Result<StorageLocation> {
+    match &spec.storage_policy {
+        Some(policy) => crate::storage_policy::resolve(node, policy, sha),
+        None => Ok(spec.storage.clone()),
+    }
+}
+
+fn resolve_multipart_storage(
+    node: &Node,
+    upload: &MultipartRow,
+    sha: &[u8; 32],
+) -> Result<StorageLocation> {
+    match &upload.storage_policy {
+        Some(policy) => crate::storage_policy::resolve(node, policy, sha),
+        None => Ok(upload.storage.clone()),
+    }
+}
+
+fn validate_write_backend(node: &Node, spec: &BucketSpec) -> Result<()> {
+    let probe_digest = [0u8; 32];
+    let storage = resolve_write_storage(node, spec, &probe_digest)?;
+    if !node.objects.supports(&storage)
+        && !node
+            .peers()
+            .values()
+            .any(|peer| peer.api_addr.is_some() && peer.capabilities.contains("rclone"))
+    {
+        bail!("集群中没有可用的 rclone 存储节点");
+    }
+    Ok(())
 }
 
 pub async fn put_object(
@@ -233,19 +305,21 @@ async fn commit_object(
     options: PutOptions,
 ) -> Result<ObjectMeta> {
     let (_, spec) = bucket_record(node, bucket).context("R2 bucket 不存在")?;
-    if !node.objects.supports(&spec.storage) {
-        bail!("当前节点不具备此 bucket 所需的存储后端");
+    let sha: [u8; 32] = Sha256::digest(bytes).into();
+    let storage = resolve_write_storage(node, &spec, &sha)?;
+    if !node.objects.supports(&storage) {
+        return forward_put_to_storage_peer(node, bucket, key, bytes, options).await;
     }
     let group = ensure_schema(node, bucket).await?;
     let _quota_guard = node.r2_quota_gate.lock().await;
     let previous = head_object(node, bucket, key).await?;
     crate::quota::validate_r2_write(node, bucket, previous.as_ref(), bytes.len() as u64).await?;
     // Failed quota admission must not consume unindexed local/rclone storage.
-    let sha = node.objects.put(&spec.storage, bytes).await?;
+    node.objects.put_verified(&storage, &sha, bytes).await?;
     let sha256 = hex::encode(sha);
     let etag = sha256.clone();
     let uploaded_at_ms = now_ms();
-    if spec.storage == StorageLocation::Local {
+    if storage == StorageLocation::Local {
         replicate_local_blob(node, &group, &sha, bytes).await?;
     }
 
@@ -282,7 +356,7 @@ async fn commit_object(
             options.content_type,
             serde_json::to_string(&options.custom_metadata)?,
             serde_json::to_string(&options.http_metadata)?,
-            serde_json::to_string(&spec.storage)?,
+            serde_json::to_string(&storage)?,
             uploaded_at_ms,
             max_bytes,
             max_objects,
@@ -303,7 +377,7 @@ async fn commit_object(
         content_type: options.content_type,
         custom_metadata: options.custom_metadata,
         http_metadata: options.http_metadata,
-        storage: spec.storage,
+        storage,
         uploaded_at_ms,
     })
 }
@@ -317,16 +391,14 @@ pub async fn create_multipart_upload(
     validate_key(key)?;
     validate_metadata(&options)?;
     let (_, spec) = bucket_record(node, bucket).context("R2 bucket 不存在")?;
-    if !node.objects.supports(&spec.storage) {
-        bail!("当前节点不具备此 bucket 所需的存储后端");
-    }
+    validate_write_backend(node, &spec)?;
     ensure_schema(node, bucket).await?;
     let upload_id = hex::encode(rand::random::<[u8; 20]>());
     let expires_at_ms = now_ms().saturating_add(MULTIPART_TTL_MS);
     exec(
         node,
         bucket,
-        "INSERT INTO multipart_uploads (upload_id, key, content_type, custom_metadata, http_metadata, storage_json, created_at_ms, expires_at_ms) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+        "INSERT INTO multipart_uploads (upload_id, key, content_type, custom_metadata, http_metadata, storage_json, storage_policy, created_at_ms, expires_at_ms) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
         json!([
             upload_id,
             key,
@@ -334,6 +406,7 @@ pub async fn create_multipart_upload(
             serde_json::to_string(&options.custom_metadata)?,
             serde_json::to_string(&options.http_metadata)?,
             serde_json::to_string(&spec.storage)?,
+            spec.storage_policy,
             now_ms(),
             expires_at_ms,
         ]),
@@ -367,13 +440,35 @@ pub async fn upload_part(
     if upload.expires_at_ms <= now_ms() {
         bail!("R2 分片上传已过期");
     }
-    let sha = node.objects.put(&upload.storage, bytes).await?;
+    let sha: [u8; 32] = Sha256::digest(bytes).into();
+    let storage = resolve_multipart_storage(node, &upload, &sha)?;
+    if !node.objects.supports(&storage) {
+        return forward_upload_part_to_storage_peer(
+            node,
+            bucket,
+            key,
+            upload_id,
+            part_number,
+            bytes,
+        )
+        .await;
+    }
+    node.objects.put_verified(&storage, &sha, bytes).await?;
     let etag = hex::encode(sha);
     let result = exec(
         node,
         bucket,
-        "INSERT INTO multipart_parts (upload_id, part_number, sha256, size, etag, uploaded_at_ms) SELECT ?1, ?2, ?3, ?4, ?5, ?6 WHERE EXISTS (SELECT 1 FROM multipart_uploads WHERE upload_id = ?1 AND key = ?7 AND expires_at_ms > ?6) ON CONFLICT(upload_id, part_number) DO UPDATE SET sha256=excluded.sha256, size=excluded.size, etag=excluded.etag, uploaded_at_ms=excluded.uploaded_at_ms",
-        json!([upload_id, part_number, etag, bytes.len(), etag, now_ms(), key]),
+        "INSERT INTO multipart_parts (upload_id, part_number, sha256, size, etag, storage_json, uploaded_at_ms) SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7 WHERE EXISTS (SELECT 1 FROM multipart_uploads WHERE upload_id = ?1 AND key = ?8 AND expires_at_ms > ?7) ON CONFLICT(upload_id, part_number) DO UPDATE SET sha256=excluded.sha256, size=excluded.size, etag=excluded.etag, storage_json=excluded.storage_json, uploaded_at_ms=excluded.uploaded_at_ms",
+        json!([
+            upload_id,
+            part_number,
+            etag,
+            bytes.len(),
+            etag,
+            serde_json::to_string(&storage)?,
+            now_ms(),
+            key
+        ]),
     )
     .await?;
     if result["rows_affected"].as_u64() != Some(1) {
@@ -401,13 +496,16 @@ pub async fn complete_multipart_upload(
     if upload.expires_at_ms <= now_ms() {
         bail!("R2 分片上传已过期");
     }
+    if multipart_requires_rclone(&upload) && node.cfg.storage.rclone_binary.is_none() {
+        return forward_complete_to_storage_peer(node, bucket, key, upload_id, parts).await;
+    }
     let mut assembled = Vec::new();
     let mut consumed_parts = Vec::new();
     for published in parts {
         let result = exec(
             node,
             bucket,
-            "SELECT sha256, size, etag FROM multipart_parts WHERE upload_id = ?1 AND part_number = ?2",
+            "SELECT sha256, size, etag, storage_json FROM multipart_parts WHERE upload_id = ?1 AND part_number = ?2",
             json!([upload_id, published.part_number]),
         )
         .await?;
@@ -437,12 +535,17 @@ pub async fn complete_multipart_upload(
         if assembled.len().saturating_add(declared_size as usize) > MAX_MULTIPART_OBJECT_BYTES {
             bail!("R2 分片合并后的对象不得超过 512 MiB");
         }
-        let bytes = node.objects.get(&upload.storage, &sha).await?;
+        let storage: StorageLocation = serde_json::from_str(
+            row.get("storage_json")
+                .and_then(Value::as_str)
+                .context("R2 分片缺少存储位置")?,
+        )?;
+        let bytes = node.objects.get(&storage, &sha).await?;
         if bytes.len() as u64 != declared_size {
             bail!("R2 分片 {} 的大小校验失败", published.part_number);
         }
         assembled.extend_from_slice(&bytes);
-        consumed_parts.push((hex::encode(sha), declared_size));
+        consumed_parts.push((hex::encode(sha), declared_size, storage));
     }
     let metadata = commit_object(node, bucket, key, &assembled, upload.options).await?;
     // Metadata is removed only after the final object has committed. A retry
@@ -462,8 +565,8 @@ pub async fn complete_multipart_upload(
         json!([upload_id, key]),
     )
     .await?;
-    for (sha256, size) in consumed_parts {
-        schedule_orphan_parts(node, bucket, &sha256, size, &upload.storage).await?;
+    for (sha256, size, storage) in consumed_parts {
+        schedule_orphan_parts(node, bucket, &sha256, size, &storage).await?;
     }
     Ok(metadata)
 }
@@ -477,11 +580,11 @@ pub async fn abort_multipart_upload(
     validate_key(key)?;
     validate_upload_id(upload_id)?;
     ensure_schema(node, bucket).await?;
-    let upload = multipart_row(node, bucket, key, upload_id).await?;
+    multipart_row(node, bucket, key, upload_id).await?;
     let part_rows = exec(
         node,
         bucket,
-        "SELECT sha256, size FROM multipart_parts WHERE upload_id = ?1",
+        "SELECT sha256, size, storage_json FROM multipart_parts WHERE upload_id = ?1",
         json!([upload_id]),
     )
     .await?;
@@ -503,11 +606,13 @@ pub async fn abort_multipart_upload(
     )
     .await?;
     for row in part_rows["rows"].as_array().into_iter().flatten() {
-        if let (Some(sha256), Some(size)) = (
+        if let (Some(sha256), Some(size), Some(storage_json)) = (
             row.get("sha256").and_then(Value::as_str),
             row.get("size").and_then(Value::as_u64),
+            row.get("storage_json").and_then(Value::as_str),
         ) {
-            schedule_orphan_parts(node, bucket, sha256, size, &upload.storage).await?;
+            let storage: StorageLocation = serde_json::from_str(storage_json)?;
+            schedule_orphan_parts(node, bucket, sha256, size, &storage).await?;
         }
     }
     Ok(())
@@ -515,8 +620,17 @@ pub async fn abort_multipart_upload(
 
 struct MultipartRow {
     storage: StorageLocation,
+    storage_policy: Option<String>,
     options: PutOptions,
     expires_at_ms: u64,
+}
+
+fn multipart_requires_rclone(upload: &MultipartRow) -> bool {
+    upload.storage_policy.is_some()
+        || matches!(
+            upload.storage,
+            StorageLocation::Rclone { .. } | StorageLocation::RcloneShard { .. }
+        )
 }
 
 async fn multipart_row(
@@ -528,7 +642,7 @@ async fn multipart_row(
     let result = exec(
         node,
         bucket,
-        "SELECT content_type, custom_metadata, http_metadata, storage_json, expires_at_ms FROM multipart_uploads WHERE upload_id = ?1 AND key = ?2",
+        "SELECT content_type, custom_metadata, http_metadata, storage_json, storage_policy, expires_at_ms FROM multipart_uploads WHERE upload_id = ?1 AND key = ?2",
         json!([upload_id, key]),
     )
     .await?;
@@ -544,6 +658,10 @@ async fn multipart_row(
     };
     Ok(MultipartRow {
         storage: serde_json::from_str(text("storage_json")?)?,
+        storage_policy: row
+            .get("storage_policy")
+            .and_then(Value::as_str)
+            .map(str::to_string),
         options: PutOptions {
             content_type: row
                 .get("content_type")
@@ -597,9 +715,158 @@ pub async fn get_object(
                     format!("本地 R2 对象缺失，且集群修复失败；原始错误：{local_error:#}")
                 })?
         }
+        Err(remote_error) if !node.objects.supports(&meta.storage) => {
+            repair_remote_blob(node, bucket, key, &meta, remote_error).await?
+        }
         Err(error) => return Err(error),
     };
     Ok(Some((meta, bytes)))
+}
+
+async fn forward_put_to_storage_peer(
+    node: &Node,
+    bucket: &str,
+    key: &str,
+    bytes: &[u8],
+    options: PutOptions,
+) -> Result<ObjectMeta> {
+    let client = PeerClient::new(node.cfg.cluster_secret_bytes()?);
+    let mut errors = Vec::new();
+    for (id, peer) in node.peers() {
+        if !peer.capabilities.contains("rclone") {
+            continue;
+        }
+        let Some(address) = peer.api_addr else {
+            continue;
+        };
+        match client
+            .r2_put(&address.to_string(), bucket, key, bytes, &options)
+            .await
+        {
+            Ok(meta) => return Ok(meta),
+            Err(error) => errors.push(format!("{id}: {error:#}")),
+        }
+    }
+    bail!(
+        "当前节点没有所需 rclone 能力，且无法借用可达节点{}",
+        if errors.is_empty() {
+            String::new()
+        } else {
+            format!("：{}", errors.join("；"))
+        }
+    )
+}
+
+async fn forward_upload_part_to_storage_peer(
+    node: &Node,
+    bucket: &str,
+    key: &str,
+    upload_id: &str,
+    part_number: u32,
+    bytes: &[u8],
+) -> Result<UploadedPart> {
+    let client = PeerClient::new(node.cfg.cluster_secret_bytes()?);
+    let mut errors = Vec::new();
+    for (id, peer) in node.peers() {
+        if !peer.capabilities.contains("rclone") {
+            continue;
+        }
+        let Some(address) = peer.api_addr else {
+            continue;
+        };
+        match client
+            .r2_upload_part(
+                &address.to_string(),
+                bucket,
+                key,
+                upload_id,
+                part_number,
+                bytes,
+            )
+            .await
+        {
+            Ok(part) => return Ok(part),
+            Err(error) => errors.push(format!("{id}: {error:#}")),
+        }
+    }
+    bail!(
+        "当前节点没有所需 rclone 能力，且无法转交 R2 multipart 分片{}",
+        storage_peer_errors(&errors)
+    )
+}
+
+async fn forward_complete_to_storage_peer(
+    node: &Node,
+    bucket: &str,
+    key: &str,
+    upload_id: &str,
+    parts: &[PublishedPart],
+) -> Result<ObjectMeta> {
+    let client = PeerClient::new(node.cfg.cluster_secret_bytes()?);
+    let mut errors = Vec::new();
+    for (id, peer) in node.peers() {
+        if !peer.capabilities.contains("rclone") {
+            continue;
+        }
+        let Some(address) = peer.api_addr else {
+            continue;
+        };
+        match client
+            .r2_complete_multipart(&address.to_string(), bucket, key, upload_id, parts)
+            .await
+        {
+            Ok(metadata) => return Ok(metadata),
+            Err(error) => errors.push(format!("{id}: {error:#}")),
+        }
+    }
+    bail!(
+        "当前节点没有所需 rclone 能力，且无法转交 R2 multipart 完成请求{}",
+        storage_peer_errors(&errors)
+    )
+}
+
+fn storage_peer_errors(errors: &[String]) -> String {
+    if errors.is_empty() {
+        String::new()
+    } else {
+        format!("：{}", errors.join("；"))
+    }
+}
+
+async fn repair_remote_blob(
+    node: &Node,
+    bucket: &str,
+    key: &str,
+    expected: &ObjectMeta,
+    original: anyhow::Error,
+) -> Result<Vec<u8>> {
+    let client = PeerClient::new(node.cfg.cluster_secret_bytes()?);
+    let mut errors = vec![format!("本机：{original:#}")];
+    for (id, peer) in node.peers() {
+        if !peer.capabilities.contains("rclone") {
+            continue;
+        }
+        let Some(address) = peer.api_addr else {
+            continue;
+        };
+        match client.r2_get(&address.to_string(), bucket, key).await {
+            Ok(Some((meta, bytes)))
+                if meta.sha256 == expected.sha256
+                    && meta.size == expected.size
+                    && meta.storage == expected.storage =>
+            {
+                let actual = hex::encode(Sha256::digest(&bytes));
+                if actual == expected.sha256 {
+                    return Ok(bytes);
+                }
+                errors.push(format!("{id}: 返回内容摘要不一致"));
+            }
+            Ok(Some(_)) => errors.push(format!("{id}: 返回对象元数据不一致")),
+            Ok(None) => errors.push(format!("{id}: 对象不存在")),
+            Err(error) => errors.push(format!("{id}: {error:#}")),
+        }
+    }
+    bail!("rclone 对象读取失败，集群借用也失败：{}", errors.join("；"))
 }
 
 pub async fn delete_object(node: &Node, bucket: &str, key: &str) -> Result<bool> {
@@ -685,6 +952,83 @@ pub async fn bucket_usage(node: &Node, bucket: &str) -> Result<BucketUsage> {
         bytes: row.get("bytes").and_then(Value::as_u64).unwrap_or(0),
         objects: row.get("objects").and_then(Value::as_u64).unwrap_or(0),
     })
+}
+
+pub async fn storage_distribution(node: &Node) -> Result<Vec<StorageUsage>> {
+    let mut totals: BTreeMap<String, StorageUsage> = BTreeMap::new();
+    for (view, _) in bucket_records(node) {
+        let bucket = view.resource.name;
+        ensure_schema(node, &bucket).await?;
+        let result = exec(
+            node,
+            &bucket,
+            "SELECT storage_json, COUNT(*) AS objects, COALESCE(SUM(size), 0) AS bytes FROM objects GROUP BY storage_json",
+            json!([]),
+        )
+        .await?;
+        for row in result["rows"].as_array().into_iter().flatten() {
+            let raw = row
+                .get("storage_json")
+                .and_then(Value::as_str)
+                .context("R2 存储分布缺少位置")?;
+            let storage: StorageLocation = serde_json::from_str(raw)?;
+            let entry = totals.entry(raw.to_string()).or_insert(StorageUsage {
+                storage,
+                bytes: 0,
+                objects: 0,
+                buckets: 0,
+            });
+            entry.bytes = entry
+                .bytes
+                .saturating_add(row.get("bytes").and_then(Value::as_u64).unwrap_or(0));
+            entry.objects = entry
+                .objects
+                .saturating_add(row.get("objects").and_then(Value::as_u64).unwrap_or(0));
+            entry.buckets = entry.buckets.saturating_add(1);
+        }
+    }
+    Ok(totals.into_values().collect())
+}
+
+/// Count every live metadata reference to a concrete policy shard, including
+/// in-flight multipart parts. Storage-policy admission uses this to prevent a
+/// remote from being removed while any committed or staged byte still relies
+/// on it.
+pub(crate) async fn shard_references(node: &Node) -> Result<BTreeMap<String, u64>> {
+    let mut totals = BTreeMap::new();
+    for (view, _) in bucket_records(node) {
+        let bucket = view.resource.name;
+        ensure_schema(node, &bucket).await?;
+        let result = exec(
+            node,
+            &bucket,
+            r#"SELECT storage_json, COUNT(*) AS references_count
+               FROM (
+                 SELECT storage_json FROM objects
+                 UNION ALL
+                 SELECT storage_json FROM multipart_parts
+               )
+               GROUP BY storage_json"#,
+            json!([]),
+        )
+        .await?;
+        for row in result["rows"].as_array().into_iter().flatten() {
+            let storage: StorageLocation = serde_json::from_str(
+                row.get("storage_json")
+                    .and_then(Value::as_str)
+                    .context("R2 分片引用缺少存储位置")?,
+            )?;
+            if let StorageLocation::RcloneShard { remote, .. } = storage {
+                let count = row
+                    .get("references_count")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0);
+                let total = totals.entry(remote).or_insert(0u64);
+                *total = total.saturating_add(count);
+            }
+        }
+    }
+    Ok(totals)
 }
 
 /// Folder-style listing compatible with R2/S3 delimiter semantics. Objects
@@ -923,7 +1267,7 @@ async fn blob_referenced_anywhere(
         let result = exec(
             node,
             bucket,
-            "SELECT 1 AS present FROM objects WHERE sha256 = ?1 AND storage_json = ?2 UNION ALL SELECT 1 AS present FROM multipart_parts AS p JOIN multipart_uploads AS u ON u.upload_id = p.upload_id WHERE p.sha256 = ?1 AND u.storage_json = ?2 LIMIT 1",
+            "SELECT 1 AS present FROM objects WHERE sha256 = ?1 AND storage_json = ?2 UNION ALL SELECT 1 AS present FROM multipart_parts WHERE sha256 = ?1 AND storage_json = ?2 LIMIT 1",
             json!([sha256, storage_json]),
         )
         .await?;
@@ -1059,6 +1403,7 @@ async fn ensure_schema(node: &Node, bucket: &str) -> Result<Vec<rf_core::identit
              custom_metadata TEXT NOT NULL,
              http_metadata TEXT NOT NULL,
              storage_json TEXT NOT NULL,
+             storage_policy TEXT,
              created_at_ms INTEGER NOT NULL,
              expires_at_ms INTEGER NOT NULL
            )"#,
@@ -1074,9 +1419,33 @@ async fn ensure_schema(node: &Node, bucket: &str) -> Result<Vec<rf_core::identit
              sha256 TEXT NOT NULL,
              size INTEGER NOT NULL CHECK(size >= 0),
              etag TEXT NOT NULL,
+             storage_json TEXT NOT NULL,
              uploaded_at_ms INTEGER NOT NULL,
              PRIMARY KEY(upload_id, part_number)
            )"#,
+        json!([]),
+    )
+    .await?;
+    ensure_column(
+        node,
+        &database,
+        "multipart_uploads",
+        "storage_policy",
+        "TEXT",
+    )
+    .await?;
+    ensure_column(node, &database, "multipart_parts", "storage_json", "TEXT").await?;
+    // Legacy in-flight parts inherited the fixed upload location. Populate
+    // the new per-part pin before any read/GC path relies on it.
+    exec_database(
+        node,
+        &database,
+        r#"UPDATE multipart_parts
+           SET storage_json = (
+             SELECT storage_json FROM multipart_uploads
+             WHERE multipart_uploads.upload_id = multipart_parts.upload_id
+           )
+           WHERE storage_json IS NULL OR storage_json = ''"#,
         json!([]),
     )
     .await?;
@@ -1089,6 +1458,36 @@ async fn ensure_schema(node: &Node, bucket: &str) -> Result<Vec<rf_core::identit
     .await?;
     node.mark_r2_schema_ready(database);
     Ok(group)
+}
+
+async fn ensure_column(
+    node: &Node,
+    database: &str,
+    table: &str,
+    column: &str,
+    definition: &str,
+) -> Result<()> {
+    let info = exec_database(
+        node,
+        database,
+        &format!("PRAGMA table_info({table})"),
+        json!([]),
+    )
+    .await?;
+    let present = info["rows"].as_array().is_some_and(|rows| {
+        rows.iter()
+            .any(|row| row.get("name").and_then(Value::as_str) == Some(column))
+    });
+    if !present {
+        exec_database(
+            node,
+            database,
+            &format!("ALTER TABLE {table} ADD COLUMN {column} {definition}"),
+            json!([]),
+        )
+        .await?;
+    }
+    Ok(())
 }
 
 async fn replicate_local_blob(
@@ -1310,6 +1709,7 @@ mod tests {
                 remote: "b2-hot".into(),
                 prefix: "randallflare".into(),
             },
+            storage_policy: None,
             max_bytes: Some(1024),
             max_objects: Some(10),
             expire_objects_after_days: Some(30),
@@ -1317,6 +1717,12 @@ mod tests {
             hostnames: vec!["objects.example.com".into()],
         };
         spec.validate().unwrap();
+        let mut internal_location = spec.clone();
+        internal_location.storage = StorageLocation::RcloneShard {
+            remote: "b2-hot".into(),
+            prefix: "randallflare".into(),
+        };
+        assert!(internal_location.validate().is_err());
         let encoded = serde_json::to_string(&spec).unwrap();
         assert!(!encoded.to_ascii_lowercase().contains("secret"));
         assert_eq!(metadata_database("events").len(), 35);
@@ -1431,6 +1837,7 @@ mod tests {
                 description: "端到端测试".into(),
                 public_access: false,
                 storage: StorageLocation::Local,
+                storage_policy: None,
                 max_bytes: Some(1024 * 1024),
                 max_objects: Some(10),
                 expire_objects_after_days: None,
@@ -1454,6 +1861,79 @@ mod tests {
         let client = PeerClient::new(node.cfg.cluster_secret_bytes().unwrap());
         let base = address.to_string();
 
+        // Reproduce the pre-storage-policy multipart schema. The first normal
+        // R2 operation must add and backfill the new columns online without
+        // invalidating an otherwise usable bucket database.
+        let database = metadata_database("e2e-bucket");
+        crate::d1::ensure_database(&node, &database).unwrap();
+        exec_database(
+            &node,
+            &database,
+            r#"CREATE TABLE multipart_uploads (
+                 upload_id TEXT PRIMARY KEY,
+                 key TEXT NOT NULL,
+                 content_type TEXT,
+                 custom_metadata TEXT NOT NULL,
+                 http_metadata TEXT NOT NULL,
+                 storage_json TEXT NOT NULL,
+                 created_at_ms INTEGER NOT NULL,
+                 expires_at_ms INTEGER NOT NULL
+               )"#,
+            json!([]),
+        )
+        .await
+        .unwrap();
+        exec_database(
+            &node,
+            &database,
+            r#"CREATE TABLE multipart_parts (
+                 upload_id TEXT NOT NULL,
+                 part_number INTEGER NOT NULL,
+                 sha256 TEXT NOT NULL,
+                 size INTEGER NOT NULL,
+                 etag TEXT NOT NULL,
+                 uploaded_at_ms INTEGER NOT NULL,
+                 PRIMARY KEY(upload_id, part_number)
+               )"#,
+            json!([]),
+        )
+        .await
+        .unwrap();
+        let legacy_upload_id = "11".repeat(20);
+        let legacy_bytes = b"legacy multipart part";
+        let legacy_sha = node
+            .objects
+            .put(&StorageLocation::Local, legacy_bytes)
+            .await
+            .unwrap();
+        exec_database(
+            &node,
+            &database,
+            "INSERT INTO multipart_uploads (upload_id, key, content_type, custom_metadata, http_metadata, storage_json, created_at_ms, expires_at_ms) VALUES (?1, ?2, NULL, '{}', '{}', ?3, ?4, ?5)",
+            json!([
+                legacy_upload_id,
+                "legacy.bin",
+                serde_json::to_string(&StorageLocation::Local).unwrap(),
+                now_ms(),
+                now_ms() + 60_000,
+            ]),
+        )
+        .await
+        .unwrap();
+        exec_database(
+            &node,
+            &database,
+            "INSERT INTO multipart_parts (upload_id, part_number, sha256, size, etag, uploaded_at_ms) VALUES (?1, 1, ?2, ?3, ?2, ?4)",
+            json!([
+                legacy_upload_id,
+                hex::encode(legacy_sha),
+                legacy_bytes.len(),
+                now_ms(),
+            ]),
+        )
+        .await
+        .unwrap();
+
         let options = PutOptions {
             content_type: Some("text/plain; charset=utf-8".into()),
             ..PutOptions::default()
@@ -1469,6 +1949,21 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(metadata.size, 8);
+        let legacy_location = exec_database(
+            &node,
+            &database,
+            "SELECT storage_json FROM multipart_parts WHERE upload_id = ?1",
+            json!([legacy_upload_id.clone()]),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            legacy_location["rows"][0]["storage_json"].as_str(),
+            Some(r#"{"type":"local"}"#)
+        );
+        abort_multipart_upload(&node, "e2e-bucket", "legacy.bin", &legacy_upload_id)
+            .await
+            .unwrap();
         client
             .r2_put(
                 &base,
@@ -1685,6 +2180,311 @@ mod tests {
         server.abort();
         manager.abort();
         drop(client);
+        drop(durable);
+        drop(registry);
+        drop(node);
+        tokio::task::yield_now().await;
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn signed_storage_policy_pins_each_rclone_shard_without_migration() {
+        let available = std::process::Command::new("rclone")
+            .arg("version")
+            .output()
+            .is_ok_and(|output| output.status.success());
+        if !available {
+            return;
+        }
+
+        let peer_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let peer_addr = peer_listener.local_addr().unwrap();
+        drop(peer_listener);
+        let gossip_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let gossip_addr = gossip_listener.local_addr().unwrap();
+        drop(gossip_listener);
+        let root = std::env::temp_dir().join(format!(
+            "rf-r2-shards-{}-{}",
+            std::process::id(),
+            rand::random::<u32>()
+        ));
+        let remote_a = root.join("remote-a");
+        let remote_b = root.join("remote-b");
+        std::fs::create_dir_all(&remote_a).unwrap();
+        std::fs::create_dir_all(&remote_b).unwrap();
+        let rclone_config = root.join("rclone.conf");
+        std::fs::write(
+            &rclone_config,
+            format!(
+                "[drive-a]\ntype = alias\nremote = {}\n[drive-b]\ntype = alias\nremote = {}\n",
+                remote_a.display(),
+                remote_b.display()
+            ),
+        )
+        .unwrap();
+
+        let operator = AnyKeypair::Ed(Keypair::from_seed([91; 32]));
+        let config: NodeConfig = toml::from_str(&format!(
+            r#"
+            data_dir = {root:?}
+            operator = "{}"
+            cluster_secret = "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
+            [gossip]
+            listen = "{gossip_addr}"
+            [peer_api]
+            listen = "{peer_addr}"
+            [ingress]
+            default_domain = "workers.test"
+            [storage]
+            local_dir = {local:?}
+            rclone_binary = "rclone"
+            rclone_config = {rclone_config:?}
+            rclone_timeout_seconds = 15
+            "#,
+            operator.signer_id(),
+            local = root.join("local"),
+        ))
+        .unwrap();
+        let node = Arc::new(Node::open(config, Keypair::from_seed([92; 32])).unwrap());
+
+        let first_policy = crate::storage_policy::prepare_after(
+            crate::storage_policy::StoragePolicy {
+                schema: crate::storage_policy::STORAGE_POLICY_SCHEMA,
+                new_bucket_backend: crate::storage_policy::NewBucketBackend::RcloneSharded,
+                shard_remotes: vec!["drive-a".into()],
+                shard_prefix: "rf-shards".into(),
+            },
+            None,
+        )
+        .unwrap();
+        resource::ingest(&node, &Envelope::seal_any(&first_policy, &operator)).unwrap();
+        let bucket = prepare_bucket(
+            &node,
+            "sharded",
+            BucketSpec {
+                description: "签名分片策略测试".into(),
+                public_access: false,
+                storage: StorageLocation::Local,
+                storage_policy: Some(crate::storage_policy::DEFAULT_POLICY_NAME.into()),
+                max_bytes: None,
+                max_objects: None,
+                expire_objects_after_days: None,
+                cors_origins: vec![],
+                hostnames: vec![],
+            },
+            false,
+        )
+        .unwrap();
+        resource::ingest(&node, &Envelope::seal_any(&bucket, &operator)).unwrap();
+
+        let registry: crate::d1::Registry = Default::default();
+        let leadership: crate::d1::Leadership = Default::default();
+        let durable =
+            crate::durable::Coordinator::new(node.clone(), registry.clone(), leadership.clone());
+        let (address, server) =
+            crate::peerapi::serve_managed(node.clone(), registry.clone(), durable.clone())
+                .await
+                .unwrap();
+        let manager = crate::d1::spawn_manager(node.clone(), registry.clone(), leadership);
+        let client = PeerClient::new(node.cfg.cluster_secret_bytes().unwrap());
+        let base = address.to_string();
+
+        let before = (0u32..)
+            .map(|index| format!("written before expansion {index}"))
+            .find(|candidate| {
+                let sha: [u8; 32] = Sha256::digest(candidate.as_bytes()).into();
+                crate::storage_policy::shard_index(&sha, 2) == Some(0)
+            })
+            .unwrap();
+        let before_meta = put_object(
+            &node,
+            "sharded",
+            "before.txt",
+            before.as_bytes(),
+            PutOptions::default(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            before_meta.storage,
+            StorageLocation::RcloneShard {
+                remote: "drive-a".into(),
+                prefix: "rf-shards".into(),
+            }
+        );
+        assert!(remote_a
+            .join("rf-shards")
+            .join(&before_meta.sha256)
+            .is_file());
+
+        let policy_head = resource::head(
+            &node,
+            crate::storage_policy::STORAGE_POLICY_KIND,
+            crate::storage_policy::DEFAULT_POLICY_NAME,
+        )
+        .unwrap();
+        let expanded_policy = crate::storage_policy::prepare_after(
+            crate::storage_policy::StoragePolicy {
+                schema: crate::storage_policy::STORAGE_POLICY_SCHEMA,
+                new_bucket_backend: crate::storage_policy::NewBucketBackend::RcloneSharded,
+                shard_remotes: vec!["drive-a".into(), "drive-b".into()],
+                shard_prefix: "rf-shards".into(),
+            },
+            Some(&policy_head),
+        )
+        .unwrap();
+        resource::ingest(&node, &Envelope::seal_any(&expanded_policy, &operator)).unwrap();
+
+        let after = (0u32..)
+            .map(|index| format!("written after expansion {index}"))
+            .find(|candidate| {
+                let sha: [u8; 32] = Sha256::digest(candidate.as_bytes()).into();
+                crate::storage_policy::shard_index(&sha, 2) == Some(1)
+            })
+            .unwrap();
+        let after_meta = put_object(
+            &node,
+            "sharded",
+            "after.txt",
+            after.as_bytes(),
+            PutOptions::default(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            after_meta.storage,
+            StorageLocation::RcloneShard {
+                remote: "drive-b".into(),
+                prefix: "rf-shards".into(),
+            }
+        );
+        assert!(remote_b
+            .join("rf-shards")
+            .join(&after_meta.sha256)
+            .is_file());
+
+        // The first object's metadata remains pinned to drive-a after policy
+        // expansion; no background migration or rewritten lookup is needed.
+        let (pinned_before, fetched_before) = get_object(&node, "sharded", "before.txt")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(pinned_before.storage, before_meta.storage);
+        assert_eq!(fetched_before, before.as_bytes());
+        let (_, fetched_after) = get_object(&node, "sharded", "after.txt")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(fetched_after, after.as_bytes());
+
+        let multipart =
+            create_multipart_upload(&node, "sharded", "multipart.bin", PutOptions::default())
+                .await
+                .unwrap();
+        let first_part = client
+            .r2_upload_part(
+                &base,
+                "sharded",
+                "multipart.bin",
+                &multipart.upload_id,
+                1,
+                before.as_bytes(),
+            )
+            .await
+            .unwrap();
+        let second_part = client
+            .r2_upload_part(
+                &base,
+                "sharded",
+                "multipart.bin",
+                &multipart.upload_id,
+                2,
+                after.as_bytes(),
+            )
+            .await
+            .unwrap();
+        let part_locations = exec(
+            &node,
+            "sharded",
+            "SELECT storage_json FROM multipart_parts WHERE upload_id = ?1 ORDER BY part_number",
+            json!([multipart.upload_id.clone()]),
+        )
+        .await
+        .unwrap();
+        let locations = part_locations["rows"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|row| {
+                serde_json::from_str::<StorageLocation>(row["storage_json"].as_str().unwrap())
+                    .unwrap()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            locations,
+            vec![before_meta.storage.clone(), after_meta.storage.clone()]
+        );
+        let completed = client
+            .r2_complete_multipart(
+                &base,
+                "sharded",
+                "multipart.bin",
+                &multipart.upload_id,
+                &[
+                    PublishedPart {
+                        part_number: 1,
+                        etag: first_part.etag,
+                    },
+                    PublishedPart {
+                        part_number: 2,
+                        etag: second_part.etag,
+                    },
+                ],
+            )
+            .await
+            .unwrap();
+        assert_eq!(completed.size, (before.len() + after.len()) as u64);
+        let (_, multipart_bytes) = get_object(&node, "sharded", "multipart.bin")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            multipart_bytes,
+            [before.as_bytes(), after.as_bytes()].concat()
+        );
+
+        let distribution = storage_distribution(&node).await.unwrap();
+        assert_eq!(distribution.iter().map(|item| item.objects).sum::<u64>(), 3);
+        assert!(distribution
+            .iter()
+            .any(|item| item.storage == before_meta.storage));
+        assert!(distribution
+            .iter()
+            .any(|item| item.storage == after_meta.storage));
+
+        let current_policy = resource::head(
+            &node,
+            crate::storage_policy::STORAGE_POLICY_KIND,
+            crate::storage_policy::DEFAULT_POLICY_NAME,
+        )
+        .unwrap();
+        let destructive_removal = crate::storage_policy::prepare_after(
+            crate::storage_policy::StoragePolicy {
+                schema: crate::storage_policy::STORAGE_POLICY_SCHEMA,
+                new_bucket_backend: crate::storage_policy::NewBucketBackend::RcloneSharded,
+                shard_remotes: vec!["drive-b".into()],
+                shard_prefix: "rf-shards".into(),
+            },
+            Some(&current_policy),
+        )
+        .unwrap();
+        let error = crate::storage_policy::validate_transition(&node, &destructive_removal)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("drive-a"));
+
+        server.abort();
+        manager.abort();
         drop(durable);
         drop(registry);
         drop(node);

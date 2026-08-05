@@ -462,8 +462,15 @@ pub async fn flush_once(node: &Node, pipeline: &str, force: bool) -> Result<Opti
     if spec.suspended && !force {
         return Ok(None);
     }
-    if crate::r2::bucket_record(node, &spec.output_bucket).is_none() {
-        bail!("Pipeline 输出 R2 bucket 不存在");
+    let (_, output_bucket) = crate::r2::bucket_record(node, &spec.output_bucket)
+        .context("Pipeline 输出 R2 bucket 不存在")?;
+    if !output_bucket.uses_local_storage()
+        && !crate::placement::system_tags(node, &node.id_hex()).contains("rclone")
+    {
+        if force {
+            bail!("当前节点没有 Pipeline 输出 bucket 所需的 rclone 能力");
+        }
+        return Ok(None);
     }
     ensure_schema(node, pipeline).await?;
     let now = now_ms();

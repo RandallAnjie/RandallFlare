@@ -80,6 +80,8 @@ pub fn router(api: Api) -> Router {
     let routes = Router::new()
         .route("/v1/ping", get(ping))
         .route("/v1/status", get(status))
+        .route("/v1/storage/status", get(storage_status))
+        .route("/v1/storage/probe", post(storage_probe))
         .route("/v1/sync/manifests", get(sync_manifests))
         .route("/v1/sync/claims", get(sync_claims))
         .route("/v1/sync/kv", get(sync_kv_digests))
@@ -169,6 +171,14 @@ pub fn router(api: Api) -> Router {
         .route("/v1/r2-blob", post(r2_blob_put))
         .route("/v1/binary-blob", post(binary_blob_put))
         .route("/v1/r2/{bucket}/meta/{*key}", get(r2_head))
+        .route(
+            "/v1/r2/{bucket}/multipart/{upload_id}/part/{part}/{*key}",
+            post(r2_multipart_part),
+        )
+        .route(
+            "/v1/r2/{bucket}/multipart/{upload_id}/complete/{*key}",
+            post(r2_multipart_complete),
+        )
         .route(
             "/v1/r2/{bucket}/object/{*key}",
             get(r2_get).post(r2_put).delete(r2_delete),
@@ -580,6 +590,10 @@ async fn status(
             })
         })
         .collect();
+    let storage_policy = crate::storage_policy::current(node)
+        .ok()
+        .map(|(_, policy)| policy)
+        .unwrap_or_default();
     axum::Json(serde_json::json!({
         "node": node.id_hex(),
         "label": node.cfg.label,
@@ -610,6 +624,7 @@ async fn status(
         "storage": {
             "local": true,
             "rclone": node.cfg.storage.rclone_binary.is_some(),
+            "policy": storage_policy,
         },
         "kv_namespaces": kv_namespaces,
         "manifest_digest": node.manifest_digest_hex(),
@@ -617,6 +632,52 @@ async fn status(
         "missing_blobs": node.missing_blobs().len(),
     }))
     .into_response()
+}
+
+async fn storage_status(
+    State(api): State<Api>,
+    ConnectInfo(remote): ConnectInfo<SocketAddr>,
+    method: Method,
+    uri: Uri,
+    headers: HeaderMap,
+) -> Response {
+    if let Err(response) = check(&api, &remote, &headers, &method, &uri, b"") {
+        return response.into_response();
+    }
+    let operation = async {
+        let (view, policy) = crate::storage_policy::current(&api.node)?;
+        let distribution = crate::r2::storage_distribution(&api.node).await?;
+        Result::<_>::Ok(serde_json::json!({
+            "policy": policy,
+            "version": view.as_ref().map(|view| view.resource.version),
+            "digest": view.as_ref().map(|view| view.digest.clone()),
+            "distribution": distribution,
+        }))
+    }
+    .await;
+    match operation {
+        Ok(value) => axum::Json(value).into_response(),
+        Err(error) => (StatusCode::BAD_REQUEST, format!("{error:#}")).into_response(),
+    }
+}
+
+async fn storage_probe(
+    State(api): State<Api>,
+    ConnectInfo(remote): ConnectInfo<SocketAddr>,
+    method: Method,
+    uri: Uri,
+    headers: HeaderMap,
+) -> Response {
+    if let Err(response) = check(&api, &remote, &headers, &method, &uri, b"") {
+        return response.into_response();
+    }
+    match crate::storage_policy::current(&api.node) {
+        Ok((_, policy)) => {
+            axum::Json(crate::storage_policy::probe_remotes(&api.node, &policy).await)
+                .into_response()
+        }
+        Err(error) => (StatusCode::BAD_REQUEST, format!("{error:#}")).into_response(),
+    }
 }
 
 async fn sync_manifests(
@@ -806,7 +867,9 @@ async fn authorization_post(
                 crate::build::ingest_source(&api.node, &approved.envelope).map(|_| ())
             }
             crate::management::ApprovalKind::Resource => {
-                ingest_resource_envelope(&api, &approved.envelope).map(|_| ())
+                ingest_resource_envelope(&api, &approved.envelope)
+                    .await
+                    .map(|_| ())
             }
             crate::management::ApprovalKind::Login => unreachable!(),
         };
@@ -841,7 +904,7 @@ fn ingest_manifest_envelope(api: &Api, envelope: &Envelope) -> Result<bool> {
     Ok(changed)
 }
 
-fn ingest_resource_envelope(
+async fn ingest_resource_envelope(
     api: &Api,
     envelope: &Envelope,
 ) -> Result<crate::resource::ResourceRecord> {
@@ -850,6 +913,7 @@ fn ingest_resource_envelope(
         .map_err(|error| anyhow::anyhow!("平台资源签名无效：{error}"))?;
     record.validate()?;
     crate::binary::validate_admission(&api.node, &record)?;
+    crate::storage_policy::validate_transition(&api.node, &record).await?;
     crate::quota::validate_resource_admission(&api.node, &record)?;
     crate::resource::ingest(&api.node, envelope)
 }
@@ -2319,6 +2383,55 @@ async fn r2_delete(
     }
 }
 
+async fn r2_multipart_part(
+    State(api): State<Api>,
+    ConnectInfo(remote): ConnectInfo<SocketAddr>,
+    Path((bucket, upload_id, part, key)): Path<(String, String, u32, String)>,
+    request: Request<Body>,
+) -> Response {
+    let (parts, body) = request.into_parts();
+    let body = match to_bytes(body, MAX_PEER_PAYLOAD).await {
+        Ok(body) => body,
+        Err(_) => return (StatusCode::PAYLOAD_TOO_LARGE, "R2 multipart 分片过大").into_response(),
+    };
+    if let Err(response) = check(
+        &api,
+        &remote,
+        &parts.headers,
+        &parts.method,
+        &parts.uri,
+        &body,
+    ) {
+        return response.into_response();
+    }
+    match r2::upload_part(&api.node, &bucket, &key, &upload_id, part, &body).await {
+        Ok(uploaded) => axum::Json(uploaded).into_response(),
+        Err(error) => r2_error(error),
+    }
+}
+
+async fn r2_multipart_complete(
+    State(api): State<Api>,
+    ConnectInfo(remote): ConnectInfo<SocketAddr>,
+    Path((bucket, upload_id, key)): Path<(String, String, String)>,
+    method: Method,
+    uri: Uri,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    if let Err(response) = check(&api, &remote, &headers, &method, &uri, &body) {
+        return response.into_response();
+    }
+    let published: Vec<r2::PublishedPart> = match serde_json::from_slice(&body) {
+        Ok(parts) => parts,
+        Err(error) => return (StatusCode::BAD_REQUEST, error.to_string()).into_response(),
+    };
+    match r2::complete_multipart_upload(&api.node, &bucket, &key, &upload_id, &published).await {
+        Ok(metadata) => axum::Json(metadata).into_response(),
+        Err(error) => r2_error(error),
+    }
+}
+
 fn r2_error(error: anyhow::Error) -> Response {
     let message = format!("{error:#}");
     let status = if message.contains("不存在") {
@@ -2480,7 +2593,7 @@ async fn resource_post(
         Ok(envelope) => envelope,
         Err(error) => return (StatusCode::BAD_REQUEST, error.to_string()).into_response(),
     };
-    match ingest_resource_envelope(&api, &envelope) {
+    match ingest_resource_envelope(&api, &envelope).await {
         Ok(resource) => axum::Json(resource).into_response(),
         Err(error) => (StatusCode::BAD_REQUEST, error.to_string()).into_response(),
     }

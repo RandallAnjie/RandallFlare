@@ -300,6 +300,19 @@ impl PeerClient {
         Ok(serde_json::from_slice(&raw)?)
     }
 
+    pub async fn storage_status(&self, base: &str) -> Result<serde_json::Value> {
+        let raw = self.get(base, "/v1/storage/status").await?;
+        Ok(serde_json::from_slice(&raw)?)
+    }
+
+    pub async fn storage_probe(
+        &self,
+        base: &str,
+    ) -> Result<Vec<crate::storage_policy::RemoteProbe>> {
+        let raw = self.post(base, "/v1/storage/probe", Vec::new()).await?;
+        Ok(serde_json::from_slice(&raw)?)
+    }
+
     /// Peer API addresses currently visible from `base`, including `base`.
     pub async fn live_api_candidates(&self, base: &str) -> Result<Vec<String>> {
         let status = self.status(base).await?;
@@ -528,6 +541,44 @@ impl PeerClient {
         }
     }
 
+    pub async fn r2_upload_part(
+        &self,
+        base: &str,
+        bucket: &str,
+        key: &str,
+        upload_id: &str,
+        part_number: u32,
+        bytes: &[u8],
+    ) -> Result<crate::r2::UploadedPart> {
+        let path = format!(
+            "/v1/r2/{}/multipart/{}/part/{}/{}",
+            component(bucket),
+            component(upload_id),
+            part_number,
+            component(key)
+        );
+        let raw = self.post(base, &path, bytes.to_vec()).await?;
+        Ok(serde_json::from_slice(&raw)?)
+    }
+
+    pub async fn r2_complete_multipart(
+        &self,
+        base: &str,
+        bucket: &str,
+        key: &str,
+        upload_id: &str,
+        parts: &[crate::r2::PublishedPart],
+    ) -> Result<crate::r2::ObjectMeta> {
+        let path = format!(
+            "/v1/r2/{}/multipart/{}/complete/{}",
+            component(bucket),
+            component(upload_id),
+            component(key)
+        );
+        let raw = self.post(base, &path, serde_json::to_vec(parts)?).await?;
+        Ok(serde_json::from_slice(&raw)?)
+    }
+
     pub async fn r2_put_blob(&self, base: &str, bytes: &[u8]) -> Result<[u8; 32]> {
         let raw = self.post(base, "/v1/r2-blob", bytes.to_vec()).await?;
         hex::decode(String::from_utf8(raw)?.trim())?
@@ -548,6 +599,9 @@ impl PeerClient {
                 component(remote),
                 component(prefix)
             ),
+            crate::objectstore::StorageLocation::RcloneShard { .. } => {
+                anyhow::bail!("Binary Deliver 不能直接选择 R2 分片策略位置")
+            }
         };
         let raw = self.post(base, &path, bytes.to_vec()).await?;
         let response: serde_json::Value = serde_json::from_slice(&raw)?;

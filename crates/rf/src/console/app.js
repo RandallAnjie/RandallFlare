@@ -34,6 +34,8 @@ const state = {
   r2Active: null,
   r2Cursor: null,
   r2Objects: [],
+  storage: null,
+  storageProbes: [],
   queues: [],
   queueActive: null,
   queueDeadLetters: [],
@@ -77,6 +79,7 @@ const titles = {
   "worker-detail": ["Worker 项目", "项目详情"],
   kv: ["分布式数据", "KV 存储"],
   r2: ["对象存储", "R2 bucket"],
+  storage: ["对象存储", "存储策略"],
   d1: ["分布式 SQLite", "D1 数据库"],
   queues: ["事件驱动", "队列"],
   analytics: ["可观测数据", "Analytics Engine"],
@@ -291,7 +294,9 @@ function renderOverview(data) {
   $("#email-nav-count").textContent = String(emailDomains.length);
   $("#metric-binaries").textContent = String(binaries.length);
   $("#binary-nav-count").textContent = String(binaries.length);
-  $("#metric-r2-backend").textContent = data.storage?.rclone ? "本地副本与 rclone 已就绪" : "集群本地多数派副本";
+  $("#metric-r2-backend").textContent = data.storage?.policy?.new_bucket_backend === "rclone_sharded"
+    ? `${data.storage.policy.shard_remotes?.length || 0} 个签名 rclone 分片盘`
+    : data.storage?.rclone ? "本地副本与 rclone 已就绪" : "集群本地多数派副本";
   $("#r2-nav-count").textContent = String(buckets.length);
   $("#metric-blobs").textContent = String(data.missing_blobs ?? 0);
   $("#cluster-version").textContent = `rf ${data.version || "—"}`;
@@ -1352,7 +1357,9 @@ function renderR2Buckets() {
   list.innerHTML = state.r2Buckets.length
     ? state.r2Buckets.map((bucket) => {
       const storage = bucket.spec?.storage || {};
-      const backend = storage.type === "rclone"
+      const backend = bucket.spec?.storage_policy
+        ? "签名 rclone 分片"
+        : storage.type === "rclone"
         ? `rclone · ${storage.remote}`
         : "集群本地副本";
       const access = bucket.spec?.public_access ? "公开" : "私有";
@@ -1368,6 +1375,12 @@ async function loadR2({ quiet = false } = {}) {
     const rcloneReady = Boolean(data.capabilities?.rclone);
     $("#r2-capability").textContent = rcloneReady ? "本地副本 + rclone" : "集群本地副本";
     $("#r2-storage-backend").querySelector('option[value="rclone"]').disabled = !rcloneReady;
+    const policyReady = (data.storage_policy?.shard_remotes || []).length > 0;
+    $("#r2-storage-backend").querySelector('option[value="policy"]').disabled = !policyReady;
+    if (!state.r2Active && data.storage_policy?.new_bucket_backend === "rclone_sharded" && policyReady) {
+      $("#r2-storage-backend").value = "policy";
+      toggleR2StorageFields();
+    }
     if (!state.r2Buckets.some((bucket) => bucket.name === state.r2Active)) {
       state.r2Active = null;
       state.r2Objects = [];
@@ -1394,7 +1407,7 @@ function fillR2BucketForm(bucket) {
   const storage = spec.storage || { type: "local" };
   $("#r2-bucket-name").value = bucket?.name || "";
   $("#r2-bucket-description").value = spec.description || "";
-  $("#r2-storage-backend").value = storage.type || "local";
+  $("#r2-storage-backend").value = spec.storage_policy ? "policy" : storage.type || "local";
   $("#r2-rclone-remote").value = storage.remote || "";
   $("#r2-rclone-prefix").value = storage.prefix || "";
   $("#r2-max-bytes").value = spec.max_bytes ?? "";
@@ -1469,7 +1482,9 @@ async function selectR2Bucket(name) {
   fillR2BucketForm(bucket);
   const storage = bucket.spec?.storage || { type: "local" };
   $("#r2-active-bucket").textContent = name;
-  const storageSummary = storage.type === "rclone"
+  const storageSummary = bucket.spec?.storage_policy
+    ? `签名 rclone 分片策略 ${bucket.spec.storage_policy} · 配置 v${bucket.version}`
+    : storage.type === "rclone"
     ? `rclone remote ${storage.remote}:${storage.prefix || "（根目录）"} · 配置 v${bucket.version}`
     : `集群本地多数派副本 · 配置 v${bucket.version}`;
   const publicHosts = [
@@ -1588,6 +1603,77 @@ async function deleteR2Bucket() {
   } catch (error) {
     toast(error.message, true);
   }
+}
+
+function storageLocationCopy(storage) {
+  if (storage?.type === "rclone_shard") return `分片 · ${storage.remote}:${storage.prefix || "（根）"}`;
+  if (storage?.type === "rclone") return `固定 rclone · ${storage.remote}:${storage.prefix || "（根）"}`;
+  return "集群本地副本";
+}
+
+function renderStorage() {
+  const data = state.storage;
+  if (!data) return;
+  const policy = data.policy || {};
+  const distribution = data.distribution || [];
+  const objects = distribution.reduce((total, item) => total + Number(item.objects || 0), 0);
+  const bytes = distribution.reduce((total, item) => total + Number(item.bytes || 0), 0);
+  $("#storage-version").textContent = data.version ? `v${data.version}` : "内置";
+  $("#storage-digest").textContent = data.digest ? shortId(data.digest, 18) : "安全本地默认值";
+  $("#storage-remote-count").textContent = String((policy.shard_remotes || []).length);
+  $("#storage-nav-count").textContent = String((policy.shard_remotes || []).length);
+  $("#storage-object-count").textContent = String(objects);
+  $("#storage-byte-count").textContent = formatBytes(bytes);
+  $("#storage-default-backend").textContent = policy.new_bucket_backend === "rclone_sharded" ? "rclone 分片" : "本地";
+  $("#storage-default").value = policy.new_bucket_backend || "local";
+  $("#storage-remotes").value = (policy.shard_remotes || []).join("\n");
+  $("#storage-prefix").value = policy.shard_prefix || "";
+  const list = $("#storage-distribution");
+  list.classList.toggle("empty-state", distribution.length === 0);
+  list.innerHTML = distribution.length ? distribution.map((item) => `<div class="database-row"><div><strong>${escapeHtml(storageLocationCopy(item.storage))}</strong><small>${escapeHtml(item.buckets)} 个 bucket · ${escapeHtml(item.objects)} 个对象</small></div><span class="badge">${escapeHtml(formatBytes(item.bytes))}</span></div>`).join("") : "暂无已索引对象。";
+}
+
+function renderStorageProbes() {
+  const list = $("#storage-probes");
+  list.classList.toggle("empty-state", state.storageProbes.length === 0);
+  list.innerHTML = state.storageProbes.length ? state.storageProbes.map((node) => {
+    const probes = node.probes || [];
+    const rows = probes.map((probe) => `<div class="grant-row"><strong>${escapeHtml(probe.remote)}</strong><small>${escapeHtml(probe.reachable ? "可读写" : probe.error || "连接失败")}</small><span class="badge ${probe.reachable ? "active" : "danger"}">${probe.reachable ? "可达" : "不可达"}</span></div>`).join("");
+    return `<div class="probe-node"><div class="panel-head"><div><strong>${escapeHtml(node.label)}</strong><small>${escapeHtml(node.api || shortId(node.node))}</small></div><span class="badge ${node.error ? "danger" : ""}">${node.error ? "节点不可达" : `${probes.filter((probe) => probe.reachable).length}/${probes.length}`}</span></div>${node.error ? `<p class="input-note">${escapeHtml(node.error)}</p>` : rows || '<p class="input-note">策略中没有 remote。</p>'}</div>`;
+  }).join("") : "策略中没有 remote，或尚未执行探测。";
+}
+
+async function loadStorage({ quiet = false } = {}) {
+  try {
+    state.storage = await api("/api/storage");
+    renderStorage();
+    if (!quiet) toast("存储策略与对象分布已刷新");
+  } catch (error) { if (!quiet) toast(error.message, true); }
+}
+
+async function saveStorage(event) {
+  event.preventDefault();
+  const payload = {
+    new_bucket_backend: $("#storage-default").value,
+    shard_remotes: $("#storage-remotes").value.split(/\r?\n/).map((value) => value.trim()).filter(Boolean),
+    shard_prefix: $("#storage-prefix").value.trim().replace(/^\/+|\/+$/g, ""),
+  };
+  try {
+    const result = await api("/api/storage", { method: "POST", body: JSON.stringify(payload) });
+    const complete = async () => { state.storageProbes = []; renderStorageProbes(); await loadStorage({ quiet: true }); await loadR2({ quiet: true }); };
+    if (result.pending_approval) showApproval(result, "批准全局存储默认值和有序 rclone 分片集合。", complete);
+    else { toast("签名存储策略已保存"); await complete(); }
+  } catch (error) { toast(error.message, true); }
+}
+
+async function probeStorage() {
+  try {
+    const data = await api("/api/storage/probe", { method: "POST", body: "{}" });
+    state.storageProbes = data.nodes || [];
+    renderStorageProbes();
+    const failed = state.storageProbes.reduce((total, node) => total + Number(Boolean(node.error)) + (node.probes || []).filter((probe) => !probe.reachable).length, 0);
+    toast(failed ? `集群探测发现 ${failed} 项不可达` : "所有节点上的策略 remote 均可达", failed > 0);
+  } catch (error) { toast(error.message, true); }
 }
 
 function queueStatsCopy(stats) {
@@ -3296,6 +3382,7 @@ const scopeAreaCopy = {
   flow: ["Flow", "定义与运行"],
   email: ["邮件", "域名与消息"],
   binary: ["Binary", "原生程序、内容与策略"],
+  storage: ["存储策略", "默认后端与 rclone 分片"],
   node: ["节点", "成员与调度"],
   quota: ["配额", "集群安全策略"],
   audit: ["审计", "签名透明日志"],
@@ -3909,7 +3996,7 @@ async function boot() {
     $("#security-copy").innerHTML = consoleMode === "public"
       ? "此节点不保存<br>任何私钥。"
       : "密钥仅保留在本地<br>控制台进程中。";
-    $$("#deploy-form button, #source-form button, #kv-editor-form button, #d1-create-form button, #d1-exec-form button, #r2-bucket-form button, #r2-upload-form button, #r2-delete-bucket, #queue-form button, #queue-send-form button, #queue-delete, #analytics-form button, #analytics-write-form button, #analytics-delete, #pipeline-form button, #pipeline-token-form button, #pipeline-ingest-form button, #pipeline-flush, #pipeline-delete, #workflow-form button, #workflow-trigger-form button, #workflow-signal-form button, #workflow-delete, #flow-form button, #flow-token-form button, #flow-trigger-form button, #flow-delete, #email-domain-form button, #email-route-form button, #email-send-form button, #email-delete, #email-verify, #binary-form button, #binary-new, #project-domain-add-form button, #project-bindings-form button, #project-secret-form button, #project-file-form button, #project-file-new, #project-triggers-form button, #project-cron-fire-form button, #project-cron-dlq button, #project-settings-form button, #project-preview-form button, #project-preview-list button, #project-source-form button, #project-redeploy, #project-delete, #quota-form button, #access-token-form button, #s3-credential-form button")
+    $$("#deploy-form button, #source-form button, #kv-editor-form button, #d1-create-form button, #d1-exec-form button, #r2-bucket-form button, #r2-upload-form button, #r2-delete-bucket, #storage-form button, #storage-probe, #queue-form button, #queue-send-form button, #queue-delete, #analytics-form button, #analytics-write-form button, #analytics-delete, #pipeline-form button, #pipeline-token-form button, #pipeline-ingest-form button, #pipeline-flush, #pipeline-delete, #workflow-form button, #workflow-trigger-form button, #workflow-signal-form button, #workflow-delete, #flow-form button, #flow-token-form button, #flow-trigger-form button, #flow-delete, #email-domain-form button, #email-route-form button, #email-send-form button, #email-delete, #email-verify, #binary-form button, #binary-new, #project-domain-add-form button, #project-bindings-form button, #project-secret-form button, #project-file-form button, #project-file-new, #project-triggers-form button, #project-cron-fire-form button, #project-cron-dlq button, #project-settings-form button, #project-preview-form button, #project-preview-list button, #project-source-form button, #project-redeploy, #project-delete, #quota-form button, #access-token-form button, #s3-credential-form button")
       .forEach((button) => { button.disabled = state.session.read_only; });
     $("#node-policy-form button").disabled = state.session.read_only;
     $$("#access-token-form input, #access-token-form button, #s3-credential-form input, #s3-credential-form button")
@@ -3918,6 +4005,7 @@ async function boot() {
     await loadNodes({ quiet: true });
     await loadWorkerOps();
     await loadKeys();
+    await loadStorage({ quiet: true });
     await loadR2({ quiet: true });
     await loadQueues({ quiet: true });
     await loadAnalytics({ quiet: true });
@@ -3941,6 +4029,7 @@ async function boot() {
 $$(".nav-item").forEach((button) => button.addEventListener("click", () => {
   switchView(button.dataset.view);
   if (button.dataset.view === "nodes") loadNodes({ quiet: true });
+  if (button.dataset.view === "storage") loadStorage({ quiet: true });
   if (button.dataset.view === "binaries") loadBinaries({ quiet: true });
   if (button.dataset.view === "security") loadSecurity({ quiet: true });
 }));
@@ -4045,6 +4134,7 @@ $("#request-log-filter").addEventListener("submit", (event) => {
 $("#refresh").addEventListener("click", async () => {
   await loadOverview();
   await loadNodes({ quiet: true });
+  await loadStorage({ quiet: true });
   await loadR2({ quiet: true });
   await loadQueues({ quiet: true });
   await loadAnalytics({ quiet: true });
@@ -4075,6 +4165,9 @@ $("#r2-object-search").addEventListener("submit", (event) => { event.preventDefa
 $("#r2-upload-form").addEventListener("submit", uploadR2Object);
 $("#r2-load-more").addEventListener("click", () => loadR2Objects({ append: true }));
 $("#r2-delete-bucket").addEventListener("click", deleteR2Bucket);
+$("#storage-form").addEventListener("submit", saveStorage);
+$("#storage-probe").addEventListener("click", probeStorage);
+$("#storage-refresh").addEventListener("click", () => loadStorage());
 $("#queue-form").addEventListener("submit", saveQueue);
 $("#queue-send-form").addEventListener("submit", sendQueueMessage);
 $("#queue-delete").addEventListener("click", deleteQueue);
@@ -4261,6 +4354,7 @@ setInterval(() => {
     loadWorkerOps();
     if (state.view === "nodes") loadNodes({ quiet: true });
     if (state.view === "r2") loadR2({ quiet: true });
+    if (state.view === "storage") loadStorage({ quiet: true });
     if (state.view === "queues") loadQueues({ quiet: true });
     if (state.view === "analytics") loadAnalytics({ quiet: true }).then(() => {
       if (state.analyticsActive) selectAnalytics(state.analyticsActive);

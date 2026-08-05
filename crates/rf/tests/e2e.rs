@@ -1028,6 +1028,7 @@ export default {
             description: "Pipeline 输出".into(),
             public_access: false,
             storage: rf::objectstore::StorageLocation::Local,
+            storage_policy: None,
             max_bytes: None,
             max_objects: None,
             expire_objects_after_days: None,

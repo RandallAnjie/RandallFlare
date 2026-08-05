@@ -18,6 +18,7 @@ use axum::middleware::{self, Next};
 use axum::response::{Html, IntoResponse, Response};
 use axum::routing::{any, delete, get, post, put};
 use axum::{Json, Router};
+use futures_util::StreamExt;
 use rand::RngCore;
 use rf_core::identity::AnyKeypair;
 use rf_core::manifest::{valid_name, AssetFile, ManifestError, Module, WorkerManifest};
@@ -394,6 +395,8 @@ pub fn router(state: ConsoleState) -> Router {
         .route("/api/d1/create", post(d1_create))
         .route("/api/d1/exec", post(d1_exec))
         .route("/api/r2/buckets", get(r2_bucket_list).post(r2_bucket_apply))
+        .route("/api/storage", get(storage_get).post(storage_apply))
+        .route("/api/storage/probe", post(storage_probe))
         .route("/api/r2/buckets/{name}", delete(r2_bucket_delete))
         .route("/api/r2/objects/{bucket}", get(r2_object_list))
         .route(
@@ -4883,6 +4886,130 @@ fn default_storage_backend() -> String {
     "local".into()
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StoragePolicyRequest {
+    new_bucket_backend: crate::storage_policy::NewBucketBackend,
+    #[serde(default)]
+    shard_remotes: Vec<String>,
+    #[serde(default)]
+    shard_prefix: String,
+}
+
+async fn storage_get(State(state): State<ConsoleState>) -> ApiResult<Json<Value>> {
+    Ok(Json(state.client.storage_status(&state.node).await?))
+}
+
+async fn storage_probe(State(state): State<ConsoleState>) -> ApiResult<Json<Value>> {
+    let status = state.client.status(&state.node).await?;
+    let mut targets: Vec<(String, String, String)> = vec![(
+        status["node"].as_str().unwrap_or("current").to_string(),
+        status["label"].as_str().unwrap_or("当前节点").to_string(),
+        state.node.to_string(),
+    )];
+    for peer in status["peers"].as_array().into_iter().flatten() {
+        if let (Some(id), Some(api)) = (
+            peer.get("id").and_then(Value::as_str),
+            peer.get("api").and_then(Value::as_str),
+        ) {
+            targets.push((
+                id.to_string(),
+                peer.get("label")
+                    .and_then(Value::as_str)
+                    .unwrap_or(id)
+                    .to_string(),
+                api.to_string(),
+            ));
+        }
+    }
+    targets.sort_by(|left, right| left.0.cmp(&right.0));
+    targets.dedup_by(|left, right| left.0 == right.0);
+    let mut nodes: Vec<(String, Value)> =
+        futures_util::stream::iter(targets.into_iter().map(|(id, label, api)| {
+            let client = state.client.clone();
+            async move {
+                let value = match client.storage_probe(&api).await {
+                    Ok(probes) => json!({
+                        "node": id,
+                        "label": label,
+                        "api": api,
+                        "probes": probes,
+                    }),
+                    Err(error) => json!({
+                        "node": id,
+                        "label": label,
+                        "api": api,
+                        "probes": [],
+                        "error": console_error_brief(&error),
+                    }),
+                };
+                (id, value)
+            }
+        }))
+        .buffer_unordered(8)
+        .collect()
+        .await;
+    nodes.sort_by(|left, right| left.0.cmp(&right.0));
+    Ok(Json(json!({
+        "nodes": nodes.into_iter().map(|(_, value)| value).collect::<Vec<_>>()
+    })))
+}
+
+fn console_error_brief(error: &anyhow::Error) -> String {
+    let rendered = format!("{error:#}");
+    let mut chars = rendered.chars();
+    let brief: String = chars.by_ref().take(1_024).collect();
+    if chars.next().is_some() {
+        format!("{brief}…")
+    } else {
+        brief
+    }
+}
+
+async fn storage_apply(
+    State(state): State<ConsoleState>,
+    Extension(principal): Extension<ConsolePrincipal>,
+    Json(request): Json<StoragePolicyRequest>,
+) -> ApiResult<Json<Value>> {
+    state.require_mutation()?;
+    let policy = crate::storage_policy::StoragePolicy {
+        schema: crate::storage_policy::STORAGE_POLICY_SCHEMA,
+        new_bucket_backend: request.new_bucket_backend,
+        shard_remotes: request.shard_remotes,
+        shard_prefix: request.shard_prefix,
+    };
+    let head = state
+        .client
+        .resource_head(
+            &state.node,
+            crate::storage_policy::STORAGE_POLICY_KIND,
+            crate::storage_policy::DEFAULT_POLICY_NAME,
+        )
+        .await?;
+    let record = crate::storage_policy::prepare_after(policy, head.as_ref())?;
+    match &state.mode {
+        ConsoleMode::Local { .. } => {
+            let envelope = rf_core::envelope::Envelope::seal_any(&record, state.operator()?);
+            state.client.post_resource(&state.node, &envelope).await?;
+            Ok(Json(json!({ "ok": true, "version": record.version })))
+        }
+        ConsoleMode::Public { node, .. } => {
+            let approval = node.management.create_resource(
+                principal.session_id,
+                &record,
+                format!("更新全局存储策略至 v{}", record.version),
+            )?;
+            Ok(Json(json!({
+                "ok": true,
+                "pending_approval": true,
+                "version": record.version,
+                "approval": approval,
+                "approve_node": node.cfg.peer_api_advertise().to_string(),
+            })))
+        }
+    }
+}
+
 #[derive(Deserialize)]
 struct R2ObjectListQuery {
     #[serde(default)]
@@ -4909,12 +5036,25 @@ async fn r2_bucket_list(State(state): State<ConsoleState>) -> ApiResult<Json<Val
         })
         .collect::<Result<Vec<_>>>()?;
     let status = state.client.status(&state.node).await?;
+    let storage_policy = state
+        .client
+        .resource_head(
+            &state.node,
+            crate::storage_policy::STORAGE_POLICY_KIND,
+            crate::storage_policy::DEFAULT_POLICY_NAME,
+        )
+        .await?
+        .filter(|view| !view.resource.deleted)
+        .map(|view| crate::storage_policy::policy_spec(&view.resource))
+        .transpose()?
+        .unwrap_or_default();
     Ok(Json(json!({
         "buckets": buckets,
         "capabilities": status.get("storage").cloned().unwrap_or_else(|| json!({
             "local": true,
             "rclone": false,
         })),
+        "storage_policy": storage_policy,
     })))
 }
 
@@ -4924,28 +5064,43 @@ async fn r2_bucket_apply(
     Json(request): Json<R2BucketRequest>,
 ) -> ApiResult<Json<Value>> {
     state.require_mutation()?;
-    let storage = match request.storage_backend.as_str() {
+    let (storage, storage_policy) = match request.storage_backend.as_str() {
         "local" if request.rclone_remote.is_empty() && request.rclone_prefix.is_empty() => {
-            crate::objectstore::StorageLocation::Local
+            (crate::objectstore::StorageLocation::Local, None)
         }
-        "rclone" if !request.rclone_remote.is_empty() => {
+        "rclone" if !request.rclone_remote.is_empty() => (
             crate::objectstore::StorageLocation::Rclone {
                 remote: request.rclone_remote,
                 prefix: request.rclone_prefix,
-            }
-        }
+            },
+            None,
+        ),
+        "policy" if request.rclone_remote.is_empty() && request.rclone_prefix.is_empty() => (
+            crate::objectstore::StorageLocation::Local,
+            Some(crate::storage_policy::DEFAULT_POLICY_NAME.to_string()),
+        ),
         "local" => {
             return Err(ApiError::bad_request(
                 "本地存储不能同时填写 rclone remote 或前缀",
             ))
         }
         "rclone" => return Err(ApiError::bad_request("请选择 rclone remote")),
-        _ => return Err(ApiError::bad_request("存储后端必须是 local 或 rclone")),
+        "policy" => {
+            return Err(ApiError::bad_request(
+                "存储策略模式不能同时填写固定 rclone remote 或前缀",
+            ))
+        }
+        _ => {
+            return Err(ApiError::bad_request(
+                "存储后端必须是 local、rclone 或 policy",
+            ))
+        }
     };
     let spec = crate::r2::BucketSpec {
         description: request.description,
         public_access: request.public_access,
         storage,
+        storage_policy,
         max_bytes: request.max_bytes,
         max_objects: request.max_objects,
         expire_objects_after_days: request.expire_objects_after_days,

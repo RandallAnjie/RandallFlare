@@ -7,7 +7,6 @@
 //! already-signed records received through anti-entropy are never discarded.
 
 use crate::node::Node;
-use crate::objectstore::StorageLocation;
 use crate::resource::{self, ResourceRecord, ResourceView};
 use anyhow::{bail, Context, Result};
 use rf_core::manifest::WorkerManifest;
@@ -182,6 +181,13 @@ pub fn validate_resource_admission(node: &Node, record: &ResourceRecord) -> Resu
         crate::binary::binary_spec(record)?;
         return Ok(());
     }
+    if record.kind == crate::storage_policy::STORAGE_POLICY_KIND {
+        crate::storage_policy::validate_admission(node, record)?;
+        return Ok(());
+    }
+    if record.kind == crate::r2::BUCKET_KIND {
+        crate::r2::validate_bucket_admission(node, record)?;
+    }
     let quota = policy(node).context("集群配额策略无效；为安全起见拒绝资源变更")?;
     if matches!(
         record.kind.as_str(),
@@ -264,7 +270,7 @@ pub async fn usage(node: &Node) -> Result<ClusterQuotaUsage> {
     for (view, spec) in crate::r2::bucket_records(node) {
         let bucket = crate::r2::bucket_usage(node, &view.resource.name).await?;
         usage.r2_objects = usage.r2_objects.saturating_add(bucket.objects);
-        if spec.storage == StorageLocation::Local {
+        if spec.uses_local_storage() {
             usage.r2_local_bytes = usage.r2_local_bytes.saturating_add(bucket.bytes);
         }
     }
@@ -283,7 +289,7 @@ pub async fn validate_r2_write(
     let projected_objects = usage
         .r2_objects
         .saturating_add(u64::from(previous.is_none()));
-    let projected_local_bytes = if bucket_spec.storage == StorageLocation::Local {
+    let projected_local_bytes = if bucket_spec.uses_local_storage() {
         usage
             .r2_local_bytes
             .saturating_sub(previous.map(|object| object.size).unwrap_or(0))

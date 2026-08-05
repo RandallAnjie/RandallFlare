@@ -46,6 +46,7 @@ pub mod s3;
 pub mod sealed;
 pub mod selfupdate;
 pub mod servicebind;
+pub mod storage_policy;
 pub mod store;
 pub mod tls;
 pub mod transport;

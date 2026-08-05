@@ -91,6 +91,13 @@ Working today, verified by multi-process fault-injection e2e tests:
   support full-account or per-bucket read/write grants through the path-style
   Signature V4 endpoint at `/s3`, including multipart upload. Secret Access
   Keys are sealed cluster-wide and shown only once.
+- **Signed zero-migration storage sharding**: policy-backed R2 buckets select
+  an ordered rclone remote from the first 32 bits of each SHA-256 and persist
+  the concrete remote/prefix per object and multipart part. Adding drives only
+  changes future writes; old bytes remain pinned, destructive remote removal
+  is rejected while references exist, and the Chinese console probes every
+  live node and reports physical distribution. See
+  [the storage-policy guide](./docs/STORAGE_POLICY.md).
 - **Decentralized Queues**: operator-signed queue definitions and independent
   D1 micro-quorum ledgers provide delayed JSON messages, batches, visibility
   leases, bounded retries, durable dead letters and redrive. Workers produce
@@ -267,6 +274,20 @@ The same wildcard also covers public object buckets: bucket `assets` receives
 name and path prefix. Provider credentials stay exclusively in each node's
 `rclone_config`; `rf doctor` verifies the binary and config without printing
 their contents.
+
+For many rclone drives, create one signed global shard policy and opt new R2
+buckets into it. Credentials are still node-local:
+
+```bash
+rf storage configure --new-bucket-backend rclone-sharded \
+  --remote drive-00 --remote drive-01 --shard-prefix randallflare/objects
+rf storage probe
+rf r2 bucket-create assets --storage-policy --public
+```
+
+Each object's concrete shard remains in its D1 metadata, so policy expansion
+requires no byte migration. Operational details and safe remote retirement are
+covered in [rclone storage policy and sharding](./docs/STORAGE_POLICY.md).
 
 For a systemd deployment, prefer `infra/install-release.sh`; it downloads the
 GitHub Actions artifact directly on the VPS and verifies its checksum. The

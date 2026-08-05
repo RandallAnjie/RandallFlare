@@ -126,6 +126,11 @@ enum Cmd {
         #[command(subcommand)]
         cmd: R2Cmd,
     },
+    /// 全局签名存储默认值、rclone 分片和物理分布。
+    Storage {
+        #[command(subcommand)]
+        cmd: StorageCmd,
+    },
     /// Decentralized Queue operations.
     Queue {
         #[command(subcommand)]
@@ -355,6 +360,9 @@ enum R2Cmd {
         public: bool,
         #[arg(long)]
         rclone_remote: Option<String>,
+        /// 新对象使用全局签名 rclone 分片策略。
+        #[arg(long, conflicts_with = "rclone_remote")]
+        storage_policy: bool,
         #[arg(long, default_value = "")]
         rclone_prefix: String,
         #[arg(long)]
@@ -463,6 +471,39 @@ enum BinaryCmd {
         node: String,
         #[arg(long, env = "RF_OPERATOR_KEY")]
         key: Option<PathBuf>,
+        #[arg(long, env = "RF_CLUSTER_SECRET")]
+        secret: String,
+    },
+}
+
+#[derive(Subcommand)]
+enum StorageCmd {
+    /// 显示签名策略和按实际位置固定的对象分布。
+    Show {
+        #[arg(long, env = "RF_NODE")]
+        node: String,
+        #[arg(long, env = "RF_CLUSTER_SECRET")]
+        secret: String,
+    },
+    /// 更新默认后端和有序 rclone 分片 remote。
+    Configure {
+        #[arg(long, value_parser = ["local", "rclone-sharded"])]
+        new_bucket_backend: String,
+        #[arg(long = "remote")]
+        shard_remotes: Vec<String>,
+        #[arg(long, default_value = "")]
+        shard_prefix: String,
+        #[arg(long, env = "RF_NODE")]
+        node: String,
+        #[arg(long, env = "RF_OPERATOR_KEY")]
+        key: Option<PathBuf>,
+        #[arg(long, env = "RF_CLUSTER_SECRET")]
+        secret: String,
+    },
+    /// 从所连接节点探测策略中的每个 rclone remote。
+    Probe {
+        #[arg(long, env = "RF_NODE")]
+        node: String,
         #[arg(long, env = "RF_CLUSTER_SECRET")]
         secret: String,
     },
@@ -1576,6 +1617,7 @@ async fn async_main(cli: Cli) -> Result<()> {
                 description,
                 public,
                 rclone_remote,
+                storage_policy,
                 rclone_prefix,
                 max_bytes,
                 max_objects,
@@ -1586,6 +1628,9 @@ async fn async_main(cli: Cli) -> Result<()> {
                 key,
                 secret,
             } => {
+                if storage_policy && !rclone_prefix.is_empty() {
+                    anyhow::bail!("--storage-policy 不能与 --rclone-prefix 同时使用");
+                }
                 let storage = match rclone_remote {
                     Some(remote) => rf::objectstore::StorageLocation::Rclone {
                         remote,
@@ -1598,6 +1643,8 @@ async fn async_main(cli: Cli) -> Result<()> {
                     description,
                     public_access: public,
                     storage,
+                    storage_policy: storage_policy
+                        .then(|| rf::storage_policy::DEFAULT_POLICY_NAME.to_string()),
                     max_bytes,
                     max_objects,
                     expire_objects_after_days: expire_after_days,
@@ -1727,6 +1774,63 @@ async fn async_main(cli: Cli) -> Result<()> {
                     anyhow::bail!("R2 对象 {bucket}/{object} 不存在");
                 }
                 println!("R2 对象 {bucket}/{object} 已删除");
+                Ok(())
+            }
+        },
+        Cmd::Storage { cmd } => match cmd {
+            StorageCmd::Show { node, secret } => {
+                let client = PeerClient::new(secret_bytes(&secret)?);
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&client.storage_status(&node).await?)?
+                );
+                Ok(())
+            }
+            StorageCmd::Configure {
+                new_bucket_backend,
+                shard_remotes,
+                shard_prefix,
+                node,
+                key,
+                secret,
+            } => {
+                let backend = match new_bucket_backend.as_str() {
+                    "local" => rf::storage_policy::NewBucketBackend::Local,
+                    "rclone-sharded" => rf::storage_policy::NewBucketBackend::RcloneSharded,
+                    _ => unreachable!("clap validates storage backend"),
+                };
+                let client = PeerClient::new(secret_bytes(&secret)?);
+                let head = client
+                    .resource_head(
+                        &node,
+                        rf::storage_policy::STORAGE_POLICY_KIND,
+                        rf::storage_policy::DEFAULT_POLICY_NAME,
+                    )
+                    .await?;
+                let record = rf::storage_policy::prepare_after(
+                    rf::storage_policy::StoragePolicy {
+                        schema: rf::storage_policy::STORAGE_POLICY_SCHEMA,
+                        new_bucket_backend: backend,
+                        shard_remotes,
+                        shard_prefix,
+                    },
+                    head.as_ref(),
+                )?;
+                client
+                    .post_resource(
+                        &node,
+                        &rf_core::envelope::Envelope::seal_any(&record, &operator_key(key)?),
+                    )
+                    .await?;
+                println!("存储策略已更新至 v{}", record.version);
+                Ok(())
+            }
+            StorageCmd::Probe { node, secret } => {
+                let client = PeerClient::new(secret_bytes(&secret)?);
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&client.storage_probe(&node).await?)?
+                );
                 Ok(())
             }
         },

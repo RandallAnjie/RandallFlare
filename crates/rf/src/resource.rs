@@ -156,7 +156,11 @@ pub fn ingest(node: &Node, envelope: &Envelope) -> Result<ResourceRecord> {
     }
     if matches!(
         resource.kind.as_str(),
-        crate::placement::NODE_POLICY_KIND | crate::quota::POLICY_KIND
+        crate::placement::NODE_POLICY_KIND
+            | crate::quota::POLICY_KIND
+            | crate::r2::BUCKET_KIND
+            | crate::binary::BINARY_KIND
+            | crate::storage_policy::STORAGE_POLICY_KIND
     ) {
         // Placement changes affect even assets-only Workers, which have no
         // runtime process whose port change could otherwise trigger gossip.

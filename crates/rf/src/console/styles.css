@@ -250,6 +250,12 @@ button.build-row:hover { border-color: #444; background: #0e0e0e; }
 .progress-track { width: 100%; height: 6px; overflow: hidden; border-radius: 999px; background: var(--line-soft); }
 .progress-value { width: 0; height: 100%; border-radius: inherit; background: var(--accent); transition: width .15s ease; }
 .binary-editor-panel { grid-template-columns: minmax(190px, .55fr) minmax(320px, 1.45fr); }
+.storage-policy-panel { grid-template-columns: minmax(190px, .55fr) minmax(320px, 1.45fr); }
+.probe-node { padding: 12px 0; border-top: 1px solid var(--line-soft); }
+.probe-node:first-child { padding-top: 0; border-top: 0; }
+.probe-node .panel-head { margin-bottom: 8px; }
+.probe-node .panel-head strong, .probe-node .panel-head small { display: block; }
+.probe-node .panel-head small { margin-top: 4px; color: var(--muted); font: 9px "Geist Mono", monospace; }
 
 .back-button { border: 0; padding: 0; margin: 0 0 20px; color: var(--muted); background: transparent; cursor: pointer; font-size: 12px; }
 .back-button:hover { color: var(--text); }

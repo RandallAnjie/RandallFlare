@@ -25,15 +25,26 @@ pub enum StorageLocation {
         #[serde(default)]
         prefix: String,
     },
+    /// A concrete shard selected from a signed storage policy. Unlike legacy
+    /// per-bucket rclone storage, shard drives are deliberately flat: every
+    /// remote contains `<prefix>/<sha256>` and no fan-out directories.
+    RcloneShard {
+        remote: String,
+        #[serde(default)]
+        prefix: String,
+    },
 }
 
 impl StorageLocation {
     pub fn validate(&self) -> Result<()> {
-        if let Self::Rclone { remote, prefix } = self {
-            if !valid_remote(remote) {
-                bail!("rclone remote 名称须由字母、数字、点、下划线或连字符组成");
+        match self {
+            Self::Local => {}
+            Self::Rclone { remote, prefix } | Self::RcloneShard { remote, prefix } => {
+                if !valid_remote(remote) {
+                    bail!("rclone remote 名称须由字母、数字、点、下划线或连字符组成");
+                }
+                validate_prefix(prefix)?;
             }
-            validate_prefix(prefix)?;
         }
         Ok(())
     }
@@ -73,7 +84,10 @@ impl ObjectStore {
 
     pub fn supports(&self, location: &StorageLocation) -> bool {
         matches!(location, StorageLocation::Local)
-            || matches!(location, StorageLocation::Rclone { .. }) && self.rclone.is_some()
+            || matches!(
+                location,
+                StorageLocation::Rclone { .. } | StorageLocation::RcloneShard { .. }
+            ) && self.rclone.is_some()
     }
 
     pub fn local_root(&self) -> &Path {
@@ -127,6 +141,30 @@ impl ObjectStore {
                     .context("rclone 写入超时")??;
                 command_ok("rclone rcat", output)
             }
+            StorageLocation::RcloneShard { remote, prefix } => {
+                let runtime = self.rclone()?;
+                let target = rclone_shard_target(remote, prefix, expected);
+                let mut child = runtime
+                    .command("rcat")
+                    .arg(&target)
+                    .arg("--size")
+                    .arg(bytes.len().to_string())
+                    .stdin(Stdio::piped())
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::piped())
+                    .spawn()
+                    .context("启动 rclone 分片写入")?;
+                let mut stdin = child.stdin.take().context("打开 rclone 标准输入")?;
+                let transfer = async move {
+                    stdin.write_all(bytes).await?;
+                    drop(stdin);
+                    child.wait_with_output().await.map_err(anyhow::Error::from)
+                };
+                let output = tokio::time::timeout(runtime.timeout, transfer)
+                    .await
+                    .context("rclone 分片写入超时")??;
+                command_ok("rclone rcat", output)
+            }
         }
     }
 
@@ -144,6 +182,20 @@ impl ObjectStore {
                 )
                 .await
                 .context("rclone 读取超时")??;
+                if !output.status.success() {
+                    return Err(command_error("rclone cat", &output.stderr));
+                }
+                output.stdout
+            }
+            StorageLocation::RcloneShard { remote, prefix } => {
+                let runtime = self.rclone()?;
+                let target = rclone_shard_target(remote, prefix, sha);
+                let output = tokio::time::timeout(
+                    runtime.timeout,
+                    runtime.command("cat").arg(&target).output(),
+                )
+                .await
+                .context("rclone 分片读取超时")??;
                 if !output.status.success() {
                     return Err(command_error("rclone cat", &output.stderr));
                 }
@@ -194,6 +246,21 @@ impl ObjectStore {
                 }
                 Err(command_error("rclone lsjson", &output.stderr))
             }
+            StorageLocation::RcloneShard { remote, prefix } => {
+                let runtime = self.rclone()?;
+                let target = rclone_shard_target(remote, prefix, sha);
+                let output = tokio::time::timeout(
+                    runtime.timeout,
+                    runtime
+                        .command("lsjson")
+                        .arg("--stat")
+                        .arg(&target)
+                        .output(),
+                )
+                .await
+                .context("rclone 分片对象检查超时")??;
+                object_exists_result("rclone lsjson", output)
+            }
         }
     }
 
@@ -229,6 +296,17 @@ impl ObjectStore {
                         Err(command_error("rclone deletefile", &output.stderr))
                     }
                 }
+            }
+            StorageLocation::RcloneShard { remote, prefix } => {
+                let runtime = self.rclone()?;
+                let target = rclone_shard_target(remote, prefix, sha);
+                let output = tokio::time::timeout(
+                    runtime.timeout,
+                    runtime.command("deletefile").arg(&target).output(),
+                )
+                .await
+                .context("rclone 分片对象删除超时")??;
+                delete_result("rclone deletefile", output)
             }
         }
     }
@@ -298,7 +376,7 @@ impl RcloneRuntime {
     }
 }
 
-fn valid_remote(remote: &str) -> bool {
+pub(crate) fn valid_remote(remote: &str) -> bool {
     !remote.is_empty()
         && remote.len() <= 128
         && !remote.starts_with('-')
@@ -307,7 +385,7 @@ fn valid_remote(remote: &str) -> bool {
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
 }
 
-fn validate_prefix(prefix: &str) -> Result<()> {
+pub(crate) fn validate_prefix(prefix: &str) -> Result<()> {
     if prefix.len() > 512
         || prefix.starts_with('/')
         || prefix.contains('\0')
@@ -328,6 +406,46 @@ fn rclone_target(remote: &str, prefix: &str, sha: &[u8; 32]) -> String {
     } else {
         format!("{remote}:{}/{key}", prefix.trim_matches('/'))
     }
+}
+
+fn rclone_shard_target(remote: &str, prefix: &str, sha: &[u8; 32]) -> String {
+    let encoded = hex::encode(sha);
+    if prefix.is_empty() {
+        format!("{remote}:{encoded}")
+    } else {
+        format!("{remote}:{}/{encoded}", prefix.trim_matches('/'))
+    }
+}
+
+fn object_exists_result(label: &str, output: std::process::Output) -> Result<bool> {
+    if output.status.success() {
+        return Ok(true);
+    }
+    if output.status.code() == Some(3) {
+        return Ok(false);
+    }
+    let stderr = String::from_utf8_lossy(&output.stderr).to_ascii_lowercase();
+    if stderr.contains("not found")
+        || stderr.contains("doesn't exist")
+        || stderr.contains("directory not found")
+    {
+        return Ok(false);
+    }
+    Err(command_error(label, &output.stderr))
+}
+
+fn delete_result(label: &str, output: std::process::Output) -> Result<()> {
+    if output.status.success() {
+        return Ok(());
+    }
+    let stderr = String::from_utf8_lossy(&output.stderr).to_ascii_lowercase();
+    if output.status.code() == Some(3)
+        || stderr.contains("not found")
+        || stderr.contains("doesn't exist")
+    {
+        return Ok(());
+    }
+    Err(command_error(label, &output.stderr))
 }
 
 fn command_ok(label: &str, output: std::process::Output) -> Result<()> {
@@ -432,6 +550,23 @@ mod tests {
         assert_eq!(store.get(&location, &sha).await.unwrap(), b"rclone bytes");
         store.delete(&location, &sha).await.unwrap();
         assert!(!store.exists(&location, &sha).await.unwrap());
+
+        let shard = StorageLocation::RcloneShard {
+            remote: "fixture".into(),
+            prefix: "flat-shard".into(),
+        };
+        let shard_sha = store.put(&shard, b"flat shard bytes").await.unwrap();
+        assert!(remote_root
+            .join("flat-shard")
+            .join(hex::encode(shard_sha))
+            .is_file());
+        assert!(!remote_root.join("flat-shard/blobs").exists());
+        assert_eq!(
+            store.get(&shard, &shard_sha).await.unwrap(),
+            b"flat shard bytes"
+        );
+        store.delete(&shard, &shard_sha).await.unwrap();
+        assert!(!store.exists(&shard, &shard_sha).await.unwrap());
 
         std::fs::remove_dir_all(root).unwrap();
     }

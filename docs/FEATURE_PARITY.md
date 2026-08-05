@@ -75,8 +75,8 @@ surface yet.
 | R2 public/custom domains and CORS | partial | signed hostnames, deterministic defaults, ACME discovery, CORS and Range delivery done; DNS ownership workflow remains |
 | R2 credentials/grants/S3 API | partial | sealed Secret Access Keys, signed revocation/rotation, full-account or per-bucket grants, path-style Signature V4, conditional/ranged GET and multipart are implemented; SDK compatibility matrix and production soak remain |
 | R2 quotas/lifecycle/dedup/replication | partial | atomic bucket quotas, lifecycle, delayed cross-bucket orphan checks, local-majority writes and repair done; multi-node fault soak remains |
-| rclone backend | partial | credential-isolated config, remote probe and verified read/write/delete done; streaming IO and read cache remain |
-| storage policy/sharding | planned | deterministic remote selection and online migration |
+| rclone backend | partial | credential-isolated config, bounded cluster-wide remote probes and verified read/write/delete done; streaming IO and read cache remain |
+| storage policy/sharding | partial | signed defaults, first-32-bit ordered remote selection, flat SHA paths, per-object/per-multipart concrete pins, old-schema backfill, zero-migration expansion, destructive-removal admission, capability-aware peer borrowing, physical distribution, CLI/API and Chinese console are implemented and two-remote/D1 tested; multi-VPS provider fault soak remains |
 
 ### Eventing and orchestration
 

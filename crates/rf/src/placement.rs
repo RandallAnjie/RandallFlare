@@ -173,6 +173,15 @@ pub fn system_tags(node: &Node, node_id: &str) -> BTreeSet<String> {
         if crate::build::configured_binary(node.cfg.build.sandbox.as_deref(), "bwrap").is_some() {
             tags.insert("binary".into());
         }
+        match crate::binary::current_os_arch() {
+            "linux/amd64" => {
+                tags.insert("arch-amd64".into());
+            }
+            "linux/arm64" => {
+                tags.insert("arch-arm64".into());
+            }
+            _ => {}
+        }
         if node.cfg.storage.rclone_binary.is_some() && node.cfg.storage.rclone_config.is_some() {
             tags.insert("rclone".into());
         }
@@ -223,8 +232,36 @@ pub fn eligible(node: &Node, node_id: &str, manifest: &rf_core::manifest::Worker
         return false;
     }
     let tags = effective_tags(node, node_id);
-    required_tags_checked(manifest)
+    workload_required_tags(node, manifest)
         .is_ok_and(|required| required.iter().all(|tag| tags.contains(tag)))
+}
+
+pub fn workload_required_tags(
+    node: &Node,
+    manifest: &rf_core::manifest::WorkerManifest,
+) -> Result<BTreeSet<String>> {
+    let mut required = required_tags_checked(manifest)?
+        .into_iter()
+        .collect::<BTreeSet<_>>();
+    for bucket in crate::deploy::r2_bindings(manifest).values() {
+        let (_, spec) = crate::r2::bucket_record(node, bucket)
+            .with_context(|| format!("Worker 引用的 R2 bucket 不存在：{bucket}"))?;
+        if !spec.uses_local_storage() {
+            required.insert("rclone".into());
+        }
+    }
+    for binary_name in crate::deploy::binary_bindings(manifest).values() {
+        let (_, spec) = crate::binary::record(node, binary_name)
+            .with_context(|| format!("Worker 引用的 Binary 不存在：{binary_name}"))?;
+        required.insert("binary".into());
+        required.extend(spec.required_tags);
+        required.insert(match spec.os_arch.as_str() {
+            "linux/amd64" => "arch-amd64".into(),
+            "linux/arm64" => "arch-arm64".into(),
+            _ => bail!("Binary {binary_name} 的架构无效"),
+        });
+    }
+    Ok(required)
 }
 
 pub fn accepts_dns(node: &Node, node_id: &str) -> bool {

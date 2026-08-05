@@ -56,6 +56,9 @@ impl BinarySpec {
             bail!("Binary 大小必须介于 1 字节和 200 MiB 之间");
         }
         self.storage.validate()?;
+        if matches!(self.storage, StorageLocation::RcloneShard { .. }) {
+            bail!("Binary Deliver 只能使用本地存储或固定 rclone remote");
+        }
         if !matches!(self.os_arch.as_str(), "linux/amd64" | "linux/arm64") {
             bail!("Binary 目标当前仅支持 linux/amd64 或 linux/arm64");
         }
