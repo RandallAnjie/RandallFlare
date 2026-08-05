@@ -3225,7 +3225,7 @@ function renderNetworkExits(exitRole = {}) {
   $("#network-local-endpoint").textContent = exitRole.enabled ? (exitRole.advertise || "尚未设置公开端点") : "仅管理签名定义";
   const list = $("#network-exit-list");
   list.classList.toggle("empty-state", state.networkExits.length === 0);
-  list.innerHTML = state.networkExits.length ? state.networkExits.map((exit) => `<div class="node-row"><span class="dot ${exit.live ? "online" : "offline"}"></span><div><div class="node-name">${escapeHtml(exit.label || shortId(exit.node_id, 18))}${exit.local ? " · 当前节点" : ""}</div><div class="node-short">${escapeHtml(shortId(exit.node_id, 22))}</div></div><div class="node-address mono">${escapeHtml(exit.endpoint || "端点未公布")}</div><span class="badge active">TLS SOCKS</span></div>`).join("") : "尚未发现出口节点。";
+  list.innerHTML = state.networkExits.length ? state.networkExits.map((exit) => `<div class="node-row"><span class="dot ${exit.live ? "online" : "offline"}"></span><div><div class="node-name">${escapeHtml(exit.label || shortId(exit.node_id, 18))}${exit.local ? " · 当前节点" : ""}</div><div class="node-short">${escapeHtml(shortId(exit.node_id, 22))}</div></div><div class="node-address mono">${escapeHtml(exit.endpoint || "端点未公布")}</div><span class="badge active">TLS SOCKS TCP/UDP</span></div>`).join("") : "尚未发现出口节点。";
 }
 
 async function loadNetwork({ quiet = false } = {}) {

@@ -187,7 +187,7 @@ enum Cmd {
         #[command(subcommand)]
         cmd: ExitCmd,
     },
-    /// 注册、撤销客户端设备，或运行本地 SOCKS / HTTP 分流代理。
+    /// 注册、撤销客户端设备，或运行本地 SOCKS TCP/UDP 与 HTTP 分流代理。
     Device {
         #[command(subcommand)]
         cmd: DeviceCmd,
@@ -818,7 +818,7 @@ enum DeviceCmd {
         #[arg(long, env = "RF_CLUSTER_SECRET")]
         secret: String,
     },
-    /// 从文件读取一次性令牌，运行本机 SOCKS5 / HTTP 代理。
+    /// 从文件读取一次性令牌，运行本机 SOCKS5 TCP/UDP 与 HTTP 代理。
     Proxy {
         #[arg(long)]
         control: String,
@@ -3162,7 +3162,7 @@ async fn async_main(cli: Cli) -> Result<()> {
                             .unwrap_or_else(|_| "info".into()),
                     )
                     .try_init();
-                println!("设备代理监听 {listen}；SOCKS5 与 HTTP 代理共用此端口");
+                println!("设备代理监听 {listen}；SOCKS5 TCP/UDP 与 HTTP 代理共用此入口");
                 rf::exitproxy::run_device_proxy(control, name, token, listen).await
             }
         },

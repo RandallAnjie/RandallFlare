@@ -11,11 +11,12 @@ use crate::node::Node;
 use anyhow::{bail, Context, Result};
 use rustls::pki_types::ServerName;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
-use tokio::net::{TcpListener, TcpStream};
+use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::sync::{RwLock, Semaphore};
 use tokio_rustls::{TlsAcceptor, TlsConnector};
 use zeroize::Zeroizing;
@@ -25,6 +26,7 @@ const AUTH_NONE: u8 = 0;
 const AUTH_PASSWORD: u8 = 2;
 const AUTH_REJECT: u8 = 0xff;
 const CMD_CONNECT: u8 = 1;
+const CMD_UDP_ASSOCIATE: u8 = 3;
 const ATYP_V4: u8 = 1;
 const ATYP_DOMAIN: u8 = 3;
 const ATYP_V6: u8 = 4;
@@ -35,6 +37,9 @@ const REP_HOST_UNREACHABLE: u8 = 4;
 const REP_COMMAND_UNSUPPORTED: u8 = 7;
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(15);
 const MAX_HTTP_HEADER: usize = 32 * 1024;
+const MAX_UDP_PAYLOAD: usize = 65_507;
+const MAX_SOCKS_UDP_FRAME: usize = MAX_UDP_PAYLOAD + 262;
+const UDP_ASSOCIATION_IDLE_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DeviceExit {
@@ -166,7 +171,11 @@ async fn serve_egress<S>(node: &Node, stream: &mut S) -> Result<()>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
-    let (principal, host, port) = server_socks_handshake(node, stream).await?;
+    let (principal, request) = server_socks_handshake(node, stream).await?;
+    let EgressRequest::Connect { host, port } = request else {
+        socks_reply(stream, REP_OK).await?;
+        return serve_udp_tunnel(node, &principal, stream).await;
+    };
     let candidates = match public_candidates(&host, port).await {
         Ok(candidates) => candidates,
         Err(error) => {
@@ -204,6 +213,11 @@ where
     Ok(())
 }
 
+enum EgressRequest {
+    Connect { host: String, port: u16 },
+    UdpAssociate,
+}
+
 fn device_decision(
     node: &Node,
     principal: &DevicePrincipal,
@@ -225,7 +239,7 @@ fn device_decision(
 async fn server_socks_handshake<S>(
     node: &Node,
     stream: &mut S,
-) -> Result<(DevicePrincipal, String, u16)>
+) -> Result<(DevicePrincipal, EgressRequest)>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
@@ -264,17 +278,28 @@ where
 
     let mut request = [0u8; 4];
     stream.read_exact(&mut request).await?;
-    if request[0] != SOCKS_VERSION || request[1] != CMD_CONNECT {
+    if request[0] != SOCKS_VERSION {
+        socks_reply(stream, REP_FAILURE).await?;
+        bail!("设备出口 SOCKS 版本无效");
+    }
+    if !matches!(request[1], CMD_CONNECT | CMD_UDP_ASSOCIATE) {
         socks_reply(stream, REP_COMMAND_UNSUPPORTED).await?;
-        bail!("设备出口当前只支持 SOCKS CONNECT");
+        bail!("设备出口只支持 SOCKS CONNECT 与 UDP ASSOCIATE");
     }
     let host = read_socks_host(stream, request[3]).await?;
     let port = stream.read_u16().await?;
-    if host.is_empty() || port == 0 {
+    if request[1] == CMD_CONNECT && (host.is_empty() || port == 0) {
         socks_reply(stream, REP_FAILURE).await?;
         bail!("出口目标无效");
     }
-    Ok((principal, host, port))
+    Ok((
+        principal,
+        if request[1] == CMD_CONNECT {
+            EgressRequest::Connect { host, port }
+        } else {
+            EgressRequest::UdpAssociate
+        },
+    ))
 }
 
 async fn read_socks_host<S>(stream: &mut S, atyp: u8) -> Result<String>
@@ -314,6 +339,231 @@ where
         .write_all(&[SOCKS_VERSION, status, 0, ATYP_V4, 0, 0, 0, 0, 0, 0])
         .await?;
     Ok(())
+}
+
+async fn socks_reply_address<S>(stream: &mut S, status: u8, address: SocketAddr) -> Result<()>
+where
+    S: AsyncWrite + Unpin,
+{
+    let mut response = vec![SOCKS_VERSION, status, 0];
+    match address.ip() {
+        IpAddr::V4(ip) => {
+            response.push(ATYP_V4);
+            response.extend_from_slice(&ip.octets());
+        }
+        IpAddr::V6(ip) => {
+            response.push(ATYP_V6);
+            response.extend_from_slice(&ip.octets());
+        }
+    }
+    response.extend_from_slice(&address.port().to_be_bytes());
+    stream.write_all(&response).await?;
+    Ok(())
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SocksUdpPacket {
+    host: String,
+    port: u16,
+    payload: Vec<u8>,
+}
+
+fn parse_socks_udp_packet(frame: &[u8]) -> Result<SocksUdpPacket> {
+    if frame.len() > MAX_SOCKS_UDP_FRAME || frame.len() < 7 || frame[..2] != [0, 0] {
+        bail!("SOCKS UDP 数据帧无效或过大");
+    }
+    if frame[2] != 0 {
+        bail!("SOCKS UDP 分片不受支持；请由 IP 层完成分片");
+    }
+    let mut offset = 4usize;
+    let host = match frame[3] {
+        ATYP_V4 => {
+            let raw: [u8; 4] = frame
+                .get(offset..offset + 4)
+                .context("SOCKS UDP IPv4 地址不完整")?
+                .try_into()
+                .unwrap();
+            offset += 4;
+            std::net::Ipv4Addr::from(raw).to_string()
+        }
+        ATYP_V6 => {
+            let raw: [u8; 16] = frame
+                .get(offset..offset + 16)
+                .context("SOCKS UDP IPv6 地址不完整")?
+                .try_into()
+                .unwrap();
+            offset += 16;
+            std::net::Ipv6Addr::from(raw).to_string()
+        }
+        ATYP_DOMAIN => {
+            let length = usize::from(*frame.get(offset).context("SOCKS UDP 域名长度缺失")?);
+            offset += 1;
+            if length == 0 {
+                bail!("SOCKS UDP 域名为空");
+            }
+            let raw = frame
+                .get(offset..offset + length)
+                .context("SOCKS UDP 域名不完整")?;
+            offset += length;
+            std::str::from_utf8(raw)
+                .context("SOCKS UDP 域名不是 UTF-8")?
+                .trim_end_matches('.')
+                .to_ascii_lowercase()
+        }
+        _ => bail!("SOCKS UDP 地址类型不受支持"),
+    };
+    let port = u16::from_be_bytes(
+        frame
+            .get(offset..offset + 2)
+            .context("SOCKS UDP 端口缺失")?
+            .try_into()
+            .unwrap(),
+    );
+    offset += 2;
+    if port == 0 {
+        bail!("SOCKS UDP 目标端口不得为 0");
+    }
+    let payload = frame.get(offset..).context("SOCKS UDP 载荷缺失")?.to_vec();
+    if payload.len() > MAX_UDP_PAYLOAD {
+        bail!("SOCKS UDP 载荷超过协议上限");
+    }
+    Ok(SocksUdpPacket {
+        host,
+        port,
+        payload,
+    })
+}
+
+fn encode_socks_udp_packet(packet: &SocksUdpPacket) -> Result<Vec<u8>> {
+    if packet.port == 0 || packet.payload.len() > MAX_UDP_PAYLOAD {
+        bail!("SOCKS UDP 响应目标或载荷无效");
+    }
+    let mut frame = vec![0, 0, 0];
+    if let Ok(ip) = packet.host.parse::<IpAddr>() {
+        match ip {
+            IpAddr::V4(ip) => {
+                frame.push(ATYP_V4);
+                frame.extend_from_slice(&ip.octets());
+            }
+            IpAddr::V6(ip) => {
+                frame.push(ATYP_V6);
+                frame.extend_from_slice(&ip.octets());
+            }
+        }
+    } else {
+        if packet.host.is_empty() || packet.host.len() > u8::MAX as usize {
+            bail!("SOCKS UDP 域名长度无效");
+        }
+        frame.push(ATYP_DOMAIN);
+        frame.push(packet.host.len() as u8);
+        frame.extend_from_slice(packet.host.as_bytes());
+    }
+    frame.extend_from_slice(&packet.port.to_be_bytes());
+    frame.extend_from_slice(&packet.payload);
+    if frame.len() > MAX_SOCKS_UDP_FRAME {
+        bail!("SOCKS UDP 数据帧超过上限");
+    }
+    Ok(frame)
+}
+
+async fn udp_exchange(
+    addresses: &[SocketAddr],
+    payload: &[u8],
+    timeout: Duration,
+) -> Result<Vec<u8>> {
+    let mut errors = Vec::new();
+    for address in addresses {
+        let bind = if address.is_ipv4() {
+            "0.0.0.0:0"
+        } else {
+            "[::]:0"
+        };
+        let socket = match UdpSocket::bind(bind).await {
+            Ok(socket) => socket,
+            Err(error) => {
+                errors.push(format!("{address}: {error}"));
+                continue;
+            }
+        };
+        if let Err(error) = socket.connect(address).await {
+            errors.push(format!("{address}: {error}"));
+            continue;
+        }
+        if let Err(error) = socket.send(payload).await {
+            errors.push(format!("{address}: {error}"));
+            continue;
+        }
+        let mut response = vec![0u8; MAX_UDP_PAYLOAD];
+        match tokio::time::timeout(timeout, socket.recv(&mut response)).await {
+            Ok(Ok(length)) => {
+                response.truncate(length);
+                return Ok(response);
+            }
+            Ok(Err(error)) => errors.push(format!("{address}: {error}")),
+            Err(_) => errors.push(format!("{address}: 超时")),
+        }
+    }
+    bail!("所有 UDP 目标均失败：{}", errors.join("；"))
+}
+
+async fn serve_udp_tunnel<S>(node: &Node, principal: &DevicePrincipal, stream: &mut S) -> Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    loop {
+        let length = match tokio::time::timeout(UDP_ASSOCIATION_IDLE_TIMEOUT, stream.read_u32())
+            .await
+        {
+            Ok(Ok(length)) => length as usize,
+            Ok(Err(error)) if error.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(()),
+            Ok(Err(error)) => return Err(error.into()),
+            Err(_) => return Ok(()),
+        };
+        if length == 0 || length > MAX_SOCKS_UDP_FRAME {
+            bail!("出口 UDP 隧道帧长度无效");
+        }
+        let mut frame = vec![0u8; length];
+        stream.read_exact(&mut frame).await?;
+        let response = async {
+            let packet = parse_socks_udp_packet(&frame)?;
+            let candidates = public_candidates(&packet.host, packet.port).await?;
+            let local_node_id = node.id_hex();
+            let allowed = candidates
+                .into_iter()
+                .filter(|address| {
+                    match device_decision(node, principal, &packet.host, Some(address.ip())) {
+                        Ok(Decision::Nearest) => true,
+                        Ok(Decision::Node(id)) => id == local_node_id,
+                        _ => false,
+                    }
+                })
+                .collect::<Vec<_>>();
+            if allowed.is_empty() {
+                bail!("设备规则不允许从此节点转发 UDP 目标");
+            }
+            let payload = udp_exchange(
+                &allowed,
+                &packet.payload,
+                Duration::from_secs(node.cfg.exit.connect_timeout_seconds),
+            )
+            .await?;
+            encode_socks_udp_packet(&SocksUdpPacket { payload, ..packet })
+        }
+        .await;
+        match response {
+            Ok(frame) => {
+                stream.write_u8(REP_OK).await?;
+                stream.write_u32(frame.len() as u32).await?;
+                stream.write_all(&frame).await?;
+            }
+            Err(error) => {
+                tracing::debug!(device = %principal.name, "出口 UDP 数据报被拒绝：{error:#}");
+                stream.write_u8(REP_FORBIDDEN).await?;
+                stream.write_u32(0).await?;
+            }
+        }
+        stream.flush().await?;
+    }
 }
 
 async fn public_candidates(host: &str, port: u16) -> Result<Vec<SocketAddr>> {
@@ -523,6 +773,9 @@ enum LocalRequest {
         host: String,
         port: u16,
     },
+    SocksUdp {
+        requested_port: u16,
+    },
     HttpConnect {
         host: String,
         port: u16,
@@ -541,10 +794,14 @@ async fn handle_local(state: ClientState, mut downstream: TcpStream) -> Result<(
     } else {
         local_http_request(&mut downstream, first).await?
     };
+    if let LocalRequest::SocksUdp { requested_port } = &request {
+        return serve_local_udp_association(state, downstream, *requested_port).await;
+    }
     let (host, port) = match &request {
         LocalRequest::Socks { host, port }
         | LocalRequest::HttpConnect { host, port }
         | LocalRequest::HttpPlain { host, port, .. } => (host.clone(), *port),
+        LocalRequest::SocksUdp { .. } => unreachable!(),
     };
     let config = state.config.read().await.clone();
     let resolved = direct_candidates(&host, port).await.ok();
@@ -632,13 +889,26 @@ async fn local_socks_request(stream: &mut TcpStream) -> Result<LocalRequest> {
     stream.write_all(&[SOCKS_VERSION, AUTH_NONE]).await?;
     let mut request = [0u8; 4];
     stream.read_exact(&mut request).await?;
-    if request[0] != SOCKS_VERSION || request[1] != CMD_CONNECT {
+    if request[0] != SOCKS_VERSION {
+        socks_reply(stream, REP_FAILURE).await?;
+        bail!("本地 SOCKS 版本无效");
+    }
+    if !matches!(request[1], CMD_CONNECT | CMD_UDP_ASSOCIATE) {
         socks_reply(stream, REP_COMMAND_UNSUPPORTED).await?;
-        bail!("本地 SOCKS 入口当前只支持 CONNECT");
+        bail!("本地 SOCKS 入口只支持 CONNECT 与 UDP ASSOCIATE");
     }
     let host = read_socks_host(stream, request[3]).await?;
     let port = stream.read_u16().await?;
-    Ok(LocalRequest::Socks { host, port })
+    if request[1] == CMD_UDP_ASSOCIATE {
+        Ok(LocalRequest::SocksUdp {
+            requested_port: port,
+        })
+    } else if host.is_empty() || port == 0 {
+        socks_reply(stream, REP_FAILURE).await?;
+        bail!("本地 SOCKS 目标无效");
+    } else {
+        Ok(LocalRequest::Socks { host, port })
+    }
 }
 
 async fn local_http_request(stream: &mut TcpStream, first: u8) -> Result<LocalRequest> {
@@ -703,6 +973,7 @@ fn split_target(value: &str, default_port: u16) -> Result<(String, u16)> {
 async fn accept_local(stream: &mut TcpStream, request: &LocalRequest) -> Result<()> {
     match request {
         LocalRequest::Socks { .. } => socks_reply(stream, REP_OK).await,
+        LocalRequest::SocksUdp { .. } => socks_reply(stream, REP_OK).await,
         LocalRequest::HttpConnect { .. } => {
             stream
                 .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
@@ -716,6 +987,7 @@ async fn accept_local(stream: &mut TcpStream, request: &LocalRequest) -> Result<
 async fn reject_local(stream: &mut TcpStream, request: &LocalRequest) -> Result<()> {
     match request {
         LocalRequest::Socks { .. } => socks_reply(stream, REP_FORBIDDEN).await,
+        LocalRequest::SocksUdp { .. } => socks_reply(stream, REP_FORBIDDEN).await,
         _ => {
             stream
                 .write_all(b"HTTP/1.1 403 Forbidden\r\nConnection: close\r\n\r\n")
@@ -728,6 +1000,7 @@ async fn reject_local(stream: &mut TcpStream, request: &LocalRequest) -> Result<
 async fn fail_local(stream: &mut TcpStream, request: &LocalRequest) -> Result<()> {
     match request {
         LocalRequest::Socks { .. } => socks_reply(stream, REP_HOST_UNREACHABLE).await,
+        LocalRequest::SocksUdp { .. } => socks_reply(stream, REP_HOST_UNREACHABLE).await,
         _ => {
             stream
                 .write_all(b"HTTP/1.1 502 Bad Gateway\r\nConnection: close\r\n\r\n")
@@ -735,6 +1008,164 @@ async fn fail_local(stream: &mut TcpStream, request: &LocalRequest) -> Result<()
             Ok(())
         }
     }
+}
+
+async fn serve_local_udp_association(
+    state: ClientState,
+    mut control: TcpStream,
+    requested_port: u16,
+) -> Result<()> {
+    let bind = if control.local_addr()?.is_ipv4() {
+        "127.0.0.1:0"
+    } else {
+        "[::1]:0"
+    };
+    let socket = UdpSocket::bind(bind).await?;
+    socks_reply_address(&mut control, REP_OK, socket.local_addr()?).await?;
+    let client_ip = control.peer_addr()?.ip();
+    let mut buffer = vec![0u8; MAX_SOCKS_UDP_FRAME];
+    let mut exit_sessions: HashMap<String, tokio_rustls::client::TlsStream<TcpStream>> =
+        HashMap::new();
+    let mut nearest_cache = None;
+    loop {
+        tokio::select! {
+            control_result = control.read_u8() => {
+                match control_result {
+                    Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(()),
+                    Ok(_) | Err(_) => return Ok(()),
+                }
+            }
+            datagram = socket.recv_from(&mut buffer) => {
+                let (length, source) = datagram?;
+                if source.ip() != client_ip || (requested_port != 0 && source.port() != requested_port) {
+                    continue;
+                }
+                let frame = &buffer[..length];
+                match route_local_udp(
+                    &state,
+                    frame,
+                    &mut exit_sessions,
+                    &mut nearest_cache,
+                ).await {
+                    Ok(response) => {
+                        socket.send_to(&response, source).await?;
+                    }
+                    Err(error) => {
+                        tracing::debug!(device = %state.device, "本地 UDP 数据报转发失败：{error:#}");
+                    }
+                }
+            }
+        }
+    }
+}
+
+async fn route_local_udp(
+    state: &ClientState,
+    frame: &[u8],
+    exit_sessions: &mut HashMap<String, tokio_rustls::client::TlsStream<TcpStream>>,
+    nearest_cache: &mut Option<DeviceExit>,
+) -> Result<Vec<u8>> {
+    let packet = parse_socks_udp_packet(frame)?;
+    let config = state.config.read().await.clone();
+    let resolved = direct_candidates(&packet.host, packet.port).await.ok();
+    let ip = resolved
+        .as_ref()
+        .and_then(|addresses| addresses.first())
+        .map(SocketAddr::ip);
+    match classify_config(&config, &packet.host, ip)? {
+        Decision::Reject => bail!("UDP 目标被出口规则拒绝"),
+        Decision::Direct => {
+            let addresses = resolved.context("UDP 直连目标无法解析")?;
+            let payload =
+                udp_exchange(&addresses, &packet.payload, Duration::from_secs(15)).await?;
+            encode_socks_udp_packet(&SocksUdpPacket { payload, ..packet })
+        }
+        Decision::Node(node_id) => {
+            let exit = config
+                .exits
+                .iter()
+                .find(|exit| exit.node_id == node_id)
+                .cloned()
+                .with_context(|| format!("指定出口节点 {node_id} 当前不可达"))?;
+            exchange_exit_udp(state, &exit, frame, exit_sessions).await
+        }
+        Decision::Nearest => {
+            if nearest_cache.as_ref().is_none_or(|cached| {
+                !config
+                    .exits
+                    .iter()
+                    .any(|exit| exit.node_id == cached.node_id)
+            }) {
+                *nearest_cache = Some(nearest_exit(&config.exits).await?);
+            }
+            let exit = nearest_cache.as_ref().context("当前没有可达出口节点")?;
+            exchange_exit_udp(state, exit, frame, exit_sessions).await
+        }
+    }
+}
+
+async fn exchange_exit_udp(
+    state: &ClientState,
+    exit: &DeviceExit,
+    frame: &[u8],
+    sessions: &mut HashMap<String, tokio_rustls::client::TlsStream<TcpStream>>,
+) -> Result<Vec<u8>> {
+    let mut last_error = None;
+    for _ in 0..2 {
+        if !sessions.contains_key(&exit.node_id) {
+            match connect_exit_udp_association(state, exit).await {
+                Ok(stream) => {
+                    sessions.insert(exit.node_id.clone(), stream);
+                }
+                Err(error) => {
+                    last_error = Some(error);
+                    continue;
+                }
+            }
+        }
+        let result = udp_tunnel_request(
+            sessions
+                .get_mut(&exit.node_id)
+                .context("UDP 出口会话未建立")?,
+            frame,
+        )
+        .await;
+        match result {
+            Ok(response) => return Ok(response),
+            Err(error) => {
+                last_error = Some(error);
+                sessions.remove(&exit.node_id);
+            }
+        }
+    }
+    Err(last_error.unwrap_or_else(|| anyhow::anyhow!("UDP 出口连接失败")))
+}
+
+async fn udp_tunnel_request<S>(stream: &mut S, frame: &[u8]) -> Result<Vec<u8>>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    if frame.is_empty() || frame.len() > MAX_SOCKS_UDP_FRAME {
+        bail!("UDP 隧道请求帧长度无效");
+    }
+    tokio::time::timeout(Duration::from_secs(30), async {
+        stream.write_u32(frame.len() as u32).await?;
+        stream.write_all(frame).await?;
+        stream.flush().await?;
+        let status = stream.read_u8().await?;
+        let length = stream.read_u32().await? as usize;
+        if status != REP_OK {
+            bail!("出口拒绝 UDP 数据报（SOCKS 状态 {status}）");
+        }
+        if length == 0 || length > MAX_SOCKS_UDP_FRAME {
+            bail!("出口 UDP 响应帧长度无效");
+        }
+        let mut response = vec![0u8; length];
+        stream.read_exact(&mut response).await?;
+        Ok(response)
+    })
+    .await
+    .context("UDP 出口响应超时")?
 }
 
 async fn nearest_exit(exits: &[DeviceExit]) -> Result<DeviceExit> {
@@ -817,6 +1248,29 @@ async fn connect_exit(
     Ok(tls)
 }
 
+async fn connect_exit_udp_association(
+    state: &ClientState,
+    exit: &DeviceExit,
+) -> Result<tokio_rustls::client::TlsStream<TcpStream>> {
+    let addresses = resolve_endpoint(&exit.endpoint).await?;
+    let tcp = connect_candidates(&addresses, Duration::from_secs(10)).await?;
+    let connector = TlsConnector::from(state.tls.clone());
+    let mut tls = connector
+        .connect(endpoint_server_name(&exit.endpoint)?, tcp)
+        .await
+        .with_context(|| format!("连接 TLS UDP 出口 {}", exit.label))?;
+    client_socks_command(
+        &mut tls,
+        &state.device,
+        state.token.as_str(),
+        CMD_UDP_ASSOCIATE,
+        "0.0.0.0",
+        0,
+    )
+    .await?;
+    Ok(tls)
+}
+
 async fn client_socks_connect<S>(
     stream: &mut S,
     device: &str,
@@ -827,6 +1281,23 @@ async fn client_socks_connect<S>(
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
+    client_socks_command(stream, device, token, CMD_CONNECT, host, port).await
+}
+
+async fn client_socks_command<S>(
+    stream: &mut S,
+    device: &str,
+    token: &str,
+    command: u8,
+    host: &str,
+    port: u16,
+) -> Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    if !matches!(command, CMD_CONNECT | CMD_UDP_ASSOCIATE) {
+        bail!("SOCKS 出口命令不受支持");
+    }
     if device.len() > u8::MAX as usize
         || token.len() > u8::MAX as usize
         || host.len() > u8::MAX as usize
@@ -838,7 +1309,7 @@ where
     request.extend_from_slice(device.as_bytes());
     request.push(token.len() as u8);
     request.extend_from_slice(token.as_bytes());
-    request.extend_from_slice(&[SOCKS_VERSION, CMD_CONNECT, 0, ATYP_DOMAIN, host.len() as u8]);
+    request.extend_from_slice(&[SOCKS_VERSION, command, 0, ATYP_DOMAIN, host.len() as u8]);
     request.extend_from_slice(host.as_bytes());
     request.extend_from_slice(&port.to_be_bytes());
     stream.write_all(&request).await?;
@@ -925,6 +1396,187 @@ mod tests {
         }
     }
 
+    #[test]
+    fn socks_udp_frames_preserve_all_address_types_and_reject_fragments() {
+        for packet in [
+            SocksUdpPacket {
+                host: "dns.example".into(),
+                port: 53,
+                payload: vec![0, 1, 2, 255],
+            },
+            SocksUdpPacket {
+                host: "1.1.1.1".into(),
+                port: 53,
+                payload: b"ipv4".to_vec(),
+            },
+            SocksUdpPacket {
+                host: "2606:4700:4700::1111".into(),
+                port: 53,
+                payload: b"ipv6".to_vec(),
+            },
+        ] {
+            let frame = encode_socks_udp_packet(&packet).unwrap();
+            assert_eq!(parse_socks_udp_packet(&frame).unwrap(), packet);
+        }
+        let mut fragmented = encode_socks_udp_packet(&SocksUdpPacket {
+            host: "dns.example".into(),
+            port: 53,
+            payload: vec![],
+        })
+        .unwrap();
+        fragmented[2] = 1;
+        assert!(parse_socks_udp_packet(&fragmented).is_err());
+        assert!(parse_socks_udp_packet(&vec![0; MAX_SOCKS_UDP_FRAME + 1]).is_err());
+    }
+
+    #[tokio::test]
+    async fn udp_exchange_uses_connected_source_and_preserves_binary_payload() {
+        let echo = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let address = echo.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let mut payload = [0u8; 128];
+            let (length, peer) = echo.recv_from(&mut payload).await.unwrap();
+            let mut response = b"echo:".to_vec();
+            response.extend_from_slice(&payload[..length]);
+            echo.send_to(&response, peer).await.unwrap();
+        });
+        let response = udp_exchange(&[address], &[0, 1, 255], Duration::from_secs(2))
+            .await
+            .unwrap();
+        assert_eq!(response, b"echo:\0\x01\xff");
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn udp_tunnel_protocol_is_length_bounded_and_reusable() {
+        let (mut client, mut server) = tokio::io::duplex(MAX_SOCKS_UDP_FRAME * 2);
+        let server_task = tokio::spawn(async move {
+            for suffix in [b"one".as_slice(), b"two".as_slice()] {
+                let length = server.read_u32().await.unwrap() as usize;
+                let mut request = vec![0u8; length];
+                server.read_exact(&mut request).await.unwrap();
+                let mut packet = parse_socks_udp_packet(&request).unwrap();
+                packet.payload.extend_from_slice(suffix);
+                let response = encode_socks_udp_packet(&packet).unwrap();
+                server.write_u8(REP_OK).await.unwrap();
+                server.write_u32(response.len() as u32).await.unwrap();
+                server.write_all(&response).await.unwrap();
+            }
+        });
+        let request = encode_socks_udp_packet(&SocksUdpPacket {
+            host: "dns.example".into(),
+            port: 53,
+            payload: b"query-".to_vec(),
+        })
+        .unwrap();
+        let first = udp_tunnel_request(&mut client, &request).await.unwrap();
+        assert_eq!(
+            parse_socks_udp_packet(&first).unwrap().payload,
+            b"query-one"
+        );
+        let second = udp_tunnel_request(&mut client, &request).await.unwrap();
+        assert_eq!(
+            parse_socks_udp_packet(&second).unwrap().payload,
+            b"query-two"
+        );
+        server_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn local_socks_udp_associate_routes_direct_datagrams_end_to_end() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let echo = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let echo_address = echo.local_addr().unwrap();
+        let echo_task = tokio::spawn(async move {
+            let mut payload = [0u8; 128];
+            let (length, peer) = echo.recv_from(&mut payload).await.unwrap();
+            echo.send_to(&payload[..length], peer).await.unwrap();
+        });
+        let config = DeviceConfig {
+            schema: 1,
+            cluster_id: "udp-test".into(),
+            device: "phone".into(),
+            label: "手机".into(),
+            rules: vec![DeviceRule {
+                name: "direct".into(),
+                version: 1,
+                digest: "00".repeat(32),
+                spec: ExitRuleSpec {
+                    schema: crate::exit::EXIT_RULE_SCHEMA,
+                    description: "UDP 直连".into(),
+                    enabled: true,
+                    priority: 0,
+                    format: crate::exit::RuleFormat::Surge,
+                    config: "FINAL,DIRECT".into(),
+                    providers: Default::default(),
+                    policy_exits: Default::default(),
+                },
+            }],
+            exits: vec![],
+            refresh_after_seconds: 30,
+        };
+        let state = ClientState {
+            control: "https://unused.test".into(),
+            device: "phone".into(),
+            token: Arc::new(Zeroizing::new("unused".into())),
+            config: Arc::new(RwLock::new(config)),
+            tls: Arc::new(
+                rustls::ClientConfig::builder()
+                    .with_root_certificates(rustls::RootCertStore::empty())
+                    .with_no_client_auth(),
+            ),
+        };
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy_address = listener.local_addr().unwrap();
+        let proxy_task = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            handle_local(state, stream).await.unwrap();
+        });
+
+        let mut control = TcpStream::connect(proxy_address).await.unwrap();
+        control
+            .write_all(&[5, 1, 0, 5, CMD_UDP_ASSOCIATE, 0, ATYP_V4, 0, 0, 0, 0, 0, 0])
+            .await
+            .unwrap();
+        let mut method = [0u8; 2];
+        control.read_exact(&mut method).await.unwrap();
+        assert_eq!(method, [SOCKS_VERSION, AUTH_NONE]);
+        let mut reply = [0u8; 10];
+        control.read_exact(&mut reply).await.unwrap();
+        assert_eq!(reply[..4], [SOCKS_VERSION, REP_OK, 0, ATYP_V4]);
+        let relay_address = SocketAddr::from((
+            [reply[4], reply[5], reply[6], reply[7]],
+            u16::from_be_bytes([reply[8], reply[9]]),
+        ));
+
+        let client_udp = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let request = encode_socks_udp_packet(&SocksUdpPacket {
+            host: echo_address.ip().to_string(),
+            port: echo_address.port(),
+            payload: vec![0, 1, 2, 255],
+        })
+        .unwrap();
+        client_udp.send_to(&request, relay_address).await.unwrap();
+        let mut response = vec![0u8; MAX_SOCKS_UDP_FRAME];
+        let (length, source) =
+            tokio::time::timeout(Duration::from_secs(2), client_udp.recv_from(&mut response))
+                .await
+                .unwrap()
+                .unwrap();
+        assert_eq!(source, relay_address);
+        response.truncate(length);
+        assert_eq!(
+            parse_socks_udp_packet(&response).unwrap().payload,
+            vec![0, 1, 2, 255]
+        );
+        drop(control);
+        echo_task.await.unwrap();
+        tokio::time::timeout(Duration::from_secs(2), proxy_task)
+            .await
+            .unwrap()
+            .unwrap();
+    }
+
     #[tokio::test]
     async fn socks_client_handshake_is_pipelined_and_bounded() {
         let (mut client, mut server) = tokio::io::duplex(4_096);
@@ -944,6 +1596,34 @@ mod tests {
             "rfd_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
             "example.com",
             443,
+        )
+        .await
+        .unwrap();
+        server_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn udp_association_authenticates_before_tunnel_frames() {
+        let (mut client, mut server) = tokio::io::duplex(4_096);
+        let server_task = tokio::spawn(async move {
+            let mut bytes = vec![0u8; 3 + 2 + 6 + 1 + 47 + 5 + 7 + 2];
+            server.read_exact(&mut bytes).await.unwrap();
+            let command_offset = 3 + 2 + 6 + 1 + 47;
+            assert_eq!(bytes[command_offset + 1], CMD_UDP_ASSOCIATE);
+            assert_eq!(&bytes[bytes.len() - 2..], &[0, 0]);
+            server.write_all(&[5, 2, 1, 0]).await.unwrap();
+            server
+                .write_all(&[5, 0, 0, 1, 0, 0, 0, 0, 0, 0])
+                .await
+                .unwrap();
+        });
+        client_socks_command(
+            &mut client,
+            "phone1",
+            "rfd_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            CMD_UDP_ASSOCIATE,
+            "0.0.0.0",
+            0,
         )
         .await
         .unwrap();
@@ -1017,9 +1697,12 @@ mod tests {
         let server_node = node.clone();
         let server = tokio::spawn(async move {
             let mut tls = acceptor.accept(server_io).await.unwrap();
-            let (principal, host, port) = server_socks_handshake(&server_node, &mut tls)
+            let (principal, request) = server_socks_handshake(&server_node, &mut tls)
                 .await
                 .unwrap();
+            let EgressRequest::Connect { host, port } = request else {
+                panic!("expected CONNECT request");
+            };
             assert_eq!(principal.name, "phone");
             assert_eq!(host, "example.com");
             assert_eq!(port, 443);

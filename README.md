@@ -167,8 +167,8 @@ Working today, verified by multi-process fault-injection e2e tests:
   DNS/routing/delivery timeline are included. See [the Email guide](./docs/EMAIL.md).
 - **Decentralized device and exit networking**: one-way device credentials
   fetch operator-signed Surge/Clash rules without exposing the cluster secret.
-  A local SOCKS5/HTTP proxy performs DIRECT and REJECT decisions or opens a
-  TLS-authenticated SOCKS tunnel to a specific/live-nearest exit. Exit nodes
+  A local SOCKS5 TCP/UDP and HTTP proxy performs DIRECT and REJECT decisions or
+  opens a reusable TLS-authenticated tunnel to a specific/live-nearest exit. Exit nodes
   re-evaluate the same signed policy and resolve destinations themselves with
   strict private, metadata, transition-prefix and reserved-address SSRF
   blocking. Remote rule-set and GEOIP content is frozen into the signed
