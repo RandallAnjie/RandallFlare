@@ -45,7 +45,7 @@ Use the binary produced by GitHub Actions. Verify the published checksum before
 using it to create or validate credentials:
 
 ```bash
-RF_VERSION=v0.9.0
+RF_VERSION=v0.10.0
 curl -fLO "https://github.com/RandallAnjie/RandallFlare/releases/download/$RF_VERSION/rf-linux-x86_64"
 curl -fLO "https://github.com/RandallAnjie/RandallFlare/releases/download/$RF_VERSION/rf-linux-x86_64.sha256"
 sha256sum --check --strict rf-linux-x86_64.sha256
@@ -90,9 +90,9 @@ scp first-vps/rf.toml root@203.0.113.7:/root/rf.toml
 scp first-vps/rf.env root@203.0.113.7:/root/rf.env  # only when used
 ssh root@203.0.113.7
 curl -fLo /tmp/install-randallflare-release.sh \
-  https://raw.githubusercontent.com/RandallAnjie/RandallFlare/v0.9.0/infra/install-release.sh
+  https://raw.githubusercontent.com/RandallAnjie/RandallFlare/v0.10.0/infra/install-release.sh
 bash /tmp/install-randallflare-release.sh \
-  --version v0.9.0 --config /root/rf.toml --env /root/rf.env
+  --version v0.10.0 --config /root/rf.toml --env /root/rf.env
 ```
 
 Omit both `scp` of `rf.env` and `--env` when no environment file is needed.
@@ -209,8 +209,8 @@ restarting the service:
 
 ```bash
 curl -fLo /tmp/install-randallflare-release.sh \
-  https://raw.githubusercontent.com/RandallAnjie/RandallFlare/v0.9.0/infra/install-release.sh
-sudo bash /tmp/install-randallflare-release.sh --version v0.9.0
+  https://raw.githubusercontent.com/RandallAnjie/RandallFlare/v0.10.0/infra/install-release.sh
+sudo bash /tmp/install-randallflare-release.sh --version v0.10.0
 ```
 
 The default hardened unit deliberately prevents the unprivileged daemon from
