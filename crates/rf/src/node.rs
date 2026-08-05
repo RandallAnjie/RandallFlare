@@ -61,6 +61,9 @@ pub struct RuntimeLogLine {
 #[derive(Debug, Clone, Default)]
 pub struct PeerView {
     pub api_addr: Option<SocketAddr>,
+    /// Public TLS device-egress endpoint advertised through authenticated
+    /// gossip; absent on ordinary compute/storage nodes.
+    pub exit_endpoint: Option<String>,
     pub public: bool,
     pub label: String,
     pub ipv4: Option<String>,

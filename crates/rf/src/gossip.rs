@@ -10,6 +10,7 @@
 //!   rf:claim:<task> base64 claim envelope (our own live claims)
 //!   rf:deploy:<worker> compact JSON local deployment/runtime state
 //!   rf:capabilities  JSON list of authenticated self-declared capabilities
+//!   rf:exit         public TLS device-egress endpoint (selected nodes only)
 //!
 //! Digest mismatch against a peer triggers an HTTP anti-entropy pull;
 //! claim keys are ingested directly off the gossip state. Claims and
@@ -38,6 +39,7 @@ pub const K_KDIG_PREFIX: &str = "rf:kdig:";
 pub const K_CLAIM_PREFIX: &str = "rf:claim:";
 pub const K_DEPLOY_PREFIX: &str = "rf:deploy:";
 pub const K_CAPABILITIES: &str = "rf:capabilities";
+pub const K_EXIT_ENDPOINT: &str = "rf:exit";
 
 fn b64() -> base64::engine::GeneralPurpose {
     base64::engine::general_purpose::STANDARD
@@ -135,6 +137,11 @@ pub async fn start(node: Arc<Node>) -> Result<Gossip> {
     if let Some(dns) = &node.cfg.dns {
         if let Some(ip) = &dns.my_ipv4 {
             initial.push((K_IP4.into(), ip.clone()));
+        }
+    }
+    if node.cfg.exit.enabled {
+        if let Some(endpoint) = &node.cfg.exit.advertise {
+            initial.push((K_EXIT_ENDPOINT.into(), endpoint.clone()));
         }
     }
     for (ns, dig) in node.kv_digests() {
@@ -282,6 +289,7 @@ async fn observer(node: Arc<Node>, chitchat: Arc<tokio::sync::Mutex<chitchat::Ch
                 if let Some(v) = state.get(K_API) {
                     view.api_addr = v.parse().ok();
                 }
+                view.exit_endpoint = state.get(K_EXIT_ENDPOINT).map(str::to_string);
                 view.public = state.get(K_PUBLIC) == Some("1");
                 view.label = state.get(K_LABEL).unwrap_or_default().to_string();
                 view.ipv4 = state.get(K_IP4).map(|s| s.to_string());

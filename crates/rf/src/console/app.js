@@ -56,6 +56,11 @@ const state = {
   flowNodeActive: null,
   flowRuns: [],
   flowRunActive: null,
+  networkRules: [],
+  networkRuleActive: null,
+  networkDevices: [],
+  networkDeviceActive: null,
+  networkExits: [],
   emailDomains: [],
   emailActive: null,
   emailRoutes: [],
@@ -86,6 +91,7 @@ const titles = {
   pipelines: ["数据传输", "Pipeline"],
   workflows: ["耐久执行", "Workflow"],
   flows: ["可视化编排", "Flow"],
+  network: ["终端网络", "设备与出口"],
   email: ["去中心化邮件", "邮件路由"],
   binaries: ["安全原生程序", "Binary Deliver"],
   security: ["安全边界", "安全与访问"],
@@ -2872,6 +2878,235 @@ async function deleteFlow() {
   catch (error) { toast(error.message, true); }
 }
 
+function parseNetworkJson(selector, label) {
+  try {
+    const value = JSON.parse($(selector).value || "{}");
+    if (!value || Array.isArray(value) || typeof value !== "object") throw new Error("必须是 JSON 对象");
+    return value;
+  } catch (error) {
+    throw new Error(`${label}无效：${error.message}`);
+  }
+}
+
+function resetNetworkRuleForm() {
+  state.networkRuleActive = null;
+  $("#network-rule-form").reset();
+  $("#network-rule-name").readOnly = false;
+  $("#network-rule-format").value = "auto";
+  $("#network-rule-priority").value = "0";
+  $("#network-rule-enabled").checked = true;
+  $("#network-rule-policies").value = JSON.stringify({
+    Proxy: { type: "nearest" },
+    DIRECT: { type: "direct" },
+    REJECT: { type: "reject" },
+  }, null, 2);
+  $("#network-rule-providers").value = "{}";
+  $("#network-rule-title").textContent = "创建分流规则";
+  $("#network-rule-delete").classList.add("hidden");
+  renderNetworkRules();
+}
+
+function renderNetworkRules() {
+  $("#network-rule-count").textContent = String(state.networkRules.length);
+  const list = $("#network-rule-list");
+  list.classList.toggle("empty-state", state.networkRules.length === 0);
+  list.innerHTML = state.networkRules.length ? state.networkRules.map((rule) => {
+    const spec = rule.spec || {};
+    return `<button class="database-item${rule.name === state.networkRuleActive ? " active" : ""}" type="button" data-network-rule="${escapeHtml(rule.name)}"><span><strong>${escapeHtml(rule.name)}</strong><small>${escapeHtml(spec.description || `${spec.format || "auto"} 规则`)} · 优先级 ${escapeHtml(spec.priority ?? 0)}</small></span><span><span class="badge ${spec.enabled ? "active" : "danger"}">${spec.enabled ? "已启用" : "已停用"}</span> v${escapeHtml(rule.version)}</span></button>`;
+  }).join("") : "暂无出口规则。";
+}
+
+function selectNetworkRule(name) {
+  const rule = state.networkRules.find((item) => item.name === name);
+  if (!rule) return;
+  state.networkRuleActive = name;
+  const spec = rule.spec || {};
+  $("#network-rule-name").value = name;
+  $("#network-rule-name").readOnly = true;
+  $("#network-rule-format").value = spec.format || "auto";
+  $("#network-rule-description").value = spec.description || "";
+  $("#network-rule-priority").value = String(spec.priority ?? 0);
+  $("#network-rule-config").value = spec.config || "";
+  $("#network-rule-policies").value = JSON.stringify(spec.policy_exits || {}, null, 2);
+  $("#network-rule-providers").value = JSON.stringify(spec.providers || {}, null, 2);
+  $("#network-rule-enabled").checked = spec.enabled !== false;
+  $("#network-rule-title").textContent = `编辑 ${name}`;
+  $("#network-rule-delete").classList.remove("hidden");
+  renderNetworkRules();
+}
+
+function renderNetworkDeviceRules(selected = []) {
+  const box = $("#network-device-rules");
+  box.classList.toggle("empty-state", state.networkRules.length === 0);
+  box.innerHTML = state.networkRules.length ? state.networkRules.map((rule) => `<label class="check-label compact"><input type="checkbox" value="${escapeHtml(rule.name)}" ${selected.includes(rule.name) ? "checked" : ""}><span>${escapeHtml(rule.name)}${rule.spec?.enabled === false ? "（已停用）" : ""}</span></label>`).join("") : "请先创建分流规则。";
+}
+
+function resetNetworkDeviceForm() {
+  state.networkDeviceActive = null;
+  $("#network-device-form").reset();
+  $("#network-device-name").readOnly = false;
+  $("#network-device-title").textContent = "注册设备";
+  $("#network-device-submit").textContent = "创建并显示令牌";
+  $("#network-device-revoke").classList.add("hidden");
+  $("#network-device-delete").classList.add("hidden");
+  $("#network-token-reveal").classList.add("hidden");
+  $("#network-token-value").textContent = "";
+  $("#network-device-command").textContent = "";
+  renderNetworkDeviceRules([]);
+  renderNetworkDevices();
+}
+
+function renderNetworkDevices() {
+  const active = state.networkDevices.filter((device) => device.active).length;
+  $("#network-device-count").textContent = String(active);
+  $("#network-device-total").textContent = `共 ${state.networkDevices.length} 台`;
+  $("#network-nav-count").textContent = String(active);
+  const list = $("#network-device-list");
+  list.classList.toggle("empty-state", state.networkDevices.length === 0);
+  list.innerHTML = state.networkDevices.length ? state.networkDevices.map((device) => {
+    const status = device.revoked_at_ms ? "已撤销" : device.suspended ? "已暂停" : !device.rules_ready ? "等待规则同步" : device.active ? "有效" : "已过期";
+    const statusClass = device.active ? "active" : "danger";
+    return `<button class="database-item${device.name === state.networkDeviceActive ? " active" : ""}" type="button" data-network-device="${escapeHtml(device.name)}"><span><strong>${escapeHtml(device.label)}</strong><small>${escapeHtml(device.name)} · ${escapeHtml(device.token_prefix)}… · 最近使用 ${escapeHtml(device.last_used_at_ms ? formatDate(device.last_used_at_ms) : "从未")}</small></span><span><span class="badge ${statusClass}">${status}</span> v${escapeHtml(device.version)}</span></button>`;
+  }).join("") : "暂无客户端设备。";
+}
+
+function selectNetworkDevice(name) {
+  const device = state.networkDevices.find((item) => item.name === name);
+  if (!device) return;
+  const preserveReveal = state.networkDeviceActive === name && Boolean($("#network-token-value").textContent);
+  state.networkDeviceActive = name;
+  $("#network-device-name").value = device.name;
+  $("#network-device-name").readOnly = true;
+  $("#network-device-label").value = device.label;
+  $("#network-device-expires").value = device.expires_at_ms ? new Date(device.expires_at_ms - new Date().getTimezoneOffset() * 60_000).toISOString().slice(0, 16) : "";
+  $("#network-device-suspended").checked = Boolean(device.suspended);
+  $("#network-device-title").textContent = `编辑 ${device.label}`;
+  $("#network-device-submit").textContent = "保存设备策略";
+  $("#network-device-revoke").classList.toggle("hidden", Boolean(device.revoked_at_ms));
+  $("#network-device-delete").classList.remove("hidden");
+  if (!preserveReveal) {
+    $("#network-token-reveal").classList.add("hidden");
+    $("#network-token-value").textContent = "";
+    $("#network-device-command").textContent = "";
+  }
+  renderNetworkDeviceRules(device.allowed_rules || []);
+  renderNetworkDevices();
+}
+
+function renderNetworkExits(exitRole = {}) {
+  $("#network-exit-count").textContent = String(state.networkExits.length);
+  $("#network-local-role").textContent = exitRole.enabled ? "出口节点" : "仅管理";
+  $("#network-local-endpoint").textContent = exitRole.enabled ? (exitRole.advertise || "尚未设置公开端点") : "仅管理签名定义";
+  const list = $("#network-exit-list");
+  list.classList.toggle("empty-state", state.networkExits.length === 0);
+  list.innerHTML = state.networkExits.length ? state.networkExits.map((exit) => `<div class="node-row"><span class="dot ${exit.live ? "online" : "offline"}"></span><div><div class="node-name">${escapeHtml(exit.label || shortId(exit.node_id, 18))}${exit.local ? " · 当前节点" : ""}</div><div class="node-short">${escapeHtml(shortId(exit.node_id, 22))}</div></div><div class="node-address mono">${escapeHtml(exit.endpoint || "端点未公布")}</div><span class="badge active">TLS SOCKS</span></div>`).join("") : "尚未发现出口节点。";
+}
+
+async function loadNetwork({ quiet = false } = {}) {
+  try {
+    const data = await api("/api/network");
+    state.networkRules = data.rules || [];
+    state.networkDevices = data.devices || [];
+    state.networkExits = data.exits || [];
+    renderNetworkRules();
+    renderNetworkDevices();
+    renderNetworkExits(data.exit_role || {});
+    if (state.networkRuleActive) {
+      const active = state.networkRules.find((rule) => rule.name === state.networkRuleActive);
+      if (active) selectNetworkRule(active.name); else resetNetworkRuleForm();
+    }
+    if (state.networkDeviceActive) {
+      const active = state.networkDevices.find((device) => device.name === state.networkDeviceActive);
+      if (active) selectNetworkDevice(active.name); else resetNetworkDeviceForm();
+    } else renderNetworkDeviceRules([]);
+    if (!quiet) toast("设备与出口状态已刷新");
+  } catch (error) {
+    if (!quiet) toast(error.message, true);
+  }
+}
+
+async function saveNetworkRule(event) {
+  event.preventDefault();
+  let policyExits;
+  let providers;
+  try {
+    policyExits = parseNetworkJson("#network-rule-policies", "策略出口映射");
+    providers = parseNetworkJson("#network-rule-providers", "规则集快照");
+  } catch (error) { return toast(error.message, true); }
+  const payload = {
+    name: $("#network-rule-name").value.trim(), schema: 1,
+    description: $("#network-rule-description").value.trim(), enabled: $("#network-rule-enabled").checked,
+    priority: Number($("#network-rule-priority").value), format: $("#network-rule-format").value,
+    config: $("#network-rule-config").value, providers, policy_exits: policyExits,
+  };
+  try {
+    const result = await api("/api/network/rules", { method: "POST", body: JSON.stringify(payload) });
+    const complete = async () => { state.networkRuleActive = payload.name; await loadNetwork({ quiet: true }); };
+    if (result.pending_approval) showApproval(result, `批准出口规则 ${payload.name} 的签名定义。`, complete);
+    else { toast("出口规则已保存"); await complete(); }
+  } catch (error) { toast(error.message, true); }
+}
+
+async function deleteNetworkRule() {
+  const name = state.networkRuleActive;
+  if (!name || !window.confirm(`要删除出口规则“${name}”吗？被设备引用时系统会拒绝删除。`)) return;
+  try {
+    const result = await api(`/api/network/rules/${encodeURIComponent(name)}`, { method: "DELETE" });
+    const complete = async () => { resetNetworkRuleForm(); await loadNetwork({ quiet: true }); };
+    if (result.pending_approval) showApproval(result, `批准删除出口规则 ${name}。`, complete); else await complete();
+  } catch (error) { toast(error.message, true); }
+}
+
+function selectedNetworkRules() {
+  return $$("#network-device-rules input:checked").map((input) => input.value);
+}
+
+async function saveNetworkDevice(event) {
+  event.preventDefault();
+  const expires = $("#network-device-expires").value;
+  const allowedRules = selectedNetworkRules();
+  if (!allowedRules.length) return toast("请至少选择一条签名分流规则", true);
+  const payload = {
+    name: $("#network-device-name").value.trim(), label: $("#network-device-label").value.trim(),
+    allowed_rules: allowedRules, expires_at_ms: expires ? new Date(expires).getTime() : null,
+    suspended: $("#network-device-suspended").checked,
+  };
+  try {
+    const editing = Boolean(state.networkDeviceActive);
+    const path = editing ? `/api/network/devices/${encodeURIComponent(payload.name)}` : "/api/network/devices";
+    const result = await api(path, { method: editing ? "PATCH" : "POST", body: JSON.stringify(editing ? { label: payload.label, allowed_rules: payload.allowed_rules, expires_at_ms: payload.expires_at_ms, suspended: payload.suspended, revoke: false } : payload) });
+    if (result.token) {
+      $("#network-token-value").textContent = result.token;
+      $("#network-device-command").textContent = `rf device proxy --control ${location.origin} --name ${payload.name} --token-file ~/.rf/devices/${payload.name}.token`;
+      $("#network-token-reveal").classList.remove("hidden");
+    }
+    const complete = async () => { state.networkDeviceActive = payload.name; await loadNetwork({ quiet: true }); };
+    if (result.pending_approval) showApproval(result, `批准客户端设备 ${payload.name} 的签名凭据。`, complete);
+    else { toast(editing ? "设备策略已保存" : "设备已注册"); await complete(); }
+  } catch (error) { toast(error.message, true); }
+}
+
+async function revokeNetworkDevice() {
+  const device = state.networkDevices.find((item) => item.name === state.networkDeviceActive);
+  if (!device || !window.confirm(`立即撤销“${device.label}”的令牌吗？此操作不可恢复。`)) return;
+  const payload = { label: device.label, allowed_rules: device.allowed_rules || [], expires_at_ms: device.expires_at_ms, suspended: true, revoke: true };
+  try {
+    const result = await api(`/api/network/devices/${encodeURIComponent(device.name)}`, { method: "PATCH", body: JSON.stringify(payload) });
+    const complete = () => loadNetwork({ quiet: true });
+    if (result.pending_approval) showApproval(result, `批准撤销客户端设备 ${device.name}。`, complete); else await complete();
+  } catch (error) { toast(error.message, true); }
+}
+
+async function deleteNetworkDevice() {
+  const name = state.networkDeviceActive;
+  if (!name || !window.confirm(`要从签名目录中删除设备“${name}”吗？`)) return;
+  try {
+    const result = await api(`/api/network/devices/${encodeURIComponent(name)}`, { method: "DELETE" });
+    const complete = async () => { resetNetworkDeviceForm(); await loadNetwork({ quiet: true }); };
+    if (result.pending_approval) showApproval(result, `批准删除客户端设备 ${name}。`, complete); else await complete();
+  } catch (error) { toast(error.message, true); }
+}
+
 function emailBooleanLabel(value, optional = false) {
   if (optional && value == null) return "未检查";
   return value ? "通过" : "未通过";
@@ -3383,6 +3618,7 @@ const scopeAreaCopy = {
   email: ["邮件", "域名与消息"],
   binary: ["Binary", "原生程序、内容与策略"],
   storage: ["存储策略", "默认后端与 rclone 分片"],
+  network: ["设备网络", "规则、设备与出口目录"],
   node: ["节点", "成员与调度"],
   quota: ["配额", "集群安全策略"],
   audit: ["审计", "签名透明日志"],
@@ -3996,8 +4232,9 @@ async function boot() {
     $("#security-copy").innerHTML = consoleMode === "public"
       ? "此节点不保存<br>任何私钥。"
       : "密钥仅保留在本地<br>控制台进程中。";
-    $$("#deploy-form button, #source-form button, #kv-editor-form button, #d1-create-form button, #d1-exec-form button, #r2-bucket-form button, #r2-upload-form button, #r2-delete-bucket, #storage-form button, #storage-probe, #queue-form button, #queue-send-form button, #queue-delete, #analytics-form button, #analytics-write-form button, #analytics-delete, #pipeline-form button, #pipeline-token-form button, #pipeline-ingest-form button, #pipeline-flush, #pipeline-delete, #workflow-form button, #workflow-trigger-form button, #workflow-signal-form button, #workflow-delete, #flow-form button, #flow-token-form button, #flow-trigger-form button, #flow-delete, #email-domain-form button, #email-route-form button, #email-send-form button, #email-delete, #email-verify, #binary-form button, #binary-new, #project-domain-add-form button, #project-bindings-form button, #project-secret-form button, #project-file-form button, #project-file-new, #project-triggers-form button, #project-cron-fire-form button, #project-cron-dlq button, #project-settings-form button, #project-preview-form button, #project-preview-list button, #project-source-form button, #project-redeploy, #project-delete, #quota-form button, #access-token-form button, #s3-credential-form button")
+    $$("#deploy-form button, #source-form button, #kv-editor-form button, #d1-create-form button, #d1-exec-form button, #r2-bucket-form button, #r2-upload-form button, #r2-delete-bucket, #storage-form button, #storage-probe, #queue-form button, #queue-send-form button, #queue-delete, #analytics-form button, #analytics-write-form button, #analytics-delete, #pipeline-form button, #pipeline-token-form button, #pipeline-ingest-form button, #pipeline-flush, #pipeline-delete, #workflow-form button, #workflow-trigger-form button, #workflow-signal-form button, #workflow-delete, #flow-form button, #flow-token-form button, #flow-trigger-form button, #flow-delete, #network-rule-form button, #network-device-form button, #email-domain-form button, #email-route-form button, #email-send-form button, #email-delete, #email-verify, #binary-form button, #binary-new, #project-domain-add-form button, #project-bindings-form button, #project-secret-form button, #project-file-form button, #project-file-new, #project-triggers-form button, #project-cron-fire-form button, #project-cron-dlq button, #project-settings-form button, #project-preview-form button, #project-preview-list button, #project-source-form button, #project-redeploy, #project-delete, #quota-form button, #access-token-form button, #s3-credential-form button")
       .forEach((button) => { button.disabled = state.session.read_only; });
+    $("#network-device-transport-warning").classList.toggle("hidden", consoleMode === "local" || credentialWritesAllowed());
     $("#node-policy-form button").disabled = state.session.read_only;
     $$("#access-token-form input, #access-token-form button, #s3-credential-form input, #s3-credential-form button")
       .forEach((control) => { control.disabled = !credentialWritable; });
@@ -4012,6 +4249,7 @@ async function boot() {
     await loadPipelines({ quiet: true });
     await loadWorkflows({ quiet: true });
     await loadFlows({ quiet: true });
+    await loadNetwork({ quiet: true });
     await loadEmail({ quiet: true });
     await loadBinaries({ quiet: true });
     await loadSecurity({ quiet: true });
@@ -4030,6 +4268,7 @@ $$(".nav-item").forEach((button) => button.addEventListener("click", () => {
   switchView(button.dataset.view);
   if (button.dataset.view === "nodes") loadNodes({ quiet: true });
   if (button.dataset.view === "storage") loadStorage({ quiet: true });
+  if (button.dataset.view === "network") loadNetwork({ quiet: true });
   if (button.dataset.view === "binaries") loadBinaries({ quiet: true });
   if (button.dataset.view === "security") loadSecurity({ quiet: true });
 }));
@@ -4141,6 +4380,7 @@ $("#refresh").addEventListener("click", async () => {
   await loadPipelines({ quiet: true });
   await loadWorkflows({ quiet: true });
   await loadFlows({ quiet: true });
+  await loadNetwork({ quiet: true });
   await loadEmail({ quiet: true });
   await loadBinaries({ quiet: true });
 });
@@ -4323,6 +4563,17 @@ $("#flow-edge-list").addEventListener("click", (event) => { const button = event
 $("#flow-token-list").addEventListener("click", (event) => { const button = event.target.closest("[data-flow-token-revoke]"); if (button) revokeFlowToken(button.dataset.flowTokenRevoke); });
 $("#flow-runs").addEventListener("click", (event) => { const button = event.target.closest("[data-flow-run]"); if (button) openFlowRun(button.dataset.flowRun); });
 $("#flow-run-actions").addEventListener("click", (event) => { const button = event.target.closest("[data-flow-action]"); if (button) runFlowAction(button.dataset.flowAction); });
+$("#network-refresh").addEventListener("click", () => loadNetwork());
+$("#network-rule-new").addEventListener("click", resetNetworkRuleForm);
+$("#network-rule-form").addEventListener("submit", saveNetworkRule);
+$("#network-rule-delete").addEventListener("click", deleteNetworkRule);
+$("#network-rule-list").addEventListener("click", (event) => { const button = event.target.closest("[data-network-rule]"); if (button) selectNetworkRule(button.dataset.networkRule); });
+$("#network-device-new").addEventListener("click", resetNetworkDeviceForm);
+$("#network-device-form").addEventListener("submit", saveNetworkDevice);
+$("#network-device-revoke").addEventListener("click", revokeNetworkDevice);
+$("#network-device-delete").addEventListener("click", deleteNetworkDevice);
+$("#network-device-list").addEventListener("click", (event) => { const button = event.target.closest("[data-network-device]"); if (button) selectNetworkDevice(button.dataset.networkDevice); });
+$("#network-token-copy").addEventListener("click", () => copyText($("#network-token-value").textContent, $("#network-token-copy")));
 $("#email-domain-form").addEventListener("submit", saveEmailDomain);
 $("#email-route-form").addEventListener("submit", saveEmailRoute);
 $("#email-route-match").addEventListener("change", updateEmailRouteFields);
@@ -4347,6 +4598,8 @@ $("#binary-storage-backend").addEventListener("change", toggleBinaryStorageField
 $("#binary-list").addEventListener("click", (event) => { const button = event.target.closest("[data-binary]"); if (button) selectBinary(button.dataset.binary); });
 updateEmailRouteFields();
 toggleBinaryStorageFields();
+resetNetworkRuleForm();
+resetNetworkDeviceForm();
 
 setInterval(() => {
   if (state.session) {
@@ -4368,6 +4621,7 @@ setInterval(() => {
     if (state.view === "flows") loadFlows({ quiet: true }).then(() => {
       if (state.flowActive) selectFlow(state.flowActive);
     });
+    if (state.view === "network") loadNetwork({ quiet: true });
     if (state.view === "email") loadEmail({ quiet: true }).then(() => {
       if (state.emailActive) loadEmailMessages();
     });

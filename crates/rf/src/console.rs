@@ -316,6 +316,7 @@ pub fn router(state: ConsoleState) -> Router {
             post(public_api_flow_action),
         )
         .route("/api/v1/email", get(public_api_email_domains))
+        .route("/api/v1/network", get(public_api_network))
         .route(
             "/api/v1/email/{domain}/messages",
             get(public_api_email_messages).post(public_api_email_send),
@@ -472,6 +473,14 @@ pub fn router(state: ConsoleState) -> Router {
             "/api/email/{name}/messages/{id}/raw",
             get(email_message_raw),
         )
+        .route("/api/network", get(network_list))
+        .route("/api/network/rules", post(network_rule_apply))
+        .route("/api/network/rules/{name}", delete(network_rule_delete))
+        .route("/api/network/devices", post(network_device_create))
+        .route(
+            "/api/network/devices/{name}",
+            axum::routing::patch(network_device_update).delete(network_device_delete),
+        )
         .route("/api/auth/logout", post(logout))
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
@@ -481,6 +490,7 @@ pub fn router(state: ConsoleState) -> Router {
         .route("/", get(index))
         .route("/app.js", get(app_js))
         .route("/styles.css", get(styles_css))
+        .route("/device/v1/config/{name}", get(device_public_config))
         .route("/api/auth/challenge", post(auth_challenge))
         .route("/api/auth/challenge/{id}", get(auth_poll))
         .route("/api/webhooks/github/{name}", post(github_webhook))
@@ -492,6 +502,459 @@ pub fn router(state: ConsoleState) -> Router {
         .with_state(state)
         .layer(DefaultBodyLimit::max(MAX_CONSOLE_UPLOAD * 2))
         .layer(middleware::from_fn(security_headers))
+}
+
+async fn device_public_config(
+    State(state): State<ConsoleState>,
+    Path(name): Path<String>,
+    headers: HeaderMap,
+) -> Response {
+    let result = (|| -> ApiResult<crate::exitproxy::DeviceConfig> {
+        let node = state.public_node()?;
+        let raw = crate::access::bearer(&headers)
+            .ok_or_else(|| ApiError::unauthorized("设备令牌缺失、过期或已撤销"))?;
+        let principal = crate::exit::resolve_device(node, &name, raw)
+            .ok_or_else(|| ApiError::unauthorized("设备令牌缺失、过期或已撤销"))?;
+        Ok(crate::exitproxy::config_for_device(node, &principal))
+    })();
+    match result {
+        Ok(config) => {
+            let mut response = Json(config).into_response();
+            response
+                .headers_mut()
+                .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+            response
+        }
+        Err(error) => {
+            let unauthorized = error.status == StatusCode::UNAUTHORIZED;
+            let mut response = error.into_response();
+            if unauthorized {
+                response.headers_mut().insert(
+                    header::WWW_AUTHENTICATE,
+                    HeaderValue::from_static("Bearer realm=\"RandallFlare device\""),
+                );
+            }
+            response
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct NetworkRuleRequest {
+    name: String,
+    #[serde(flatten)]
+    spec: crate::exit::ExitRuleSpec,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct NetworkDeviceCreateRequest {
+    name: String,
+    label: String,
+    #[serde(default)]
+    allowed_rules: Vec<String>,
+    #[serde(default)]
+    expires_at_ms: Option<u64>,
+    #[serde(default)]
+    suspended: bool,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct NetworkDeviceUpdateRequest {
+    label: String,
+    #[serde(default)]
+    allowed_rules: Vec<String>,
+    #[serde(default)]
+    expires_at_ms: Option<u64>,
+    #[serde(default)]
+    suspended: bool,
+    #[serde(default)]
+    revoke: bool,
+}
+
+async fn network_list(State(state): State<ConsoleState>) -> ApiResult<Json<Value>> {
+    if let Ok(node) = state.public_node() {
+        return Ok(Json(network_snapshot(node)));
+    }
+    let rule_views = state
+        .client
+        .resource_heads(&state.node, Some(crate::exit::EXIT_RULE_KIND))
+        .await?;
+    let rules = rule_views
+        .into_iter()
+        .filter(|view| !view.resource.deleted)
+        .filter_map(|view| {
+            let spec = crate::exit::exit_rule_spec(&view.resource).ok()?;
+            Some(json!({
+                "name": view.resource.name,
+                "version": view.resource.version,
+                "digest": view.digest,
+                "spec": spec,
+            }))
+        })
+        .collect::<Vec<_>>();
+    let known_rules = rules
+        .iter()
+        .filter_map(|rule| rule.get("name").and_then(Value::as_str))
+        .collect::<std::collections::BTreeSet<_>>();
+    let now = now_ms();
+    let devices = state
+        .client
+        .resource_heads(&state.node, Some(crate::exit::DEVICE_KIND))
+        .await?
+        .into_iter()
+        .filter(|view| !view.resource.deleted)
+        .filter_map(|view| {
+            let spec = crate::exit::device_spec(&view.resource).ok()?;
+            let rules_ready = spec
+                .allowed_rules
+                .iter()
+                .all(|rule| known_rules.contains(rule.as_str()));
+            Some(json!({
+                "name": view.resource.name,
+                "version": view.resource.version,
+                "digest": view.digest,
+                "label": spec.label,
+                "token_prefix": spec.token_prefix,
+                "allowed_rules": spec.allowed_rules,
+                "created_at_ms": spec.created_at_ms,
+                "expires_at_ms": spec.expires_at_ms,
+                "revoked_at_ms": spec.revoked_at_ms,
+                "suspended": spec.suspended,
+                "rules_ready": rules_ready,
+                "active": spec.active(now) && rules_ready,
+                "last_used_at_ms": Value::Null,
+            }))
+        })
+        .collect::<Vec<_>>();
+    let status = state.client.status(&state.node).await?;
+    let exit_role = status
+        .get("exit_node")
+        .cloned()
+        .unwrap_or_else(|| json!({ "enabled": false }));
+    let mut exits = Vec::new();
+    if exit_role
+        .get("enabled")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+    {
+        exits.push(json!({
+            "node_id": status.get("node"),
+            "label": status.get("label"),
+            "endpoint": exit_role.get("endpoint"),
+            "local": true,
+            "live": true,
+        }));
+    }
+    if let Some(peers) = status.get("peers").and_then(Value::as_array) {
+        for peer in peers {
+            if let Some(endpoint) = peer.get("exit_endpoint").filter(|value| !value.is_null()) {
+                exits.push(json!({
+                    "node_id": peer.get("id"),
+                    "label": peer.get("label"),
+                    "endpoint": endpoint,
+                    "local": false,
+                    "live": true,
+                }));
+            }
+        }
+    }
+    Ok(Json(json!({
+        "rules": rules,
+        "devices": devices,
+        "exits": exits,
+        "exit_role": exit_role,
+    })))
+}
+
+async fn validate_console_device_rules(state: &ConsoleState, names: &[String]) -> ApiResult<()> {
+    if names.is_empty() {
+        return Err(ApiError::bad_request("请至少选择一条出口规则"));
+    }
+    let available = state
+        .client
+        .resource_heads(&state.node, Some(crate::exit::EXIT_RULE_KIND))
+        .await?
+        .into_iter()
+        .filter(|view| {
+            !view.resource.deleted && crate::exit::exit_rule_spec(&view.resource).is_ok()
+        })
+        .map(|view| view.resource.name)
+        .collect::<std::collections::BTreeSet<_>>();
+    if let Some(missing) = names.iter().find(|name| !available.contains(*name)) {
+        return Err(ApiError::bad_request(format!(
+            "设备引用的出口规则不存在：{missing}"
+        )));
+    }
+    Ok(())
+}
+
+fn network_snapshot(node: &Node) -> Value {
+    let rules = crate::exit::rule_records(node)
+        .into_iter()
+        .map(|(view, spec)| {
+            json!({
+                "name": view.resource.name,
+                "version": view.resource.version,
+                "digest": view.digest,
+                "spec": spec,
+            })
+        })
+        .collect::<Vec<_>>();
+    let devices = crate::exit::device_views(node);
+    let mut exits = Vec::new();
+    if node.cfg.exit.enabled {
+        exits.push(json!({
+            "node_id": node.id_hex(),
+            "label": node.cfg.label,
+            "endpoint": node.cfg.exit.advertise,
+            "local": true,
+            "live": true,
+        }));
+    }
+    exits.extend(node.peers().into_iter().filter_map(|(node_id, peer)| {
+        peer.capabilities.contains("exit").then(|| {
+            json!({
+                "node_id": node_id,
+                "label": peer.label,
+                "endpoint": peer.exit_endpoint,
+                "local": false,
+                "live": true,
+            })
+        })
+    }));
+    exits.sort_by(|left, right| {
+        left.get("node_id")
+            .and_then(Value::as_str)
+            .cmp(&right.get("node_id").and_then(Value::as_str))
+    });
+    json!({
+        "rules": rules,
+        "devices": devices,
+        "exits": exits,
+        "exit_role": {
+            "enabled": node.cfg.exit.enabled,
+            "listen": node.cfg.exit.listen,
+            "advertise": node.cfg.exit.advertise,
+            "max_sessions": node.cfg.exit.max_sessions,
+        },
+    })
+}
+
+async fn submit_network_resource(
+    state: &ConsoleState,
+    principal: &ConsolePrincipal,
+    record: crate::resource::ResourceRecord,
+    description: String,
+) -> ApiResult<Value> {
+    match &state.mode {
+        ConsoleMode::Local { .. } => {
+            let envelope = rf_core::envelope::Envelope::seal_any(&record, state.operator()?);
+            state.client.post_resource(&state.node, &envelope).await?;
+            Ok(json!({
+                "ok": true,
+                "name": record.name,
+                "version": record.version,
+            }))
+        }
+        ConsoleMode::Public { node, .. } => {
+            let approval = node.management.create_resource(
+                principal.session_id,
+                &record,
+                format!("{description} v{}", record.version),
+            )?;
+            Ok(json!({
+                "ok": true,
+                "pending_approval": true,
+                "name": record.name,
+                "version": record.version,
+                "approval": approval,
+                "approve_node": node.cfg.peer_api_advertise().to_string(),
+            }))
+        }
+    }
+}
+
+async fn network_rule_apply(
+    State(state): State<ConsoleState>,
+    Extension(principal): Extension<ConsolePrincipal>,
+    Json(request): Json<NetworkRuleRequest>,
+) -> ApiResult<Json<Value>> {
+    state.require_mutation()?;
+    if !valid_name(&request.name) {
+        return Err(ApiError::bad_request("出口规则名称无效"));
+    }
+    request.spec.validate()?;
+    let head = state
+        .client
+        .resource_head(&state.node, crate::exit::EXIT_RULE_KIND, &request.name)
+        .await?;
+    let record = crate::resource::prepare_after(
+        crate::exit::EXIT_RULE_KIND,
+        &request.name,
+        serde_json::to_value(request.spec)?,
+        false,
+        head.as_ref(),
+    )?;
+    Ok(Json(
+        submit_network_resource(
+            &state,
+            &principal,
+            record,
+            format!("创建或更新出口规则 {}", request.name),
+        )
+        .await?,
+    ))
+}
+
+async fn network_rule_delete(
+    State(state): State<ConsoleState>,
+    Extension(principal): Extension<ConsolePrincipal>,
+    Path(name): Path<String>,
+) -> ApiResult<Json<Value>> {
+    state.require_mutation()?;
+    let head = state
+        .client
+        .resource_head(&state.node, crate::exit::EXIT_RULE_KIND, &name)
+        .await?
+        .filter(|view| !view.resource.deleted)
+        .ok_or_else(|| ApiError::not_found("出口规则不存在"))?;
+    let spec = crate::exit::exit_rule_spec(&head.resource)?;
+    let record = crate::resource::prepare_after(
+        crate::exit::EXIT_RULE_KIND,
+        &name,
+        serde_json::to_value(spec)?,
+        true,
+        Some(&head),
+    )?;
+    let referenced = state
+        .client
+        .resource_heads(&state.node, Some(crate::exit::DEVICE_KIND))
+        .await?
+        .into_iter()
+        .filter(|view| !view.resource.deleted)
+        .filter_map(|view| crate::exit::device_spec(&view.resource).ok())
+        .any(|device| device.allowed_rules.iter().any(|rule| rule == &name));
+    if referenced {
+        return Err(ApiError::bad_request(
+            "仍有客户端设备引用此出口规则，不能删除",
+        ));
+    }
+    Ok(Json(
+        submit_network_resource(&state, &principal, record, format!("删除出口规则 {name}")).await?,
+    ))
+}
+
+async fn network_device_create(
+    State(state): State<ConsoleState>,
+    Extension(principal): Extension<ConsolePrincipal>,
+    Json(request): Json<NetworkDeviceCreateRequest>,
+) -> ApiResult<Json<Value>> {
+    state.require_mutation()?;
+    if !state.allows_secret_writes() {
+        return Err(ApiError::forbidden("设备令牌只能通过 HTTPS 管理界面签发"));
+    }
+    validate_console_device_rules(&state, &request.allowed_rules).await?;
+    if state
+        .client
+        .resource_head(&state.node, crate::exit::DEVICE_KIND, &request.name)
+        .await?
+        .is_some()
+    {
+        return Err(ApiError::bad_request("此设备 ID 已存在或已进入历史链"));
+    }
+    let (mut record, token) = crate::exit::mint_device_record(
+        &request.name,
+        request.label,
+        request.allowed_rules,
+        request.expires_at_ms,
+    )?;
+    if request.suspended {
+        let mut spec = crate::exit::device_spec(&record)?;
+        spec.suspended = true;
+        record = crate::resource::prepare_after(
+            crate::exit::DEVICE_KIND,
+            &request.name,
+            serde_json::to_value(spec)?,
+            false,
+            None,
+        )?;
+    }
+    let token = zeroize::Zeroizing::new(token);
+    let mut response = submit_network_resource(
+        &state,
+        &principal,
+        record,
+        format!("注册客户端设备 {}", request.name),
+    )
+    .await?;
+    response["token"] = Value::String(token.to_string());
+    Ok(Json(response))
+}
+
+async fn network_device_update(
+    State(state): State<ConsoleState>,
+    Extension(principal): Extension<ConsolePrincipal>,
+    Path(name): Path<String>,
+    Json(request): Json<NetworkDeviceUpdateRequest>,
+) -> ApiResult<Json<Value>> {
+    state.require_mutation()?;
+    validate_console_device_rules(&state, &request.allowed_rules).await?;
+    let head = state
+        .client
+        .resource_head(&state.node, crate::exit::DEVICE_KIND, &name)
+        .await?
+        .filter(|view| !view.resource.deleted)
+        .ok_or_else(|| ApiError::not_found("客户端设备不存在"))?;
+    let mut spec = crate::exit::device_spec(&head.resource)?;
+    spec.label = request.label;
+    spec.allowed_rules = request.allowed_rules;
+    spec.expires_at_ms = request.expires_at_ms;
+    spec.suspended = request.suspended;
+    if request.revoke && spec.revoked_at_ms.is_none() {
+        spec.revoked_at_ms = Some(now_ms());
+    }
+    spec.label = spec.label.trim().to_string();
+    spec.validate()?;
+    let record = crate::resource::prepare_after(
+        crate::exit::DEVICE_KIND,
+        &name,
+        serde_json::to_value(spec)?,
+        false,
+        Some(&head),
+    )?;
+    Ok(Json(
+        submit_network_resource(&state, &principal, record, format!("更新客户端设备 {name}"))
+            .await?,
+    ))
+}
+
+async fn network_device_delete(
+    State(state): State<ConsoleState>,
+    Extension(principal): Extension<ConsolePrincipal>,
+    Path(name): Path<String>,
+) -> ApiResult<Json<Value>> {
+    state.require_mutation()?;
+    let head = state
+        .client
+        .resource_head(&state.node, crate::exit::DEVICE_KIND, &name)
+        .await?
+        .filter(|view| !view.resource.deleted)
+        .ok_or_else(|| ApiError::not_found("客户端设备不存在"))?;
+    let spec = crate::exit::device_spec(&head.resource)?;
+    let record = crate::resource::prepare_after(
+        crate::exit::DEVICE_KIND,
+        &name,
+        serde_json::to_value(spec)?,
+        true,
+        Some(&head),
+    )?;
+    Ok(Json(
+        submit_network_resource(&state, &principal, record, format!("删除客户端设备 {name}"))
+            .await?,
+    ))
 }
 
 async fn s3_endpoint(
@@ -555,6 +1018,7 @@ async fn public_api_discovery(
             "workflows": "/api/v1/workflows/{workflow}/instances",
             "flows": "/api/v1/flows/{flow}/runs",
             "email": "/api/v1/email/{domain}/messages",
+            "network": "/api/v1/network",
             "audit": "/api/v1/audit",
             "s3": "/s3"
         }
@@ -734,7 +1198,9 @@ fn public_resource_spec(node: &Node, record: &crate::resource::ResourceRecord) -
                 })
             })
             .unwrap_or(Value::Null),
-        crate::access::TOKEN_KIND | crate::s3::CREDENTIAL_KIND => Value::Null,
+        crate::access::TOKEN_KIND | crate::s3::CREDENTIAL_KIND | crate::exit::DEVICE_KIND => {
+            Value::Null
+        }
         _ => record.spec().unwrap_or(Value::Null),
     }
 }
@@ -1596,6 +2062,14 @@ async fn public_api_email_send(
     Ok(Json(json!({ "queued": queued })))
 }
 
+async fn public_api_network(
+    State(state): State<ConsoleState>,
+    Extension(principal): Extension<crate::access::AccessPrincipal>,
+) -> ApiResult<Json<Value>> {
+    require_api_scope(&principal, "network:read")?;
+    Ok(Json(network_snapshot(state.public_node()?)))
+}
+
 async fn require_console_auth(
     State(state): State<ConsoleState>,
     mut request: Request<axum::body::Body>,
@@ -2432,6 +2906,7 @@ async fn security_audit(
                 | crate::pipeline::PIPELINE_KIND
                 | crate::flow::FLOW_KIND
                 | crate::preview::PREVIEW_KIND
+                | crate::exit::DEVICE_KIND
         );
         json!({
             "kind": view.resource.kind,
@@ -7654,6 +8129,113 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(allowed.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn device_config_requires_its_one_way_token_and_never_exposes_digest() {
+        let (state, node, operator) = public_state(true);
+        let rule = crate::resource::prepare_after(
+            crate::exit::EXIT_RULE_KIND,
+            "default-route",
+            serde_json::json!({
+                "schema": 1,
+                "description": "测试",
+                "enabled": true,
+                "priority": 0,
+                "format": "surge",
+                "config": "FINAL,DIRECT",
+                "providers": {},
+                "policy_exits": {},
+            }),
+            false,
+            None,
+        )
+        .unwrap();
+        crate::resource::ingest(
+            &node,
+            &rf_core::envelope::Envelope::seal_any(&rule, &operator),
+        )
+        .unwrap();
+        let (record, raw) = crate::exit::mint_device(
+            &node,
+            "phone",
+            "测试手机".into(),
+            vec!["default-route".into()],
+            None,
+        )
+        .unwrap();
+        let digest = crate::exit::device_spec(&record).unwrap().token_sha256;
+        crate::resource::ingest(
+            &node,
+            &rf_core::envelope::Envelope::seal_any(&record, &operator),
+        )
+        .unwrap();
+        let (access_record, access_token) = crate::access::mint(
+            &node,
+            "设备目录读取".into(),
+            vec!["network:read".into()],
+            None,
+        )
+        .unwrap();
+        crate::resource::ingest(
+            &node,
+            &rf_core::envelope::Envelope::seal_any(&access_record, &operator),
+        )
+        .unwrap();
+        let app = router(state);
+
+        for authorization in [None, Some("Bearer rfd_invalid")] {
+            let mut request = Request::builder().uri("/device/v1/config/phone");
+            if let Some(authorization) = authorization {
+                request = request.header(header::AUTHORIZATION, authorization);
+            }
+            let response = app
+                .clone()
+                .oneshot(request.body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+            assert!(response.headers().contains_key(header::WWW_AUTHENTICATE));
+        }
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/device/v1/config/phone")
+                    .header(header::AUTHORIZATION, format!("Bearer {raw}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers()[header::CACHE_CONTROL], "no-store");
+        let body = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+        let text = String::from_utf8(body.to_vec()).unwrap();
+        assert!(text.contains("测试手机"));
+        assert!(!text.contains(&raw));
+        assert!(!text.contains(&digest));
+        assert!(!text.contains("token_sha256"));
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/network")
+                    .header(header::AUTHORIZATION, format!("Bearer {access_token}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+        let text = String::from_utf8(body.to_vec()).unwrap();
+        assert!(text.contains("default-route"));
+        assert!(text.contains("测试手机"));
+        assert!(!text.contains(&raw));
+        assert!(!text.contains(&digest));
+        assert!(!text.contains("token_sha256"));
     }
 
     #[test]

@@ -185,6 +185,13 @@ pub fn validate_resource_admission(node: &Node, record: &ResourceRecord) -> Resu
         crate::storage_policy::validate_admission(node, record)?;
         return Ok(());
     }
+    if matches!(
+        record.kind.as_str(),
+        crate::exit::EXIT_RULE_KIND | crate::exit::DEVICE_KIND
+    ) {
+        crate::exit::validate_admission(node, record)?;
+        return Ok(());
+    }
     if record.kind == crate::r2::BUCKET_KIND {
         crate::r2::validate_bucket_admission(node, record)?;
     }

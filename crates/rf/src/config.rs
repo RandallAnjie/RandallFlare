@@ -59,6 +59,48 @@ pub struct NodeConfig {
     /// not open port 25 and never claim mail-delivery leases.
     #[serde(default)]
     pub email: EmailConfig,
+    /// Optional TLS-encrypted device egress role. Client devices authenticate
+    /// with one-way signed device tokens and never receive the cluster PSK.
+    #[serde(default)]
+    pub exit: ExitConfig,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ExitConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    /// TLS SOCKS egress listener. Required only on selected exit nodes.
+    #[serde(default)]
+    pub listen: Option<SocketAddr>,
+    /// Public `hostname:port` returned to enrolled devices. The hostname must
+    /// have a certificate in `<data_dir>/certs`.
+    #[serde(default)]
+    pub advertise: Option<String>,
+    #[serde(default = "default_exit_sessions")]
+    pub max_sessions: u32,
+    #[serde(default = "default_exit_connect_timeout_seconds")]
+    pub connect_timeout_seconds: u64,
+}
+
+impl Default for ExitConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            listen: None,
+            advertise: None,
+            max_sessions: default_exit_sessions(),
+            connect_timeout_seconds: default_exit_connect_timeout_seconds(),
+        }
+    }
+}
+
+fn default_exit_sessions() -> u32 {
+    512
+}
+
+fn default_exit_connect_timeout_seconds() -> u64 {
+    15
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -504,6 +546,26 @@ impl NodeConfig {
                 anyhow::bail!("email.mx_hostname must be a lowercase DNS hostname");
             }
         }
+        if self.exit.max_sessions == 0 || self.exit.max_sessions > 16_384 {
+            anyhow::bail!("exit.max_sessions must be between 1 and 16384");
+        }
+        if self.exit.connect_timeout_seconds == 0 || self.exit.connect_timeout_seconds > 300 {
+            anyhow::bail!("exit.connect_timeout_seconds must be between 1 and 300");
+        }
+        if self.exit.enabled {
+            self.exit
+                .listen
+                .context("exit.listen is required when exit.enabled=true")?;
+            let advertise = self
+                .exit
+                .advertise
+                .as_deref()
+                .context("exit.advertise is required when exit.enabled=true")?;
+            validate_host_port(advertise).context("exit.advertise")?;
+            if advertise.parse::<SocketAddr>().is_ok() {
+                anyhow::bail!("exit.advertise must use a DNS hostname so TLS clients can send SNI");
+            }
+        }
         Ok(())
     }
 
@@ -529,6 +591,23 @@ impl NodeConfig {
         self.default_worker_domain()
             .map(|domain| format!("{worker}.{domain}"))
     }
+}
+
+fn validate_host_port(value: &str) -> Result<()> {
+    if value.parse::<SocketAddr>().is_ok() {
+        return Ok(());
+    }
+    let (host, port) = value
+        .rsplit_once(':')
+        .context("must be hostname:port or an IP socket address")?;
+    if !valid_hostname(host) {
+        anyhow::bail!("hostname is invalid");
+    }
+    let port: u16 = port.parse().context("port is invalid")?;
+    if port == 0 {
+        anyhow::bail!("port must be non-zero");
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -661,6 +740,31 @@ mod tests {
         assert!(invalid.validate().is_err());
         invalid.email.mx_hostname = Some("mx.example.com".into());
         invalid.email.max_sessions = 0;
+        assert!(invalid.validate().is_err());
+    }
+
+    #[test]
+    fn exit_node_requires_a_dialable_tls_endpoint() {
+        let raw = r#"
+            data_dir = "/var/lib/rf"
+            operator = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+            cluster_secret = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+            [gossip]
+            listen = "127.0.0.1:7381"
+            [peer_api]
+            listen = "127.0.0.1:7382"
+            [exit]
+            enabled = true
+            listen = "0.0.0.0:51821"
+            advertise = "exit.example.com:51821"
+        "#;
+        let cfg: NodeConfig = toml::from_str(raw).unwrap();
+        cfg.validate().unwrap();
+        assert!(cfg.exit.enabled);
+        let mut invalid = cfg;
+        invalid.exit.advertise = Some("https://bad.example.com".into());
+        assert!(invalid.validate().is_err());
+        invalid.exit.advertise = Some("192.0.2.1:51821".into());
         assert!(invalid.validate().is_err());
     }
 }

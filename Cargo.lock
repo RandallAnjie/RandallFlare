@@ -2750,11 +2750,13 @@ dependencies = [
  "sha2 0.10.9",
  "time",
  "tokio",
+ "tokio-rustls",
  "tokio-stream",
  "toml",
  "tower",
  "tracing",
  "tracing-subscriber",
+ "webpki-roots",
  "zeroize",
  "zstd",
 ]

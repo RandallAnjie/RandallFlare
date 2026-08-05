@@ -8,7 +8,7 @@ use rf::peers::PeerClient;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
-use zeroize::Zeroize;
+use zeroize::{Zeroize, Zeroizing};
 
 #[derive(Parser)]
 #[command(
@@ -165,6 +165,16 @@ enum Cmd {
     Binary {
         #[command(subcommand)]
         cmd: BinaryCmd,
+    },
+    /// 去中心化 Surge / Clash 分流规则与 TLS 出口目录。
+    Exit {
+        #[command(subcommand)]
+        cmd: ExitCmd,
+    },
+    /// 注册、撤销客户端设备，或运行本地 SOCKS / HTTP 分流代理。
+    Device {
+        #[command(subcommand)]
+        cmd: DeviceCmd,
     },
     /// 聚合所有存活节点上的 Worker 请求日志。
     Requests {
@@ -506,6 +516,117 @@ enum StorageCmd {
         node: String,
         #[arg(long, env = "RF_CLUSTER_SECRET")]
         secret: String,
+    },
+}
+
+#[derive(Subcommand)]
+enum ExitCmd {
+    /// 列出签名出口规则和节点自行声明的出口端点。
+    List {
+        #[arg(long, env = "RF_NODE")]
+        node: String,
+        #[arg(long, env = "RF_CLUSTER_SECRET")]
+        secret: String,
+    },
+    /// 从 ExitRuleSpec JSON 文件创建或更新规则。
+    Apply {
+        name: String,
+        file: PathBuf,
+        #[arg(long, env = "RF_NODE")]
+        node: String,
+        #[arg(long, env = "RF_OPERATOR_KEY")]
+        key: Option<PathBuf>,
+        #[arg(long, env = "RF_CLUSTER_SECRET")]
+        secret: String,
+    },
+    /// 删除未被任何设备引用的出口规则。
+    Delete {
+        name: String,
+        #[arg(long, env = "RF_NODE")]
+        node: String,
+        #[arg(long, env = "RF_OPERATOR_KEY")]
+        key: Option<PathBuf>,
+        #[arg(long, env = "RF_CLUSTER_SECRET")]
+        secret: String,
+    },
+}
+
+#[derive(Subcommand)]
+enum DeviceCmd {
+    /// 列出设备的脱敏状态；绝不返回令牌摘要或明文。
+    List {
+        #[arg(long, env = "RF_NODE")]
+        node: String,
+        #[arg(long, env = "RF_CLUSTER_SECRET")]
+        secret: String,
+    },
+    /// 注册设备并显示一次令牌。
+    Create {
+        name: String,
+        #[arg(long)]
+        label: String,
+        #[arg(long = "rule", required = true)]
+        rules: Vec<String>,
+        /// 令牌从现在起有效的天数；省略表示永不过期。
+        #[arg(long)]
+        expires_in_days: Option<u32>,
+        #[arg(long, env = "RF_NODE")]
+        node: String,
+        #[arg(long, env = "RF_OPERATOR_KEY")]
+        key: Option<PathBuf>,
+        #[arg(long, env = "RF_CLUSTER_SECRET")]
+        secret: String,
+    },
+    /// 替换设备标签、规则与生命周期策略。
+    Configure {
+        name: String,
+        #[arg(long)]
+        label: Option<String>,
+        #[arg(long = "rule")]
+        rules: Vec<String>,
+        #[arg(long)]
+        expires_in_days: Option<u32>,
+        #[arg(long)]
+        clear_expiry: bool,
+        #[arg(long, num_args = 0..=1, default_missing_value = "true")]
+        suspended: Option<bool>,
+        #[arg(long, env = "RF_NODE")]
+        node: String,
+        #[arg(long, env = "RF_OPERATOR_KEY")]
+        key: Option<PathBuf>,
+        #[arg(long, env = "RF_CLUSTER_SECRET")]
+        secret: String,
+    },
+    /// 永久撤销设备令牌。
+    Revoke {
+        name: String,
+        #[arg(long, env = "RF_NODE")]
+        node: String,
+        #[arg(long, env = "RF_OPERATOR_KEY")]
+        key: Option<PathBuf>,
+        #[arg(long, env = "RF_CLUSTER_SECRET")]
+        secret: String,
+    },
+    /// 删除设备签名定义。
+    Delete {
+        name: String,
+        #[arg(long, env = "RF_NODE")]
+        node: String,
+        #[arg(long, env = "RF_OPERATOR_KEY")]
+        key: Option<PathBuf>,
+        #[arg(long, env = "RF_CLUSTER_SECRET")]
+        secret: String,
+    },
+    /// 从文件读取一次性令牌，运行本机 SOCKS5 / HTTP 代理。
+    Proxy {
+        #[arg(long)]
+        control: String,
+        #[arg(long)]
+        name: String,
+        #[arg(long)]
+        token_file: PathBuf,
+        #[arg(long, default_value = "127.0.0.1:7388")]
+        listen: SocketAddr,
     },
 }
 
@@ -1225,6 +1346,23 @@ fn secret_bytes(s: &str) -> Result<[u8; 32]> {
     let b = hex::decode(s.trim()).context("cluster secret must be hex")?;
     b.try_into()
         .map_err(|_| anyhow::anyhow!("cluster secret must be 32 bytes"))
+}
+
+fn device_expiry(days: Option<u32>) -> Result<Option<u64>> {
+    let Some(days) = days else {
+        return Ok(None);
+    };
+    if !(1..=3_650).contains(&days) {
+        anyhow::bail!("设备有效期必须介于 1 天和 3650 天之间");
+    }
+    let duration = u64::from(days)
+        .checked_mul(24 * 60 * 60 * 1_000)
+        .context("设备有效期溢出")?;
+    Ok(Some(
+        rf::node::now_ms()
+            .checked_add(duration)
+            .context("设备到期时间溢出")?,
+    ))
 }
 
 fn operator_key(path: Option<PathBuf>) -> Result<rf_core::identity::AnyKeypair> {
@@ -2000,6 +2138,319 @@ async fn async_main(cli: Cli) -> Result<()> {
                 client.post_resource(&node, &envelope).await?;
                 println!("Binary {} 已删除（v{}）", record.name, record.version);
                 Ok(())
+            }
+        },
+        Cmd::Exit { cmd } => match cmd {
+            ExitCmd::List { node, secret } => {
+                let client = PeerClient::new(secret_bytes(&secret)?);
+                let rules = client
+                    .resource_heads(&node, Some(rf::exit::EXIT_RULE_KIND))
+                    .await?
+                    .into_iter()
+                    .filter(|view| !view.resource.deleted)
+                    .map(|view| {
+                        let spec = rf::exit::exit_rule_spec(&view.resource)?;
+                        Ok(serde_json::json!({
+                            "name": view.resource.name,
+                            "version": view.resource.version,
+                            "digest": view.digest,
+                            "spec": spec,
+                        }))
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                let status = client.status(&node).await?;
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::json!({
+                        "rules": rules,
+                        "exit_node": status.get("exit_node"),
+                        "peers": status.get("peers"),
+                    }))?
+                );
+                Ok(())
+            }
+            ExitCmd::Apply {
+                name,
+                file,
+                node,
+                key,
+                secret,
+            } => {
+                let bytes = std::fs::read(&file)
+                    .with_context(|| format!("读取出口规则文件 {}", file.display()))?;
+                let spec: rf::exit::ExitRuleSpec =
+                    serde_json::from_slice(&bytes).context("出口规则文件不是有效 JSON")?;
+                spec.validate()?;
+                let client = PeerClient::new(secret_bytes(&secret)?);
+                let head = client
+                    .resource_head(&node, rf::exit::EXIT_RULE_KIND, &name)
+                    .await?;
+                let record = rf::resource::prepare_after(
+                    rf::exit::EXIT_RULE_KIND,
+                    &name,
+                    serde_json::to_value(spec)?,
+                    false,
+                    head.as_ref(),
+                )?;
+                client
+                    .post_resource(
+                        &node,
+                        &rf_core::envelope::Envelope::seal_any(&record, &operator_key(key)?),
+                    )
+                    .await?;
+                println!("出口规则 {} 已发布至 v{}", record.name, record.version);
+                Ok(())
+            }
+            ExitCmd::Delete {
+                name,
+                node,
+                key,
+                secret,
+            } => {
+                let client = PeerClient::new(secret_bytes(&secret)?);
+                let head = client
+                    .resource_head(&node, rf::exit::EXIT_RULE_KIND, &name)
+                    .await?
+                    .filter(|view| !view.resource.deleted)
+                    .with_context(|| format!("出口规则 {name} 不存在"))?;
+                let spec = rf::exit::exit_rule_spec(&head.resource)?;
+                let record = rf::resource::prepare_after(
+                    rf::exit::EXIT_RULE_KIND,
+                    &name,
+                    serde_json::to_value(spec)?,
+                    true,
+                    Some(&head),
+                )?;
+                client
+                    .post_resource(
+                        &node,
+                        &rf_core::envelope::Envelope::seal_any(&record, &operator_key(key)?),
+                    )
+                    .await?;
+                println!("出口规则 {} 已删除（v{}）", record.name, record.version);
+                Ok(())
+            }
+        },
+        Cmd::Device { cmd } => match cmd {
+            DeviceCmd::List { node, secret } => {
+                let client = PeerClient::new(secret_bytes(&secret)?);
+                let now = rf::node::now_ms();
+                let known_rules = client
+                    .resource_heads(&node, Some(rf::exit::EXIT_RULE_KIND))
+                    .await?
+                    .into_iter()
+                    .filter(|view| {
+                        !view.resource.deleted && rf::exit::exit_rule_spec(&view.resource).is_ok()
+                    })
+                    .map(|view| view.resource.name)
+                    .collect::<std::collections::BTreeSet<_>>();
+                let devices = client
+                    .resource_heads(&node, Some(rf::exit::DEVICE_KIND))
+                    .await?
+                    .into_iter()
+                    .filter(|view| !view.resource.deleted)
+                    .map(|view| {
+                        let spec = rf::exit::device_spec(&view.resource)?;
+                        let rules_ready = spec
+                            .allowed_rules
+                            .iter()
+                            .all(|rule| known_rules.contains(rule));
+                        Ok(serde_json::json!({
+                            "name": view.resource.name,
+                            "version": view.resource.version,
+                            "digest": view.digest,
+                            "label": spec.label,
+                            "token_prefix": spec.token_prefix,
+                            "allowed_rules": spec.allowed_rules,
+                            "created_at_ms": spec.created_at_ms,
+                            "expires_at_ms": spec.expires_at_ms,
+                            "revoked_at_ms": spec.revoked_at_ms,
+                            "suspended": spec.suspended,
+                            "rules_ready": rules_ready,
+                            "active": spec.active(now) && rules_ready,
+                        }))
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                println!("{}", serde_json::to_string_pretty(&devices)?);
+                Ok(())
+            }
+            DeviceCmd::Create {
+                name,
+                label,
+                rules,
+                expires_in_days,
+                node,
+                key,
+                secret,
+            } => {
+                let expires_at_ms = device_expiry(expires_in_days)?;
+                let client = PeerClient::new(secret_bytes(&secret)?);
+                if client
+                    .resource_head(&node, rf::exit::DEVICE_KIND, &name)
+                    .await?
+                    .is_some()
+                {
+                    anyhow::bail!("设备 {name} 已存在；删除后的名称也不能复用");
+                }
+                let (record, token) =
+                    rf::exit::mint_device_record(&name, label, rules, expires_at_ms)?;
+                let token = Zeroizing::new(token);
+                let envelope = rf_core::envelope::Envelope::seal_any(&record, &operator_key(key)?);
+                let published = client.post_resource(&node, &envelope).await;
+                if published.is_ok() {
+                    println!("设备 {} 已注册至 v{}", record.name, record.version);
+                    println!("一次性设备令牌（请立即保存，无法找回）：");
+                    println!("{}", token.as_str());
+                }
+                published?;
+                Ok(())
+            }
+            DeviceCmd::Configure {
+                name,
+                label,
+                rules,
+                expires_in_days,
+                clear_expiry,
+                suspended,
+                node,
+                key,
+                secret,
+            } => {
+                if clear_expiry && expires_in_days.is_some() {
+                    anyhow::bail!("--clear-expiry 不能与 --expires-in-days 同时使用");
+                }
+                let client = PeerClient::new(secret_bytes(&secret)?);
+                let head = client
+                    .resource_head(&node, rf::exit::DEVICE_KIND, &name)
+                    .await?
+                    .filter(|view| !view.resource.deleted)
+                    .with_context(|| format!("设备 {name} 不存在"))?;
+                let mut spec = rf::exit::device_spec(&head.resource)?;
+                if spec.revoked_at_ms.is_some() {
+                    anyhow::bail!("设备 {name} 已撤销，不能重新启用");
+                }
+                if let Some(label) = label {
+                    spec.label = label;
+                }
+                if !rules.is_empty() {
+                    spec.allowed_rules = rules;
+                }
+                if clear_expiry {
+                    spec.expires_at_ms = None;
+                } else if expires_in_days.is_some() {
+                    spec.expires_at_ms = device_expiry(expires_in_days)?;
+                }
+                if let Some(suspended) = suspended {
+                    spec.suspended = suspended;
+                }
+                spec.validate()?;
+                let record = rf::resource::prepare_after(
+                    rf::exit::DEVICE_KIND,
+                    &name,
+                    serde_json::to_value(spec)?,
+                    false,
+                    Some(&head),
+                )?;
+                client
+                    .post_resource(
+                        &node,
+                        &rf_core::envelope::Envelope::seal_any(&record, &operator_key(key)?),
+                    )
+                    .await?;
+                println!("设备 {} 已更新至 v{}", record.name, record.version);
+                Ok(())
+            }
+            DeviceCmd::Revoke {
+                name,
+                node,
+                key,
+                secret,
+            } => {
+                let client = PeerClient::new(secret_bytes(&secret)?);
+                let head = client
+                    .resource_head(&node, rf::exit::DEVICE_KIND, &name)
+                    .await?
+                    .filter(|view| !view.resource.deleted)
+                    .with_context(|| format!("设备 {name} 不存在"))?;
+                let mut spec = rf::exit::device_spec(&head.resource)?;
+                if spec.revoked_at_ms.is_some() {
+                    anyhow::bail!("设备 {name} 已撤销");
+                }
+                spec.revoked_at_ms = Some(rf::node::now_ms());
+                spec.suspended = true;
+                let record = rf::resource::prepare_after(
+                    rf::exit::DEVICE_KIND,
+                    &name,
+                    serde_json::to_value(spec)?,
+                    false,
+                    Some(&head),
+                )?;
+                client
+                    .post_resource(
+                        &node,
+                        &rf_core::envelope::Envelope::seal_any(&record, &operator_key(key)?),
+                    )
+                    .await?;
+                println!("设备 {} 的令牌已永久撤销", record.name);
+                Ok(())
+            }
+            DeviceCmd::Delete {
+                name,
+                node,
+                key,
+                secret,
+            } => {
+                let client = PeerClient::new(secret_bytes(&secret)?);
+                let head = client
+                    .resource_head(&node, rf::exit::DEVICE_KIND, &name)
+                    .await?
+                    .filter(|view| !view.resource.deleted)
+                    .with_context(|| format!("设备 {name} 不存在"))?;
+                let spec = rf::exit::device_spec(&head.resource)?;
+                let record = rf::resource::prepare_after(
+                    rf::exit::DEVICE_KIND,
+                    &name,
+                    serde_json::to_value(spec)?,
+                    true,
+                    Some(&head),
+                )?;
+                client
+                    .post_resource(
+                        &node,
+                        &rf_core::envelope::Envelope::seal_any(&record, &operator_key(key)?),
+                    )
+                    .await?;
+                println!("设备 {} 已删除（v{}）", record.name, record.version);
+                Ok(())
+            }
+            DeviceCmd::Proxy {
+                control,
+                name,
+                token_file,
+                listen,
+            } => {
+                let metadata = std::fs::metadata(&token_file)
+                    .with_context(|| format!("读取设备令牌文件 {}", token_file.display()))?;
+                if !metadata.is_file() || metadata.len() > 512 {
+                    anyhow::bail!("设备令牌文件必须是普通小文件");
+                }
+                let mut token = std::fs::read_to_string(&token_file)
+                    .with_context(|| format!("读取设备令牌文件 {}", token_file.display()))?;
+                token = token.trim().to_string();
+                if !token.starts_with(rf::exit::DEVICE_TOKEN_PREFIX)
+                    || token.len() != rf::exit::DEVICE_TOKEN_PREFIX.len() + 43
+                {
+                    token.zeroize();
+                    anyhow::bail!("设备令牌格式无效");
+                }
+                let _ = tracing_subscriber::fmt()
+                    .with_env_filter(
+                        tracing_subscriber::EnvFilter::try_from_default_env()
+                            .unwrap_or_else(|_| "info".into()),
+                    )
+                    .try_init();
+                println!("设备代理监听 {listen}；SOCKS5 与 HTTP 代理共用此端口");
+                rf::exitproxy::run_device_proxy(control, name, token, listen).await
             }
         },
         Cmd::Queue { cmd } => match cmd {
@@ -3405,6 +3856,39 @@ fn doctor(config: PathBuf, json: bool) -> Result<()> {
     } else {
         false
     };
+    let exit_tls = if cfg.exit.enabled {
+        let advertise = cfg.exit.advertise.as_deref().unwrap_or_default();
+        let hostname = advertise
+            .rsplit_once(':')
+            .map(|(hostname, _)| hostname)
+            .unwrap_or_default();
+        let cert_dir = cfg.data_dir.join("certs");
+        let exact = cert_dir.join(format!("{hostname}.crt")).is_file()
+            && cert_dir.join(format!("{hostname}.key")).is_file();
+        let wildcard = hostname.split_once('.').is_some_and(|(_, parent)| {
+            cert_dir.join(format!("_wildcard.{parent}.crt")).is_file()
+                && cert_dir.join(format!("_wildcard.{parent}.key")).is_file()
+        });
+        if !exact && !wildcard {
+            warnings.push("exit is enabled without a materialized TLS certificate for its advertised hostname");
+        }
+        if let Some(acme) = &cfg.acme {
+            let covered = acme.hostnames.iter().any(|candidate| {
+                candidate == hostname
+                    || candidate.strip_prefix("*.").is_some_and(|parent| {
+                        hostname
+                            .split_once('.')
+                            .is_some_and(|(_, rest)| rest == parent)
+                    })
+            });
+            if !covered && !exact && !wildcard {
+                warnings.push("exit advertised hostname is not included in ACME hostnames");
+            }
+        }
+        exact || wildcard
+    } else {
+        false
+    };
     if cfg.update.enabled {
         warnings.push(
             "self-update is enabled; the hardened systemd service intentionally cannot replace /usr/local/bin/rf",
@@ -3442,6 +3926,13 @@ fn doctor(config: PathBuf, json: bool) -> Result<()> {
             "outbound": cfg.email.outbound,
             "max_sessions": cfg.email.max_sessions,
             "starttls_ready": email_tls,
+        },
+        "exit": {
+            "enabled": cfg.exit.enabled,
+            "listen": cfg.exit.listen,
+            "advertise": cfg.exit.advertise,
+            "max_sessions": cfg.exit.max_sessions,
+            "tls_ready": exit_tls,
         },
         "warnings": warnings,
     });
@@ -3491,6 +3982,19 @@ fn doctor(config: PathBuf, json: bool) -> Result<()> {
             );
         } else {
             println!("email: disabled");
+        }
+        if cfg.exit.enabled {
+            println!(
+                "device exit: {} -> {} (TLS {})",
+                cfg.exit
+                    .listen
+                    .map(|value| value.to_string())
+                    .unwrap_or_else(|| "unavailable".into()),
+                cfg.exit.advertise.as_deref().unwrap_or("unavailable"),
+                if exit_tls { "ready" } else { "not ready" }
+            );
+        } else {
+            println!("device exit: disabled");
         }
         for warning in report["warnings"].as_array().into_iter().flatten() {
             println!("warning: {}", warning.as_str().unwrap_or("unknown warning"));
@@ -3657,6 +4161,8 @@ async fn run(config_path: PathBuf) -> Result<()> {
     rf::flow::spawn_driver(node.clone());
     rf::email::spawn_driver(node.clone());
     tracing::info!("gossip on {}", node.cfg.gossip.listen);
+
+    rf::exitproxy::serve(node.clone()).await?;
 
     tokio::spawn(rf::runtime::Runtime::new(node.clone(), durable.clone()).run());
 

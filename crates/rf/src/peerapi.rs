@@ -403,6 +403,7 @@ async fn status(
                 "label": v.label,
                 "public": v.public,
                 "api": v.api_addr.map(|a| a.to_string()),
+                "exit_endpoint": v.exit_endpoint,
                 "ip4": v.ipv4,
                 "capabilities": v.capabilities,
                 "deployments": v.deployments,
@@ -620,6 +621,12 @@ async fn status(
             "outbound": node.cfg.email.outbound,
             "mx_hostname": node.cfg.email.mx_hostname,
             "smtp_listen": node.cfg.email.smtp_listen.map(|address| address.to_string()),
+        },
+        "exit_node": {
+            "enabled": node.cfg.exit.enabled,
+            "endpoint": node.cfg.exit.advertise,
+            "listen": node.cfg.exit.listen.map(|address| address.to_string()),
+            "max_sessions": node.cfg.exit.max_sessions,
         },
         "storage": {
             "local": true,
@@ -913,6 +920,7 @@ async fn ingest_resource_envelope(
         .map_err(|error| anyhow::anyhow!("平台资源签名无效：{error}"))?;
     record.validate()?;
     crate::binary::validate_admission(&api.node, &record)?;
+    crate::exit::validate_admission(&api.node, &record)?;
     crate::storage_policy::validate_transition(&api.node, &record).await?;
     crate::quota::validate_resource_admission(&api.node, &record)?;
     crate::resource::ingest(&api.node, envelope)

@@ -51,7 +51,7 @@ curl --fail-with-body \
 ```
 
 Available exact scopes are `worker`, `kv`, `d1`, `r2`, `queue`, `analytics`,
-`pipeline`, `workflow`, `flow`, and `email`, each with `:read` and `:write`,
+`pipeline`, `workflow`, `flow`, `email`, `binary`, `storage`, and `network`, each with `:read` and `:write`,
 plus `node:read`, `node:write`, `quota:read`, `quota:write`, and `audit:read`.
 The standalone `*` scope grants every API permission. Access-token and S3
 credential creation are intentionally unavailable through bearer-token
@@ -72,6 +72,7 @@ flow.
 | Pipelines | `/api/v1/pipelines/…` including ingest, status, batches, and flush |
 | Workflows and Flows | `/api/v1/workflows/…`, `/api/v1/flows/…` |
 | Email | `/api/v1/email/…` including message metadata, sending, and raw source |
+| Device network | `GET /api/v1/network` returns redacted rules, devices, and live exit endpoints |
 | Audit | `GET /api/v1/audit` |
 
 Worker and generic resource writes accept an operator-signed binary envelope,

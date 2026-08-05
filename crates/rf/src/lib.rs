@@ -20,6 +20,8 @@ pub mod dns;
 pub mod durable;
 pub mod email;
 pub mod emailbind;
+pub mod exit;
+pub mod exitproxy;
 pub mod flow;
 pub mod gossip;
 pub mod ingress;

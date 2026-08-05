@@ -185,6 +185,9 @@ pub fn system_tags(node: &Node, node_id: &str) -> BTreeSet<String> {
         if node.cfg.storage.rclone_binary.is_some() && node.cfg.storage.rclone_config.is_some() {
             tags.insert("rclone".into());
         }
+        if node.cfg.exit.enabled {
+            tags.insert("exit".into());
+        }
     } else if let Some(peer) = node.peers().get(node_id) {
         if peer.public {
             tags.insert("public".into());

@@ -43,6 +43,8 @@ axum-server = { version = "0.8.0", features = ["tls-rustls"] }
 rcgen = "0.14.8"
 rustls = "0.23.43"
 rustls-pemfile = "2.2.0"
+tokio-rustls = "0.26.3"
+webpki-roots = "1"
 instant-acme = "0.8.5"
 rusqlite = { version = "0.40.1", features = ["bundled"] }
 zstd = "0.13"

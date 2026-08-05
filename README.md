@@ -147,6 +147,16 @@ Working today, verified by multi-process fault-injection e2e tests:
   Worker `email()` handlers, `env.MAIL.send()`, Flow email nodes, CLI/API,
   retention cleanup and a dedicated Chinese DNS/routing/delivery console are
   included. See [the Email guide](./docs/EMAIL.md).
+- **Decentralized device and exit networking**: one-way device credentials
+  fetch operator-signed Surge/Clash rules without exposing the cluster secret.
+  A local SOCKS5/HTTP proxy performs DIRECT and REJECT decisions or opens a
+  TLS-authenticated SOCKS tunnel to a specific/live-nearest exit. Exit nodes
+  re-evaluate the same signed policy and resolve destinations themselves with
+  strict private, metadata, transition-prefix and reserved-address SSRF
+  blocking. Remote rule-set and GEOIP content is frozen into the signed
+  resource, while exit roles remain optional node-local capabilities. CLI and
+  a dedicated Chinese management page are included. See
+  [the device and exit guide](./docs/DEVICE_EXIT.md).
 
 Also in: HTTPS ingress (SNI cert store, hot-reload, wildcard files,
 self-signed fallback) and **native workerd kvNamespace bindings** —
@@ -258,6 +268,13 @@ enabled = false                      # ordinary nodes leave this false
 # smtp_listen = "0.0.0.0:25"
 # mx_hostname = "mx1.example.com"   # also the cert stem and signed MX target
 # outbound = true
+
+[exit]                               # optional TLS device-exit role
+enabled = false                      # rules/devices can be managed everywhere
+# listen = "0.0.0.0:7443"
+# advertise = "exit.example.com:7443" # DNS hostname required for TLS SNI
+# max_sessions = 512
+# connect_timeout_seconds = 15
 # max_sessions = 32
 
 rf run --config rf.toml

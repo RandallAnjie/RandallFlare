@@ -47,6 +47,9 @@
           <button class="nav-item" data-view="nodes">
             <span class="nav-glyph" aria-hidden="true">◎</span><span>节点与调度</span><span id="node-nav-count" class="count">0</span>
           </button>
+          <button class="nav-item" data-view="network">
+            <span class="nav-glyph" aria-hidden="true">⌾</span><span>设备与出口</span><span id="network-nav-count" class="count">0</span>
+          </button>
           <button class="nav-item" data-view="workers">
             <span class="nav-glyph" aria-hidden="true">◇</span><span>Worker</span><span id="worker-nav-count" class="count">0</span>
           </button>
@@ -793,6 +796,66 @@
               </article>
             </div>
           </div>
+        </section>
+
+        <section id="view-network" class="view" aria-labelledby="section-title">
+          <div class="projects-header">
+            <div><p class="eyebrow">去中心化终端网络</p><h2>设备与出口</h2><p class="muted">设备使用一次性令牌读取管理员签名的 Surge / Clash 分流规则；DIRECT 在设备本机建立连接，指定节点与自动最近出口通过 TLS 隧道转发。设备永远不会获得集群密钥。</p></div>
+            <button id="network-refresh" class="secondary" type="button">刷新网络状态</button>
+          </div>
+          <div class="metrics compact-metrics">
+            <article class="metric"><span>签名规则</span><strong id="network-rule-count">0</strong><small>完整快照随资源链传播</small></article>
+            <article class="metric"><span>有效设备</span><strong id="network-device-count">0</strong><small id="network-device-total">共 0 台</small></article>
+            <article class="metric"><span>在线出口</span><strong id="network-exit-count">0</strong><small>由节点自行声明</small></article>
+            <article class="metric"><span>当前节点角色</span><strong id="network-local-role">未启用</strong><small id="network-local-endpoint">仅管理签名定义</small></article>
+          </div>
+
+          <div class="grid one-one">
+            <article class="panel settings-panel">
+              <div class="panel-head"><div><p class="eyebrow">Surge / Clash</p><h2 id="network-rule-title">创建分流规则</h2><p class="muted compact-copy">规则集 URL 和 GEOIP 数据必须作为签名快照一并保存，终端不会自行下载可变远程内容。</p></div><button id="network-rule-new" class="secondary compact" type="button">新建</button></div>
+              <form id="network-rule-form" class="settings-form">
+                <div class="form-grid"><label><span>规则名称</span><input id="network-rule-name" pattern="[a-z0-9-]{1,63}" placeholder="global-route" required></label><label><span>格式</span><select id="network-rule-format"><option value="auto">自动识别</option><option value="surge">Surge</option><option value="clash">Clash</option></select></label></div>
+                <div class="form-grid"><label><span>说明</span><input id="network-rule-description" maxlength="1000" placeholder="团队设备默认路由"></label><label><span>优先级</span><input id="network-rule-priority" type="number" value="0" required></label></div>
+                <label><span>规则内容</span><textarea id="network-rule-config" class="code-input" rows="12" placeholder="DOMAIN-SUFFIX,example.com,Proxy&#10;IP-CIDR,203.0.113.0/24,REJECT&#10;FINAL,DIRECT" required></textarea></label>
+                <label><span>策略到出口的映射（JSON）</span><textarea id="network-rule-policies" class="code-input" rows="7">{
+  "Proxy": { "type": "nearest" },
+  "DIRECT": { "type": "direct" },
+  "REJECT": { "type": "reject" }
+}</textarea><small>出口类型：<code>direct</code>、<code>reject</code>、<code>nearest</code>，或 <code>{"type":"node","node_id":"…"}</code>。</small></label>
+                <details><summary><strong>签名规则集快照</strong><span class="muted">RULE-SET URL / geoip:CC → 文本内容</span></summary><div class="details-form"><textarea id="network-rule-providers" class="code-input" rows="10">{}</textarea></div></details>
+                <label class="check-label"><input id="network-rule-enabled" type="checkbox" checked><span>启用此规则</span></label>
+                <div class="button-row"><button class="primary" type="submit">保存并签名</button><button id="network-rule-delete" class="danger ghost hidden" type="button">删除规则</button></div>
+              </form>
+            </article>
+            <article class="panel">
+              <div class="panel-head"><div><p class="eyebrow">规则目录</p><h2>分流规则</h2></div><span class="badge">确定性编译</span></div>
+              <div id="network-rule-list" class="database-list empty-state">暂无出口规则。</div>
+            </article>
+          </div>
+
+          <div class="grid one-one">
+            <article class="panel settings-panel">
+              <div class="panel-head"><div><p class="eyebrow">一次性凭据</p><h2 id="network-device-title">注册设备</h2><p class="muted compact-copy">节点仅保存 SHA-256；令牌只在创建成功后显示一次，无法找回。</p></div><button id="network-device-new" class="secondary compact" type="button">新设备</button></div>
+              <div id="network-device-transport-warning" class="banner warning hidden">设备令牌只能通过 HTTPS 公共控制台或回环地址本地控制台签发。</div>
+              <form id="network-device-form" class="settings-form">
+                <div class="form-grid"><label><span>设备 ID</span><input id="network-device-name" pattern="[a-z0-9-]{1,63}" placeholder="randall-phone" required></label><label><span>显示名称</span><input id="network-device-label" maxlength="80" placeholder="Randall 的手机" required></label></div>
+                <label><span>到期时间 <em>可选，本地时间</em></span><input id="network-device-expires" type="datetime-local"></label>
+                <fieldset><legend>允许使用的签名规则</legend><div id="network-device-rules" class="grant-list empty-state">请先创建分流规则。</div><small>必须明确选择至少一条；按优先级从小到大匹配。依赖尚未同步完成时会失败关闭。</small></fieldset>
+                <label class="check-label"><input id="network-device-suspended" type="checkbox"><span>暂停此设备</span></label>
+                <div class="button-row"><button id="network-device-submit" class="primary" type="submit">创建并显示令牌</button><button id="network-device-revoke" class="danger ghost hidden" type="button">立即撤销</button><button id="network-device-delete" class="danger ghost hidden" type="button">删除设备</button></div>
+              </form>
+              <article id="network-token-reveal" class="credential-reveal hidden"><p class="eyebrow">仅显示一次</p><h3>设备接入凭据</h3><p class="banner warning">请立即复制并安全保存；离开本页后无法再次查看。</p><pre id="network-token-value" class="result"></pre><div class="command-row"><code id="network-device-command"></code><button id="network-token-copy" class="secondary compact" type="button">复制</button></div></article>
+            </article>
+            <article class="panel">
+              <div class="panel-head"><div><p class="eyebrow">设备目录</p><h2>已注册终端</h2></div><span class="badge">摘要认证</span></div>
+              <div id="network-device-list" class="database-list empty-state">暂无客户端设备。</div>
+            </article>
+          </div>
+
+          <article class="panel">
+            <div class="panel-head"><div><p class="eyebrow">实时 Gossip</p><h2>TLS 出口节点</h2><p class="muted compact-copy">指定出口会在服务端再次执行同一份签名规则，并拒绝回环、内网、链路本地、云元数据和保留地址。</p></div><span class="badge">严格 SSRF 防护</span></div>
+            <div id="network-exit-list" class="node-list empty-state">尚未发现出口节点。</div>
+          </article>
         </section>
 
         <section id="view-email" class="view" aria-labelledby="section-title">
