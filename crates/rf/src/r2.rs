@@ -1220,7 +1220,7 @@ fn row_to_meta(row: &Value) -> Result<ObjectMeta> {
     })
 }
 
-fn validate_key(key: &str) -> Result<()> {
+pub(crate) fn validate_key(key: &str) -> Result<()> {
     if key.is_empty()
         || key.len() > MAX_OBJECT_KEY_BYTES
         || key.as_bytes().contains(&0)

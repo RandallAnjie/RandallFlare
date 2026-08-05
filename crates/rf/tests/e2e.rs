@@ -861,6 +861,8 @@ async fn module_worker_on_real_workerd() {
             "analytics":{"METRICS":"web-metrics"},
             "pipelines":{"ARCHIVE":"events-pipe"},
             "workflows":{"ORDER_WORKFLOW":"order-flow"},
+            "r2":{"OUTPUTS":"pipeline-output"},
+            "binaries":{"SHELL":"sandbox-shell"},
             "services":{"BACKEND":"backend"},
             "crons":["0 0 * * *"],
             "compatibility_flags":["nodejs_compat"]}"#,
@@ -954,6 +956,15 @@ export default {
         headers: { "x-rf-service-target": "attempted-override" }
       }));
     }
+    if (url.pathname === "/binary") {
+      const result = await env.SHELL.exec({
+        args: ["-c", "read value; printf 'stdout:%s' \"$value\"; printf 'artifact:%s' \"$value\" > result.txt"],
+        stdin: new TextEncoder().encode("signed-sandbox\n"),
+        env: { TEST_MODE: "e2e" },
+        outputFiles: [{ path: "result.txt", bucket: "OUTPUTS", key: "binary/result.txt", contentType: "text/plain" }]
+      });
+      return Response.json(result);
+    }
     if (url.pathname === "/secret") return new Response(env.API_TOKEN);
     if (url.pathname === "/workflow-trigger") {
       const instance = await env.ORDER_WORKFLOW.create({ id: "order-e2e", params: { orderId: "RF-1001" } });
@@ -1032,6 +1043,43 @@ export default {
         .post_resource(
             &n.api,
             &rf_core::envelope::Envelope::seal_any(&bucket_record, &op_any),
+        )
+        .await
+        .unwrap();
+    let shell_bytes = std::fs::read("/bin/sh").unwrap();
+    let (shell_sha256, shell_size, shell_storage) = client
+        .binary_put_blob(
+            &n.api,
+            &shell_bytes,
+            &rf::objectstore::StorageLocation::Local,
+        )
+        .await
+        .unwrap();
+    let binary_record = rf::binary::prepare_after(
+        "sandbox-shell",
+        rf::binary::BinarySpec {
+            schema: rf::binary::BINARY_SCHEMA,
+            description: "真实 workerd Binary binding".into(),
+            sha256: shell_sha256,
+            size_bytes: shell_size,
+            storage: shell_storage,
+            os_arch: rf::binary::current_os_arch().into(),
+            default_timeout_ms: 5_000,
+            max_stdin_bytes: 1024,
+            max_output_bytes: 4096,
+            allow_network: false,
+            allow_r2: true,
+            required_tags: Vec::new(),
+            suspended: false,
+        },
+        false,
+        None,
+    )
+    .unwrap();
+    client
+        .post_resource(
+            &n.api,
+            &rf_core::envelope::Envelope::seal_any(&binary_record, &op_any),
         )
         .await
         .unwrap();
@@ -1185,6 +1233,48 @@ export default {
         .await
         .unwrap();
     assert_eq!(secret_response, secret_plaintext);
+    let binary_response: serde_json::Value = http
+        .get(format!("http://127.0.0.1:{}/binary", n.ingress))
+        .header("host", "api.test")
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(binary_response["ok"], true);
+    assert_eq!(binary_response["exitCode"], 0);
+    assert_eq!(binary_response["stdout"], "stdout:signed-sandbox");
+    assert_eq!(binary_response["uploads"][0]["key"], "binary/result.txt");
+    assert!(binary_response["uploads"][0]["error"].is_null());
+    let (_, binary_output) = client
+        .r2_get(&n.api, "pipeline-output", "binary/result.txt")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(binary_output, b"artifact:signed-sandbox");
+    let binary_head = client
+        .resource_head(&n.api, rf::binary::BINARY_KIND, "sandbox-shell")
+        .await
+        .unwrap()
+        .unwrap();
+    let binary_tombstone = rf::binary::prepare_after(
+        "sandbox-shell",
+        rf::binary::binary_spec(&binary_head.resource).unwrap(),
+        true,
+        Some(&binary_head),
+    )
+    .unwrap();
+    let delete_error = client
+        .post_resource(
+            &n.api,
+            &rf_core::envelope::Envelope::seal_any(&binary_tombstone, &op_any),
+        )
+        .await
+        .unwrap_err();
+    assert!(format!("{delete_error:#}").contains("仍被 Worker 绑定"));
     assert!(
         !n._dir.join("data/workers/api/2/config.capnp").exists(),
         "含 Secret 的明文 workerd 配置应在启动成功后删除"

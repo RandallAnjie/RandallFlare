@@ -372,6 +372,7 @@ impl Runtime {
                 workflow: self.node.workflowbind_port(),
                 email: self.node.emailbind_port(),
                 service: self.node.servicebind_port(),
+                binary: self.node.binarybind_port(),
             },
             &durable_dir,
             &secret_bindings,
@@ -578,6 +579,12 @@ fn rf_entry_source(
             .collect::<Vec<_>>(),
     )
     .expect("Email binding names are serializable");
+    let binary_names = serde_json::to_string(
+        &crate::deploy::binary_bindings(manifest)
+            .keys()
+            .collect::<Vec<_>>(),
+    )
+    .expect("Binary binding names are serializable");
     let event_token = serde_json::to_string(event_token).expect("event token is serializable");
     let mut durable_wrappers = String::new();
     let mut seen = std::collections::BTreeSet::new();
@@ -597,6 +604,7 @@ fn rf_entry_source(
         .replace("__RF_PIPELINE_BINDING_NAMES__", &pipeline_names)
         .replace("__RF_WORKFLOW_BINDING_NAMES__", &workflow_names)
         .replace("__RF_EMAIL_BINDING_NAMES__", &email_names)
+        .replace("__RF_BINARY_BINDING_NAMES__", &binary_names)
         .replace("__RF_EVENT_TOKEN__", &event_token)
         .replace("__RF_DURABLE_WRAPPERS__", &durable_wrappers)
 }
@@ -790,12 +798,68 @@ class RandallFlareEmailBinding {
   }
 }
 
+function __rfU8ToBase64(value) {
+  let output = "";
+  for (let offset = 0; offset < value.length; offset += 0x8000) {
+    output += String.fromCharCode(...value.subarray(offset, offset + 0x8000));
+  }
+  return btoa(output);
+}
+
+class RandallFlareBinary {
+  constructor(service) { this._service = service; }
+  async exec(options = {}) {
+    if (options == null || typeof options !== "object" || Array.isArray(options)) {
+      throw new TypeError("Binary exec() expects an options object");
+    }
+    const body = {
+      args: Array.isArray(options.args) ? options.args.map(String) : [],
+      timeoutMs: Number.isFinite(options.timeoutMs) ? Number(options.timeoutMs) : undefined,
+      env: options.env && typeof options.env === "object" ? options.env : undefined,
+      outputFiles: Array.isArray(options.outputFiles) ? options.outputFiles.map((file) => ({
+        path: String(file.path || ""),
+        bucket: String(file.bucket || ""),
+        key: String(file.key || ""),
+        contentType: file.contentType == null ? undefined : String(file.contentType),
+      })) : undefined,
+    };
+    if (options.stdin != null) {
+      if (typeof options.stdin === "string") body.stdin = options.stdin;
+      else if (options.stdin instanceof Uint8Array) body.stdinBase64 = __rfU8ToBase64(options.stdin);
+      else if (options.stdin instanceof ArrayBuffer) body.stdinBase64 = __rfU8ToBase64(new Uint8Array(options.stdin));
+      else throw new TypeError("Binary stdin must be a string, Uint8Array or ArrayBuffer");
+    }
+    const response = await this._service.fetch("http://binary-binding/exec", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(body),
+    });
+    const output = await response.json().catch(() => ({}));
+    if (!response.ok && !output.error) throw new Error("BINARY_ERROR: " + response.status);
+    return {
+      ok: !!output.ok,
+      exitCode: typeof output.exitCode === "number" ? output.exitCode : -1,
+      stdout: typeof output.stdout === "string" ? output.stdout : "",
+      stderr: typeof output.stderr === "string" ? output.stderr : "",
+      stdoutBase64: output.stdoutBase64 || "",
+      stderrBase64: output.stderrBase64 || "",
+      stdoutTruncated: !!output.stdoutTruncated,
+      stderrTruncated: !!output.stderrTruncated,
+      durationMs: Number(output.durationMs || 0),
+      timedOut: !!output.timedOut,
+      error: output.error || "",
+      uploads: Array.isArray(output.uploads) ? output.uploads : [],
+    };
+  }
+}
+
 const __rfD1Names = __RF_D1_BINDING_NAMES__;
 const __rfQueueNames = __RF_QUEUE_BINDING_NAMES__;
 const __rfAnalyticsNames = __RF_ANALYTICS_BINDING_NAMES__;
 const __rfPipelineNames = __RF_PIPELINE_BINDING_NAMES__;
 const __rfWorkflowNames = __RF_WORKFLOW_BINDING_NAMES__;
 const __rfEmailNames = __RF_EMAIL_BINDING_NAMES__;
+const __rfBinaryNames = __RF_BINARY_BINDING_NAMES__;
 const __rfEventToken = __RF_EVENT_TOKEN__;
 function __rfWrapEnv(env, context) {
   const wrapped = Object.create(env);
@@ -827,6 +891,11 @@ function __rfWrapEnv(env, context) {
   for (const name of __rfEmailNames) {
     Object.defineProperty(wrapped, name, {
       value: new RandallFlareEmailBinding(env[name]), enumerable: true, configurable: false,
+    });
+  }
+  for (const name of __rfBinaryNames) {
+    Object.defineProperty(wrapped, name, {
+      value: new RandallFlareBinary(env[name]), enumerable: true, configurable: false,
     });
   }
   return wrapped;
@@ -1177,6 +1246,7 @@ pub struct BindingPorts {
     pub workflow: u16,
     pub email: u16,
     pub service: u16,
+    pub binary: u16,
 }
 
 pub fn generate_config(
@@ -1197,6 +1267,7 @@ pub fn generate_config(
         workflow: workflowbind_port,
         email: emailbind_port,
         service: servicebind_port,
+        binary: binarybind_port,
     } = binding_ports;
     let mut modules = String::new();
     modules
@@ -1230,6 +1301,7 @@ pub fn generate_config(
             || k == crate::deploy::WORKFLOW_METADATA_ENV
             || k == crate::deploy::EMAIL_METADATA_ENV
             || k == crate::deploy::SERVICE_METADATA_ENV
+            || k == crate::deploy::BINARY_METADATA_ENV
             || k == crate::deploy::SECRET_METADATA_ENV
             || k == crate::deploy::COMPATIBILITY_FLAGS_METADATA_ENV
             || k == crate::deploy::REQUIRED_TAGS_METADATA_ENV
@@ -1415,6 +1487,27 @@ pub fn generate_config(
             target = capnp_string(&target),
         ));
     }
+    let mut binary_services = String::new();
+    for (binding, _binary) in crate::deploy::binary_bindings(m) {
+        let service = format!("binary-{binding}");
+        bindings.push_str(&format!(
+            "        (name = {binding}, service = {service}),\n",
+            binding = capnp_string(&binding),
+            service = capnp_string(&service),
+        ));
+        binary_services.push_str(&format!(
+            "    (name = {service}, external = (address = \"127.0.0.1:{binarybind_port}\", \
+             http = (injectRequestHeaders = [\
+               (name = \"{worker_header}\", value = {worker}),\
+               (name = \"{binding_header}\", value = {binding})\
+             ]))),\n",
+            service = capnp_string(&service),
+            worker_header = crate::binarybind::WORKER_HEADER,
+            worker = capnp_string(&m.name),
+            binding_header = crate::binarybind::BINDING_HEADER,
+            binding = capnp_string(&binding),
+        ));
+    }
     let durable_objects = crate::deploy::durable_objects(m);
     let mut durable_namespaces = String::new();
     let mut seen_durable = std::collections::BTreeSet::new();
@@ -1477,7 +1570,7 @@ const config :Workerd.Config = (
       bindings = [
 {bindings}      ],
 {global_outbound}{durable_worker}    )),
-{kv_services}{r2_services}{d1_services}{queue_services}{analytics_services}{pipeline_services}{workflow_services}{email_services}{worker_services}{durable_service}{blocked_outbound_service}  ],
+{kv_services}{r2_services}{d1_services}{queue_services}{analytics_services}{pipeline_services}{workflow_services}{email_services}{worker_services}{binary_services}{durable_service}{blocked_outbound_service}  ],
   sockets = [
     (name = "http", address = "127.0.0.1:{port}", http = (), service = "main"),
   ],
@@ -1596,6 +1689,14 @@ mod tests {
             .unwrap(),
         );
         m.env.insert(
+            crate::deploy::BINARY_METADATA_ENV.into(),
+            serde_json::to_string(&BTreeMap::from([(
+                "FFMPEG".to_string(),
+                "ffmpeg".to_string(),
+            )]))
+            .unwrap(),
+        );
+        m.env.insert(
             crate::deploy::COMPATIBILITY_FLAGS_METADATA_ENV.into(),
             serde_json::to_string(&vec!["nodejs_compat", "global_navigator"]).unwrap(),
         );
@@ -1612,6 +1713,7 @@ mod tests {
                 workflow: 7388,
                 email: 7389,
                 service: 7390,
+                binary: 7391,
             },
             std::path::Path::new("/tmp/rf-do"),
             &BTreeMap::from([("API_TOKEN".into(), "private-value".into())]),
@@ -1653,6 +1755,10 @@ mod tests {
         assert!(cfg.contains("address = \"127.0.0.1:7390\""));
         assert!(cfg.contains("x-rf-service-source\", value = \"w\""));
         assert!(cfg.contains("x-rf-service-target\", value = \"backend\""));
+        assert!(cfg.contains("(name = \"FFMPEG\", service = \"binary-FFMPEG\")"));
+        assert!(cfg.contains("address = \"127.0.0.1:7391\""));
+        assert!(cfg.contains("x-rf-binary-worker\", value = \"w\""));
+        assert!(cfg.contains("x-rf-binary-binding\", value = \"FFMPEG\""));
         assert!(cfg.contains("name = \"randallflare:workers\""));
         assert!(cfg.contains("compatibilityDate = \"2026-07-31\""));
         assert!(cfg.contains("compatibilityFlags = [\"nodejs_compat\", \"global_navigator\"]"));
@@ -1674,6 +1780,7 @@ mod tests {
                 workflow: 7388,
                 email: 7389,
                 service: 7390,
+                binary: 7391,
             },
             std::path::Path::new("/tmp/rf-do"),
             &BTreeMap::new(),

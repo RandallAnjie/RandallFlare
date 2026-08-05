@@ -77,6 +77,9 @@
           <button class="nav-item" data-view="email">
             <span class="nav-glyph" aria-hidden="true">@</span><span>邮件路由</span><span id="email-nav-count" class="count">0</span>
           </button>
+          <button class="nav-item" data-view="binaries">
+            <span class="nav-glyph" aria-hidden="true">▣</span><span>Binary Deliver</span><span id="binary-nav-count" class="count">0</span>
+          </button>
           <button class="nav-item" data-view="security">
             <span class="nav-glyph" aria-hidden="true">⌾</span><span>安全与访问</span>
           </button>
@@ -119,6 +122,7 @@
             <article class="metric"><span>Workflow</span><strong id="metric-workflows">—</strong><small>可恢复步骤与外部信号</small></article>
             <article class="metric"><span>Flow</span><strong id="metric-flows">—</strong><small>可视化 DAG 与租约接管</small></article>
             <article class="metric"><span>邮件域</span><strong id="metric-email">—</strong><small>可选 SMTP 节点与耐久路由</small></article>
+            <article class="metric"><span>Binary</span><strong id="metric-binaries">—</strong><small>按摘要缓存的沙箱程序</small></article>
             <article class="metric"><span>内容块状态</span><strong id="metric-blobs">—</strong><small>本地缺失数</small></article>
           </div>
 
@@ -340,7 +344,7 @@
           </div>
 
           <div id="project-tab-bindings" class="project-tab">
-            <article class="panel settings-panel"><div class="settings-copy"><p class="eyebrow">运行配置</p><h2>变量与绑定</h2><p class="muted">环境变量与平台绑定会随签名清单复制。敏感凭据请使用下方的加密 Secret，不要写入普通变量。</p></div><form id="project-bindings-form" class="settings-form"><label><span>环境变量 <em>每行 KEY=value</em></span><textarea id="project-env" class="code-input" rows="8"></textarea></label><label><span>KV 绑定 <em>每行 BINDING=namespace</em></span><textarea id="project-kv-bindings" class="code-input" rows="6"></textarea></label><label><span>R2 绑定 <em>每行 BINDING=bucket</em></span><textarea id="project-r2-bindings" class="code-input" rows="5"></textarea></label><label><span>D1 绑定 <em>每行 BINDING=database</em></span><textarea id="project-d1-bindings" class="code-input" rows="5"></textarea></label><label><span>Queue 生产者绑定 <em>每行 BINDING=queue</em></span><textarea id="project-queue-bindings" class="code-input" rows="5"></textarea></label><label><span>Analytics Engine 绑定 <em>每行 BINDING=dataset</em></span><textarea id="project-analytics-bindings" class="code-input" rows="5"></textarea></label><label><span>Pipeline 绑定 <em>每行 BINDING=pipeline</em></span><textarea id="project-pipeline-bindings" class="code-input" rows="5"></textarea></label><label><span>Workflow 绑定 <em>每行 BINDING=workflow</em></span><textarea id="project-workflow-bindings" class="code-input" rows="5"></textarea></label><label><span>Email 发送绑定 <em>每行 BINDING=邮件域资源</em></span><textarea id="project-email-bindings" class="code-input" rows="5"></textarea></label><label><span>Worker Service 绑定 <em>每行 BINDING=目标 Worker</em></span><textarea id="project-service-bindings" class="code-input" rows="5"></textarea><small>在 Worker 中直接调用 <code>env.BINDING.fetch(request)</code>；请求不会离开当前节点。</small></label><button class="primary" type="submit">保存变量与绑定</button></form></article>
+            <article class="panel settings-panel"><div class="settings-copy"><p class="eyebrow">运行配置</p><h2>变量与绑定</h2><p class="muted">环境变量与平台绑定会随签名清单复制。敏感凭据请使用下方的加密 Secret，不要写入普通变量。</p></div><form id="project-bindings-form" class="settings-form"><label><span>环境变量 <em>每行 KEY=value</em></span><textarea id="project-env" class="code-input" rows="8"></textarea></label><label><span>KV 绑定 <em>每行 BINDING=namespace</em></span><textarea id="project-kv-bindings" class="code-input" rows="6"></textarea></label><label><span>R2 绑定 <em>每行 BINDING=bucket</em></span><textarea id="project-r2-bindings" class="code-input" rows="5"></textarea></label><label><span>D1 绑定 <em>每行 BINDING=database</em></span><textarea id="project-d1-bindings" class="code-input" rows="5"></textarea></label><label><span>Queue 生产者绑定 <em>每行 BINDING=queue</em></span><textarea id="project-queue-bindings" class="code-input" rows="5"></textarea></label><label><span>Analytics Engine 绑定 <em>每行 BINDING=dataset</em></span><textarea id="project-analytics-bindings" class="code-input" rows="5"></textarea></label><label><span>Pipeline 绑定 <em>每行 BINDING=pipeline</em></span><textarea id="project-pipeline-bindings" class="code-input" rows="5"></textarea></label><label><span>Workflow 绑定 <em>每行 BINDING=workflow</em></span><textarea id="project-workflow-bindings" class="code-input" rows="5"></textarea></label><label><span>Email 发送绑定 <em>每行 BINDING=邮件域资源</em></span><textarea id="project-email-bindings" class="code-input" rows="5"></textarea></label><label><span>Worker Service 绑定 <em>每行 BINDING=目标 Worker</em></span><textarea id="project-service-bindings" class="code-input" rows="5"></textarea><small>在 Worker 中直接调用 <code>env.BINDING.fetch(request)</code>；请求不会离开当前节点。</small></label><label><span>Binary Deliver 绑定 <em>每行 BINDING=Binary 资源</em></span><textarea id="project-binary-bindings" class="code-input" rows="5"></textarea><small>调用 <code>await env.BINDING.exec({ args, stdin })</code>；每次执行使用独立沙箱。</small></label><button class="primary" type="submit">保存变量与绑定</button></form></article>
             <article class="panel settings-panel">
               <div class="settings-copy"><p class="eyebrow">敏感配置</p><h2>加密 Secret</h2><p class="muted">Secret 以密文写入签名清单，只在各节点启动 Worker 时解密。值写入后不可查看；同名写入即安全替换。</p><p id="project-secret-transport" class="form-note"></p></div>
               <div class="settings-form">
@@ -919,6 +923,38 @@ Content-Type: text/plain; charset=utf-8
               </form>
               <div class="result-head"><h3>执行结果</h3><span id="d1-result-meta" class="muted"></span></div>
               <pre id="d1-result" class="result">执行一条语句后，结果会显示在这里。</pre>
+            </article>
+          </div>
+        </section>
+
+        <section id="view-binaries" class="view" aria-labelledby="section-title">
+          <div class="projects-header">
+            <div><p class="eyebrow">安全原生程序</p><h2>Binary Deliver</h2><p class="muted">将签名、内容寻址的 Linux 程序绑定到 Worker；运行时按需缓存，每次都在独立 bubblewrap 命名空间中执行。</p></div>
+            <button id="binary-new" class="primary" type="button">上传新程序</button>
+          </div>
+          <div class="grid one-one">
+            <article class="panel">
+              <div class="panel-head"><div><p class="eyebrow">内容目录</p><h2>已签名程序</h2></div><span id="binary-count" class="badge">0 个</span></div>
+              <div id="binary-list" class="database-list empty-state">暂无 Binary Deliver 程序。</div>
+            </article>
+            <article class="panel settings-panel binary-editor-panel">
+              <div class="settings-copy"><p class="eyebrow">不可变内容 + 签名策略</p><h2 id="binary-editor-title">上传程序</h2><p id="binary-editor-summary" class="muted">新文件会先存入内容地址存储，再等待管理员批准它的 SHA-256 和执行权限。</p></div>
+              <form id="binary-form" class="settings-form">
+                <div class="form-grid"><label><span>资源名称</span><input id="binary-name" pattern="[a-z0-9-]{1,63}" placeholder="ffmpeg" required></label><label><span>目标架构</span><select id="binary-os-arch"><option value="linux/amd64">linux/amd64</option><option value="linux/arm64">linux/arm64</option></select></label></div>
+                <label><span>用途描述</span><input id="binary-description" maxlength="2000" placeholder="音视频转码和探测"></label>
+                <label id="binary-file-label"><span>可执行文件 <em>上限 200 MiB</em></span><input id="binary-file" type="file"><small>更新策略时可留空；选择文件即会发布新的内容摘要。</small></label>
+                <div class="form-grid"><label><span>存储后端</span><select id="binary-storage-backend"><option value="local">本地多节点修复</option><option value="rclone">rclone remote</option></select></label><label id="binary-rclone-remote-label" class="hidden"><span>rclone remote</span><input id="binary-rclone-remote" placeholder="archive"></label></div>
+                <label id="binary-rclone-prefix-label" class="hidden"><span>rclone 内容前缀</span><input id="binary-rclone-prefix" placeholder="randallflare/binaries"></label>
+                <div class="form-grid"><label><span>默认超时（ms）</span><input id="binary-timeout" type="number" min="100" max="600000" value="30000" required></label><label><span>标准输入上限（字节）</span><input id="binary-stdin-limit" type="number" min="0" max="209715200" value="10485760" required></label></div>
+                <label><span>stdout / stderr 单路上限（字节）</span><input id="binary-output-limit" type="number" min="0" max="209715200" value="10485760" required></label>
+                <label><span>必需节点标签 <em>每行一个</em></span><textarea id="binary-required-tags" class="code-input" rows="4" placeholder="gpu&#10;high-memory"></textarea></label>
+                <label class="check-label"><input id="binary-network" type="checkbox"><span>允许程序访问网络（仍受集群出站策略约束）</span></label>
+                <label class="check-label"><input id="binary-r2" type="checkbox"><span>允许将沙箱输出发布到调用 Worker 已绑定的 R2 bucket</span></label>
+                <label class="check-label"><input id="binary-suspended" type="checkbox"><span>暂停所有新执行</span></label>
+                <div id="binary-upload-progress" class="hidden"><div class="result-head"><span id="binary-upload-label">正在上传…</span><span id="binary-upload-percent">0%</span></div><div class="progress-track"><div id="binary-upload-bar" class="progress-value"></div></div></div>
+                <div class="button-row"><button id="binary-submit" class="primary" type="submit">上传并提交签名</button><button id="binary-delete" class="secondary danger hidden" type="button">删除 Binary</button></div>
+              </form>
+              <article id="binary-current" class="credential-reveal hidden"><p class="eyebrow">当前不可变内容</p><dl id="binary-current-detail" class="detail-list"></dl><p class="form-note">Worker 使用 <code>"binaries": { "FFMPEG": "ffmpeg" }</code> 绑定后，调用 <code>await env.FFMPEG.exec({ args: [...] })</code>。</p></article>
             </article>
           </div>
         </section>

@@ -15,7 +15,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-const MAX_PEER_RESPONSE: usize = 64 * 1024 * 1024 + 16;
+const MAX_PEER_RESPONSE: usize = crate::binary::MAX_BINARY_BYTES + 1024 * 1024 + 16;
 
 #[derive(Debug)]
 struct PeerHttpError {
@@ -533,6 +533,34 @@ impl PeerClient {
         hex::decode(String::from_utf8(raw)?.trim())?
             .try_into()
             .map_err(|_| anyhow::anyhow!("peer returned an invalid R2 blob digest"))
+    }
+
+    pub async fn binary_put_blob(
+        &self,
+        base: &str,
+        bytes: &[u8],
+        storage: &crate::objectstore::StorageLocation,
+    ) -> Result<(String, u64, crate::objectstore::StorageLocation)> {
+        let path = match storage {
+            crate::objectstore::StorageLocation::Local => "/v1/binary-blob".to_string(),
+            crate::objectstore::StorageLocation::Rclone { remote, prefix } => format!(
+                "/v1/binary-blob?remote={}&prefix={}",
+                component(remote),
+                component(prefix)
+            ),
+        };
+        let raw = self.post(base, &path, bytes.to_vec()).await?;
+        let response: serde_json::Value = serde_json::from_slice(&raw)?;
+        Ok((
+            response["sha256"]
+                .as_str()
+                .context("node omitted Binary blob sha256")?
+                .to_string(),
+            response["size_bytes"]
+                .as_u64()
+                .context("node omitted Binary blob size")?,
+            serde_json::from_value(response["storage"].clone())?,
+        ))
     }
 
     pub async fn r2_fetch_blob(&self, base: &str, sha: &[u8; 32]) -> Result<Option<Vec<u8>>> {

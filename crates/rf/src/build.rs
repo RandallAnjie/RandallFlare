@@ -1000,7 +1000,7 @@ fn sandbox_command(
 }
 
 #[cfg(target_os = "linux")]
-fn clear_child_capabilities() -> std::io::Result<()> {
+pub(crate) fn clear_child_capabilities() -> std::io::Result<()> {
     #[repr(C)]
     struct CapHeader {
         version: u32,

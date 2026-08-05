@@ -170,6 +170,9 @@ pub fn system_tags(node: &Node, node_id: &str) -> BTreeSet<String> {
         if node.cfg.build.enabled {
             tags.insert("build".into());
         }
+        if crate::build::configured_binary(node.cfg.build.sandbox.as_deref(), "bwrap").is_some() {
+            tags.insert("binary".into());
+        }
         if node.cfg.storage.rclone_binary.is_some() && node.cfg.storage.rclone_config.is_some() {
             tags.insert("rclone".into());
         }

@@ -21,7 +21,7 @@ use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 
-const MAX_PEER_PAYLOAD: usize = 64 * 1024 * 1024;
+const MAX_PEER_PAYLOAD: usize = crate::binary::MAX_BINARY_BYTES + 1024 * 1024;
 
 #[derive(Clone)]
 pub struct Api {
@@ -167,6 +167,7 @@ pub fn router(api: Api) -> Router {
         .route("/v1/r2/{bucket}", get(r2_list))
         .route("/v1/r2-blob/{sha}", get(r2_blob_get))
         .route("/v1/r2-blob", post(r2_blob_put))
+        .route("/v1/binary-blob", post(binary_blob_put))
         .route("/v1/r2/{bucket}/meta/{*key}", get(r2_head))
         .route(
             "/v1/r2/{bucket}/object/{*key}",
@@ -568,6 +569,17 @@ async fn status(
             })
         })
         .collect();
+    let binaries: Vec<serde_json::Value> = crate::binary::records(node)
+        .into_iter()
+        .map(|(view, spec)| {
+            serde_json::json!({
+                "name": view.resource.name,
+                "version": view.resource.version,
+                "digest": view.digest,
+                "spec": spec,
+            })
+        })
+        .collect();
     axum::Json(serde_json::json!({
         "node": node.id_hex(),
         "label": node.cfg.label,
@@ -588,6 +600,7 @@ async fn status(
         "workflows": workflows,
         "flows": flows,
         "email_domains": email_domains,
+        "binaries": binaries,
         "email_node": {
             "enabled": node.cfg.email.enabled,
             "outbound": node.cfg.email.outbound,
@@ -836,6 +849,7 @@ fn ingest_resource_envelope(
         .open(Some(&api.node.cfg.operator))
         .map_err(|error| anyhow::anyhow!("平台资源签名无效：{error}"))?;
     record.validate()?;
+    crate::binary::validate_admission(&api.node, &record)?;
     crate::quota::validate_resource_admission(&api.node, &record)?;
     crate::resource::ingest(&api.node, envelope)
 }
@@ -2356,8 +2370,8 @@ async fn r2_blob_put(
     if let Err(response) = check(&api, &remote, &headers, &method, &uri, &body) {
         return response.into_response();
     }
-    if body.len() > r2::MAX_DIRECT_OBJECT_BYTES {
-        return (StatusCode::PAYLOAD_TOO_LARGE, "R2 对象副本过大").into_response();
+    if body.len() > crate::binary::MAX_BINARY_BYTES {
+        return (StatusCode::PAYLOAD_TOO_LARGE, "内容地址对象副本过大").into_response();
     }
     match api
         .node
@@ -2366,6 +2380,51 @@ async fn r2_blob_put(
         .await
     {
         Ok(digest) => hex::encode(digest).into_response(),
+        Err(error) => r2_error(error),
+    }
+}
+
+#[derive(Deserialize)]
+struct BinaryBlobQuery {
+    #[serde(default)]
+    remote: Option<String>,
+    #[serde(default)]
+    prefix: String,
+}
+
+async fn binary_blob_put(
+    State(api): State<Api>,
+    ConnectInfo(remote): ConnectInfo<SocketAddr>,
+    Query(query): Query<BinaryBlobQuery>,
+    method: Method,
+    uri: Uri,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    if let Err(response) = check(&api, &remote, &headers, &method, &uri, &body) {
+        return response.into_response();
+    }
+    let storage = match query.remote {
+        Some(remote) => crate::objectstore::StorageLocation::Rclone {
+            remote,
+            prefix: query.prefix,
+        },
+        None if query.prefix.is_empty() => crate::objectstore::StorageLocation::Local,
+        None => {
+            return (
+                StatusCode::BAD_REQUEST,
+                "Binary rclone prefix 必须与 remote 一起使用",
+            )
+                .into_response();
+        }
+    };
+    match crate::binary::store_bytes(&api.node, &storage, &body).await {
+        Ok((sha256, size_bytes)) => axum::Json(serde_json::json!({
+            "sha256": sha256,
+            "size_bytes": size_bytes,
+            "storage": storage,
+        }))
+        .into_response(),
         Err(error) => r2_error(error),
     }
 }

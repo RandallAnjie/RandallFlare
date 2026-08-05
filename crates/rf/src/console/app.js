@@ -60,6 +60,9 @@ const state = {
   emailMessages: [],
   emailMessageActive: null,
   emailContext: { buckets: [], workers: [], email_node: null },
+  binaries: [],
+  binaryActive: null,
+  binaryContext: { capabilities: {}, current_os_arch: "linux/amd64" },
   security: null,
   securityDirty: false,
   s3Editing: null,
@@ -81,6 +84,7 @@ const titles = {
   workflows: ["耐久执行", "Workflow"],
   flows: ["可视化编排", "Flow"],
   email: ["去中心化邮件", "邮件路由"],
+  binaries: ["安全原生程序", "Binary Deliver"],
   security: ["安全边界", "安全与访问"],
 };
 
@@ -254,6 +258,7 @@ function renderOverview(data) {
   const workflows = Array.isArray(data.workflows) ? data.workflows : [];
   const flows = Array.isArray(data.flows) ? data.flows : [];
   const emailDomains = Array.isArray(data.email_domains) ? data.email_domains : [];
+  const binaries = Array.isArray(data.binaries) ? data.binaries : [];
   const allNodes = [
     {
       id: data.node,
@@ -284,6 +289,8 @@ function renderOverview(data) {
   $("#flow-nav-count").textContent = String(flows.length);
   $("#metric-email").textContent = String(emailDomains.length);
   $("#email-nav-count").textContent = String(emailDomains.length);
+  $("#metric-binaries").textContent = String(binaries.length);
+  $("#binary-nav-count").textContent = String(binaries.length);
   $("#metric-r2-backend").textContent = data.storage?.rclone ? "本地副本与 rclone 已就绪" : "集群本地多数派副本";
   $("#r2-nav-count").textContent = String(buckets.length);
   $("#metric-blobs").textContent = String(data.missing_blobs ?? 0);
@@ -762,6 +769,7 @@ function renderWorkerDetail(data) {
   $("#project-workflow-bindings").value = mapToLines(worker.workflow_bindings);
   $("#project-email-bindings").value = mapToLines(worker.email_bindings);
   $("#project-service-bindings").value = mapToLines(worker.service_bindings);
+  $("#project-binary-bindings").value = mapToLines(worker.binary_bindings);
   renderWorkerSecrets(worker.secret_names || []);
   $("#project-crons").value = (worker.crons || []).join("\n");
   $("#project-cron-fire-expression").innerHTML = ["manual", ...(worker.crons || [])]
@@ -1019,6 +1027,7 @@ async function saveProjectBindings(event) {
       workflow_bindings: linesToMap($("#project-workflow-bindings").value, "Workflow 绑定"),
       email_bindings: linesToMap($("#project-email-bindings").value, "Email 绑定"),
       service_bindings: linesToMap($("#project-service-bindings").value, "Service 绑定"),
+      binary_bindings: linesToMap($("#project-binary-bindings").value, "Binary Deliver 绑定"),
     };
     await updateWorkerSettings(payload, `更新 ${state.activeWorker} 的变量与绑定。`);
   } catch (error) {
@@ -3061,6 +3070,220 @@ async function sendEmailMessage(event) {
   } catch (error) { toast(error.message, true); }
 }
 
+function binaryStorageLabel(storage) {
+  if (storage?.type === "rclone") {
+    const prefix = storage.prefix ? `/${storage.prefix}` : "";
+    return `rclone ${storage.remote}:${prefix}`;
+  }
+  return "本地内容存储";
+}
+
+function renderBinaries() {
+  $("#binary-count").textContent = `${state.binaries.length} 个程序`;
+  $("#binary-nav-count").textContent = String(state.binaries.length);
+  const list = $("#binary-list");
+  list.classList.toggle("empty-state", state.binaries.length === 0);
+  list.innerHTML = state.binaries.length
+    ? state.binaries.map((binary) => {
+      const spec = binary.spec || {};
+      const active = binary.name === state.binaryActive ? " active" : "";
+      const stateCopy = spec.suspended ? "已暂停" : "可执行";
+      return `<button class="database-item${active}" type="button" data-binary="${escapeHtml(binary.name)}"><span><strong>${escapeHtml(binary.name)}</strong><small>${escapeHtml(spec.description || spec.os_arch || "Binary Deliver")} · ${escapeHtml(formatBytes(spec.size_bytes))}</small></span><span><span class="badge ${spec.suspended ? "danger" : "active"}">${stateCopy}</span> v${escapeHtml(binary.version)}</span></button>`;
+    }).join("")
+    : "暂无 Binary Deliver 程序。";
+}
+
+function toggleBinaryStorageFields() {
+  const rclone = $("#binary-storage-backend").value === "rclone";
+  $("#binary-rclone-remote-label").classList.toggle("hidden", !rclone);
+  $("#binary-rclone-prefix-label").classList.toggle("hidden", !rclone);
+  $("#binary-rclone-remote").required = rclone;
+}
+
+function resetBinaryForm() {
+  state.binaryActive = null;
+  $("#binary-form").reset();
+  $("#binary-name").readOnly = false;
+  $("#binary-os-arch").value = state.binaryContext.current_os_arch || "linux/amd64";
+  $("#binary-timeout").value = "30000";
+  $("#binary-stdin-limit").value = String(10 * 1024 * 1024);
+  $("#binary-output-limit").value = String(10 * 1024 * 1024);
+  $("#binary-storage-backend").value = "local";
+  $("#binary-editor-title").textContent = "上传程序";
+  $("#binary-editor-summary").textContent = "新文件会先存入内容地址存储，再等待管理员批准它的 SHA-256 和执行权限。";
+  $("#binary-submit").textContent = "上传并提交签名";
+  $("#binary-delete").classList.add("hidden");
+  $("#binary-current").classList.add("hidden");
+  $("#binary-upload-progress").classList.add("hidden");
+  $("#binary-upload-bar").style.width = "0%";
+  toggleBinaryStorageFields();
+  renderBinaries();
+}
+
+function fillBinaryForm(binary) {
+  const spec = binary.spec || {};
+  const storage = spec.storage || { type: "local" };
+  state.binaryActive = binary.name;
+  $("#binary-name").value = binary.name;
+  $("#binary-name").readOnly = true;
+  $("#binary-description").value = spec.description || "";
+  $("#binary-file").value = "";
+  $("#binary-os-arch").value = spec.os_arch || state.binaryContext.current_os_arch || "linux/amd64";
+  $("#binary-storage-backend").value = storage.type || "local";
+  $("#binary-rclone-remote").value = storage.remote || "";
+  $("#binary-rclone-prefix").value = storage.prefix || "";
+  $("#binary-timeout").value = String(spec.default_timeout_ms ?? 30000);
+  $("#binary-stdin-limit").value = String(spec.max_stdin_bytes ?? 10 * 1024 * 1024);
+  $("#binary-output-limit").value = String(spec.max_output_bytes ?? 10 * 1024 * 1024);
+  $("#binary-required-tags").value = (spec.required_tags || []).join("\n");
+  $("#binary-network").checked = Boolean(spec.allow_network);
+  $("#binary-r2").checked = Boolean(spec.allow_r2);
+  $("#binary-suspended").checked = Boolean(spec.suspended);
+  $("#binary-editor-title").textContent = binary.name;
+  $("#binary-editor-summary").textContent = `签名定义 v${binary.version}。留空文件只更新沙箱策略；选择文件会产生新的不可变摘要。`;
+  $("#binary-submit").textContent = "保存策略或替换文件";
+  $("#binary-delete").classList.remove("hidden");
+  $("#binary-current").classList.remove("hidden");
+  const details = [
+    ["SHA-256", spec.sha256 || "—"],
+    ["文件大小", formatBytes(spec.size_bytes)],
+    ["存储位置", binaryStorageLabel(storage)],
+    ["目标架构", spec.os_arch || "—"],
+    ["网络", spec.allow_network ? "允许（服从集群策略）" : "隔离"],
+    ["R2 输出", spec.allow_r2 ? "允许" : "禁止"],
+    ["节点标签", (spec.required_tags || []).join(", ") || "无"],
+    ["资源版本", `v${binary.version}`],
+  ];
+  $("#binary-current-detail").innerHTML = details.map(([key, value]) => `<div><dt>${escapeHtml(key)}</dt><dd class="${key === "SHA-256" ? "mono" : ""}">${escapeHtml(value)}</dd></div>`).join("");
+  toggleBinaryStorageFields();
+  renderBinaries();
+}
+
+async function loadBinaries({ quiet = false } = {}) {
+  try {
+    const data = await api("/api/binaries");
+    state.binaries = data.binaries || [];
+    state.binaryContext = data;
+    const rcloneOption = $('#binary-storage-backend option[value="rclone"]');
+    if (rcloneOption) rcloneOption.disabled = !Boolean(data.capabilities?.rclone);
+    renderBinaries();
+    if (state.binaryActive) {
+      const current = state.binaries.find((item) => item.name === state.binaryActive);
+      if (current) fillBinaryForm(current); else resetBinaryForm();
+    }
+  } catch (error) {
+    if (!quiet) toast(error.message, true);
+  }
+}
+
+function selectBinary(name) {
+  const binary = state.binaries.find((item) => item.name === name);
+  if (!binary) return;
+  fillBinaryForm(binary);
+}
+
+function uploadBinaryBlob(file) {
+  return new Promise((resolve, reject) => {
+    const params = new URLSearchParams({ storage_backend: $("#binary-storage-backend").value });
+    if ($("#binary-storage-backend").value === "rclone") {
+      params.set("rclone_remote", $("#binary-rclone-remote").value.trim());
+      params.set("rclone_prefix", $("#binary-rclone-prefix").value.trim());
+    }
+    const xhr = new XMLHttpRequest();
+    xhr.open("POST", `/api/binaries/blob?${params}`);
+    xhr.withCredentials = true;
+    xhr.setRequestHeader("content-type", "application/octet-stream");
+    if (consoleMode === "local") xhr.setRequestHeader("x-rf-console-token", token);
+    if (consoleMode === "public" && state.session?.csrf) xhr.setRequestHeader("x-rf-csrf", state.session.csrf);
+    xhr.upload.onprogress = (event) => {
+      if (!event.lengthComputable) return;
+      const percent = Math.min(100, Math.round(event.loaded / event.total * 100));
+      $("#binary-upload-percent").textContent = `${percent}%`;
+      $("#binary-upload-label").textContent = percent === 100 ? "正在校验并持久化…" : `正在上传 ${file.name}`;
+      $("#binary-upload-bar").style.width = `${percent}%`;
+    };
+    xhr.onerror = () => reject(new Error("Binary 上传连接中断"));
+    xhr.onload = () => {
+      let payload;
+      try { payload = JSON.parse(xhr.responseText || "{}"); }
+      catch { payload = xhr.responseText; }
+      if (xhr.status >= 200 && xhr.status < 300) resolve(payload);
+      else reject(new Error(payload?.error || payload || `上传失败（HTTP ${xhr.status}）`));
+    };
+    $("#binary-upload-progress").classList.remove("hidden");
+    $("#binary-upload-percent").textContent = "0%";
+    $("#binary-upload-label").textContent = `正在上传 ${file.name}`;
+    $("#binary-upload-bar").style.width = "0%";
+    setBusy(true);
+    xhr.addEventListener("loadend", () => setBusy(false), { once: true });
+    xhr.send(file);
+  });
+}
+
+async function saveBinary(event) {
+  event.preventDefault();
+  const file = $("#binary-file").files?.[0];
+  if (file && file.size > 200 * 1024 * 1024) {
+    toast("Binary 文件不能超过 200 MiB", true);
+    return;
+  }
+  const current = state.binaries.find((item) => item.name === state.binaryActive);
+  if (!file && !current) {
+    toast("首次创建 Binary 必须选择可执行文件", true);
+    return;
+  }
+  try {
+    let blob = file ? await uploadBinaryBlob(file) : {
+      sha256: current.spec.sha256,
+      size_bytes: current.spec.size_bytes,
+      storage: current.spec.storage,
+    };
+    if (!file) {
+      const requestedBackend = $("#binary-storage-backend").value;
+      if ((blob.storage?.type || "local") !== requestedBackend) {
+        throw new Error("变更存储后端时请重新选择文件，以便写入新的内容存储");
+      }
+      if (requestedBackend === "rclone" && (blob.storage.remote !== $("#binary-rclone-remote").value.trim() || (blob.storage.prefix || "") !== $("#binary-rclone-prefix").value.trim())) {
+        throw new Error("变更 rclone 位置时请重新选择文件，以便写入新的内容存储");
+      }
+    }
+    const payload = {
+      name: $("#binary-name").value.trim(),
+      description: $("#binary-description").value.trim(),
+      sha256: blob.sha256,
+      size_bytes: blob.size_bytes,
+      storage: blob.storage,
+      os_arch: $("#binary-os-arch").value,
+      default_timeout_ms: Number($("#binary-timeout").value),
+      max_stdin_bytes: Number($("#binary-stdin-limit").value),
+      max_output_bytes: Number($("#binary-output-limit").value),
+      allow_network: $("#binary-network").checked,
+      allow_r2: $("#binary-r2").checked,
+      required_tags: $("#binary-required-tags").value.split(/\r?\n/).map((value) => value.trim()).filter(Boolean),
+      suspended: $("#binary-suspended").checked,
+    };
+    const result = await api("/api/binaries", { method: "POST", body: JSON.stringify(payload) });
+    const complete = async () => { await loadBinaries({ quiet: true }); selectBinary(payload.name); await loadOverview({ quiet: true }); };
+    if (result.pending_approval) showApproval(result, `批准 Binary Deliver ${payload.name} 的内容摘要与沙箱策略。`, complete);
+    else { toast(`Binary Deliver ${payload.name} 已保存`); await complete(); }
+  } catch (error) {
+    toast(error.message, true);
+  } finally {
+    $("#binary-upload-progress").classList.add("hidden");
+  }
+}
+
+async function deleteBinary() {
+  const name = state.binaryActive;
+  if (!name || !window.confirm(`要删除 Binary Deliver“${name}”吗？仍被 Worker 绑定时，集群会拒绝删除。`)) return;
+  try {
+    const result = await api(`/api/binaries/${encodeURIComponent(name)}`, { method: "DELETE" });
+    const complete = async () => { resetBinaryForm(); await loadBinaries({ quiet: true }); await loadOverview({ quiet: true }); };
+    if (result.pending_approval) showApproval(result, `批准删除 Binary Deliver ${name}。`, complete);
+    else { toast(`Binary Deliver ${name} 已删除`); await complete(); }
+  } catch (error) { toast(error.message, true); }
+}
+
 const scopeAreaCopy = {
   worker: ["Worker", "项目、部署与日志"],
   kv: ["KV", "键值命名空间"],
@@ -3072,6 +3295,7 @@ const scopeAreaCopy = {
   workflow: ["Workflow", "实例与信号"],
   flow: ["Flow", "定义与运行"],
   email: ["邮件", "域名与消息"],
+  binary: ["Binary", "原生程序、内容与策略"],
   node: ["节点", "成员与调度"],
   quota: ["配额", "集群安全策略"],
   audit: ["审计", "签名透明日志"],
@@ -3685,7 +3909,7 @@ async function boot() {
     $("#security-copy").innerHTML = consoleMode === "public"
       ? "此节点不保存<br>任何私钥。"
       : "密钥仅保留在本地<br>控制台进程中。";
-    $$("#deploy-form button, #source-form button, #kv-editor-form button, #d1-create-form button, #d1-exec-form button, #r2-bucket-form button, #r2-upload-form button, #r2-delete-bucket, #queue-form button, #queue-send-form button, #queue-delete, #analytics-form button, #analytics-write-form button, #analytics-delete, #pipeline-form button, #pipeline-token-form button, #pipeline-ingest-form button, #pipeline-flush, #pipeline-delete, #workflow-form button, #workflow-trigger-form button, #workflow-signal-form button, #workflow-delete, #flow-form button, #flow-token-form button, #flow-trigger-form button, #flow-delete, #email-domain-form button, #email-route-form button, #email-send-form button, #email-delete, #email-verify, #project-domain-add-form button, #project-bindings-form button, #project-secret-form button, #project-file-form button, #project-file-new, #project-triggers-form button, #project-cron-fire-form button, #project-cron-dlq button, #project-settings-form button, #project-preview-form button, #project-preview-list button, #project-source-form button, #project-redeploy, #project-delete, #quota-form button, #access-token-form button, #s3-credential-form button")
+    $$("#deploy-form button, #source-form button, #kv-editor-form button, #d1-create-form button, #d1-exec-form button, #r2-bucket-form button, #r2-upload-form button, #r2-delete-bucket, #queue-form button, #queue-send-form button, #queue-delete, #analytics-form button, #analytics-write-form button, #analytics-delete, #pipeline-form button, #pipeline-token-form button, #pipeline-ingest-form button, #pipeline-flush, #pipeline-delete, #workflow-form button, #workflow-trigger-form button, #workflow-signal-form button, #workflow-delete, #flow-form button, #flow-token-form button, #flow-trigger-form button, #flow-delete, #email-domain-form button, #email-route-form button, #email-send-form button, #email-delete, #email-verify, #binary-form button, #binary-new, #project-domain-add-form button, #project-bindings-form button, #project-secret-form button, #project-file-form button, #project-file-new, #project-triggers-form button, #project-cron-fire-form button, #project-cron-dlq button, #project-settings-form button, #project-preview-form button, #project-preview-list button, #project-source-form button, #project-redeploy, #project-delete, #quota-form button, #access-token-form button, #s3-credential-form button")
       .forEach((button) => { button.disabled = state.session.read_only; });
     $("#node-policy-form button").disabled = state.session.read_only;
     $$("#access-token-form input, #access-token-form button, #s3-credential-form input, #s3-credential-form button")
@@ -3701,6 +3925,7 @@ async function boot() {
     await loadWorkflows({ quiet: true });
     await loadFlows({ quiet: true });
     await loadEmail({ quiet: true });
+    await loadBinaries({ quiet: true });
     await loadSecurity({ quiet: true });
   } catch (error) {
     if (consoleMode === "public" && error.status === 401) {
@@ -3716,6 +3941,7 @@ async function boot() {
 $$(".nav-item").forEach((button) => button.addEventListener("click", () => {
   switchView(button.dataset.view);
   if (button.dataset.view === "nodes") loadNodes({ quiet: true });
+  if (button.dataset.view === "binaries") loadBinaries({ quiet: true });
   if (button.dataset.view === "security") loadSecurity({ quiet: true });
 }));
 $$('[data-go]').forEach((button) => button.addEventListener("click", () => switchView(button.dataset.go)));
@@ -3826,6 +4052,7 @@ $("#refresh").addEventListener("click", async () => {
   await loadWorkflows({ quiet: true });
   await loadFlows({ quiet: true });
   await loadEmail({ quiet: true });
+  await loadBinaries({ quiet: true });
 });
 $("#deploy-form").addEventListener("submit", deployWorker);
 $("#deploy-file-picker").addEventListener("click", () => $("#deploy-files").click());
@@ -4020,7 +4247,13 @@ $("#email-route-list").addEventListener("click", (event) => {
   if (remove) { state.emailRoutes = state.emailRoutes.filter((route) => route.id !== remove.dataset.emailRouteRemove); renderEmailRoutes(); }
 });
 $("#email-message-list").addEventListener("click", (event) => { const button = event.target.closest("[data-email-message]"); if (button) openEmailMessage(button.dataset.emailMessage); });
+$("#binary-new").addEventListener("click", () => { resetBinaryForm(); $("#binary-name").focus(); });
+$("#binary-form").addEventListener("submit", saveBinary);
+$("#binary-delete").addEventListener("click", deleteBinary);
+$("#binary-storage-backend").addEventListener("change", toggleBinaryStorageFields);
+$("#binary-list").addEventListener("click", (event) => { const button = event.target.closest("[data-binary]"); if (button) selectBinary(button.dataset.binary); });
 updateEmailRouteFields();
+toggleBinaryStorageFields();
 
 setInterval(() => {
   if (state.session) {
@@ -4044,6 +4277,7 @@ setInterval(() => {
     if (state.view === "email") loadEmail({ quiet: true }).then(() => {
       if (state.emailActive) loadEmailMessages();
     });
+    if (state.view === "binaries") loadBinaries({ quiet: true });
     if (state.view === "security") loadSecurity({ quiet: true });
   }
 }, 10_000);

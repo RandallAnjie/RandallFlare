@@ -61,7 +61,7 @@ surface yet.
 | runtime/build/request logs and cluster distribution | done | runtime output and 7-day request history aggregate across live nodes; longer archival/export is optional future work |
 | previews and pull-request deployments | partial | deterministic version/PR domains, isolated runtimes and DO disks, signed approval/tombstones, automatic expiry, ACME/blob repair, request observability and Chinese UI are implemented; GitHub check/comment reporting and multi-node fault soak remain |
 | service bindings and placement tags | partial | signed node-local dynamic Service router, native `env.SERVICE.fetch()`, placement requirements and encrypted mesh fallback are done; multi-service cycle diagnostics remain |
-| R2, D1, Queue, Analytics, Pipeline, Workflow, Email, Binary bindings | partial | native R2, CF-shaped D1, Queue producer/consumer, Analytics Engine, Pipeline, Workflow and Email bindings + console editors done; Binary Deliver remains |
+| R2, D1, Queue, Analytics, Pipeline, Workflow, Email, Binary bindings | partial | native bindings and Chinese editors are implemented for every listed service, including per-call signed Binary authorization and R2 output publication; cross-service fault soak remains |
 
 ### Data and storage
 
@@ -87,7 +87,7 @@ surface yet.
 | Pipelines | partial | signed definitions, one-time bearer tokens stored only as SHA-256, default/custom domains, ACME discovery, 32-MiB JSON/array/events/NDJSON/text ingest, Draft JSON Schema validation, D1 durable staging, quorum leases, deterministic retry-safe keys, gzip JSONL, direct/multipart R2 output over local or rclone buckets, Worker binding, encrypted API, CLI, status/batch audit and Chinese console are real-workerd/public-ingress tested; streaming request bodies, transform stages and multi-node crash-point soak remain |
 | Workflow | partial | signed definitions, per-Workflow D1 quorum, idempotent instances, exactly-once replay boundaries, step retry/timeout, durable sleep/sleepUntil, signals, fenced leases and heartbeats, crash replay, pause/resume/terminate/restart, retention, Worker binding and built-in module, encrypted API, CLI, audit timeline and Chinese console are real-workerd tested; cron/webhook triggers, version-pinned definitions, concurrency groups and multi-node crash-point soak remain |
 | visual Flow | partial | signed/version-frozen DAGs, Vercel-style Chinese canvas and inspector, manual/webhook/cron triggers, one-way token hashes, synchronous Flow-as-API, idempotency, per-Flow D1 run/step/audit ledger, fenced recovery, cancellation/retry/retention/concurrency, durable loop subgraphs, typed templates, guarded inline subflows, SSRF-safe HTTP/local credentials, failure alerts, and Worker/KV/D1/R2/Queue/Analytics/Pipeline/Workflow nodes are real-daemon tested; Email now durably queues through signed mail domains; full JSONata grammar, nested loops in subflows and multi-node crash-point soak remain |
-| Binary Deliver | planned | signed binaries, content cache, sandboxed execution and bindings |
+| Binary Deliver | partial | operator-signed definitions, SHA-256 local/rclone blobs, authenticated peer repair, executable cache, architecture/tag placement, fresh bubblewrap isolation, network/R2 policy gates, bounded stdin/stdout/stderr/timeouts, R2 output files, CLI/scoped API/Chinese console and native Worker binding are implemented and sandbox-tested; multi-node cache repair and production load soak remain |
 
 ### Optional email nodes
 

@@ -178,6 +178,10 @@ pub fn validate_resource_admission(node: &Node, record: &ResourceRecord) -> Resu
         crate::s3::credential_spec(record)?;
         return Ok(());
     }
+    if record.kind == crate::binary::BINARY_KIND {
+        crate::binary::binary_spec(record)?;
+        return Ok(());
+    }
     let quota = policy(node).context("集群配额策略无效；为安全起见拒绝资源变更")?;
     if matches!(
         record.kind.as_str(),

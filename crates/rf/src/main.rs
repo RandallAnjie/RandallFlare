@@ -156,6 +156,11 @@ enum Cmd {
         #[command(subcommand)]
         cmd: EmailCmd,
     },
+    /// 签名 Binary Deliver 程序、沙箱策略与存储。
+    Binary {
+        #[command(subcommand)]
+        cmd: BinaryCmd,
+    },
     /// 聚合所有存活节点上的 Worker 请求日志。
     Requests {
         worker: String,
@@ -436,6 +441,94 @@ enum R2Cmd {
         #[arg(long, env = "RF_CLUSTER_SECRET")]
         secret: String,
     },
+}
+
+#[derive(Subcommand)]
+enum BinaryCmd {
+    /// 列出所有可用 Binary Deliver 定义。
+    List {
+        #[arg(long, env = "RF_NODE")]
+        node: String,
+        #[arg(long, env = "RF_CLUSTER_SECRET")]
+        secret: String,
+    },
+    /// 上传或替换二进制，并发布新的签名定义。
+    Upload(Box<BinaryUploadArgs>),
+    /// 保留当前不可变内容，只更新执行策略。
+    Configure(Box<BinaryConfigureArgs>),
+    /// 删除（写入墓碑）Binary Deliver 定义。
+    Delete {
+        name: String,
+        #[arg(long, env = "RF_NODE")]
+        node: String,
+        #[arg(long, env = "RF_OPERATOR_KEY")]
+        key: Option<PathBuf>,
+        #[arg(long, env = "RF_CLUSTER_SECRET")]
+        secret: String,
+    },
+}
+
+#[derive(clap::Args)]
+struct BinaryUploadArgs {
+    name: String,
+    file: PathBuf,
+    #[arg(long, default_value = "")]
+    description: String,
+    #[arg(long)]
+    rclone_remote: Option<String>,
+    #[arg(long, default_value = "")]
+    rclone_prefix: String,
+    #[arg(long)]
+    os_arch: Option<String>,
+    #[arg(long, default_value_t = 30_000)]
+    default_timeout_ms: u64,
+    #[arg(long, default_value_t = 10 * 1024 * 1024)]
+    max_stdin_bytes: u64,
+    #[arg(long, default_value_t = 10 * 1024 * 1024)]
+    max_output_bytes: u64,
+    #[arg(long)]
+    allow_network: bool,
+    #[arg(long)]
+    allow_r2: bool,
+    #[arg(long = "required-tag")]
+    required_tags: Vec<String>,
+    #[arg(long)]
+    suspended: bool,
+    #[arg(long, env = "RF_NODE")]
+    node: String,
+    #[arg(long, env = "RF_OPERATOR_KEY")]
+    key: Option<PathBuf>,
+    #[arg(long, env = "RF_CLUSTER_SECRET")]
+    secret: String,
+}
+
+#[derive(clap::Args)]
+struct BinaryConfigureArgs {
+    name: String,
+    #[arg(long)]
+    description: Option<String>,
+    #[arg(long)]
+    default_timeout_ms: Option<u64>,
+    #[arg(long)]
+    max_stdin_bytes: Option<u64>,
+    #[arg(long)]
+    max_output_bytes: Option<u64>,
+    #[arg(long, num_args = 0..=1, default_missing_value = "true")]
+    allow_network: Option<bool>,
+    #[arg(long, num_args = 0..=1, default_missing_value = "true")]
+    allow_r2: Option<bool>,
+    #[arg(long = "required-tag")]
+    required_tags: Vec<String>,
+    #[arg(long, conflicts_with = "required_tags")]
+    clear_required_tags: bool,
+    #[arg(long, num_args = 0..=1, default_missing_value = "true")]
+    suspended: Option<bool>,
+    #[arg(long, env = "RF_NODE")]
+    node: String,
+    #[arg(long, env = "RF_OPERATOR_KEY")]
+    key: Option<PathBuf>,
+    #[arg(long, env = "RF_CLUSTER_SECRET")]
+    secret: String,
 }
 
 #[derive(Subcommand)]
@@ -1634,6 +1727,174 @@ async fn async_main(cli: Cli) -> Result<()> {
                     anyhow::bail!("R2 对象 {bucket}/{object} 不存在");
                 }
                 println!("R2 对象 {bucket}/{object} 已删除");
+                Ok(())
+            }
+        },
+        Cmd::Binary { cmd } => match cmd {
+            BinaryCmd::List { node, secret } => {
+                let client = PeerClient::new(secret_bytes(&secret)?);
+                let binaries = client
+                    .resource_heads(&node, Some(rf::binary::BINARY_KIND))
+                    .await?
+                    .into_iter()
+                    .filter(|view| !view.resource.deleted)
+                    .map(|view| {
+                        let spec = rf::binary::binary_spec(&view.resource)?;
+                        Ok(serde_json::json!({
+                            "name": view.resource.name,
+                            "version": view.resource.version,
+                            "digest": view.digest,
+                            "spec": spec,
+                        }))
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                println!("{}", serde_json::to_string_pretty(&binaries)?);
+                Ok(())
+            }
+            BinaryCmd::Upload(arguments) => {
+                let BinaryUploadArgs {
+                    name,
+                    file,
+                    description,
+                    rclone_remote,
+                    rclone_prefix,
+                    os_arch,
+                    default_timeout_ms,
+                    max_stdin_bytes,
+                    max_output_bytes,
+                    allow_network,
+                    allow_r2,
+                    required_tags,
+                    suspended,
+                    node,
+                    key,
+                    secret,
+                } = *arguments;
+                let storage = match rclone_remote {
+                    Some(remote) => rf::objectstore::StorageLocation::Rclone {
+                        remote,
+                        prefix: rclone_prefix,
+                    },
+                    None if rclone_prefix.is_empty() => rf::objectstore::StorageLocation::Local,
+                    None => anyhow::bail!("--rclone-prefix 必须与 --rclone-remote 一起使用"),
+                };
+                let bytes = std::fs::read(&file)
+                    .with_context(|| format!("读取 Binary 文件 {}", file.display()))?;
+                if bytes.is_empty() || bytes.len() > rf::binary::MAX_BINARY_BYTES {
+                    anyhow::bail!("Binary 文件必须介于 1 字节和 200 MiB 之间");
+                }
+                let client = PeerClient::new(secret_bytes(&secret)?);
+                let head = client
+                    .resource_head(&node, rf::binary::BINARY_KIND, &name)
+                    .await?;
+                let (sha256, size_bytes, storage) =
+                    client.binary_put_blob(&node, &bytes, &storage).await?;
+                let spec = rf::binary::BinarySpec {
+                    schema: rf::binary::BINARY_SCHEMA,
+                    description,
+                    sha256,
+                    size_bytes,
+                    storage,
+                    os_arch: os_arch.unwrap_or_else(|| rf::binary::current_os_arch().into()),
+                    default_timeout_ms,
+                    max_stdin_bytes,
+                    max_output_bytes,
+                    allow_network,
+                    allow_r2,
+                    required_tags,
+                    suspended,
+                };
+                let record = rf::binary::prepare_after(&name, spec, false, head.as_ref())?;
+                let envelope = rf_core::envelope::Envelope::seal_any(&record, &operator_key(key)?);
+                client.post_resource(&node, &envelope).await?;
+                println!(
+                    "Binary {} 已发布 v{}（{} 字节，SHA-256 {}）",
+                    record.name,
+                    record.version,
+                    size_bytes,
+                    record
+                        .spec()?
+                        .get("sha256")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or("")
+                );
+                Ok(())
+            }
+            BinaryCmd::Configure(arguments) => {
+                let BinaryConfigureArgs {
+                    name,
+                    description,
+                    default_timeout_ms,
+                    max_stdin_bytes,
+                    max_output_bytes,
+                    allow_network,
+                    allow_r2,
+                    required_tags,
+                    clear_required_tags,
+                    suspended,
+                    node,
+                    key,
+                    secret,
+                } = *arguments;
+                let client = PeerClient::new(secret_bytes(&secret)?);
+                let head = client
+                    .resource_head(&node, rf::binary::BINARY_KIND, &name)
+                    .await?
+                    .filter(|view| !view.resource.deleted)
+                    .with_context(|| format!("Binary {name} 不存在"))?;
+                let mut spec = rf::binary::binary_spec(&head.resource)?;
+                if let Some(description) = description {
+                    spec.description = description;
+                }
+                if let Some(default_timeout_ms) = default_timeout_ms {
+                    spec.default_timeout_ms = default_timeout_ms;
+                }
+                if let Some(max_stdin_bytes) = max_stdin_bytes {
+                    spec.max_stdin_bytes = max_stdin_bytes;
+                }
+                if let Some(max_output_bytes) = max_output_bytes {
+                    spec.max_output_bytes = max_output_bytes;
+                }
+                if let Some(allow_network) = allow_network {
+                    spec.allow_network = allow_network;
+                }
+                if let Some(allow_r2) = allow_r2 {
+                    spec.allow_r2 = allow_r2;
+                }
+                if clear_required_tags {
+                    spec.required_tags.clear();
+                } else if !required_tags.is_empty() {
+                    spec.required_tags = required_tags;
+                }
+                if let Some(suspended) = suspended {
+                    spec.suspended = suspended;
+                }
+                let record = rf::binary::prepare_after(&name, spec, false, Some(&head))?;
+                let envelope = rf_core::envelope::Envelope::seal_any(&record, &operator_key(key)?);
+                client.post_resource(&node, &envelope).await?;
+                println!(
+                    "Binary {} 执行策略已更新至 v{}",
+                    record.name, record.version
+                );
+                Ok(())
+            }
+            BinaryCmd::Delete {
+                name,
+                node,
+                key,
+                secret,
+            } => {
+                let client = PeerClient::new(secret_bytes(&secret)?);
+                let head = client
+                    .resource_head(&node, rf::binary::BINARY_KIND, &name)
+                    .await?
+                    .filter(|view| !view.resource.deleted)
+                    .with_context(|| format!("Binary {name} 不存在"))?;
+                let spec = rf::binary::binary_spec(&head.resource)?;
+                let record = rf::binary::prepare_after(&name, spec, true, Some(&head))?;
+                let envelope = rf_core::envelope::Envelope::seal_any(&record, &operator_key(key)?);
+                client.post_resource(&node, &envelope).await?;
+                println!("Binary {} 已删除（v{}）", record.name, record.version);
                 Ok(())
             }
         },
@@ -2969,6 +3230,9 @@ fn doctor(config: PathBuf, json: bool) -> Result<()> {
             "bubblewrap was not found; zero-config builds work, custom build commands do not",
         );
     }
+    if sandbox.is_none() {
+        warnings.push("bubblewrap was not found; Binary Deliver execution is unavailable");
+    }
     if let Some(path) = &cfg.storage.rclone_binary {
         if rclone_version.is_none() {
             anyhow::bail!(
@@ -3276,6 +3540,9 @@ async fn run(config_path: PathBuf) -> Result<()> {
     let servicebind_port = rf::servicebind::serve(node.clone()).await?;
     node.set_servicebind_port(servicebind_port);
     tracing::info!("Worker Service binding on 127.0.0.1:{servicebind_port}");
+    let binarybind_port = rf::binarybind::serve(node.clone()).await?;
+    node.set_binarybind_port(binarybind_port);
+    tracing::info!("Binary Deliver binding on 127.0.0.1:{binarybind_port}");
 
     let _gossip = rf::gossip::start(node.clone()).await?;
     durable.spawn_ensurer();

@@ -27,6 +27,7 @@ pub const PIPELINE_METADATA_ENV: &str = "__RF_PIPELINE_BINDINGS_V1";
 pub const WORKFLOW_METADATA_ENV: &str = "__RF_WORKFLOW_BINDINGS_V1";
 pub const EMAIL_METADATA_ENV: &str = "__RF_EMAIL_BINDINGS_V1";
 pub const SERVICE_METADATA_ENV: &str = "__RF_SERVICE_BINDINGS_V1";
+pub const BINARY_METADATA_ENV: &str = "__RF_BINARY_BINDINGS_V1";
 pub const SECRET_METADATA_ENV: &str = "__RF_SECRET_BINDINGS_V1";
 pub const COMPATIBILITY_FLAGS_METADATA_ENV: &str = "__RF_COMPATIBILITY_FLAGS_V1";
 pub const REQUIRED_TAGS_METADATA_ENV: &str = crate::placement::REQUIRED_TAGS_METADATA_ENV;
@@ -103,6 +104,13 @@ pub fn service_bindings(m: &WorkerManifest) -> BTreeMap<String, String> {
         .unwrap_or_default()
 }
 
+pub fn binary_bindings(m: &WorkerManifest) -> BTreeMap<String, String> {
+    m.env
+        .get(BINARY_METADATA_ENV)
+        .and_then(|raw| serde_json::from_str(raw).ok())
+        .unwrap_or_default()
+}
+
 pub fn compatibility_flags(m: &WorkerManifest) -> Vec<String> {
     m.env
         .get(COMPATIBILITY_FLAGS_METADATA_ENV)
@@ -154,6 +162,9 @@ pub struct DeploySpec {
     /// binding name → target Worker name.
     #[serde(default)]
     pub services: BTreeMap<String, String>,
+    /// binding name → signed Binary Deliver resource name.
+    #[serde(default)]
+    pub binaries: BTreeMap<String, String>,
     #[serde(default)]
     pub crons: Vec<String>,
     /// Relative dir of static assets.
@@ -208,6 +219,7 @@ fn validate_spec(spec: &DeploySpec) -> Result<()> {
         .chain(spec.workflows.keys())
         .chain(spec.email.keys())
         .chain(spec.services.keys())
+        .chain(spec.binaries.keys())
     {
         if !binding_names.insert(name) {
             bail!("binding name {name:?} is used more than once");
@@ -216,6 +228,11 @@ fn validate_spec(spec: &DeploySpec) -> Result<()> {
     for target in spec.services.values() {
         if !rf_core::manifest::valid_name(target) || target == &spec.name {
             bail!("invalid Worker Service binding target {target:?}");
+        }
+    }
+    for binary in spec.binaries.values() {
+        if !rf_core::manifest::valid_name(binary) {
+            bail!("invalid Binary Deliver binding target {binary:?}");
         }
     }
     validate_compatibility_flags(&spec.compatibility_flags)?;
@@ -680,6 +697,25 @@ fn manifest_from_bundle(
         env.insert(
             SERVICE_METADATA_ENV.into(),
             serde_json::to_string(&bundle.spec.services)?,
+        );
+    }
+    if !bundle.spec.binaries.is_empty() {
+        let identifier = |value: &str| {
+            let mut characters = value.chars();
+            characters.next().is_some_and(|character| {
+                character.is_ascii_alphabetic() || character == '_' || character == '$'
+            }) && characters.all(|character| {
+                character.is_ascii_alphanumeric() || character == '_' || character == '$'
+            })
+        };
+        for (binding, binary) in &bundle.spec.binaries {
+            if !identifier(binding) || !rf_core::manifest::valid_name(binary) {
+                bail!("invalid Binary Deliver binding {binding:?}");
+            }
+        }
+        env.insert(
+            BINARY_METADATA_ENV.into(),
+            serde_json::to_string(&bundle.spec.binaries)?,
         );
     }
     if !bundle.spec.compatibility_flags.is_empty() {

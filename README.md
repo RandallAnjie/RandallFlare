@@ -362,6 +362,7 @@ my-worker/
                    #  "workflows":{"ORDER_FLOW":"order-flow"},
                    #  "email":{"MAIL":"support-mail"},
                    #  "services":{"BACKEND":"api-worker"},
+                   #  "binaries":{"FFMPEG":"ffmpeg"},
                    #  "compatibility_flags":["nodejs_compat"]}
   index.js         # omit "main" entirely for a pure static site
   public/…
@@ -377,6 +378,9 @@ rf cron fire site --expression '*/5 * * * *'
 rf cron list site --dlq
 rf cron replay site <run-id>
 rf requests site --hostname site.example.com --status-class 5
+rf binary upload ffmpeg ./ffmpeg --allow-r2
+rf binary configure ffmpeg --allow-network=false --suspended=false
+rf binary list
 rf worker-delete site
 ```
 
@@ -400,6 +404,13 @@ new manifest. Nodes decrypt it only into a mode-`0600` temporary workerd config
 and remove that plaintext file as soon as workerd is listening.
 Use HTTPS for the public console; the UI disables Secret writes on public HTTP.
 See [Worker bindings and encrypted Secrets](./docs/WORKERS.md).
+
+Binary Deliver definitions are signed and hash chained while their bytes are
+content addressed on local replicas or an operator-selected rclone remote.
+`env.FFMPEG.exec()` verifies the calling Worker and current Binary policy on
+every invocation, then starts a fresh bubblewrap namespace with no host
+filesystem and no network by default. See
+[Binary Deliver](./docs/BINARY_DELIVER.md).
 
 The project “Code” tab edits module and static files without mutating an old
 deployment. Every save verifies content hashes and creates a new signed,

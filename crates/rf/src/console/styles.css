@@ -247,6 +247,9 @@ button.build-row:hover { border-color: #444; background: #0e0e0e; }
 .pipeline-state.deployed { background: var(--success); }
 .pipeline-state.success { background: var(--success); }
 .pipeline-state.failed { background: var(--danger); }
+.progress-track { width: 100%; height: 6px; overflow: hidden; border-radius: 999px; background: var(--line-soft); }
+.progress-value { width: 0; height: 100%; border-radius: inherit; background: var(--accent); transition: width .15s ease; }
+.binary-editor-panel { grid-template-columns: minmax(190px, .55fr) minmax(320px, 1.45fr); }
 
 .back-button { border: 0; padding: 0; margin: 0 0 20px; color: var(--muted); background: transparent; cursor: pointer; font-size: 12px; }
 .back-button:hover { color: var(--text); }

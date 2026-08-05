@@ -6,6 +6,8 @@ pub mod analytics;
 pub mod analyticsbind;
 pub mod anchor;
 pub mod auth;
+pub mod binary;
+pub mod binarybind;
 pub mod blob;
 pub mod build;
 pub mod config;

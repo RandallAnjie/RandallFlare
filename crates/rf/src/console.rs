@@ -37,7 +37,7 @@ const TOKEN_HEADER: &str = "x-rf-console-token";
 const CSRF_HEADER: &str = "x-rf-csrf";
 const SESSION_COOKIE: &str = "rf_console_session";
 const MAX_CONSOLE_VALUE: usize = 1024 * 1024;
-const MAX_CONSOLE_UPLOAD: usize = 64 * 1024 * 1024;
+const MAX_CONSOLE_UPLOAD: usize = crate::binary::MAX_BINARY_BYTES;
 const MAX_CONSOLE_FILES: usize = 2048;
 const MAX_EDITOR_CHANGES: usize = 256;
 const MAX_EDITOR_FILE: usize = 25 * 1024 * 1024;
@@ -247,6 +247,7 @@ pub fn router(state: ConsoleState) -> Router {
                 .put(public_api_r2_put)
                 .delete(public_api_r2_delete),
         )
+        .route("/api/v1/binaries/blob", post(public_api_binary_blob))
         .route("/api/v1/d1", get(public_api_d1_list))
         .route("/api/v1/d1/{database}/query", post(public_api_d1_query))
         .route("/api/v1/d1/{database}/exec", post(public_api_d1_exec))
@@ -401,6 +402,9 @@ pub fn router(state: ConsoleState) -> Router {
                 .put(r2_object_put)
                 .delete(r2_object_delete),
         )
+        .route("/api/binaries", get(binary_list).post(binary_apply))
+        .route("/api/binaries/blob", post(binary_blob_upload))
+        .route("/api/binaries/{name}", delete(binary_delete))
         .route("/api/queues", get(queue_list).post(queue_apply))
         .route("/api/queues/{name}", delete(queue_delete))
         .route("/api/queues/{name}/messages", post(queue_send))
@@ -618,6 +622,7 @@ fn public_worker_view(node: &Node, manifest: WorkerManifest) -> Value {
         "workflow_bindings": deploy::workflow_bindings(&manifest),
         "email_bindings": deploy::email_bindings(&manifest),
         "service_bindings": deploy::service_bindings(&manifest),
+        "binary_bindings": deploy::binary_bindings(&manifest),
         "required_tags": crate::placement::required_tags(&manifest),
         "crons": manifest.crons,
         "compatibility_date": manifest.compatibility_date,
@@ -935,6 +940,29 @@ async fn public_api_r2_delete(
     require_api_scope(&principal, "r2:write")?;
     let deleted = state.client.r2_delete(&state.node, &bucket, &key).await?;
     Ok(Json(json!({ "ok": true, "deleted": deleted })))
+}
+
+async fn public_api_binary_blob(
+    State(state): State<ConsoleState>,
+    Extension(principal): Extension<crate::access::AccessPrincipal>,
+    Query(query): Query<BinaryBlobQuery>,
+    body: Bytes,
+) -> ApiResult<Json<Value>> {
+    require_api_scope(&principal, "binary:write")?;
+    if body.is_empty() || body.len() > crate::binary::MAX_BINARY_BYTES {
+        return Err(ApiError::bad_request(
+            "Binary 文件必须介于 1 字节和 200 MiB 之间",
+        ));
+    }
+    let storage = binary_storage(query)?;
+    let (sha256, size_bytes) =
+        crate::binary::store_bytes(state.public_node()?, &storage, &body).await?;
+    Ok(Json(json!({
+        "ok": true,
+        "sha256": sha256,
+        "size_bytes": size_bytes,
+        "storage": storage,
+    })))
 }
 
 async fn public_api_d1_list(
@@ -2589,6 +2617,8 @@ struct WorkerSettingsRequest {
     #[serde(default)]
     service_bindings: Option<BTreeMap<String, String>>,
     #[serde(default)]
+    binary_bindings: Option<BTreeMap<String, String>>,
+    #[serde(default)]
     crons: Option<Vec<String>>,
     #[serde(default)]
     compatibility_date: Option<String>,
@@ -2665,6 +2695,7 @@ async fn worker_get(
     let workflow_bindings = deploy::workflow_bindings(&manifest);
     let email_bindings = deploy::email_bindings(&manifest);
     let service_bindings = deploy::service_bindings(&manifest);
+    let binary_bindings = deploy::binary_bindings(&manifest);
     let secret_names: Vec<String> = crate::worker_secret::encrypted_secrets_checked(&manifest)?
         .into_keys()
         .collect();
@@ -2724,6 +2755,7 @@ async fn worker_get(
             "workflow_bindings": workflow_bindings,
             "email_bindings": email_bindings,
             "service_bindings": service_bindings,
+            "binary_bindings": binary_bindings,
             "secret_names": secret_names,
             "crons": manifest.crons,
             "compatibility_date": manifest.compatibility_date,
@@ -2747,6 +2779,7 @@ fn worker_console_environment(manifest: &WorkerManifest) -> BTreeMap<String, Str
     env.remove(deploy::WORKFLOW_METADATA_ENV);
     env.remove(deploy::EMAIL_METADATA_ENV);
     env.remove(deploy::SERVICE_METADATA_ENV);
+    env.remove(deploy::BINARY_METADATA_ENV);
     env.remove(deploy::SECRET_METADATA_ENV);
     env.remove(deploy::COMPATIBILITY_FLAGS_METADATA_ENV);
     env.remove(crate::placement::REQUIRED_TAGS_METADATA_ENV);
@@ -3303,6 +3336,7 @@ fn apply_worker_settings(
         workflow_bindings,
         email_bindings,
         service_bindings,
+        binary_bindings,
         crons,
         compatibility_date,
         compatibility_flags,
@@ -3319,6 +3353,7 @@ fn apply_worker_settings(
         && workflow_bindings.is_none()
         && email_bindings.is_none()
         && service_bindings.is_none()
+        && binary_bindings.is_none()
         && crons.is_none()
         && compatibility_date.is_none()
         && compatibility_flags.is_none()
@@ -3372,6 +3407,9 @@ fn apply_worker_settings(
         }
         if let Some(services) = manifest.env.get(deploy::SERVICE_METADATA_ENV).cloned() {
             env.insert(deploy::SERVICE_METADATA_ENV.into(), services);
+        }
+        if let Some(binaries) = manifest.env.get(deploy::BINARY_METADATA_ENV).cloned() {
+            env.insert(deploy::BINARY_METADATA_ENV.into(), binaries);
         }
         if let Some(secrets) = manifest.env.get(deploy::SECRET_METADATA_ENV).cloned() {
             env.insert(deploy::SECRET_METADATA_ENV.into(), secrets);
@@ -3625,6 +3663,32 @@ fn apply_worker_settings(
             );
         }
     }
+    if let Some(binary_bindings) = binary_bindings {
+        validate_settings_map(&binary_bindings, "Binary Deliver 绑定")?;
+        let identifier = |value: &str| {
+            let mut chars = value.chars();
+            chars.next().is_some_and(|character| {
+                character.is_ascii_alphabetic() || matches!(character, '_' | '$')
+            }) && chars.all(|character| {
+                character.is_ascii_alphanumeric() || matches!(character, '_' | '$')
+            })
+        };
+        for (binding, binary) in &binary_bindings {
+            if !identifier(binding) || !valid_name(binary) {
+                return Err(ApiError::bad_request(format!(
+                    "Binary Deliver 绑定 {binding} 或 Binary 资源名称无效"
+                )));
+            }
+        }
+        if binary_bindings.is_empty() {
+            manifest.env.remove(deploy::BINARY_METADATA_ENV);
+        } else {
+            manifest.env.insert(
+                deploy::BINARY_METADATA_ENV.into(),
+                serde_json::to_string(&binary_bindings)?,
+            );
+        }
+    }
     if let Some(crons) = crons {
         if crons.len() > 256 {
             return Err(ApiError::bad_request(
@@ -3674,6 +3738,7 @@ fn apply_worker_settings(
         .chain(deploy::workflow_bindings(&manifest).keys())
         .chain(deploy::email_bindings(&manifest).keys())
         .chain(deploy::service_bindings(&manifest).keys())
+        .chain(deploy::binary_bindings(&manifest).keys())
         .chain(encrypted_secrets.keys())
     {
         if !binding_names.insert(name.clone()) {
@@ -4959,6 +5024,231 @@ async fn r2_bucket_delete(
                 "ok": true,
                 "pending_approval": true,
                 "name": record.name,
+                "version": record.version,
+                "approval": approval,
+                "approve_node": node.cfg.peer_api_advertise().to_string(),
+            })))
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct BinaryBlobQuery {
+    #[serde(default = "default_storage_backend")]
+    storage_backend: String,
+    #[serde(default)]
+    rclone_remote: String,
+    #[serde(default)]
+    rclone_prefix: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct BinaryRequest {
+    name: String,
+    #[serde(default)]
+    description: String,
+    sha256: String,
+    size_bytes: u64,
+    storage: crate::objectstore::StorageLocation,
+    #[serde(default = "default_binary_os_arch")]
+    os_arch: String,
+    #[serde(default = "default_binary_timeout")]
+    default_timeout_ms: u64,
+    #[serde(default = "default_binary_io_limit")]
+    max_stdin_bytes: u64,
+    #[serde(default = "default_binary_io_limit")]
+    max_output_bytes: u64,
+    #[serde(default)]
+    allow_network: bool,
+    #[serde(default)]
+    allow_r2: bool,
+    #[serde(default)]
+    required_tags: Vec<String>,
+    #[serde(default)]
+    suspended: bool,
+}
+
+fn default_binary_os_arch() -> String {
+    crate::binary::current_os_arch().into()
+}
+
+fn default_binary_timeout() -> u64 {
+    30_000
+}
+
+fn default_binary_io_limit() -> u64 {
+    10 * 1024 * 1024
+}
+
+fn binary_storage(query: BinaryBlobQuery) -> ApiResult<crate::objectstore::StorageLocation> {
+    match query.storage_backend.as_str() {
+        "local" if query.rclone_remote.is_empty() && query.rclone_prefix.is_empty() => {
+            Ok(crate::objectstore::StorageLocation::Local)
+        }
+        "rclone" if !query.rclone_remote.is_empty() => {
+            Ok(crate::objectstore::StorageLocation::Rclone {
+                remote: query.rclone_remote,
+                prefix: query.rclone_prefix,
+            })
+        }
+        "local" => Err(ApiError::bad_request(
+            "本地存储不能同时填写 rclone remote 或前缀",
+        )),
+        "rclone" => Err(ApiError::bad_request("请选择 rclone remote")),
+        _ => Err(ApiError::bad_request("存储后端必须是 local 或 rclone")),
+    }
+}
+
+async fn binary_blob_upload(
+    State(state): State<ConsoleState>,
+    Query(query): Query<BinaryBlobQuery>,
+    body: Bytes,
+) -> ApiResult<Json<Value>> {
+    state.require_mutation()?;
+    let storage = binary_storage(query)?;
+    if body.is_empty() || body.len() > crate::binary::MAX_BINARY_BYTES {
+        return Err(ApiError::bad_request(
+            "Binary 文件必须介于 1 字节和 200 MiB 之间",
+        ));
+    }
+    let (sha256, size_bytes, storage) = match &state.mode {
+        ConsoleMode::Local { .. } => {
+            state
+                .client
+                .binary_put_blob(&state.node, &body, &storage)
+                .await?
+        }
+        ConsoleMode::Public { node, .. } => {
+            let (sha256, size_bytes) = crate::binary::store_bytes(node, &storage, &body).await?;
+            (sha256, size_bytes, storage)
+        }
+    };
+    Ok(Json(json!({
+        "ok": true,
+        "sha256": sha256,
+        "size_bytes": size_bytes,
+        "storage": storage,
+    })))
+}
+
+async fn binary_list(State(state): State<ConsoleState>) -> ApiResult<Json<Value>> {
+    let binaries = state
+        .client
+        .resource_heads(&state.node, Some(crate::binary::BINARY_KIND))
+        .await?
+        .into_iter()
+        .filter(|view| !view.resource.deleted)
+        .map(|view| {
+            let spec = crate::binary::binary_spec(&view.resource)?;
+            Ok(json!({
+                "name": view.resource.name,
+                "version": view.resource.version,
+                "digest": view.digest,
+                "spec": spec,
+            }))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let status = state.client.status(&state.node).await?;
+    Ok(Json(json!({
+        "binaries": binaries,
+        "capabilities": status.get("storage").cloned().unwrap_or_else(|| json!({
+            "local": true,
+            "rclone": false,
+        })),
+        "current_os_arch": crate::binary::current_os_arch(),
+    })))
+}
+
+async fn binary_apply(
+    State(state): State<ConsoleState>,
+    Extension(principal): Extension<ConsolePrincipal>,
+    Json(request): Json<BinaryRequest>,
+) -> ApiResult<Json<Value>> {
+    state.require_mutation()?;
+    let approval_size = request.size_bytes;
+    let approval_sha_prefix = request.sha256[..request.sha256.len().min(12)].to_string();
+    let spec = crate::binary::BinarySpec {
+        schema: crate::binary::BINARY_SCHEMA,
+        description: request.description,
+        sha256: request.sha256,
+        size_bytes: request.size_bytes,
+        storage: request.storage,
+        os_arch: request.os_arch,
+        default_timeout_ms: request.default_timeout_ms,
+        max_stdin_bytes: request.max_stdin_bytes,
+        max_output_bytes: request.max_output_bytes,
+        allow_network: request.allow_network,
+        allow_r2: request.allow_r2,
+        required_tags: request.required_tags,
+        suspended: request.suspended,
+    };
+    let head = state
+        .client
+        .resource_head(&state.node, crate::binary::BINARY_KIND, &request.name)
+        .await?;
+    let record = crate::binary::prepare_after(&request.name, spec, false, head.as_ref())?;
+    match &state.mode {
+        ConsoleMode::Local { .. } => {
+            let envelope = rf_core::envelope::Envelope::seal_any(&record, state.operator()?);
+            state.client.post_resource(&state.node, &envelope).await?;
+            Ok(Json(json!({
+                "ok": true,
+                "name": record.name,
+                "version": record.version,
+            })))
+        }
+        ConsoleMode::Public { node, .. } => {
+            let approval = node.management.create_resource(
+                principal.session_id,
+                &record,
+                format!(
+                    "创建或更新 Binary Deliver {} v{}（{} 字节，SHA-256 {}...）",
+                    record.name, record.version, approval_size, approval_sha_prefix
+                ),
+            )?;
+            Ok(Json(json!({
+                "ok": true,
+                "pending_approval": true,
+                "name": record.name,
+                "version": record.version,
+                "approval": approval,
+                "approve_node": node.cfg.peer_api_advertise().to_string(),
+            })))
+        }
+    }
+}
+
+async fn binary_delete(
+    State(state): State<ConsoleState>,
+    Extension(principal): Extension<ConsolePrincipal>,
+    Path(name): Path<String>,
+) -> ApiResult<Json<Value>> {
+    state.require_mutation()?;
+    let head = state
+        .client
+        .resource_head(&state.node, crate::binary::BINARY_KIND, &name)
+        .await?
+        .filter(|view| !view.resource.deleted)
+        .ok_or_else(|| ApiError::not_found("Binary Deliver 定义不存在"))?;
+    let spec = crate::binary::binary_spec(&head.resource)?;
+    let record = crate::binary::prepare_after(&name, spec, true, Some(&head))?;
+    match &state.mode {
+        ConsoleMode::Local { .. } => {
+            let envelope = rf_core::envelope::Envelope::seal_any(&record, state.operator()?);
+            state.client.post_resource(&state.node, &envelope).await?;
+            Ok(Json(json!({ "ok": true, "version": record.version })))
+        }
+        ConsoleMode::Public { node, .. } => {
+            let approval = node.management.create_resource(
+                principal.session_id,
+                &record,
+                format!("Binary Deliver {} 删除墓碑 v{}", name, record.version),
+            )?;
+            Ok(Json(json!({
+                "ok": true,
+                "pending_approval": true,
                 "version": record.version,
                 "approval": approval,
                 "approve_node": node.cfg.peer_api_advertise().to_string(),
@@ -6909,6 +7199,7 @@ mod tests {
                     "support-mail".into(),
                 )])),
                 service_bindings: Some(BTreeMap::from([("BACKEND".into(), "backend".into())])),
+                binary_bindings: Some(BTreeMap::from([("FFMPEG".into(), "ffmpeg".into())])),
                 crons: Some(vec!["*/5 * * * *".into()]),
                 compatibility_date: Some("2026-08-04".into()),
                 compatibility_flags: Some(vec!["nodejs_compat".into()]),
@@ -6938,6 +7229,7 @@ mod tests {
             "order-flow"
         );
         assert_eq!(deploy::service_bindings(&updated)["BACKEND"], "backend");
+        assert_eq!(deploy::binary_bindings(&updated)["FFMPEG"], "ffmpeg");
         assert_eq!(updated.kv_bindings["CACHE"], "shared");
         assert_eq!(updated.crons, vec!["*/5 * * * *"]);
         assert_eq!(deploy::compatibility_flags(&updated), ["nodejs_compat"]);
