@@ -799,6 +799,21 @@ impl Driver {
             tx.commit()?;
             Ok((is_batch, results))
         })();
+        if result.is_ok() {
+            let audit = crate::data_audit::d1_mutation(
+                &self.name,
+                &entry,
+                self.node.id_hex(),
+                crate::node::now_ms(),
+            );
+            if let Err(error) = self.node.store.put_data_audit(&audit) {
+                tracing::error!(
+                    "d1 {}: persist data audit for seq {}: {error:#}",
+                    self.name,
+                    entry.seq
+                );
+            }
+        }
         // Answer the proposer if this was ours.
         if let Some(tag) = self.my_entries.remove(&entry.seq) {
             if let Some(resp) = self.pending.remove(&tag) {

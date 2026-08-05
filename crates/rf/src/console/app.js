@@ -4137,13 +4137,34 @@ async function revokeS3Credential(id) {
 
 async function loadSecurityAudit({ quiet = false } = {}) {
   try {
+    const bucketSelect = $("#security-audit-bucket");
+    const selectedBucket = bucketSelect.value;
+    bucketSelect.innerHTML = '<option value="">请选择 bucket</option>' + (state.r2Buckets || []).map((bucket) => `<option value="${escapeHtml(bucket.name)}">${escapeHtml(bucket.name)} · ${escapeHtml(storageLocationCopy(bucket.storage))}</option>`).join("");
+    if ((state.r2Buckets || []).some((bucket) => bucket.name === selectedBucket)) bucketSelect.value = selectedBucket;
     const data = await api("/api/security/audit?limit=500");
     state.auditRecords = data.records || [];
+    const mutations = data.mutations || [];
     const box = $("#security-audit-list");
-    box.classList.toggle("empty-state", state.auditRecords.length === 0);
-    box.innerHTML = state.auditRecords.length ? state.auditRecords.map((record) => `<article class="build-row success"><span class="pipeline-state success"></span><div><strong>${escapeHtml(record.kind)}/${escapeHtml(record.name)} · v${escapeHtml(record.version)}</strong><small>${record.deleted ? "墓碑" : record.redacted ? "敏感配置已隐藏" : "签名配置"}</small><code>${escapeHtml(record.digest)}</code></div><div><span class="badge">前序 ${escapeHtml(record.previous ? shortId(record.previous, 14) : "创世")}</span></div></article>`).join("") : "暂无平台资源历史。";
+    box.classList.toggle("empty-state", state.auditRecords.length === 0 && mutations.length === 0);
+    const signedRows = state.auditRecords.map((record) => `<article class="build-row success"><span class="pipeline-state success"></span><div><strong>${escapeHtml(record.kind)}/${escapeHtml(record.name)} · v${escapeHtml(record.version)}</strong><small>${record.deleted ? "墓碑" : record.redacted ? "敏感配置已隐藏" : "签名配置"}</small><code>${escapeHtml(record.digest)}</code></div><div><span class="badge">前序 ${escapeHtml(record.previous ? shortId(record.previous, 14) : "创世")}</span></div></article>`).join("");
+    const mutationLabels = { kv_put: "KV 写入", kv_delete: "KV 删除", d1_commit: "D1 提交" };
+    const mutationRows = mutations.map((entry) => `<article class="build-row"><span class="pipeline-state active"></span><div><strong>${escapeHtml(mutationLabels[entry.kind] || entry.kind)} · ${escapeHtml(entry.resource)}</strong><small>${escapeHtml(new Date(entry.occurred_at_ms).toLocaleString("zh-CN"))} · ${entry.sequence == null ? `键摘要 ${escapeHtml(shortId(entry.subject_sha256, 16))}` : `Raft 序号 ${escapeHtml(entry.sequence)}`} · ${escapeHtml(formatBytes(entry.bytes || 0))}</small><code>${escapeHtml(entry.content_sha256)}</code></div><div><span class="badge">仅保存内容证明</span><small>观测节点 ${escapeHtml(shortId(entry.observed_by, 12))}</small></div></article>`).join("");
+    box.innerHTML = signedRows + mutationRows || "暂无签名资源或数据变更审计。";
     if (!quiet) toast("签名资源审计已刷新");
   } catch (error) { if (!quiet) toast(error.message, true); }
+}
+
+async function archiveSecurityAudit(event) {
+  event.preventDefault();
+  const bucket = $("#security-audit-bucket").value;
+  if (!bucket) return toast("请选择数据审计归档 bucket", true);
+  try {
+    const archive = await api("/api/security/audit/archive", {
+      method: "POST",
+      body: JSON.stringify({ bucket, prefix: $("#security-audit-prefix").value.trim() || "data-audit" }),
+    });
+    toast(`已归档 ${archive.entries} 条证明：${archive.object_key}`);
+  } catch (error) { toast(error.message, true); }
 }
 
 async function loadOverview({ quiet = false } = {}) {
@@ -4903,6 +4924,7 @@ $("#hostname-list").addEventListener("click", (event) => {
 });
 $("#security-refresh").addEventListener("click", () => loadSecurity());
 $("#security-audit-refresh").addEventListener("click", () => loadSecurityAudit());
+$("#security-audit-archive-form").addEventListener("submit", archiveSecurityAudit);
 $("#quota-form").addEventListener("submit", saveQuota);
 $("#quota-form").addEventListener("input", () => { state.securityDirty = true; });
 $("#quota-form").addEventListener("change", () => { state.securityDirty = true; });

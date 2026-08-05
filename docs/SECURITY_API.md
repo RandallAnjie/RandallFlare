@@ -87,7 +87,7 @@ flow.
 | Workflows and Flows | `/api/v1/workflows/…`, `/api/v1/flows/…` |
 | Email | `/api/v1/email/…` including message metadata, sending, and raw source |
 | Device network | `GET /api/v1/network` returns redacted rules, devices, and live exit endpoints |
-| Audit | `GET /api/v1/audit` |
+| Audit | `GET /api/v1/audit` returns signed history plus privacy-preserving KV/D1 mutation proofs |
 
 Worker and generic resource writes accept an operator-signed binary envelope,
 not unsigned JSON. Admission rechecks the signature, hash-chain relationship,

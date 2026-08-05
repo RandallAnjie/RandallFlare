@@ -16,6 +16,7 @@ pub mod cron_driver;
 pub mod d1;
 pub mod d1_backup;
 pub mod d1bind;
+pub mod data_audit;
 pub mod deploy;
 pub mod dns;
 pub mod durable;

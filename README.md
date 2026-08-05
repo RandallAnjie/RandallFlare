@@ -126,6 +126,10 @@ Working today, verified by multi-process fault-injection e2e tests:
   domains, automatic TLS discovery, Worker `env.ARCHIVE.send()`, SQL transforms,
   status/batch audit, CLI and the Chinese console are covered by real-workerd
   and public-ingress tests. See [the Pipeline guide](./docs/PIPELINES.md).
+- **Privacy-preserving data audit**: KV keys/values and D1 SQL/parameters never
+  enter the audit log; deterministic mutation proofs merge across live nodes
+  and can be archived as gzip JSONL into local or rclone-backed R2. See
+  [the data audit guide](./docs/DATA_AUDIT.md).
 - **Durable Workflows**: operator-signed definitions use an independent D1
   micro-quorum for idempotent instances, replay logs, external signals and an
   append-only audit trail. Export a `WorkflowEntrypoint` from the same Worker;

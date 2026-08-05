@@ -97,6 +97,11 @@ enum Cmd {
         #[command(subcommand)]
         cmd: AccessCmd,
     },
+    /// 查看或归档不含业务正文的 KV/D1 数据变更证明。
+    Audit {
+        #[command(subcommand)]
+        cmd: AuditCmd,
+    },
     /// Delete (tombstone) a worker.
     WorkerDelete {
         name: String,
@@ -252,6 +257,34 @@ enum AccessCmd {
         node: String,
         #[arg(long, env = "RF_OPERATOR_KEY")]
         key: Option<PathBuf>,
+        #[arg(long, env = "RF_CLUSTER_SECRET")]
+        secret: String,
+    },
+}
+
+#[derive(Subcommand)]
+enum AuditCmd {
+    /// 聚合存活节点的 KV/D1 数据变更证明。
+    List {
+        #[arg(long)]
+        before_ms: Option<u64>,
+        #[arg(long, default_value_t = 500)]
+        limit: usize,
+        #[arg(long, env = "RF_NODE")]
+        node: String,
+        #[arg(long, env = "RF_CLUSTER_SECRET")]
+        secret: String,
+    },
+    /// 把当前审计窗口压缩为 JSONL 并写入本地或 rclone-backed R2 bucket。
+    Archive {
+        #[arg(long)]
+        bucket: String,
+        #[arg(long, default_value = "data-audit")]
+        prefix: String,
+        #[arg(long)]
+        before_ms: Option<u64>,
+        #[arg(long, env = "RF_NODE")]
+        node: String,
         #[arg(long, env = "RF_CLUSTER_SECRET")]
         secret: String,
     },
@@ -1834,6 +1867,33 @@ async fn async_main(cli: Cli) -> Result<()> {
                     )
                     .await?;
                 println!("API 访问令牌 {id} 已撤销（v{}）", record.version);
+                Ok(())
+            }
+        },
+        Cmd::Audit { cmd } => match cmd {
+            AuditCmd::List {
+                before_ms,
+                limit,
+                node,
+                secret,
+            } => {
+                let client = PeerClient::new(secret_bytes(&secret)?);
+                let snapshot = client.data_audit_cluster(&node, before_ms, limit).await?;
+                println!("{}", serde_json::to_string_pretty(&snapshot)?);
+                Ok(())
+            }
+            AuditCmd::Archive {
+                bucket,
+                prefix,
+                before_ms,
+                node,
+                secret,
+            } => {
+                let client = PeerClient::new(secret_bytes(&secret)?);
+                let archive = client
+                    .data_audit_archive(&node, &bucket, &prefix, before_ms)
+                    .await?;
+                println!("{}", serde_json::to_string_pretty(&archive)?);
                 Ok(())
             }
         },

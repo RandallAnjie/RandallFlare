@@ -1857,6 +1857,36 @@ export default {
     assert_eq!(backed_up_name, "安杰");
     drop(backup_db);
     std::fs::remove_file(backup_path).unwrap();
+    let audit = client
+        .data_audit_cluster(&n.api, None, 1_000)
+        .await
+        .unwrap();
+    assert!(audit
+        .entries
+        .iter()
+        .any(|entry| entry.kind == "kv_put" && entry.resource == "ns1"));
+    assert!(audit.entries.iter().any(|entry| {
+        entry.kind == "d1_commit" && entry.resource == "worker-db" && entry.sequence.is_some()
+    }));
+    let audit_archive = client
+        .data_audit_archive(&n.api, "pipeline-output", "audit-e2e", None)
+        .await
+        .unwrap();
+    assert!(audit_archive.entries >= 2);
+    let (_, compressed_audit) = client
+        .r2_get(&n.api, "pipeline-output", &audit_archive.object_key)
+        .await
+        .unwrap()
+        .unwrap();
+    let mut archived_jsonl = String::new();
+    flate2::read::GzDecoder::new(compressed_audit.as_slice())
+        .read_to_string(&mut archived_jsonl)
+        .unwrap();
+    assert!(archived_jsonl
+        .lines()
+        .all(|line| { serde_json::from_str::<rf::data_audit::DataMutationAudit>(line).is_ok() }));
+    assert!(!archived_jsonl.contains("written-by-worker"));
+    assert!(!archived_jsonl.contains("INSERT INTO users"));
     assert!(client
         .email_verification(&n.api, "mail-e2e")
         .await

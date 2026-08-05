@@ -8,6 +8,7 @@
 //!   claims:     "task\0holder_hex"   → claim Envelope
 //!   kv:         "ns\0key"            → KvEntry (postcard)
 
+use crate::data_audit::DataMutationAudit;
 use crate::observability::{RequestAggregate, RequestLogEntry};
 use anyhow::{Context, Result};
 use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition};
@@ -27,6 +28,7 @@ const D1LOG: TableDefinition<&str, &[u8]> = TableDefinition::new("d1_log");
 const LOG: TableDefinition<&str, &[u8]> = TableDefinition::new("manifest_log");
 /// Node-local Worker request metadata. The key preserves worker/time ordering.
 const REQUEST_LOGS: TableDefinition<&str, &[u8]> = TableDefinition::new("request_logs");
+const DATA_AUDIT: TableDefinition<&str, &[u8]> = TableDefinition::new("data_audit");
 /// Node-local best-effort credential activity. Secrets/hashes never enter this
 /// table; each node only records the last successful use it observed.
 const CREDENTIAL_USAGE: TableDefinition<&str, u64> = TableDefinition::new("credential_usage");
@@ -57,6 +59,7 @@ impl Store {
             tx.open_table(D1META)?;
             tx.open_table(D1LOG)?;
             tx.open_table(REQUEST_LOGS)?;
+            tx.open_table(DATA_AUDIT)?;
             tx.open_table(CREDENTIAL_USAGE)?;
         }
         tx.commit()?;
@@ -265,14 +268,94 @@ impl Store {
     }
 
     pub fn put_kv(&self, ns: &str, key: &str, entry: &KvEntry) -> Result<()> {
+        self.put_kv_audited(ns, key, entry, None)
+    }
+
+    pub fn put_kv_audited(
+        &self,
+        ns: &str,
+        key: &str,
+        entry: &KvEntry,
+        audit: Option<&DataMutationAudit>,
+    ) -> Result<()> {
         let bytes = postcard::to_stdvec(entry)?;
+        let audit = match audit {
+            Some(entry) => Some((entry.id.clone(), postcard::to_stdvec(entry)?)),
+            None => None,
+        };
         let tx = self.db.begin_write()?;
         {
             let mut t = tx.open_table(KV)?;
             t.insert(Self::kv_key(ns, key).as_str(), bytes.as_slice())?;
+            if let Some((id, bytes)) = &audit {
+                tx.open_table(DATA_AUDIT)?
+                    .insert(id.as_str(), bytes.as_slice())?;
+            }
         }
         tx.commit()?;
         Ok(())
+    }
+
+    // ---- privacy-preserving data mutation audit ----
+
+    pub fn put_data_audit(&self, entry: &DataMutationAudit) -> Result<()> {
+        let bytes = postcard::to_stdvec(entry)?;
+        let tx = self.db.begin_write()?;
+        {
+            tx.open_table(DATA_AUDIT)?
+                .insert(entry.id.as_str(), bytes.as_slice())?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn load_data_audit(
+        &self,
+        before_ms: Option<u64>,
+        limit: usize,
+    ) -> Result<Vec<DataMutationAudit>> {
+        let tx = self.db.begin_read()?;
+        let table = tx.open_table(DATA_AUDIT)?;
+        let mut entries = Vec::new();
+        for item in table.range::<&str>(..)? {
+            let (_, value) = item?;
+            let entry: DataMutationAudit =
+                postcard::from_bytes(value.value()).context("corrupt data audit entry")?;
+            if before_ms.is_none_or(|before| entry.occurred_at_ms < before) {
+                entries.push(entry);
+            }
+        }
+        entries.sort_by(|left, right| {
+            right
+                .occurred_at_ms
+                .cmp(&left.occurred_at_ms)
+                .then_with(|| right.id.cmp(&left.id))
+        });
+        entries.truncate(limit.clamp(1, crate::data_audit::MAX_DATA_AUDIT_PAGE));
+        Ok(entries)
+    }
+
+    pub fn delete_data_audit_before(&self, cutoff_ms: u64) -> Result<usize> {
+        let tx = self.db.begin_write()?;
+        let removed;
+        {
+            let mut table = tx.open_table(DATA_AUDIT)?;
+            let mut stale = Vec::new();
+            for item in table.range::<&str>(..)? {
+                let (key, value) = item?;
+                let entry: DataMutationAudit =
+                    postcard::from_bytes(value.value()).context("corrupt data audit entry")?;
+                if entry.occurred_at_ms < cutoff_ms {
+                    stale.push(key.value().to_string());
+                }
+            }
+            removed = stale.len();
+            for key in stale {
+                table.remove(key.as_str())?;
+            }
+        }
+        tx.commit()?;
+        Ok(removed)
     }
 
     pub fn delete_kv(&self, ns: &str, key: &str) -> Result<()> {
@@ -469,6 +552,30 @@ mod tests {
         assert_eq!(store.load_kv().unwrap(), vec![("ns".into(), "k".into(), e)]);
         store.delete_kv("ns", "k").unwrap();
         assert!(store.load_kv().unwrap().is_empty());
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn kv_and_privacy_audit_commit_atomically_and_expire() {
+        let path = tmp();
+        let store = Store::open(&path).unwrap();
+        let entry = KvEntry {
+            hlc: Hlc {
+                wall_ms: 9_000,
+                logical: 1,
+            },
+            writer: PublicId([8; 32]),
+            value: Some(b"private".to_vec()),
+            expires_at_ms: None,
+        };
+        let audit = crate::data_audit::kv_mutation("customer", "key", &entry).unwrap();
+        store
+            .put_kv_audited("customer", "key", &entry, Some(&audit))
+            .unwrap();
+        assert_eq!(store.load_data_audit(None, 10).unwrap(), [audit]);
+        assert_eq!(store.delete_data_audit_before(10_000).unwrap(), 1);
+        assert!(store.load_data_audit(None, 10).unwrap().is_empty());
+        drop(store);
         std::fs::remove_file(&path).ok();
     }
 

@@ -350,6 +350,7 @@ pub fn router(state: ConsoleState) -> Router {
         .route("/api/nodes/{id}", axum::routing::patch(node_update))
         .route("/api/security", get(security_overview))
         .route("/api/security/audit", get(security_audit))
+        .route("/api/security/audit/archive", post(data_audit_archive))
         .route("/api/security/quota", axum::routing::patch(quota_update))
         .route("/api/security/tokens", post(access_token_create))
         .route("/api/security/tokens/{id}", delete(access_token_revoke))
@@ -1283,7 +1284,8 @@ async fn public_api_audit(
         .collect::<Vec<_>>();
     records.extend(worker_audit_records(node, None)?);
     records.sort_by(audit_value_order);
-    Ok(Json(json!({ "records": records })))
+    let mutations = crate::data_audit::cluster_entries(node, None, 500).await?;
+    Ok(Json(json!({ "records": records, "mutations": mutations })))
 }
 
 #[derive(Debug, Deserialize)]
@@ -3003,6 +3005,37 @@ struct SecurityAuditQuery {
     limit: Option<usize>,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DataAuditArchiveRequest {
+    bucket: String,
+    #[serde(default = "console_default_data_audit_prefix")]
+    prefix: String,
+    #[serde(default)]
+    before_ms: Option<u64>,
+}
+
+fn console_default_data_audit_prefix() -> String {
+    "data-audit".into()
+}
+
+async fn data_audit_archive(
+    State(state): State<ConsoleState>,
+    Json(request): Json<DataAuditArchiveRequest>,
+) -> ApiResult<Json<Value>> {
+    state.require_mutation()?;
+    let archive = state
+        .client
+        .data_audit_archive(
+            &state.node,
+            &request.bucket,
+            &request.prefix,
+            request.before_ms,
+        )
+        .await?;
+    Ok(Json(serde_json::to_value(archive)?))
+}
+
 async fn security_audit(
     State(state): State<ConsoleState>,
     Query(query): Query<SecurityAuditQuery>,
@@ -3051,7 +3084,12 @@ async fn security_audit(
     }
     records.sort_by(audit_value_order);
     records.truncate(limit);
-    Ok(Json(json!({ "records": records })))
+    let mutations = if query.kind.is_none() && query.name.is_none() {
+        crate::data_audit::cluster_entries(node, None, limit).await?
+    } else {
+        Vec::new()
+    };
+    Ok(Json(json!({ "records": records, "mutations": mutations })))
 }
 
 fn worker_audit_records(node: &Node, name: Option<&str>) -> ApiResult<Vec<Value>> {

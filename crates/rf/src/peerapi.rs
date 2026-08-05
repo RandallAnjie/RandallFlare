@@ -107,6 +107,9 @@ pub fn router(api: Api) -> Router {
         .route("/v1/worker-dispatch", post(worker_dispatch))
         .route("/v1/worker-tunnel", post(worker_tunnel))
         .route("/v1/log/{name}", get(log_get))
+        .route("/v1/audit/data", get(data_audit))
+        .route("/v1/audit/data/cluster", get(data_audit_cluster))
+        .route("/v1/audit/data/archive", post(data_audit_archive))
         .route(
             "/v1/observability/{worker}/requests",
             get(worker_request_logs),
@@ -2065,6 +2068,103 @@ async fn worker_request_logs(
 #[derive(serde::Deserialize)]
 struct WorkerRuntimeLogsQuery {
     limit: Option<usize>,
+}
+
+#[derive(serde::Deserialize)]
+struct DataAuditQuery {
+    before_ms: Option<u64>,
+    limit: Option<usize>,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DataAuditArchiveRequest {
+    bucket: String,
+    #[serde(default = "default_data_audit_prefix")]
+    prefix: String,
+    #[serde(default)]
+    before_ms: Option<u64>,
+}
+
+fn default_data_audit_prefix() -> String {
+    "data-audit".into()
+}
+
+async fn data_audit(
+    State(api): State<Api>,
+    ConnectInfo(remote): ConnectInfo<SocketAddr>,
+    Query(query): Query<DataAuditQuery>,
+    method: Method,
+    uri: Uri,
+    headers: HeaderMap,
+) -> Response {
+    if let Err(response) = check(&api, &remote, &headers, &method, &uri, b"") {
+        return response.into_response();
+    }
+    match api
+        .node
+        .store
+        .load_data_audit(query.before_ms, query.limit.unwrap_or(500))
+    {
+        Ok(entries) => axum::Json(serde_json::json!({
+            "node": api.node.id_hex(),
+            "label": api.node.cfg.label.clone(),
+            "entries": entries,
+        }))
+        .into_response(),
+        Err(error) => (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()).into_response(),
+    }
+}
+
+async fn data_audit_cluster(
+    State(api): State<Api>,
+    ConnectInfo(remote): ConnectInfo<SocketAddr>,
+    Query(query): Query<DataAuditQuery>,
+    method: Method,
+    uri: Uri,
+    headers: HeaderMap,
+) -> Response {
+    if let Err(response) = check(&api, &remote, &headers, &method, &uri, b"") {
+        return response.into_response();
+    }
+    match crate::data_audit::cluster_entries(&api.node, query.before_ms, query.limit.unwrap_or(500))
+        .await
+    {
+        Ok(entries) => axum::Json(crate::data_audit::DataAuditSnapshot {
+            node: api.node.id_hex(),
+            label: "集群合并视图".into(),
+            entries,
+        })
+        .into_response(),
+        Err(error) => (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()).into_response(),
+    }
+}
+
+async fn data_audit_archive(
+    State(api): State<Api>,
+    ConnectInfo(remote): ConnectInfo<SocketAddr>,
+    method: Method,
+    uri: Uri,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    if let Err(response) = check(&api, &remote, &headers, &method, &uri, &body) {
+        return response.into_response();
+    }
+    let Ok(request) = serde_json::from_slice::<DataAuditArchiveRequest>(&body) else {
+        return (StatusCode::BAD_REQUEST, "bad data audit archive request").into_response();
+    };
+    match crate::data_audit::archive(
+        &api.node,
+        &request.bucket,
+        &request.prefix,
+        request.before_ms,
+    )
+    .await
+    {
+        Ok(archive) => axum::Json(archive).into_response(),
+        Err(error) => (StatusCode::UNPROCESSABLE_ENTITY, error.to_string()).into_response(),
+    }
 }
 
 async fn worker_runtime_logs(

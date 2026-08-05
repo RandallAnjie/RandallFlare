@@ -820,6 +820,55 @@ impl PeerClient {
         Ok(serde_json::from_slice(&raw)?)
     }
 
+    pub async fn data_audit(
+        &self,
+        base: &str,
+        before_ms: Option<u64>,
+        limit: usize,
+    ) -> Result<crate::data_audit::DataAuditSnapshot> {
+        let mut path = format!("/v1/audit/data?limit={}", limit.clamp(1, 10_000));
+        if let Some(before_ms) = before_ms {
+            path.push_str(&format!("&before_ms={before_ms}"));
+        }
+        let raw = self.get(base, &path).await?;
+        Ok(serde_json::from_slice(&raw)?)
+    }
+
+    pub async fn data_audit_cluster(
+        &self,
+        base: &str,
+        before_ms: Option<u64>,
+        limit: usize,
+    ) -> Result<crate::data_audit::DataAuditSnapshot> {
+        let mut path = format!("/v1/audit/data/cluster?limit={}", limit.clamp(1, 10_000));
+        if let Some(before_ms) = before_ms {
+            path.push_str(&format!("&before_ms={before_ms}"));
+        }
+        let raw = self.get(base, &path).await?;
+        Ok(serde_json::from_slice(&raw)?)
+    }
+
+    pub async fn data_audit_archive(
+        &self,
+        base: &str,
+        bucket: &str,
+        prefix: &str,
+        before_ms: Option<u64>,
+    ) -> Result<crate::data_audit::DataAuditArchive> {
+        let raw = self
+            .post(
+                base,
+                "/v1/audit/data/archive",
+                serde_json::to_vec(&serde_json::json!({
+                    "bucket": bucket,
+                    "prefix": prefix,
+                    "before_ms": before_ms,
+                }))?,
+            )
+            .await?;
+        Ok(serde_json::from_slice(&raw)?)
+    }
+
     pub async fn kv_get(&self, base: &str, ns: &str, key: &str) -> Result<Option<Vec<u8>>> {
         let path = format!("/v1/kv/{}/{}", component(ns), component(key));
         match self.get(base, &path).await {

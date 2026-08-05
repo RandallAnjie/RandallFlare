@@ -1216,7 +1216,12 @@ Content-Type: text/plain; charset=utf-8
           </article>
 
           <article class="panel">
-            <div class="panel-head"><div><p class="eyebrow">全资源透明日志</p><h2>签名变更审计</h2><p class="muted compact-copy">每条记录都有前序摘要、版本与当前摘要；令牌摘要和凭据密文在控制台审计响应中整体隐藏。</p></div><button id="security-audit-refresh" class="secondary compact" type="button">刷新审计</button></div>
+            <div class="panel-head"><div><p class="eyebrow">全资源透明日志</p><h2>签名与数据变更审计</h2><p class="muted compact-copy">签名资源保留前序摘要、版本与当前摘要；KV/D1 仅保留键/命令与内容摘要，不记录键名、值、SQL 或参数。令牌摘要和凭据密文始终隐藏。</p></div><button id="security-audit-refresh" class="secondary compact" type="button">刷新审计</button></div>
+            <form id="security-audit-archive-form" class="inline-form">
+              <label><span>归档到 R2 / rclone</span><select id="security-audit-bucket" required><option value="">请选择 bucket</option></select></label>
+              <label><span>对象前缀</span><input id="security-audit-prefix" value="data-audit" maxlength="512"></label>
+              <button class="secondary" type="submit">生成 gzip JSONL 归档</button>
+            </form>
             <div id="security-audit-list" class="build-list empty-state">正在读取签名资源历史…</div>
           </article>
         </section>

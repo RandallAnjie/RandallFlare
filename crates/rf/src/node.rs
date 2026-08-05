@@ -466,7 +466,8 @@ impl Node {
                 inner.platform_resource_generation =
                     inner.platform_resource_generation.wrapping_add(1);
             }
-            self.store.put_kv(ns, key, &entry)?;
+            let audit = crate::data_audit::kv_mutation(ns, key, &entry);
+            self.store.put_kv_audited(ns, key, &entry, audit.as_ref())?;
         }
         self.emit(NodeEvent::Kv(ns.to_string()));
         Ok(())
@@ -571,7 +572,9 @@ impl Node {
                     .merge(&key, entry.clone())
                     == Merge::Applied
                 {
-                    self.store.put_kv(ns, &key, &entry)?;
+                    let audit = crate::data_audit::kv_mutation(ns, &key, &entry);
+                    self.store
+                        .put_kv_audited(ns, &key, &entry, audit.as_ref())?;
                     applied += 1;
                 }
             }

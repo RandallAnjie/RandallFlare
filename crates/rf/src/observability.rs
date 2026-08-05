@@ -216,6 +216,11 @@ pub fn spawn(node: Arc<Node>) {
                 } else {
                     last_cleanup = now;
                 }
+                if let Err(error) = node.store.delete_data_audit_before(
+                    now.saturating_sub(crate::data_audit::DATA_AUDIT_RETENTION_MS),
+                ) {
+                    tracing::warn!("清理过期 KV/D1 数据审计失败：{error:#}");
+                }
             }
         }
     });
