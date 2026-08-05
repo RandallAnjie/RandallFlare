@@ -13,7 +13,7 @@ use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::Duration;
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::process::Command;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -166,6 +166,66 @@ impl ObjectStore {
                 command_ok("rclone rcat", output)
             }
         }
+    }
+
+    /// Publish an already-spooled file without reading it into memory. The
+    /// source is hashed again before any backend mutation, so callers cannot
+    /// use a forged expected digest to select a content-addressed path.
+    pub async fn put_file_verified(
+        &self,
+        location: &StorageLocation,
+        expected: &[u8; 32],
+        source: &Path,
+    ) -> Result<u64> {
+        location.validate()?;
+        let mut file = tokio::fs::File::open(source)
+            .await
+            .with_context(|| format!("打开待发布对象 {}", source.display()))?;
+        let mut hasher = Sha256::new();
+        let mut size = 0u64;
+        let mut buffer = vec![0u8; 1024 * 1024];
+        loop {
+            let read = file.read(&mut buffer).await?;
+            if read == 0 {
+                break;
+            }
+            hasher.update(&buffer[..read]);
+            size = size.checked_add(read as u64).context("对象文件大小溢出")?;
+        }
+        let actual: [u8; 32] = hasher.finalize().into();
+        if actual != *expected {
+            bail!(
+                "object hash mismatch: expected {} got {}",
+                hex::encode(expected),
+                hex::encode(actual)
+            );
+        }
+
+        match location {
+            StorageLocation::Local => {
+                let target = self.local_path(expected);
+                if target.is_file() {
+                    return Ok(size);
+                }
+                tokio::fs::create_dir_all(target.parent().context("对象路径没有父目录")?).await?;
+                let temporary = target.with_extension(format!(
+                    "tmp-{}-{}",
+                    std::process::id(),
+                    rand::random::<u64>()
+                ));
+                tokio::fs::copy(source, &temporary).await?;
+                tokio::fs::rename(&temporary, target).await?;
+            }
+            StorageLocation::Rclone { remote, prefix } => {
+                self.rclone_file(source, size, rclone_target(remote, prefix, expected))
+                    .await?;
+            }
+            StorageLocation::RcloneShard { remote, prefix } => {
+                self.rclone_file(source, size, rclone_shard_target(remote, prefix, expected))
+                    .await?;
+            }
+        }
+        Ok(size)
     }
 
     pub async fn get(&self, location: &StorageLocation, sha: &[u8; 32]) -> Result<Vec<u8>> {
@@ -332,6 +392,32 @@ impl ObjectStore {
         .await
         .context("rclone 连通性检查超时")??;
         command_ok("rclone lsf", output)
+    }
+
+    async fn rclone_file(&self, source: &Path, size: u64, target: String) -> Result<()> {
+        let runtime = self.rclone()?;
+        let mut child = runtime
+            .command("rcat")
+            .arg(&target)
+            .arg("--size")
+            .arg(size.to_string())
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .context("启动 rclone 文件流写入")?;
+        let mut stdin = child.stdin.take().context("打开 rclone 标准输入")?;
+        let mut file = tokio::fs::File::open(source).await?;
+        let transfer = async move {
+            tokio::io::copy(&mut file, &mut stdin).await?;
+            stdin.shutdown().await?;
+            drop(stdin);
+            child.wait_with_output().await.map_err(anyhow::Error::from)
+        };
+        let output = tokio::time::timeout(runtime.timeout, transfer)
+            .await
+            .context("rclone 文件流写入超时")??;
+        command_ok("rclone rcat", output)
     }
 
     fn put_local(&self, sha: &[u8; 32], bytes: &[u8]) -> Result<()> {
@@ -502,6 +588,29 @@ mod tests {
             .put_verified(&StorageLocation::Local, &[0; 32], b"wrong")
             .await
             .is_err());
+
+        let source = root.join("streamed-source.bin");
+        let streamed = vec![0x5au8; 2 * 1024 * 1024 + 17];
+        std::fs::write(&source, &streamed).unwrap();
+        let streamed_sha: [u8; 32] = Sha256::digest(&streamed).into();
+        assert_eq!(
+            store
+                .put_file_verified(&StorageLocation::Local, &streamed_sha, &source)
+                .await
+                .unwrap(),
+            streamed.len() as u64
+        );
+        assert_eq!(
+            store
+                .get(&StorageLocation::Local, &streamed_sha)
+                .await
+                .unwrap(),
+            streamed
+        );
+        assert!(store
+            .put_file_verified(&StorageLocation::Local, &[0; 32], &source)
+            .await
+            .is_err());
         store.delete(&StorageLocation::Local, &sha).await.unwrap();
         assert!(!store.exists(&StorageLocation::Local, &sha).await.unwrap());
         std::fs::remove_dir_all(root).unwrap();
@@ -550,6 +659,20 @@ mod tests {
         assert_eq!(store.get(&location, &sha).await.unwrap(), b"rclone bytes");
         store.delete(&location, &sha).await.unwrap();
         assert!(!store.exists(&location, &sha).await.unwrap());
+
+        let source = root.join("rclone-stream-source.bin");
+        let streamed = vec![0xa5u8; 2 * 1024 * 1024 + 31];
+        std::fs::write(&source, &streamed).unwrap();
+        let streamed_sha: [u8; 32] = Sha256::digest(&streamed).into();
+        assert_eq!(
+            store
+                .put_file_verified(&location, &streamed_sha, &source)
+                .await
+                .unwrap(),
+            streamed.len() as u64
+        );
+        assert_eq!(store.get(&location, &streamed_sha).await.unwrap(), streamed);
+        store.delete(&location, &streamed_sha).await.unwrap();
 
         let shard = StorageLocation::RcloneShard {
             remote: "fixture".into(),

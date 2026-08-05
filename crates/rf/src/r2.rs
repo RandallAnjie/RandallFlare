@@ -16,13 +16,16 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashSet};
+use tokio::io::AsyncWriteExt;
 
 pub const BUCKET_KIND: &str = "r2_bucket";
 pub const MAX_OBJECT_KEY_BYTES: usize = 1024;
 pub const MAX_LIST_LIMIT: usize = 1000;
 pub const MAX_DIRECT_OBJECT_BYTES: usize = 63 * 1024 * 1024;
 pub const MAX_MULTIPART_PART_BYTES: usize = 63 * 1024 * 1024;
-pub const MAX_MULTIPART_OBJECT_BYTES: usize = 512 * 1024 * 1024;
+pub const MAX_MULTIPART_OBJECT_BYTES: u64 =
+    MAX_MULTIPART_PART_BYTES as u64 * MAX_MULTIPART_PARTS as u64;
+const MAX_LOCAL_MULTIPART_OBJECT_BYTES: u64 = 512 * 1024 * 1024;
 pub const MAX_MULTIPART_PARTS: usize = 10_000;
 const MULTIPART_TTL_MS: u64 = 24 * 60 * 60 * 1000;
 const ORPHAN_GRACE_MS: u64 = 24 * 60 * 60 * 1000;
@@ -359,15 +362,41 @@ async fn commit_object(
     crate::quota::validate_r2_write(node, bucket, previous.as_ref(), bytes.len() as u64).await?;
     // Failed quota admission must not consume unindexed local/rclone storage.
     node.objects.put_verified(&storage, &sha, bytes).await?;
-    let sha256 = hex::encode(sha);
-    let etag = sha256.clone();
-    let uploaded_at_ms = now_ms();
     if storage == StorageLocation::Local {
         replicate_local_blob(node, &group, &sha, bytes).await?;
     }
 
+    index_committed_object(
+        node,
+        bucket,
+        key,
+        sha,
+        bytes.len() as u64,
+        storage,
+        options,
+        &spec,
+        previous,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn index_committed_object(
+    node: &Node,
+    bucket: &str,
+    key: &str,
+    sha: [u8; 32],
+    size: u64,
+    storage: StorageLocation,
+    options: PutOptions,
+    spec: &BucketSpec,
+    previous: Option<ObjectMeta>,
+) -> Result<ObjectMeta> {
     let max_bytes = spec.max_bytes.unwrap_or(0);
     let max_objects = spec.max_objects.unwrap_or(0);
+    let sha256 = hex::encode(sha);
+    let etag = sha256.clone();
+    let uploaded_at_ms = now_ms();
     let result = exec(
         node,
         bucket,
@@ -394,7 +423,7 @@ async fn commit_object(
         json!([
             key,
             sha256,
-            bytes.len(),
+            size,
             etag,
             options.content_type,
             serde_json::to_string(&options.custom_metadata)?,
@@ -415,7 +444,7 @@ async fn commit_object(
     Ok(ObjectMeta {
         key: key.into(),
         sha256,
-        size: bytes.len() as u64,
+        size,
         etag,
         content_type: options.content_type,
         custom_metadata: options.custom_metadata,
@@ -423,6 +452,47 @@ async fn commit_object(
         storage,
         uploaded_at_ms,
     })
+}
+
+async fn commit_object_file(
+    node: &Node,
+    bucket: &str,
+    key: &str,
+    source: &std::path::Path,
+    size: u64,
+    sha: [u8; 32],
+    options: PutOptions,
+) -> Result<ObjectMeta> {
+    let (_, spec) = bucket_record(node, bucket).context("R2 bucket 不存在")?;
+    let storage = resolve_write_storage(node, &spec, &sha)?;
+    if storage == StorageLocation::Local {
+        if size <= MAX_DIRECT_OBJECT_BYTES as u64 {
+            let bytes = tokio::fs::read(source).await?;
+            return commit_object(node, bucket, key, &bytes, options).await;
+        }
+        let group = ensure_schema(node, bucket).await?;
+        if group.len() != 1 || group[0] != node.id() {
+            bail!("本地多数派 R2 大对象需要流式副本传输；当前请改用 rclone 存储策略");
+        }
+    }
+    if !node.objects.supports(&storage) {
+        bail!("当前节点没有完成此 R2 大对象所需的 rclone 能力");
+    }
+    ensure_schema(node, bucket).await?;
+    let _quota_guard = node.r2_quota_gate.lock().await;
+    let previous = head_object(node, bucket, key).await?;
+    crate::quota::validate_r2_write(node, bucket, previous.as_ref(), size).await?;
+    let stored_size = node
+        .objects
+        .put_file_verified(&storage, &sha, source)
+        .await?;
+    if stored_size != size {
+        bail!("R2 流式对象大小在发布前发生变化");
+    }
+    index_committed_object(
+        node, bucket, key, sha, size, storage, options, &spec, previous,
+    )
+    .await
 }
 
 pub async fn create_multipart_upload(
@@ -542,55 +612,99 @@ pub async fn complete_multipart_upload(
     if multipart_requires_rclone(&upload) && node.cfg.storage.rclone_binary.is_none() {
         return forward_complete_to_storage_peer(node, bucket, key, upload_id, parts).await;
     }
-    let mut assembled = Vec::new();
-    let mut consumed_parts = Vec::new();
-    for published in parts {
-        let result = exec(
+    let assembly_dir = node.objects.local_root().join(".multipart-assembly");
+    tokio::fs::create_dir_all(&assembly_dir).await?;
+    let assembly_path = assembly_dir.join(format!(
+        "{upload_id}-{}-{}.tmp",
+        std::process::id(),
+        rand::random::<u64>()
+    ));
+    let max_object_bytes = if multipart_requires_rclone(&upload) {
+        MAX_MULTIPART_OBJECT_BYTES
+    } else {
+        MAX_LOCAL_MULTIPART_OBJECT_BYTES
+    };
+    let assembled = async {
+        let mut file = tokio::fs::OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(&assembly_path)
+            .await?;
+        let mut hasher = Sha256::new();
+        let mut assembled_size = 0u64;
+        let mut consumed_parts = Vec::new();
+        for published in parts {
+            let result = exec(
+                node,
+                bucket,
+                "SELECT sha256, size, etag, storage_json FROM multipart_parts WHERE upload_id = ?1 AND part_number = ?2",
+                json!([upload_id, published.part_number]),
+            )
+            .await?;
+            let row = result["rows"]
+                .as_array()
+                .and_then(|rows| rows.first())
+                .and_then(Value::as_object)
+                .with_context(|| format!("R2 分片 {} 不存在", published.part_number))?;
+            let etag = row
+                .get("etag")
+                .and_then(Value::as_str)
+                .context("R2 分片缺少 ETag")?;
+            if !constant_time_string_eq(etag, published.etag.trim_matches('"')) {
+                bail!("R2 分片 {} 的 ETag 不匹配", published.part_number);
+            }
+            let sha: [u8; 32] = hex::decode(
+                row.get("sha256")
+                    .and_then(Value::as_str)
+                    .context("R2 分片缺少摘要")?,
+            )?
+            .try_into()
+            .map_err(|_| anyhow::anyhow!("R2 分片摘要长度无效"))?;
+            let declared_size = row
+                .get("size")
+                .and_then(Value::as_u64)
+                .context("R2 分片缺少大小")?;
+            assembled_size = assembled_size
+                .checked_add(declared_size)
+                .context("R2 分片合并大小溢出")?;
+            if assembled_size > max_object_bytes {
+                bail!(
+                    "R2 分片合并后的对象超过当前后端上限 {} 字节",
+                    max_object_bytes
+                );
+            }
+            let storage: StorageLocation = serde_json::from_str(
+                row.get("storage_json")
+                    .and_then(Value::as_str)
+                    .context("R2 分片缺少存储位置")?,
+            )?;
+            let bytes = node.objects.get(&storage, &sha).await?;
+            if bytes.len() as u64 != declared_size {
+                bail!("R2 分片 {} 的大小校验失败", published.part_number);
+            }
+            hasher.update(&bytes);
+            file.write_all(&bytes).await?;
+            consumed_parts.push((hex::encode(sha), declared_size, storage));
+        }
+        file.flush().await?;
+        file.sync_data().await?;
+        drop(file);
+        let sha: [u8; 32] = hasher.finalize().into();
+        let metadata = commit_object_file(
             node,
             bucket,
-            "SELECT sha256, size, etag, storage_json FROM multipart_parts WHERE upload_id = ?1 AND part_number = ?2",
-            json!([upload_id, published.part_number]),
+            key,
+            &assembly_path,
+            assembled_size,
+            sha,
+            upload.options.clone(),
         )
         .await?;
-        let row = result["rows"]
-            .as_array()
-            .and_then(|rows| rows.first())
-            .and_then(Value::as_object)
-            .with_context(|| format!("R2 分片 {} 不存在", published.part_number))?;
-        let etag = row
-            .get("etag")
-            .and_then(Value::as_str)
-            .context("R2 分片缺少 ETag")?;
-        if !constant_time_string_eq(etag, published.etag.trim_matches('"')) {
-            bail!("R2 分片 {} 的 ETag 不匹配", published.part_number);
-        }
-        let sha: [u8; 32] = hex::decode(
-            row.get("sha256")
-                .and_then(Value::as_str)
-                .context("R2 分片缺少摘要")?,
-        )?
-        .try_into()
-        .map_err(|_| anyhow::anyhow!("R2 分片摘要长度无效"))?;
-        let declared_size = row
-            .get("size")
-            .and_then(Value::as_u64)
-            .context("R2 分片缺少大小")?;
-        if assembled.len().saturating_add(declared_size as usize) > MAX_MULTIPART_OBJECT_BYTES {
-            bail!("R2 分片合并后的对象不得超过 512 MiB");
-        }
-        let storage: StorageLocation = serde_json::from_str(
-            row.get("storage_json")
-                .and_then(Value::as_str)
-                .context("R2 分片缺少存储位置")?,
-        )?;
-        let bytes = node.objects.get(&storage, &sha).await?;
-        if bytes.len() as u64 != declared_size {
-            bail!("R2 分片 {} 的大小校验失败", published.part_number);
-        }
-        assembled.extend_from_slice(&bytes);
-        consumed_parts.push((hex::encode(sha), declared_size, storage));
+        Ok::<_, anyhow::Error>((metadata, consumed_parts))
     }
-    let metadata = commit_object(node, bucket, key, &assembled, upload.options).await?;
+    .await;
+    let _ = tokio::fs::remove_file(&assembly_path).await;
+    let (metadata, consumed_parts) = assembled?;
     // Metadata is removed only after the final object has committed. A retry
     // after a timeout is therefore safe until this point; afterwards it sees a
     // clear no-such-upload result instead of assembling an incomplete object.
@@ -1315,6 +1429,7 @@ pub struct SweepResult {
     pub expired_uploads: u64,
     pub collected_blobs: u64,
     pub retained_blobs: u64,
+    pub stale_assembly_files: u64,
 }
 
 /// Apply bucket lifecycle rules, expire abandoned multipart uploads and safely
@@ -1428,6 +1543,24 @@ pub async fn sweep_lifecycle(node: &Node) -> Result<SweepResult> {
             node.objects.delete(&storage, &sha).await?;
             remove_orphan_candidate(node, bucket, sha256, storage_json).await?;
             outcome.collected_blobs += 1;
+        }
+    }
+    let assembly_dir = node.objects.local_root().join(".multipart-assembly");
+    if let Ok(mut entries) = tokio::fs::read_dir(&assembly_dir).await {
+        while let Some(entry) = entries.next_entry().await? {
+            let path = entry.path();
+            if path.extension().and_then(|value| value.to_str()) != Some("tmp") {
+                continue;
+            }
+            let modified = entry.metadata().await?.modified()?;
+            let age = std::time::SystemTime::now()
+                .duration_since(modified)
+                .unwrap_or_default();
+            if age.as_millis() >= MULTIPART_TTL_MS as u128
+                && tokio::fs::remove_file(path).await.is_ok()
+            {
+                outcome.stale_assembly_files += 1;
+            }
         }
     }
     Ok(outcome)
@@ -2272,6 +2405,12 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(completed.size, 15);
+        assert_eq!(
+            std::fs::read_dir(node.objects.local_root().join(".multipart-assembly"))
+                .unwrap()
+                .count(),
+            0
+        );
         assert_eq!(
             get_object(&node, "e2e-bucket", "large/report.txt")
                 .await
