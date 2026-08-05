@@ -44,7 +44,7 @@ surface yet.
 | signed audit/transparency history | done | Worker manifests and every signed platform resource are exposed through a redacted cluster audit; scoped one-way API tokens support Chinese console plus operator-signed CLI list/create/revoke; privacy-preserving KV/D1 mutation proofs are deterministically deduplicated across live nodes, retained for 30 days, exposed through scoped API/CLI/Chinese console and archived as gzip JSONL to local or rclone-backed R2 |
 | node tags, placement requirements, drain/suspend | partial | signed policies, system/custom/region tags, Worker constraints, encrypted exact-revision peer fallback, preview placement, DNS draining, capability-aware initial DO quorums and Chinese node UI are implemented and two-node tested; existing-DO owner migration and multi-VPS production soak remain |
 | topology, quotas, request metrics, DLQ | partial | placement topology, privacy-bounded request history, aggregation, status trends and DLQs are done; signed Worker/hostname/R2/outbound quotas and deterministic per-live-node request admission are implemented; partition/fault soak remains |
-| access tokens and scoped API credentials | partial | one-way signed tokens, exact read/write scopes, expiry/revocation, last-used telemetry, cookie-isolated `/api/v1` and Chinese UI are implemented; CLI management and production soak remain |
+| access tokens and scoped API credentials | done | one-way signed tokens, exact read/write scopes, expiry/revocation, last-used telemetry, cookie-isolated `/api/v1`, Chinese UI and operator-signed CLI list/create/revoke are implemented; production soak remains |
 | device/exit networking | partial | one-way signed enrolment, capability-tagged exits, TLS SOCKS tunnels, local HTTP/SOCKS split routing, server-side policy replay and Chinese console are implemented; SOCKS5 UDP and OS TUN adapters remain |
 
 ### Workers (including Pages)
@@ -96,10 +96,10 @@ surface yet.
 | --- | --- | --- |
 | capability-selected MX nodes | partial | explicit node role, signed MX match, capability reporting, bounded SMTP pool, deferred STARTTLS enablement and per-connection certificate hot-reload are implemented and real-rustls tested; health-weighted placement and multi-MX soak remain |
 | inbound SMTP and routing | partial | RFC 822 limits, SMTPUTF8/8BITMIME, verified domains, exact/prefix/catch-all routes, D1 leases, crash recovery, rate limits, terminal retention and idempotent locally-routed DSN generation are done; multi-node SMTP fault soak remains |
-| authentication results | partial | SPF, DKIM, DMARC, ARC chain validation and full Authentication-Results are persisted/exposed to operators and Worker email events; outbound MTA-STS policy remains |
+| authentication results | done | SPF, DKIM, DMARC, ARC chain validation and full Authentication-Results are persisted/exposed to operators and Worker email events |
 | raw-message R2 archival | partial | immutable source, metadata hashes, shared-recipient reference-safe retention and local/rclone buckets done; multi-GiB streaming remains |
 | Worker email handler | partial | `email()` event, headers/raw stream, `setReject`, reliable idempotent `forward`, loop protection and `env.MAIL.send()` done; real-SMTP/workerd fault soak remains |
-| outbound SMTP | partial | per-recipient durable queue, fenced leases, bounded exponential retry, direct sorted MX, Null MX, SMTPUTF8 negotiation, opportunistic TLS, node-local RSA DKIM signing, crash-safe DSN processing with loop protection, CLI/API/Flow and Chinese delivery console are done; reputation automation and multi-MX production soak remain |
+| outbound SMTP | partial | per-recipient durable queue, fenced leases, bounded exponential retry, direct sorted MX, Null MX, SMTPUTF8 negotiation, node-local RSA DKIM signing, crash-safe DSN processing, and RFC 8461 MTA-STS discovery/caching/MX matching/strict STARTTLS are implemented; testing-mode failures are audited and surfaced per message; aggregate TLSRPT, reputation automation and multi-MX production soak remain |
 
 ## Delivery order
 

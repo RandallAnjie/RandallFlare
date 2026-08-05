@@ -156,9 +156,10 @@ Working today, verified by multi-process fault-injection e2e tests:
   with SPF/DKIM/DMARC/ARC, archive immutable source in ordinary local or
   rclone-backed R2, and dispatch through fenced D1 leases. Outbound mail is
   durably queued per recipient, DKIM-signed using node-local keys, delivered
-  directly to sorted MX targets with SMTPUTF8 and opportunistic TLS, and retried
-  five times. Permanent failure creates a crash-safe, loop-protected DSN through
-  the sender's signed local route.
+  directly to sorted MX targets with SMTPUTF8, opportunistic TLS, and RFC 8461
+  MTA-STS discovery, durable policy caching, MX matching and strict STARTTLS
+  enforcement. Permanent failure creates a crash-safe, loop-protected DSN
+  through the sender's signed local route.
   Worker `email()` handlers, `env.MAIL.send()`, Flow email nodes, CLI/API,
   retention cleanup and a dedicated Chinese DNS/routing/delivery console are
   included. See [the Email guide](./docs/EMAIL.md).

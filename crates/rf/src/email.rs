@@ -15,6 +15,7 @@ use crate::r2::{self, PutOptions};
 use crate::resource::{self, ResourceRecord, ResourceView};
 use anyhow::{bail, Context, Result};
 use base64::Engine as _;
+use futures_util::StreamExt;
 use lettre::address::{Address, Envelope as SmtpEnvelope};
 use lettre::transport::smtp::{
     client::{Tls, TlsParameters},
@@ -40,7 +41,7 @@ use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashSet};
 use std::io;
-use std::net::{IpAddr, Ipv4Addr, TcpListener};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener};
 use std::sync::Arc;
 
 pub const EMAIL_DOMAIN_KIND: &str = "email_domain";
@@ -60,6 +61,9 @@ const MAX_ROUTES: usize = 512;
 const MAX_SEND_METADATA_BYTES: usize = 64 * 1024;
 const OUTBOUND_LEASE_MS: u64 = 2 * 60 * 1_000;
 const OUTBOUND_MAX_ATTEMPTS: u16 = 5;
+const MTA_STS_MAX_POLICY_BYTES: usize = 64 * 1024;
+const MTA_STS_MAX_AGE_SECONDS: u64 = 31_557_600;
+const MTA_STS_FETCH_RETRY_MS: u64 = 5 * 60 * 1_000;
 
 fn default_message_bytes() -> u64 {
     DEFAULT_MESSAGE_BYTES
@@ -364,6 +368,10 @@ pub struct EmailMessage {
     pub arc: Option<String>,
     pub attempts: u16,
     pub last_error: Option<String>,
+    pub smtp_response: Option<String>,
+    pub mta_sts_mode: Option<String>,
+    pub mta_sts_policy_id: Option<String>,
+    pub mta_sts_result: Option<String>,
     pub dsn_status: Option<String>,
     pub dsn_message_id: Option<String>,
     pub dsn_attempts: u16,
@@ -452,6 +460,47 @@ struct OutboundClaim {
 struct DeliveryFailure {
     permanent: bool,
     detail: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MtaStsMode {
+    Enforce,
+    Testing,
+    None,
+}
+
+impl MtaStsMode {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Enforce => "enforce",
+            Self::Testing => "testing",
+            Self::None => "none",
+        }
+    }
+
+    fn parse(value: &str) -> Option<Self> {
+        match value {
+            "enforce" => Some(Self::Enforce),
+            "testing" => Some(Self::Testing),
+            "none" => Some(Self::None),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct MtaStsPolicy {
+    id: String,
+    mode: MtaStsMode,
+    mx: Vec<String>,
+    max_age_seconds: u64,
+    fetched_at_ms: u64,
+}
+
+#[derive(Debug)]
+struct SmtpDelivery {
+    response: String,
+    mta_sts_testing_failure: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1678,6 +1727,20 @@ pub async fn sweep_retention(
         json!([now_ms().saturating_sub(2 * 60 * 60 * 1_000)]),
     )
     .await?;
+    exec(
+        node,
+        domain_name,
+        "DELETE FROM email_mta_sts_cache WHERE expires_at_ms<=?1",
+        json!([now_ms()]),
+    )
+    .await?;
+    exec(
+        node,
+        domain_name,
+        "DELETE FROM email_mta_sts_fetch WHERE last_attempt_ms<?1",
+        json!([now_ms().saturating_sub(7 * 24 * 60 * 60 * 1_000)]),
+    )
+    .await?;
     if deleted > 0 {
         append_audit(
             node,
@@ -1743,13 +1806,109 @@ pub async fn process_outbound_once(
             return Ok(true);
         }
     };
+    let recipient_domain = match split_address(&claim.message.rcpt_to) {
+        Ok((_, domain)) => domain.to_string(),
+        Err(error) => {
+            finish_outbound(
+                node,
+                domain_name,
+                &claim,
+                Err(DeliveryFailure {
+                    permanent: true,
+                    detail: format!("收件地址无效：{error:#}"),
+                }),
+            )
+            .await?;
+            return Ok(true);
+        }
+    };
+    let mta_sts = discover_mta_sts_policy(
+        node,
+        domain_name,
+        &recipient_domain,
+        claim.message.attempts >= OUTBOUND_MAX_ATTEMPTS,
+    )
+    .await;
+    let policy = match mta_sts {
+        Ok(policy) => policy,
+        Err(error) => {
+            finish_outbound(
+                node,
+                domain_name,
+                &claim,
+                Err(DeliveryFailure {
+                    permanent: false,
+                    detail: format!("读取 MTA-STS 策略缓存失败：{error:#}"),
+                }),
+            )
+            .await?;
+            return Ok(true);
+        }
+    };
+    if let Some(policy) = &policy {
+        append_audit(
+            node,
+            domain_name,
+            "mta_sts_policy_applied",
+            json!({
+                "message_id": claim.message.id,
+                "recipient_domain": recipient_domain,
+                "policy_id": policy.id,
+                "mode": policy.mode.as_str(),
+                "fetched_at_ms": policy.fetched_at_ms,
+            }),
+        )
+        .await?;
+    }
     let outcome = deliver_direct_smtp(
         &spec.mx_hostname,
         &claim.message.mail_from,
         &claim.message.rcpt_to,
         &signed,
+        policy.as_ref(),
     )
     .await;
+    let mta_sts_result = match &outcome {
+        Ok(delivery) if delivery.mta_sts_testing_failure.is_some() => "testing_failure",
+        Ok(_) if policy.is_some() => "pass",
+        Err(_) if policy.is_some() => "delivery_failed",
+        _ => "not_applicable",
+    };
+    exec(
+        node,
+        domain_name,
+        r#"UPDATE email_messages SET
+             mta_sts_mode=?1,mta_sts_policy_id=?2,mta_sts_result=?3,updated_at_ms=?4
+           WHERE id=?5 AND status='sending' AND lease_token=?6"#,
+        json!([
+            policy.as_ref().map(|policy| policy.mode.as_str()),
+            policy.as_ref().map(|policy| &policy.id),
+            mta_sts_result,
+            now_ms(),
+            claim.message.id,
+            claim.lease,
+        ]),
+    )
+    .await?;
+    let outcome = match outcome {
+        Ok(delivery) => {
+            if let Some(detail) = delivery.mta_sts_testing_failure {
+                append_audit(
+                    node,
+                    domain_name,
+                    "mta_sts_testing_failure",
+                    json!({
+                        "message_id": claim.message.id,
+                        "recipient_domain": recipient_domain,
+                        "detail": detail,
+                    }),
+                )
+                .await?;
+            }
+            Ok(delivery.response)
+        }
+        Err(error) => Err(error),
+    };
     finish_outbound(node, domain_name, &claim, outcome).await?;
     Ok(true)
 }
@@ -2171,12 +2330,441 @@ fn sign_dkim(spec: &EmailDomainSpec, raw: &[u8]) -> Result<Vec<u8>> {
     Ok(signed)
 }
 
+async fn discover_mta_sts_policy(
+    node: &Node,
+    email_domain: &str,
+    recipient_domain: &str,
+    force_refresh: bool,
+) -> Result<Option<MtaStsPolicy>> {
+    let now = now_ms();
+    let cached = load_mta_sts_policy(node, email_domain, recipient_domain, now).await?;
+    if cached.is_some() && !force_refresh {
+        return Ok(cached);
+    }
+
+    let authenticator = match MessageAuthenticator::new_system_conf() {
+        Ok(authenticator) => authenticator,
+        Err(error) => {
+            record_mta_sts_warning(
+                node,
+                email_domain,
+                recipient_domain,
+                "dns_initialization_failed",
+                &error.to_string(),
+            )
+            .await?;
+            return Ok(cached);
+        }
+    };
+    let txt_values = match mta_sts_txt_lookup(&authenticator, recipient_domain).await {
+        Ok(values) => values,
+        Err(error) => {
+            record_mta_sts_warning(
+                node,
+                email_domain,
+                recipient_domain,
+                "dns_lookup_failed",
+                &format!("{error:#}"),
+            )
+            .await?;
+            return Ok(cached);
+        }
+    };
+    let Some(policy_id) = parse_mta_sts_txt_records(&txt_values) else {
+        return Ok(cached);
+    };
+    if cached.as_ref().is_some_and(|policy| policy.id == policy_id) && !force_refresh {
+        return Ok(cached);
+    }
+
+    let last_attempt = rows(
+        exec(
+            node,
+            email_domain,
+            "SELECT last_attempt_ms FROM email_mta_sts_fetch WHERE recipient_domain=?1 AND policy_id=?2",
+            json!([recipient_domain, policy_id]),
+        )
+        .await?,
+    )
+    .first()
+    .map(|row| u64_field(row, "last_attempt_ms"))
+    .unwrap_or(0);
+    if now.saturating_sub(last_attempt) < MTA_STS_FETCH_RETRY_MS {
+        return Ok(cached);
+    }
+
+    let fetched = fetch_mta_sts_policy(recipient_domain, &policy_id, now).await;
+    let policy = match fetched {
+        Ok(policy) => policy,
+        Err(error) => {
+            let detail = format!("{error:#}");
+            exec(
+                node,
+                email_domain,
+                r#"INSERT INTO email_mta_sts_fetch(recipient_domain,policy_id,last_attempt_ms,last_error)
+                   VALUES(?1,?2,?3,?4)
+                   ON CONFLICT(recipient_domain,policy_id) DO UPDATE SET
+                     last_attempt_ms=excluded.last_attempt_ms,last_error=excluded.last_error"#,
+                json!([recipient_domain, policy_id, now, detail]),
+            )
+            .await?;
+            record_mta_sts_warning(
+                node,
+                email_domain,
+                recipient_domain,
+                "https_policy_fetch_failed",
+                &detail,
+            )
+            .await?;
+            return Ok(cached);
+        }
+    };
+
+    if policy.mode == MtaStsMode::None {
+        exec(
+            node,
+            email_domain,
+            "DELETE FROM email_mta_sts_cache WHERE recipient_domain=?1",
+            json!([recipient_domain]),
+        )
+        .await?;
+        return Ok(None);
+    }
+    let expires_at_ms = now.saturating_add(policy.max_age_seconds.saturating_mul(1_000));
+    exec(
+        node,
+        email_domain,
+        r#"INSERT INTO email_mta_sts_cache
+           (recipient_domain,policy_id,mode,mx_json,max_age_seconds,fetched_at_ms,expires_at_ms)
+           VALUES(?1,?2,?3,?4,?5,?6,?7)
+           ON CONFLICT(recipient_domain) DO UPDATE SET
+             policy_id=excluded.policy_id,mode=excluded.mode,mx_json=excluded.mx_json,
+             max_age_seconds=excluded.max_age_seconds,fetched_at_ms=excluded.fetched_at_ms,
+             expires_at_ms=excluded.expires_at_ms"#,
+        json!([
+            recipient_domain,
+            policy.id,
+            policy.mode.as_str(),
+            serde_json::to_string(&policy.mx)?,
+            policy.max_age_seconds,
+            policy.fetched_at_ms,
+            expires_at_ms,
+        ]),
+    )
+    .await?;
+    exec(
+        node,
+        email_domain,
+        "DELETE FROM email_mta_sts_fetch WHERE recipient_domain=?1",
+        json!([recipient_domain]),
+    )
+    .await?;
+    append_audit(
+        node,
+        email_domain,
+        "mta_sts_policy_cached",
+        json!({
+            "recipient_domain": recipient_domain,
+            "policy_id": policy.id,
+            "mode": policy.mode.as_str(),
+            "mx": policy.mx,
+            "max_age_seconds": policy.max_age_seconds,
+            "expires_at_ms": expires_at_ms,
+        }),
+    )
+    .await?;
+    Ok(Some(policy))
+}
+
+async fn load_mta_sts_policy(
+    node: &Node,
+    email_domain: &str,
+    recipient_domain: &str,
+    now: u64,
+) -> Result<Option<MtaStsPolicy>> {
+    let Some(row) = rows(
+        exec(
+            node,
+            email_domain,
+            r#"SELECT policy_id,mode,mx_json,max_age_seconds,fetched_at_ms
+               FROM email_mta_sts_cache
+               WHERE recipient_domain=?1 AND expires_at_ms>?2"#,
+            json!([recipient_domain, now]),
+        )
+        .await?,
+    )
+    .into_iter()
+    .next() else {
+        return Ok(None);
+    };
+    let mode =
+        MtaStsMode::parse(string_field(&row, "mode")?).context("MTA-STS 缓存包含无效模式")?;
+    let mx = serde_json::from_str::<Vec<String>>(string_field(&row, "mx_json")?)
+        .context("MTA-STS 缓存包含无效 MX 列表")?;
+    Ok(Some(MtaStsPolicy {
+        id: string_field(&row, "policy_id")?.into(),
+        mode,
+        mx,
+        max_age_seconds: u64_field(&row, "max_age_seconds"),
+        fetched_at_ms: u64_field(&row, "fetched_at_ms"),
+    }))
+}
+
+async fn record_mta_sts_warning(
+    node: &Node,
+    email_domain: &str,
+    recipient_domain: &str,
+    reason: &str,
+    detail: &str,
+) -> Result<()> {
+    append_audit(
+        node,
+        email_domain,
+        "mta_sts_discovery_warning",
+        json!({
+            "recipient_domain": recipient_domain,
+            "reason": reason,
+            "detail": detail.chars().take(2_000).collect::<String>(),
+        }),
+    )
+    .await
+}
+
+async fn mta_sts_txt_lookup(
+    authenticator: &MessageAuthenticator,
+    recipient_domain: &str,
+) -> Result<Vec<String>> {
+    let name = format!("_mta-sts.{recipient_domain}");
+    match authenticator.0.txt_lookup(name.as_str()).await {
+        Ok(response) => {
+            let mut values = response
+                .answers()
+                .iter()
+                .filter_map(|record| match &record.data {
+                    RData::TXT(txt) => Some(
+                        txt.txt_data
+                            .iter()
+                            .map(|chunk| String::from_utf8_lossy(chunk).into_owned())
+                            .collect::<String>(),
+                    ),
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            values.sort();
+            Ok(values)
+        }
+        Err(mail_auth::hickory_resolver::net::NetError::Dns(
+            mail_auth::hickory_resolver::net::DnsError::NoRecordsFound(no_records),
+        )) if no_records.response_code
+            == mail_auth::hickory_resolver::proto::op::ResponseCode::NoError =>
+        {
+            Ok(Vec::new())
+        }
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn parse_mta_sts_txt_records(records: &[String]) -> Option<String> {
+    let candidates = records
+        .iter()
+        .filter_map(|record| parse_mta_sts_txt(record))
+        .collect::<Vec<_>>();
+    (candidates.len() == 1).then(|| candidates[0].clone())
+}
+
+fn parse_mta_sts_txt(record: &str) -> Option<String> {
+    if !record.is_ascii() || !record.starts_with("v=STSv1;") {
+        return None;
+    }
+    let fields = record.split(';').map(str::trim).collect::<Vec<_>>();
+    if fields.first().copied() != Some("v=STSv1") {
+        return None;
+    }
+    let mut id = None;
+    for field in fields.into_iter().skip(1).filter(|field| !field.is_empty()) {
+        let (name, value) = field.split_once('=')?;
+        if name.is_empty()
+            || name.len() > 32
+            || !name.bytes().enumerate().all(|(index, byte)| {
+                byte.is_ascii_alphanumeric() || (index > 0 && matches!(byte, b'_' | b'-' | b'.'))
+            })
+            || value.is_empty()
+            || value
+                .bytes()
+                .any(|byte| byte <= b' ' || matches!(byte, b';' | b'='))
+        {
+            return None;
+        }
+        if name == "id" && id.is_none() {
+            if value.len() > 32 || !value.bytes().all(|byte| byte.is_ascii_alphanumeric()) {
+                return None;
+            }
+            id = Some(value.to_string());
+        }
+    }
+    id
+}
+
+async fn fetch_mta_sts_policy(
+    recipient_domain: &str,
+    policy_id: &str,
+    fetched_at_ms: u64,
+) -> Result<MtaStsPolicy> {
+    let host = format!("mta-sts.{recipient_domain}");
+    let addresses = tokio::net::lookup_host((host.as_str(), 443))
+        .await
+        .context("解析 MTA-STS 策略主机失败")?
+        .collect::<Vec<SocketAddr>>();
+    if addresses.is_empty() || addresses.iter().any(|address| !is_public_ip(address.ip())) {
+        bail!("MTA-STS 策略主机解析到了本机、内网、链路本地或特殊地址");
+    }
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(60))
+        .redirect(reqwest::redirect::Policy::none())
+        .https_only(true)
+        .resolve_to_addrs(&host, &addresses)
+        .build()?;
+    let response = client
+        .get(format!("https://{host}/.well-known/mta-sts.txt"))
+        .send()
+        .await
+        .context("下载 MTA-STS 策略失败")?;
+    if response.status() != reqwest::StatusCode::OK {
+        bail!("MTA-STS 策略端点返回 {}", response.status());
+    }
+    let content_type = response
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("");
+    if !content_type
+        .split(';')
+        .next()
+        .is_some_and(|value| value.trim().eq_ignore_ascii_case("text/plain"))
+    {
+        bail!("MTA-STS 策略端点没有返回 text/plain");
+    }
+    if response
+        .content_length()
+        .is_some_and(|length| length > MTA_STS_MAX_POLICY_BYTES as u64)
+    {
+        bail!("MTA-STS 策略超过 64 KiB");
+    }
+    let mut body = Vec::new();
+    let mut stream = response.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.context("读取 MTA-STS 策略失败")?;
+        if body.len().saturating_add(chunk.len()) > MTA_STS_MAX_POLICY_BYTES {
+            bail!("MTA-STS 策略超过 64 KiB");
+        }
+        body.extend_from_slice(&chunk);
+    }
+    let body = std::str::from_utf8(&body).context("MTA-STS 策略不是 UTF-8")?;
+    parse_mta_sts_policy(policy_id, body, fetched_at_ms)
+}
+
+fn parse_mta_sts_policy(policy_id: &str, body: &str, fetched_at_ms: u64) -> Result<MtaStsPolicy> {
+    let mut version = None;
+    let mut mode = None;
+    let mut max_age_seconds = None;
+    let mut mx = Vec::new();
+    for raw_line in body.lines() {
+        let line = raw_line.strip_suffix('\r').unwrap_or(raw_line);
+        if line.is_empty() {
+            continue;
+        }
+        let (name, value) = line.split_once(':').context("MTA-STS 策略行缺少冒号")?;
+        if name.is_empty()
+            || name.len() > 32
+            || !name.bytes().enumerate().all(|(index, byte)| {
+                byte.is_ascii_alphanumeric() || (index > 0 && matches!(byte, b'_' | b'-' | b'.'))
+            })
+        {
+            bail!("MTA-STS 策略字段名无效");
+        }
+        let value = value.trim_start_matches([' ', '\t']);
+        if value.is_empty()
+            || value.trim_end_matches([' ', '\t']) != value
+            || value.chars().any(char::is_control)
+        {
+            bail!("MTA-STS 策略字段值无效");
+        }
+        match name {
+            "version" if version.is_none() => version = Some(value),
+            "mode" if mode.is_none() => mode = Some(value),
+            "max_age" if max_age_seconds.is_none() => {
+                let parsed = value.parse::<u64>().context("MTA-STS max_age 无效")?;
+                if parsed > MTA_STS_MAX_AGE_SECONDS {
+                    bail!("MTA-STS max_age 超过 31557600 秒");
+                }
+                max_age_seconds = Some(parsed);
+            }
+            "mx" => {
+                let pattern = value.to_ascii_lowercase();
+                let hostname = pattern.strip_prefix("*.").unwrap_or(&pattern);
+                if !valid_domain(hostname) || pattern.matches('*').count() > 1 {
+                    bail!("MTA-STS MX 模式无效：{value}");
+                }
+                mx.push(pattern);
+            }
+            _ => {}
+        }
+    }
+    if version != Some("STSv1") {
+        bail!("MTA-STS 策略版本必须是 STSv1");
+    }
+    let mode =
+        MtaStsMode::parse(mode.context("MTA-STS 策略缺少 mode")?).context("MTA-STS mode 无效")?;
+    if mode != MtaStsMode::None && mx.is_empty() {
+        bail!("MTA-STS enforce/testing 策略至少需要一个 MX 模式");
+    }
+    mx.sort();
+    mx.dedup();
+    Ok(MtaStsPolicy {
+        id: policy_id.into(),
+        mode,
+        mx,
+        max_age_seconds: max_age_seconds.context("MTA-STS 策略缺少 max_age")?,
+        fetched_at_ms,
+    })
+}
+
+fn is_public_ip(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(ip) => {
+            let octets = ip.octets();
+            !(ip.is_private()
+                || ip.is_loopback()
+                || ip.is_link_local()
+                || ip.is_multicast()
+                || ip.is_unspecified()
+                || octets[0] == 0
+                || octets[0] >= 224
+                || (octets[0] == 100 && (64..=127).contains(&octets[1]))
+                || (octets[0] == 192 && octets[1] == 0 && octets[2] == 0)
+                || (octets[0] == 198 && matches!(octets[1], 18 | 19)))
+        }
+        IpAddr::V6(ip) => {
+            if let Some(mapped) = ip.to_ipv4_mapped() {
+                return is_public_ip(IpAddr::V4(mapped));
+            }
+            let segments = ip.segments();
+            !(ip.is_loopback()
+                || ip.is_unspecified()
+                || ip.is_multicast()
+                || (segments[0] & 0xfe00) == 0xfc00
+                || (segments[0] & 0xffc0) == 0xfe80)
+        }
+    }
+}
+
 async fn deliver_direct_smtp(
     mx_hostname: &str,
     mail_from: &str,
     recipient: &str,
     raw: &[u8],
-) -> std::result::Result<String, DeliveryFailure> {
+    mta_sts: Option<&MtaStsPolicy>,
+) -> std::result::Result<SmtpDelivery, DeliveryFailure> {
     let (_, recipient_domain) = split_address(recipient).map_err(|error| DeliveryFailure {
         permanent: true,
         detail: format!("收件地址无效：{error:#}"),
@@ -2260,26 +2848,69 @@ async fn deliver_direct_smtp(
 
     let mut errors = Vec::new();
     let mut all_permanent = true;
+    let mut testing_failures = Vec::new();
     let requires_smtp_utf8 = !mail_from.is_ascii() || !recipient.is_ascii();
     for (_, exchange) in exchanges {
-        let tls = match TlsParameters::new(exchange.clone()) {
-            Ok(parameters) => Tls::Opportunistic(parameters),
+        let policy_matches = mta_sts
+            .map(|policy| {
+                policy
+                    .mx
+                    .iter()
+                    .any(|pattern| mta_sts_mx_matches(pattern, &exchange))
+            })
+            .unwrap_or(true);
+        if matches!(mta_sts.map(|policy| policy.mode), Some(MtaStsMode::Enforce)) && !policy_matches
+        {
+            errors.push(format!("{exchange}: 不匹配 MTA-STS MX 策略"));
+            all_permanent = false;
+            continue;
+        }
+        if matches!(mta_sts.map(|policy| policy.mode), Some(MtaStsMode::Testing)) && !policy_matches
+        {
+            testing_failures.push(format!("{exchange}: 不匹配策略中的 MX 模式"));
+        }
+        let tls_parameters = match TlsParameters::new(exchange.clone()) {
+            Ok(parameters) => parameters,
             Err(error) => {
                 errors.push(format!("{exchange}: TLS 配置失败：{error}"));
                 all_permanent = false;
                 continue;
             }
         };
-        let transport = AsyncSmtpTransport::<Tokio1Executor>::builder_dangerous(exchange.clone())
-            .port(25)
-            .hello_name(ClientId::Domain(mx_hostname.into()))
-            .tls(tls)
-            .timeout(Some(std::time::Duration::from_secs(60)))
-            .build();
+        let requires_strict_tls = policy_matches
+            && matches!(
+                mta_sts.map(|policy| policy.mode),
+                Some(MtaStsMode::Enforce | MtaStsMode::Testing)
+            );
+        let tls = if requires_strict_tls {
+            Tls::Required(tls_parameters.clone())
+        } else {
+            Tls::Opportunistic(tls_parameters.clone())
+        };
+        let transport = smtp_transport(mx_hostname, &exchange, tls);
         match transport.send_raw(&envelope, raw).await {
-            Ok(response) => return Ok(format!("{exchange}: {response:?}")),
+            Ok(response) => {
+                return Ok(SmtpDelivery {
+                    response: format!("{exchange}: {response:?}"),
+                    mta_sts_testing_failure: (!testing_failures.is_empty())
+                        .then(|| testing_failures.join("；")),
+                });
+            }
             Err(error) => {
                 let detail = error.to_string();
+                if matches!(mta_sts.map(|policy| policy.mode), Some(MtaStsMode::Testing))
+                    && requires_strict_tls
+                {
+                    testing_failures.push(format!("{exchange}: STARTTLS/证书验证失败：{detail}"));
+                    let fallback =
+                        smtp_transport(mx_hostname, &exchange, Tls::Opportunistic(tls_parameters));
+                    if let Ok(response) = fallback.send_raw(&envelope, raw).await {
+                        return Ok(SmtpDelivery {
+                            response: format!("{exchange}: {response:?}"),
+                            mta_sts_testing_failure: Some(testing_failures.join("；")),
+                        });
+                    }
+                }
                 let smtp_utf8_rejected = requires_smtp_utf8
                     && detail
                         .to_ascii_lowercase()
@@ -2297,6 +2928,29 @@ async fn deliver_direct_smtp(
             errors.join("；")
         },
     })
+}
+
+fn smtp_transport(
+    mx_hostname: &str,
+    exchange: &str,
+    tls: Tls,
+) -> AsyncSmtpTransport<Tokio1Executor> {
+    AsyncSmtpTransport::<Tokio1Executor>::builder_dangerous(exchange.to_string())
+        .port(25)
+        .hello_name(ClientId::Domain(mx_hostname.into()))
+        .tls(tls)
+        .timeout(Some(std::time::Duration::from_secs(60)))
+        .build()
+}
+
+fn mta_sts_mx_matches(pattern: &str, exchange: &str) -> bool {
+    if let Some(suffix) = pattern.strip_prefix("*.") {
+        let Some(prefix) = exchange.strip_suffix(suffix) else {
+            return false;
+        };
+        return prefix.ends_with('.') && !prefix[..prefix.len() - 1].contains('.');
+    }
+    pattern == exchange
 }
 
 pub async fn list_messages(node: &Node, name: &str, limit: usize) -> Result<Vec<EmailMessage>> {
@@ -2597,6 +3251,9 @@ async fn ensure_schema(node: &Node, name: &str) -> Result<()> {
              leased_by TEXT,
              last_error TEXT,
              smtp_response TEXT,
+             mta_sts_mode TEXT,
+             mta_sts_policy_id TEXT,
+             mta_sts_result TEXT,
              delivered_at_ms INTEGER,
              dsn_status TEXT,
              dsn_message_id TEXT,
@@ -2624,11 +3281,31 @@ async fn ensure_schema(node: &Node, name: &str) -> Result<()> {
              created_at_ms INTEGER NOT NULL
            )"#,
         "CREATE INDEX IF NOT EXISTS email_audit_created ON email_audit(created_at_ms DESC,id DESC)",
+        r#"CREATE TABLE IF NOT EXISTS email_mta_sts_cache (
+             recipient_domain TEXT PRIMARY KEY,
+             policy_id TEXT NOT NULL,
+             mode TEXT NOT NULL,
+             mx_json TEXT NOT NULL,
+             max_age_seconds INTEGER NOT NULL,
+             fetched_at_ms INTEGER NOT NULL,
+             expires_at_ms INTEGER NOT NULL
+           )"#,
+        "CREATE INDEX IF NOT EXISTS email_mta_sts_expiry ON email_mta_sts_cache(expires_at_ms)",
+        r#"CREATE TABLE IF NOT EXISTS email_mta_sts_fetch (
+             recipient_domain TEXT NOT NULL,
+             policy_id TEXT NOT NULL,
+             last_attempt_ms INTEGER NOT NULL,
+             last_error TEXT NOT NULL,
+             PRIMARY KEY(recipient_domain,policy_id)
+           )"#,
     ] {
         exec_database(node, &database, sql, json!([])).await?;
     }
     for (column, definition) in [
         ("arc", "TEXT"),
+        ("mta_sts_mode", "TEXT"),
+        ("mta_sts_policy_id", "TEXT"),
+        ("mta_sts_result", "TEXT"),
         ("dsn_status", "TEXT"),
         ("dsn_message_id", "TEXT"),
         ("dsn_attempts", "INTEGER NOT NULL DEFAULT 0"),
@@ -2695,7 +3372,7 @@ async fn exec_database(node: &Node, database: &str, sql: &str, params: Value) ->
     client.d1_exec(&base, database, sql, params).await
 }
 
-const MESSAGE_FIELDS: &str = "id,direction,mail_from,rcpt_to,subject,message_id,object_key,size,sha256,status,route_id,target,auth_results,spf,dkim,dmarc,arc,attempts,last_error,dsn_status,dsn_message_id,dsn_attempts,dsn_last_error,created_at_ms,updated_at_ms";
+const MESSAGE_FIELDS: &str = "id,direction,mail_from,rcpt_to,subject,message_id,object_key,size,sha256,status,route_id,target,auth_results,spf,dkim,dmarc,arc,attempts,last_error,smtp_response,mta_sts_mode,mta_sts_policy_id,mta_sts_result,dsn_status,dsn_message_id,dsn_attempts,dsn_last_error,created_at_ms,updated_at_ms";
 
 fn rows(result: Value) -> Vec<Value> {
     result["rows"].as_array().cloned().unwrap_or_default()
@@ -2722,6 +3399,10 @@ fn row_to_message(row: &Value) -> Result<EmailMessage> {
         arc: optional_string_field(row, "arc"),
         attempts: u64_field(row, "attempts") as u16,
         last_error: optional_string_field(row, "last_error"),
+        smtp_response: optional_string_field(row, "smtp_response"),
+        mta_sts_mode: optional_string_field(row, "mta_sts_mode"),
+        mta_sts_policy_id: optional_string_field(row, "mta_sts_policy_id"),
+        mta_sts_result: optional_string_field(row, "mta_sts_result"),
         dsn_status: optional_string_field(row, "dsn_status"),
         dsn_message_id: optional_string_field(row, "dsn_message_id"),
         dsn_attempts: u64_field(row, "dsn_attempts") as u16,
@@ -3064,5 +3745,79 @@ mod tests {
     fn r2_object_key_uses_real_utc_calendar_components() {
         let key = object_key(&spec(), "inbound", 1_735_689_600_000, "message");
         assert_eq!(key, "mail/inbound/2025/01/01/message.eml");
+    }
+
+    #[test]
+    fn mta_sts_txt_discovery_is_strict_and_unambiguous() {
+        assert_eq!(
+            parse_mta_sts_txt_records(&["v=STSv1; id=20260804; vendor=enabled;".into()]),
+            Some("20260804".into())
+        );
+        assert_eq!(
+            parse_mta_sts_txt_records(&["unrelated=value".into(), "v=STSv1; id=active;".into(),]),
+            Some("active".into())
+        );
+        assert_eq!(
+            parse_mta_sts_txt_records(&["v=STSv1; id=one;".into(), "v=STSv1; id=two;".into(),]),
+            None
+        );
+        assert_eq!(
+            parse_mta_sts_txt_records(&["v=STSv1; id=same;".into(), "v=STSv1; id=same;".into(),]),
+            None
+        );
+        assert_eq!(
+            parse_mta_sts_txt_records(&[" v=STSv1; id=leadingSpace;".into()]),
+            None
+        );
+        assert_eq!(
+            parse_mta_sts_txt_records(&["v=STSv1; id=contains-dash;".into()]),
+            None
+        );
+    }
+
+    #[test]
+    fn mta_sts_policy_enforces_rfc_wildcard_shape_and_bounds() {
+        let policy = parse_mta_sts_policy(
+            "policy1",
+            "version: STSv1\r\nmode: enforce\r\nmx: mail.example.com\r\nmx: *.backup.example.com\r\nmax_age: 604800\r\n",
+            42,
+        )
+        .unwrap();
+        assert_eq!(policy.mode, MtaStsMode::Enforce);
+        assert_eq!(policy.max_age_seconds, 604_800);
+        assert!(mta_sts_mx_matches(
+            "*.backup.example.com",
+            "mx.backup.example.com"
+        ));
+        assert!(!mta_sts_mx_matches(
+            "*.backup.example.com",
+            "deep.mx.backup.example.com"
+        ));
+        assert!(!mta_sts_mx_matches(
+            "*.backup.example.com",
+            "backup.example.com"
+        ));
+        assert!(parse_mta_sts_policy(
+            "bad",
+            "version: STSv1\nmode: enforce\nmx: *.example.com\nmax_age: 31557601\n",
+            0,
+        )
+        .is_err());
+        assert!(
+            parse_mta_sts_policy("bad", "version: STSv1\nmode: testing\nmax_age: 60\n", 0,)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn mta_sts_policy_none_removes_mx_requirement() {
+        let policy = parse_mta_sts_policy(
+            "disabled",
+            "version: STSv1\nmode: none\nmax_age: 0\nfuture-field: accepted\n",
+            7,
+        )
+        .unwrap();
+        assert_eq!(policy.mode, MtaStsMode::None);
+        assert!(policy.mx.is_empty());
     }
 }
