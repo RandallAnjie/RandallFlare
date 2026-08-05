@@ -76,17 +76,29 @@ impl Runtime {
         let mut rx = self.node.subscribe();
         // Initial reconcile at boot.
         self.reconcile().await;
+        // Keep one interval alive across event-heavy iterations. Recreating a
+        // sleep inside select would let a sustained stream of KV/runtime
+        // notifications postpone the periodic full reconcile forever.
+        let mut periodic = tokio::time::interval(std::time::Duration::from_millis(500));
+        periodic.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        periodic.tick().await;
         loop {
             tokio::select! {
                 ev = rx.recv() => match ev {
                     Ok(NodeEvent::Manifests) => self.reconcile().await,
                     Ok(_) => {}
-                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
+                    // A lagged receiver may have dropped the only manifest or
+                    // blob notification. Rebuild desired state from the
+                    // signed store instead of waiting for another event.
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
+                        tracing::warn!(skipped, "Worker 调和器事件积压，正在执行全量恢复");
+                        self.reconcile().await;
+                    }
                     Err(_) => return,
                 },
                 // Re-check periodically: blobs may have arrived, or a
                 // child may have died.
-                _ = tokio::time::sleep(std::time::Duration::from_millis(500)) => {
+                _ = periodic.tick() => {
                     self.reap();
                     self.reconcile().await;
                 }
