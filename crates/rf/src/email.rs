@@ -50,6 +50,7 @@ pub const AUTH_RESULTS_HEADER: &str = "x-rf-email-authentication-results";
 pub const SPF_RESULT_HEADER: &str = "x-rf-email-spf";
 pub const DKIM_RESULT_HEADER: &str = "x-rf-email-dkim";
 pub const DMARC_RESULT_HEADER: &str = "x-rf-email-dmarc";
+pub const ARC_RESULT_HEADER: &str = "x-rf-email-arc";
 pub const MAX_MESSAGE_BYTES: u64 = 63 * 1024 * 1024;
 const DEFAULT_MESSAGE_BYTES: u64 = 25 * 1024 * 1024;
 const DEFAULT_INBOUND_PER_MINUTE: u32 = 1_000;
@@ -360,6 +361,7 @@ pub struct EmailMessage {
     pub spf: Option<String>,
     pub dkim: Option<String>,
     pub dmarc: Option<String>,
+    pub arc: Option<String>,
     pub attempts: u16,
     pub last_error: Option<String>,
     pub dsn_status: Option<String>,
@@ -437,6 +439,7 @@ struct AuthSummary {
     spf: String,
     dkim: String,
     dmarc: String,
+    arc: String,
 }
 
 #[derive(Debug, Clone)]
@@ -984,9 +987,9 @@ async fn ingest_inbound_inner(
             domain_name,
             r#"INSERT OR IGNORE INTO email_messages
                (id,direction,mail_from,rcpt_to,subject,message_id,object_key,size,sha256,
-                status,route_id,target,auth_results,spf,dkim,dmarc,attempts,
+                status,route_id,target,auth_results,spf,dkim,dmarc,arc,attempts,
                 created_at_ms,updated_at_ms)
-               VALUES(?1,'inbound',?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,0,?16,?16)"#,
+               VALUES(?1,'inbound',?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,0,?17,?17)"#,
             json!([
                 id,
                 envelope.mail_from,
@@ -1003,6 +1006,7 @@ async fn ingest_inbound_inner(
                 auth.as_ref().map(|value| &value.spf),
                 auth.as_ref().map(|value| &value.dkim),
                 auth.as_ref().map(|value| &value.dmarc),
+                auth.as_ref().map(|value| &value.arc),
                 timestamp,
             ]),
         )
@@ -1363,6 +1367,7 @@ async fn dispatch_email_worker(
         (SPF_RESULT_HEADER, message.spf.as_deref()),
         (DKIM_RESULT_HEADER, message.dkim.as_deref()),
         (DMARC_RESULT_HEADER, message.dmarc.as_deref()),
+        (ARC_RESULT_HEADER, message.arc.as_deref()),
     ] {
         if let Some(value) = value {
             let unfolded = value.split_whitespace().collect::<Vec<_>>().join(" ");
@@ -2437,6 +2442,7 @@ async fn authenticate_message(
             &spf,
         ))
         .await;
+    let arc = authenticator.verify_arc(&message).await;
     let header_from = message.from.first().map(String::as_str).unwrap_or("");
     let header = AuthenticationResults::new(mx_hostname)
         .with_dkim_results(&dkim, header_from)
@@ -2446,6 +2452,7 @@ async fn authenticate_message(
             &envelope.mail_from,
             &envelope.helo_domain,
         )
+        .with_arc_result(&arc, envelope.client_ip)
         .with_dmarc_result(&dmarc)
         .to_string();
     let dkim_status = if dkim
@@ -2482,7 +2489,19 @@ async fn authenticate_message(
         .into(),
         dkim: dkim_status.into(),
         dmarc: dmarc_status.into(),
+        arc: dkim_result_status(arc.result()).into(),
     })
+}
+
+fn dkim_result_status(result: &DkimResult) -> &'static str {
+    match result {
+        DkimResult::Pass => "pass",
+        DkimResult::Neutral(_) => "neutral",
+        DkimResult::Fail(_) => "fail",
+        DkimResult::PermError(_) => "permerror",
+        DkimResult::TempError(_) => "temperror",
+        DkimResult::None => "none",
+    }
 }
 
 async fn enforce_rate_limit(
@@ -2570,6 +2589,7 @@ async fn ensure_schema(node: &Node, name: &str) -> Result<()> {
              spf TEXT,
              dkim TEXT,
              dmarc TEXT,
+             arc TEXT,
              attempts INTEGER NOT NULL DEFAULT 0,
              next_attempt_ms INTEGER,
              lease_token TEXT,
@@ -2608,6 +2628,7 @@ async fn ensure_schema(node: &Node, name: &str) -> Result<()> {
         exec_database(node, &database, sql, json!([])).await?;
     }
     for (column, definition) in [
+        ("arc", "TEXT"),
         ("dsn_status", "TEXT"),
         ("dsn_message_id", "TEXT"),
         ("dsn_attempts", "INTEGER NOT NULL DEFAULT 0"),
@@ -2674,7 +2695,7 @@ async fn exec_database(node: &Node, database: &str, sql: &str, params: Value) ->
     client.d1_exec(&base, database, sql, params).await
 }
 
-const MESSAGE_FIELDS: &str = "id,direction,mail_from,rcpt_to,subject,message_id,object_key,size,sha256,status,route_id,target,auth_results,spf,dkim,dmarc,attempts,last_error,dsn_status,dsn_message_id,dsn_attempts,dsn_last_error,created_at_ms,updated_at_ms";
+const MESSAGE_FIELDS: &str = "id,direction,mail_from,rcpt_to,subject,message_id,object_key,size,sha256,status,route_id,target,auth_results,spf,dkim,dmarc,arc,attempts,last_error,dsn_status,dsn_message_id,dsn_attempts,dsn_last_error,created_at_ms,updated_at_ms";
 
 fn rows(result: Value) -> Vec<Value> {
     result["rows"].as_array().cloned().unwrap_or_default()
@@ -2698,6 +2719,7 @@ fn row_to_message(row: &Value) -> Result<EmailMessage> {
         spf: optional_string_field(row, "spf"),
         dkim: optional_string_field(row, "dkim"),
         dmarc: optional_string_field(row, "dmarc"),
+        arc: optional_string_field(row, "arc"),
         attempts: u64_field(row, "attempts") as u16,
         last_error: optional_string_field(row, "last_error"),
         dsn_status: optional_string_field(row, "dsn_status"),
@@ -3027,6 +3049,15 @@ mod tests {
         );
         assert_eq!(enhanced_status("550 5.1.1 user unknown"), "5.1.1");
         assert_eq!(enhanced_status("connection refused"), "5.0.0");
+    }
+
+    #[tokio::test]
+    async fn arc_without_a_chain_is_reported_as_none() {
+        let raw = b"From: sender@example.com\r\nTo: user@example.net\r\n\r\nhello";
+        let message = AuthenticatedMessage::parse(raw).unwrap();
+        let authenticator = MessageAuthenticator::new_system_conf().unwrap();
+        let arc = authenticator.verify_arc(&message).await;
+        assert_eq!(dkim_result_status(arc.result()), "none");
     }
 
     #[test]

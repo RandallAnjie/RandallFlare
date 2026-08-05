@@ -1158,6 +1158,7 @@ async function __rfEmailEvent(request, env, context) {
     spf: request.headers.get("x-rf-email-spf") || "none",
     dkim: request.headers.get("x-rf-email-dkim") || "none",
     dmarc: request.headers.get("x-rf-email-dmarc") || "none",
+    arc: request.headers.get("x-rf-email-arc") || "none",
     raw: new Blob([raw], { type: "message/rfc822" }).stream(),
     rawSize: raw.byteLength,
     headers: __rfParseMailHeaders(raw),
@@ -1906,6 +1907,7 @@ mod tests {
         assert!(source.contains("setReject(reason)"));
         assert!(source.contains("authResults: request.headers.get"));
         assert!(source.contains("x-rf-email-dmarc"));
+        assert!(source.contains("x-rf-email-arc"));
         assert!(source.contains("export class Counter extends __rfUserModule.Counter"));
         assert!(
             source.contains("__rfUserDefault.fetch(request, __rfWrapEnv(env, context), context)")

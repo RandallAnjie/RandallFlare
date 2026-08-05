@@ -153,7 +153,7 @@ Working today, verified by multi-process fault-injection e2e tests:
 - **Optional decentralized Email**: operator-signed domains define exact,
   prefix and catch-all routes to Workers, reliable forwards or drops. Selected
   MX nodes receive SMTP with optional STARTTLS, authenticate inbound RFC 822
-  with SPF/DKIM/DMARC, archive immutable source in ordinary local or
+  with SPF/DKIM/DMARC/ARC, archive immutable source in ordinary local or
   rclone-backed R2, and dispatch through fenced D1 leases. Outbound mail is
   durably queued per recipient, DKIM-signed using node-local keys, delivered
   directly to sorted MX targets with SMTPUTF8 and opportunistic TLS, and retried

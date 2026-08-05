@@ -199,7 +199,8 @@ Flow 的 `email` 节点可以使用完整 `raw`，也可以由平台生成纯文
 - 永久失败或重试耗尽后，平台生成 `multipart/report` / `message/global-delivery-status`
   DSN，以空逆向路径写回原发件人的本域签名路由。DSN 具有 D1 栅栏租约、稳定消息
   ID、最多五次重试和完整审计；`Auto-Submitted` 会阻断退信环；
-- SPF、DKIM、DMARC 与完整 `Authentication-Results` 会随入站记录保存；
+- SPF、DKIM、DMARC、ARC 链验证与完整 `Authentication-Results` 会随入站记录保存，
+  并传给邮件处理 Worker；
 - 原文按 `<prefix>/<direction>/<年>/<月>/<日>/<id>.eml` 写入 R2；
 - 达到签名 `retention_days` 后，只有终态记录会被清理；仍被其他收件人引用的共享
   原文不会提前删除；
