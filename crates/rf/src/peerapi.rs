@@ -116,6 +116,7 @@ pub fn router(api: Api) -> Router {
         .route("/v1/d1/create", post(d1_create))
         .route("/v1/d1/{db}/exec", post(d1_exec))
         .route("/v1/d1/{db}/export", get(d1_export))
+        .route("/v1/d1/{db}/backup", post(d1_backup))
         .route("/v1/queue/{queue}/messages", post(queue_send))
         .route("/v1/queue/{queue}/stats", get(queue_stats))
         .route("/v1/queue/{queue}/dead", get(queue_dead_letters))
@@ -1442,6 +1443,39 @@ async fn d1_export(
         Ok(Ok(Err(error))) => (StatusCode::UNPROCESSABLE_ENTITY, error.to_string()).into_response(),
         Ok(Err(_)) => (StatusCode::SERVICE_UNAVAILABLE, "driver dropped").into_response(),
         Err(_) => (StatusCode::GATEWAY_TIMEOUT, "snapshot timed out").into_response(),
+    }
+}
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct D1BackupReq {
+    bucket: String,
+    #[serde(default = "default_d1_backup_prefix")]
+    prefix: String,
+}
+
+fn default_d1_backup_prefix() -> String {
+    "d1-backups".into()
+}
+
+async fn d1_backup(
+    State(api): State<Api>,
+    ConnectInfo(remote): ConnectInfo<SocketAddr>,
+    Path(db): Path<String>,
+    method: Method,
+    uri: Uri,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    if let Err(response) = check(&api, &remote, &headers, &method, &uri, &body) {
+        return response.into_response();
+    }
+    let Ok(request) = serde_json::from_slice::<D1BackupReq>(&body) else {
+        return (StatusCode::BAD_REQUEST, "bad D1 backup request").into_response();
+    };
+    match crate::d1_backup::backup_now(&api.node, &db, &request.bucket, &request.prefix).await {
+        Ok(backup) => axum::Json(backup).into_response(),
+        Err(error) => (StatusCode::UNPROCESSABLE_ENTITY, error.to_string()).into_response(),
     }
 }
 

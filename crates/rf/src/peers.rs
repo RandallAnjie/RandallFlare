@@ -1480,6 +1480,26 @@ impl PeerClient {
         bail!("no leader found for D1 export {db} after retries")
     }
 
+    pub async fn d1_backup(
+        &self,
+        base: &str,
+        db: &str,
+        bucket: &str,
+        prefix: &str,
+    ) -> Result<crate::d1_backup::D1Backup> {
+        let raw = self
+            .post(
+                base,
+                &format!("/v1/d1/{}/backup", component(db)),
+                serde_json::to_vec(&serde_json::json!({
+                    "bucket": bucket,
+                    "prefix": prefix,
+                }))?,
+            )
+            .await?;
+        Ok(serde_json::from_slice(&raw)?)
+    }
+
     async fn d1_request(&self, base: &str, db: &str, body: Vec<u8>) -> Result<serde_json::Value> {
         let mut target = base.to_string();
         let mut candidates = vec![target.clone()];

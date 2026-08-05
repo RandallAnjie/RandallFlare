@@ -1703,6 +1703,7 @@ function renderStorage() {
   $("#storage-default").value = policy.new_bucket_backend || "local";
   $("#storage-remotes").value = (policy.shard_remotes || []).join("\n");
   $("#storage-prefix").value = policy.shard_prefix || "";
+  $("#storage-d1-backups").value = JSON.stringify(policy.d1_backups || [], null, 2);
   const list = $("#storage-distribution");
   list.classList.toggle("empty-state", distribution.length === 0);
   list.innerHTML = distribution.length ? distribution.map((item) => `<div class="database-row"><div><strong>${escapeHtml(storageLocationCopy(item.storage))}</strong><small>${escapeHtml(item.buckets)} 个 bucket · ${escapeHtml(item.objects)} 个对象</small></div><span class="badge">${escapeHtml(formatBytes(item.bytes))}</span></div>`).join("") : "暂无已索引对象。";
@@ -1728,10 +1729,19 @@ async function loadStorage({ quiet = false } = {}) {
 
 async function saveStorage(event) {
   event.preventDefault();
+  let d1Backups;
+  try {
+    d1Backups = JSON.parse($("#storage-d1-backups").value || "[]");
+    if (!Array.isArray(d1Backups)) throw new Error("D1 自动备份策略必须是 JSON 数组");
+  } catch (error) {
+    toast(`D1 自动备份策略无效：${error.message}`, true);
+    return;
+  }
   const payload = {
     new_bucket_backend: $("#storage-default").value,
     shard_remotes: $("#storage-remotes").value.split(/\r?\n/).map((value) => value.trim()).filter(Boolean),
     shard_prefix: $("#storage-prefix").value.trim().replace(/^\/+|\/+$/g, ""),
+    d1_backups: d1Backups,
   };
   try {
     const result = await api("/api/storage", { method: "POST", body: JSON.stringify(payload) });
@@ -4604,6 +4614,29 @@ async function exportD1() {
   }
 }
 
+async function backupD1(event) {
+  event.preventDefault();
+  const name = state.d1Active || $("#d1-name").value.trim();
+  if (!name) { toast("请先选择 D1 数据库", true); return; }
+  try {
+    $("#d1-transfer-status").textContent = `正在把 ${name} 在线备份到 R2…`;
+    const backup = await api("/api/d1/backup", {
+      method: "POST",
+      body: JSON.stringify({
+        name,
+        bucket: $("#d1-backup-bucket").value.trim(),
+        prefix: $("#d1-backup-prefix").value.trim().replace(/^\/+|\/+$/g, ""),
+      }),
+    });
+    $("#d1-transfer-status").textContent = `备份完成：${backup.bucket}/${backup.object_key} · ${formatBytes(backup.size)}`;
+    toast(`D1 备份已写入 ${backup.bucket}`);
+    await loadR2({ quiet: true });
+  } catch (error) {
+    $("#d1-transfer-status").textContent = error.message;
+    toast(error.message, true);
+  }
+}
+
 async function executeSql(event) {
   event.preventDefault();
   let params;
@@ -4841,6 +4874,7 @@ $("#d1-exec-form").addEventListener("submit", executeSql);
 $("#d1-import-picker").addEventListener("click", () => $("#d1-import").click());
 $("#d1-import").addEventListener("change", importD1);
 $("#d1-export").addEventListener("click", exportD1);
+$("#d1-backup-form").addEventListener("submit", backupD1);
 $("#d1-refresh").addEventListener("click", loadD1Info);
 $("#r2-bucket-form").addEventListener("submit", saveR2Bucket);
 $("#r2-bucket-name").addEventListener("input", updateR2DefaultDomainPreview);

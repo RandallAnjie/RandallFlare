@@ -17,6 +17,52 @@ pub const STORAGE_POLICY_KIND: &str = "storage_policy";
 pub const DEFAULT_POLICY_NAME: &str = "default";
 pub const STORAGE_POLICY_SCHEMA: u8 = 1;
 pub const MAX_SHARD_REMOTES: usize = 256;
+pub const MAX_D1_BACKUP_POLICIES: usize = 256;
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct D1BackupPolicy {
+    pub database: String,
+    pub bucket: String,
+    #[serde(default = "default_d1_backup_prefix")]
+    pub prefix: String,
+    #[serde(default = "default_d1_backup_interval_hours")]
+    pub interval_hours: u16,
+    #[serde(default = "default_d1_backup_retention_days")]
+    pub retention_days: u16,
+    #[serde(default)]
+    pub suspended: bool,
+}
+
+fn default_d1_backup_prefix() -> String {
+    "d1-backups".into()
+}
+
+fn default_d1_backup_interval_hours() -> u16 {
+    24
+}
+
+fn default_d1_backup_retention_days() -> u16 {
+    30
+}
+
+impl D1BackupPolicy {
+    fn validate(&self) -> Result<()> {
+        if !rf_core::manifest::valid_name(&self.database)
+            || !rf_core::manifest::valid_name(&self.bucket)
+        {
+            bail!("D1 备份策略中的数据库或 R2 bucket 名称无效");
+        }
+        crate::objectstore::validate_prefix(&self.prefix)?;
+        if !(1..=720).contains(&self.interval_hours) {
+            bail!("D1 自动备份间隔必须介于 1 和 720 小时之间");
+        }
+        if !(1..=3650).contains(&self.retention_days) {
+            bail!("D1 备份保留期必须介于 1 和 3650 天之间");
+        }
+        Ok(())
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -34,6 +80,8 @@ pub struct StoragePolicy {
     pub shard_remotes: Vec<String>,
     #[serde(default)]
     pub shard_prefix: String,
+    #[serde(default)]
+    pub d1_backups: Vec<D1BackupPolicy>,
 }
 
 impl Default for StoragePolicy {
@@ -43,6 +91,7 @@ impl Default for StoragePolicy {
             new_bucket_backend: NewBucketBackend::Local,
             shard_remotes: Vec::new(),
             shard_prefix: String::new(),
+            d1_backups: Vec::new(),
         }
     }
 }
@@ -65,6 +114,19 @@ impl StoragePolicy {
             }
         }
         crate::objectstore::validate_prefix(&self.shard_prefix)?;
+        if self.d1_backups.len() > MAX_D1_BACKUP_POLICIES {
+            bail!("D1 自动备份策略最多 {MAX_D1_BACKUP_POLICIES} 条");
+        }
+        let mut backup_databases = HashSet::new();
+        for backup in &self.d1_backups {
+            backup.validate()?;
+            if !backup_databases.insert(&backup.database) {
+                bail!(
+                    "每个 D1 数据库只能配置一条自动备份策略：{}",
+                    backup.database
+                );
+            }
+        }
         if self.new_bucket_backend == NewBucketBackend::RcloneSharded
             && self.shard_remotes.is_empty()
         {
@@ -106,6 +168,14 @@ pub fn prepare_after(
         .filter(|remote| !remote.is_empty())
         .collect();
     policy.shard_prefix = policy.shard_prefix.trim_matches('/').to_string();
+    for backup in &mut policy.d1_backups {
+        backup.database = backup.database.trim().to_ascii_lowercase();
+        backup.bucket = backup.bucket.trim().to_ascii_lowercase();
+        backup.prefix = backup.prefix.trim_matches('/').to_string();
+    }
+    policy
+        .d1_backups
+        .sort_by(|left, right| left.database.cmp(&right.database));
     policy.validate()?;
     resource::prepare_after(
         STORAGE_POLICY_KIND,
@@ -147,6 +217,15 @@ pub async fn validate_transition(node: &Node, record: &ResourceRecord) -> Result
         return Ok(());
     }
     let next = policy_spec(record)?;
+    let databases = crate::d1::database_names(node);
+    for backup in &next.d1_backups {
+        if !databases.contains(&backup.database) {
+            bail!("D1 自动备份策略引用了不存在的数据库：{}", backup.database);
+        }
+        if crate::r2::bucket_record(node, &backup.bucket).is_none() {
+            bail!("D1 自动备份策略引用了不存在的 R2 bucket：{}", backup.bucket);
+        }
+    }
     let (_, current) = current(node)?;
     let removed = current
         .shard_remotes
@@ -274,11 +353,34 @@ mod tests {
             new_bucket_backend: NewBucketBackend::RcloneSharded,
             shard_remotes: vec!["drive-00".into()],
             shard_prefix: String::new(),
+            d1_backups: Vec::new(),
         };
         policy.validate().unwrap();
         policy.shard_remotes.push("drive-00".into());
         assert!(policy.validate().is_err());
         policy.shard_remotes.clear();
+        assert!(policy.validate().is_err());
+    }
+
+    #[test]
+    fn backup_policies_are_bounded_and_unique_per_database() {
+        let backup = D1BackupPolicy {
+            database: "appdb".into(),
+            bucket: "backups".into(),
+            prefix: "d1".into(),
+            interval_hours: 24,
+            retention_days: 30,
+            suspended: false,
+        };
+        let mut policy = StoragePolicy {
+            d1_backups: vec![backup.clone()],
+            ..Default::default()
+        };
+        policy.validate().unwrap();
+        policy.d1_backups.push(backup);
+        assert!(policy.validate().is_err());
+        policy.d1_backups[1].database = "other".into();
+        policy.d1_backups[1].interval_hours = 0;
         assert!(policy.validate().is_err());
     }
 }

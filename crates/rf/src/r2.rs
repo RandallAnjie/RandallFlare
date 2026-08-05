@@ -264,6 +264,20 @@ pub fn bucket_spec(resource: &ResourceRecord) -> Result<BucketSpec> {
 
 pub fn validate_bucket_admission(node: &Node, resource: &ResourceRecord) -> Result<()> {
     let spec = bucket_spec(resource)?;
+    if resource.deleted {
+        let (_, storage) = crate::storage_policy::current(node)?;
+        if let Some(backup) = storage
+            .d1_backups
+            .iter()
+            .find(|backup| backup.bucket == resource.name)
+        {
+            bail!(
+                "R2 bucket {} 仍被 D1 数据库 {} 的自动备份策略使用",
+                resource.name,
+                backup.database
+            );
+        }
+    }
     if let Some(policy) = &spec.storage_policy {
         crate::storage_policy::resolve(node, policy, &[0u8; 32])?;
     }
@@ -2476,6 +2490,7 @@ mod tests {
                 new_bucket_backend: crate::storage_policy::NewBucketBackend::RcloneSharded,
                 shard_remotes: vec!["drive-a".into()],
                 shard_prefix: "rf-shards".into(),
+                d1_backups: Vec::new(),
             },
             None,
         )
@@ -2552,6 +2567,7 @@ mod tests {
                 new_bucket_backend: crate::storage_policy::NewBucketBackend::RcloneSharded,
                 shard_remotes: vec!["drive-a".into(), "drive-b".into()],
                 shard_prefix: "rf-shards".into(),
+                d1_backups: Vec::new(),
             },
             Some(&policy_head),
         )
@@ -2697,6 +2713,7 @@ mod tests {
                 new_bucket_backend: crate::storage_policy::NewBucketBackend::RcloneSharded,
                 shard_remotes: vec!["drive-b".into()],
                 shard_prefix: "rf-shards".into(),
+                d1_backups: Vec::new(),
             },
             Some(&current_policy),
         )

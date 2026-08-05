@@ -184,7 +184,10 @@ commit through a majority; killing the leader loses nothing
 --params '[…]'` against any node — requests chase the leader
 automatically. Mixed read/write batches are one replicated SQLite transaction;
 the Chinese console browses schema/rows/metrics, imports bounded SQL files and
-downloads a portable online-backup snapshot from the current leader.
+downloads a portable online-backup snapshot from the current leader. Manual and
+operator-signed scheduled backups write verified SQLite snapshots directly to
+R2—including fixed or sharded rclone buckets—with multipart upload and retention
+cleanup. See [the D1 guide](./docs/D1.md).
 
 Worker manifests can bind a database with `"d1": {"DB":"mydb"}`.
 The runtime exposes the familiar `env.DB.prepare(...).bind(...).all()/first()/run()/raw()`,

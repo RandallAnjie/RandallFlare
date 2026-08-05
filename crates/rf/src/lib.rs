@@ -14,6 +14,7 @@ pub mod config;
 pub mod console;
 pub mod cron_driver;
 pub mod d1;
+pub mod d1_backup;
 pub mod d1bind;
 pub mod deploy;
 pub mod dns;

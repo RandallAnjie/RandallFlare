@@ -1032,6 +1032,7 @@ Content-Type: text/plain; charset=utf-8
                 <label><span>新 bucket 默认后端</span><select id="storage-default"><option value="local">集群本地多数派副本</option><option value="rclone_sharded">rclone 内容分片</option></select></label>
                 <label><span>有序 rclone remote <em>每行一个，最多 256 个</em></span><textarea id="storage-remotes" class="code-input" rows="10" placeholder="drive-00&#10;drive-01&#10;drive-02"></textarea><small>名称必须对应各节点私有 rclone.conf 中的 section；配置与凭据绝不会写入资源链。</small></label>
                 <label><span>盘内平铺前缀</span><input id="storage-prefix" placeholder="randallflare/shards"><small>实际 key 为 &lt;前缀&gt;/&lt;sha256&gt;，不创建哈希目录。</small></label>
+                <label><span>D1 自动备份策略（JSON）</span><textarea id="storage-d1-backups" class="code-input" rows="10" placeholder='[{"database":"appdb","bucket":"backups","prefix":"d1-backups","interval_hours":24,"retention_days":30,"suspended":false}]'></textarea><small>快照直接写入签名 R2 bucket；bucket 可使用本地、固定 rclone 或分片 rclone 后端。</small></label>
                 <div class="button-row"><button class="primary" type="submit">提交签名存储策略</button><button id="storage-probe" class="secondary" type="button">探测所有节点</button></div>
               </form>
             </article>
@@ -1064,6 +1065,10 @@ Content-Type: text/plain; charset=utf-8
                 <button id="d1-refresh" class="secondary compact" type="button">刷新概览</button>
                 <input id="d1-import" type="file" accept=".sql,.txt,application/sql,text/plain" hidden>
               </div>
+              <form id="d1-backup-form" class="stack-form">
+                <div class="form-grid"><label><span>备份 R2 bucket</span><input id="d1-backup-bucket" pattern="[a-z0-9-]{1,63}" placeholder="backups" required></label><label><span>对象前缀</span><input id="d1-backup-prefix" value="d1-backups"></label></div>
+                <button class="secondary compact" type="submit">立即备份到 R2</button>
+              </form>
               <p id="d1-transfer-status" class="form-note">先从上方选择数据库。SQL 导入按每 100 条组成原子批次；SQLite 快照由当前主节点在线备份。</p>
             </article>
             <article class="panel sql-panel">

@@ -13,6 +13,7 @@ use std::time::{Duration, Instant};
 
 use rf::peers::PeerClient;
 use rf_core::identity::{AnyKeypair, Keypair};
+use sha2::Digest as _;
 
 #[tokio::test(flavor = "multi_thread")]
 async fn default_ingress_console_uses_operator_approved_cluster_session() {
@@ -1643,6 +1644,31 @@ export default {
     assert_eq!(d1["all"]["results"][1]["name"], "Randall");
     assert_eq!(d1["batch"][1]["results"][0]["id"], 1);
     assert_eq!(d1["raw"][0], serde_json::json!(["id", "name"]));
+    let d1_backup = client
+        .d1_backup(&n.api, "worker-db", "pipeline-output", "d1-e2e")
+        .await
+        .unwrap();
+    assert_eq!(d1_backup.database, "worker-db");
+    assert_eq!(d1_backup.bucket, "pipeline-output");
+    let (_, backup_bytes) = client
+        .r2_get(&n.api, "pipeline-output", &d1_backup.object_key)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(backup_bytes.starts_with(b"SQLite format 3\0"));
+    assert_eq!(
+        hex::encode(sha2::Sha256::digest(&backup_bytes)),
+        d1_backup.sha256
+    );
+    let backup_path = n._dir.join("worker-db-backup.sqlite");
+    std::fs::write(&backup_path, backup_bytes).unwrap();
+    let backup_db = rusqlite::Connection::open(&backup_path).unwrap();
+    let backed_up_name: String = backup_db
+        .query_row("SELECT name FROM users WHERE id=1", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(backed_up_name, "安杰");
+    drop(backup_db);
+    std::fs::remove_file(backup_path).unwrap();
     let analytics_response = http
         .get(format!("http://127.0.0.1:{}/analytics", n.ingress))
         .header("host", "api.test")

@@ -345,6 +345,18 @@ enum D1Cmd {
         #[arg(long, env = "RF_CLUSTER_SECRET")]
         secret: String,
     },
+    /// Create an online SQLite snapshot directly in an R2/rclone bucket.
+    Backup {
+        name: String,
+        #[arg(long)]
+        bucket: String,
+        #[arg(long, default_value = "d1-backups")]
+        prefix: String,
+        #[arg(long, env = "RF_NODE")]
+        node: String,
+        #[arg(long, env = "RF_CLUSTER_SECRET")]
+        secret: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -568,6 +580,9 @@ enum StorageCmd {
         shard_remotes: Vec<String>,
         #[arg(long, default_value = "")]
         shard_prefix: String,
+        /// JSON array of signed D1 automatic-backup policies. Omit to preserve.
+        #[arg(long)]
+        d1_backups_file: Option<PathBuf>,
         #[arg(long, env = "RF_NODE")]
         node: String,
         #[arg(long, env = "RF_OPERATOR_KEY")]
@@ -1936,6 +1951,19 @@ async fn async_main(cli: Cli) -> Result<()> {
                 );
                 Ok(())
             }
+            D1Cmd::Backup {
+                name,
+                bucket,
+                prefix,
+                node,
+                secret,
+            } => {
+                let backup = PeerClient::new(secret_bytes(&secret)?)
+                    .d1_backup(&node, &name, &bucket, &prefix)
+                    .await?;
+                println!("{}", serde_json::to_string_pretty(&backup)?);
+                Ok(())
+            }
         },
         Cmd::R2 { cmd } => match cmd {
             R2Cmd::BucketList { node, secret } => {
@@ -2177,6 +2205,7 @@ async fn async_main(cli: Cli) -> Result<()> {
                 new_bucket_backend,
                 shard_remotes,
                 shard_prefix,
+                d1_backups_file,
                 node,
                 key,
                 secret,
@@ -2194,12 +2223,31 @@ async fn async_main(cli: Cli) -> Result<()> {
                         rf::storage_policy::DEFAULT_POLICY_NAME,
                     )
                     .await?;
+                let existing_backups = head
+                    .as_ref()
+                    .filter(|view| !view.resource.deleted)
+                    .map(|view| rf::storage_policy::policy_spec(&view.resource))
+                    .transpose()?
+                    .map(|policy| policy.d1_backups)
+                    .unwrap_or_default();
+                let d1_backups = match d1_backups_file {
+                    Some(path) => {
+                        serde_json::from_slice::<Vec<rf::storage_policy::D1BackupPolicy>>(
+                            &std::fs::read(&path).with_context(|| {
+                                format!("读取 D1 自动备份策略 {}", path.display())
+                            })?,
+                        )
+                        .context("D1 自动备份策略文件必须是 JSON 数组")?
+                    }
+                    None => existing_backups,
+                };
                 let record = rf::storage_policy::prepare_after(
                     rf::storage_policy::StoragePolicy {
                         schema: rf::storage_policy::STORAGE_POLICY_SCHEMA,
                         new_bucket_backend: backend,
                         shard_remotes,
                         shard_prefix,
+                        d1_backups,
                     },
                     head.as_ref(),
                 )?;
@@ -4536,6 +4584,7 @@ async fn run(config_path: PathBuf) -> Result<()> {
     durable.spawn_checkpointer();
     rf::gossip::spawn_blob_fetcher(node.clone());
     rf::pipeline::spawn_driver(node.clone());
+    rf::d1_backup::spawn_driver(node.clone());
     rf::workflow::spawn_driver(node.clone());
     rf::flow::spawn_driver(node.clone());
     rf::email::spawn_driver(node.clone());

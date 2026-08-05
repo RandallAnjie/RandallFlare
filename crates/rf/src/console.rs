@@ -412,6 +412,7 @@ pub fn router(state: ConsoleState) -> Router {
         .route("/api/d1/info", get(d1_info))
         .route("/api/d1/import", post(d1_import))
         .route("/api/d1/export", get(d1_export))
+        .route("/api/d1/backup", post(d1_backup))
         .route("/api/r2/buckets", get(r2_bucket_list).post(r2_bucket_apply))
         .route("/api/storage", get(storage_get).post(storage_apply))
         .route("/api/storage/probe", post(storage_probe))
@@ -5883,6 +5884,19 @@ struct D1ImportRequest {
     sql: String,
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct D1BackupRequest {
+    name: String,
+    bucket: String,
+    #[serde(default = "console_default_d1_backup_prefix")]
+    prefix: String,
+}
+
+fn console_default_d1_backup_prefix() -> String {
+    "d1-backups".into()
+}
+
 fn empty_array() -> Value {
     json!([])
 }
@@ -5906,6 +5920,18 @@ async fn d1_create(
         )
         .await?;
     Ok(Json(serde_json::from_slice(&raw)?))
+}
+
+async fn d1_backup(
+    State(state): State<ConsoleState>,
+    Json(request): Json<D1BackupRequest>,
+) -> ApiResult<Json<Value>> {
+    state.require_mutation()?;
+    let backup = state
+        .client
+        .d1_backup(&state.node, &request.name, &request.bucket, &request.prefix)
+        .await?;
+    Ok(Json(serde_json::to_value(backup)?))
 }
 
 async fn d1_exec(
@@ -6198,6 +6224,8 @@ struct StoragePolicyRequest {
     shard_remotes: Vec<String>,
     #[serde(default)]
     shard_prefix: String,
+    #[serde(default)]
+    d1_backups: Vec<crate::storage_policy::D1BackupPolicy>,
 }
 
 async fn storage_get(State(state): State<ConsoleState>) -> ApiResult<Json<Value>> {
@@ -6281,6 +6309,7 @@ async fn storage_apply(
         new_bucket_backend: request.new_bucket_backend,
         shard_remotes: request.shard_remotes,
         shard_prefix: request.shard_prefix,
+        d1_backups: request.d1_backups,
     };
     let head = state
         .client
