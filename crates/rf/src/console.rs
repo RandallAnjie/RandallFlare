@@ -402,6 +402,12 @@ pub fn router(state: ConsoleState) -> Router {
         .route("/api/builds", get(build_list))
         .route("/api/builds/{id}", get(build_get))
         .route("/api/approvals/{id}", get(approval_status))
+        .route("/api/hostnames", get(hostname_list).post(hostname_claim))
+        .route("/api/hostnames/{hostname}", delete(hostname_delete))
+        .route(
+            "/api/hostnames/{hostname}/verification",
+            post(hostname_verify),
+        )
         .route("/api/kv", get(kv_list))
         .route("/api/kv/value", get(kv_get).put(kv_put).delete(kv_delete))
         .route("/api/kv/export", get(kv_export))
@@ -3396,12 +3402,45 @@ async fn worker_get(
             .map(|record| serde_json::to_value(record).unwrap_or(Value::Null)),
         ConsoleMode::Local { .. } => None,
     };
+    let hostname_claims = state
+        .client
+        .resource_heads(&state.node, Some(crate::hostname::HOSTNAME_CLAIM_KIND))
+        .await?
+        .into_iter()
+        .filter(|view| !view.resource.deleted)
+        .filter_map(|view| {
+            let spec = crate::hostname::claim_spec(&view.resource).ok()?;
+            manifest.hostnames.contains(&spec.hostname).then(|| {
+                json!({
+                    "hostname": spec.hostname,
+                    "verified": spec.verified_at_ms.is_some(),
+                    "verified_at_ms": spec.verified_at_ms,
+                    "txt_name": spec.txt_name(),
+                    "txt_value": spec.txt_value(),
+                    "version": view.resource.version,
+                })
+            })
+        })
+        .collect::<Vec<_>>();
     let (default_hostname, effective_hostnames) = match &state.mode {
         ConsoleMode::Public { node, .. } => (
             node.default_worker_hostname(&manifest.name),
             node.effective_worker_hostnames(&manifest),
         ),
-        ConsoleMode::Local { .. } => (None, manifest.hostnames.clone()),
+        ConsoleMode::Local { .. } => (
+            None,
+            manifest
+                .hostnames
+                .iter()
+                .filter(|hostname| {
+                    hostname_claims.iter().any(|claim| {
+                        claim["hostname"].as_str() == Some(hostname)
+                            && claim["verified"].as_bool() == Some(true)
+                    })
+                })
+                .cloned()
+                .collect(),
+        ),
     };
     let tls = match &state.mode {
         ConsoleMode::Public { node, .. } => worker_tls_view(node, &effective_hostnames),
@@ -3435,6 +3474,7 @@ async fn worker_get(
             "assets": manifest.assets,
             "hostnames": effective_hostnames,
             "custom_hostnames": manifest.hostnames,
+            "hostname_claims": hostname_claims,
             "default_hostname": default_hostname,
             "env": env,
             "kv_bindings": manifest.kv_bindings,
@@ -4643,6 +4683,208 @@ async fn approval_status(
         "summary": poll.summary,
         "error": poll.error,
     })))
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct HostnameClaimRequest {
+    hostname: String,
+}
+
+async fn hostname_list(State(state): State<ConsoleState>) -> ApiResult<Json<Value>> {
+    let claims = state
+        .client
+        .resource_heads(&state.node, Some(crate::hostname::HOSTNAME_CLAIM_KIND))
+        .await?
+        .into_iter()
+        .filter(|view| !view.resource.deleted)
+        .filter_map(|view| {
+            let spec = crate::hostname::claim_spec(&view.resource).ok()?;
+            Some(json!({
+                "name": view.resource.name,
+                "version": view.resource.version,
+                "digest": view.digest,
+                "hostname": spec.hostname,
+                "verified": spec.verified_at_ms.is_some(),
+                "verified_at_ms": spec.verified_at_ms,
+                "txt_name": spec.txt_name(),
+                "txt_value": spec.txt_value(),
+            }))
+        })
+        .collect::<Vec<_>>();
+    Ok(Json(json!({ "claims": claims })))
+}
+
+async fn hostname_claim(
+    State(state): State<ConsoleState>,
+    Extension(principal): Extension<ConsolePrincipal>,
+    Json(request): Json<HostnameClaimRequest>,
+) -> ApiResult<Json<Value>> {
+    state.require_mutation()?;
+    let hostname = request
+        .hostname
+        .trim()
+        .trim_end_matches('.')
+        .to_ascii_lowercase();
+    if !rf_core::manifest::valid_hostname(&hostname) {
+        return Err(ApiError::bad_request("请输入有效的小写 DNS 主机名"));
+    }
+    let head = state
+        .client
+        .resource_head(
+            &state.node,
+            crate::hostname::HOSTNAME_CLAIM_KIND,
+            &crate::hostname::claim_name(&hostname),
+        )
+        .await?;
+    if let Some(view) = head.as_ref().filter(|view| !view.resource.deleted) {
+        let spec = crate::hostname::claim_spec(&view.resource)?;
+        return Ok(Json(json!({
+            "ok": true,
+            "existing": true,
+            "hostname": hostname,
+            "version": view.resource.version,
+            "verified": spec.verified_at_ms.is_some(),
+            "txt_name": spec.txt_name(),
+            "txt_value": spec.txt_value(),
+        })));
+    }
+    let record = crate::hostname::prepare_claim_after(&hostname, None, None, false, head.as_ref())?;
+    let spec = crate::hostname::claim_spec(&record)?;
+    let mut response = submit_hostname_resource(
+        &state,
+        &principal,
+        record,
+        format!("创建域名 {hostname} 的 DNS 所有权声明"),
+    )
+    .await?
+    .0;
+    response["hostname"] = Value::String(hostname);
+    response["verified"] = Value::Bool(false);
+    response["txt_name"] = Value::String(spec.txt_name());
+    response["txt_value"] = Value::String(spec.txt_value());
+    Ok(Json(response))
+}
+
+async fn hostname_verify(
+    State(state): State<ConsoleState>,
+    Extension(principal): Extension<ConsolePrincipal>,
+    Path(hostname): Path<String>,
+) -> ApiResult<Json<Value>> {
+    state.require_mutation()?;
+    let hostname = hostname.trim_end_matches('.').to_ascii_lowercase();
+    let head = state
+        .client
+        .resource_head(
+            &state.node,
+            crate::hostname::HOSTNAME_CLAIM_KIND,
+            &crate::hostname::claim_name(&hostname),
+        )
+        .await?
+        .filter(|view| !view.resource.deleted)
+        .ok_or_else(|| ApiError::not_found("域名所有权声明不存在"))?;
+    let spec = crate::hostname::claim_spec(&head.resource)?;
+    if spec.verified_at_ms.is_some() {
+        return Ok(Json(json!({
+            "ok": true,
+            "existing": true,
+            "hostname": hostname,
+            "verified": true,
+            "version": head.resource.version,
+        })));
+    }
+    let verification = state
+        .client
+        .hostname_verification(&state.node, &hostname)
+        .await?;
+    if !verification.verified {
+        return Err(ApiError::bad_request(format!(
+            "尚未查询到匹配的 TXT 记录；需要在 {} 配置 {}",
+            verification.txt_name, verification.txt_value
+        )));
+    }
+    let record = crate::hostname::prepare_claim_after(
+        &hostname,
+        Some(spec),
+        Some(verification.checked_at_ms),
+        false,
+        Some(&head),
+    )?;
+    let mut response = submit_hostname_resource(
+        &state,
+        &principal,
+        record,
+        format!("确认域名 {hostname} 的 DNS 所有权并启用路由"),
+    )
+    .await?
+    .0;
+    response["hostname"] = Value::String(hostname);
+    response["verified"] = Value::Bool(true);
+    response["verification"] = serde_json::to_value(verification)?;
+    Ok(Json(response))
+}
+
+async fn hostname_delete(
+    State(state): State<ConsoleState>,
+    Extension(principal): Extension<ConsolePrincipal>,
+    Path(hostname): Path<String>,
+) -> ApiResult<Json<Value>> {
+    state.require_mutation()?;
+    let hostname = hostname.trim_end_matches('.').to_ascii_lowercase();
+    let head = state
+        .client
+        .resource_head(
+            &state.node,
+            crate::hostname::HOSTNAME_CLAIM_KIND,
+            &crate::hostname::claim_name(&hostname),
+        )
+        .await?
+        .filter(|view| !view.resource.deleted)
+        .ok_or_else(|| ApiError::not_found("域名所有权声明不存在"))?;
+    let spec = crate::hostname::claim_spec(&head.resource)?;
+    let record =
+        crate::hostname::prepare_claim_after(&hostname, Some(spec), None, true, Some(&head))?;
+    submit_hostname_resource(
+        &state,
+        &principal,
+        record,
+        format!("撤销域名 {hostname} 的所有权和所有公开路由"),
+    )
+    .await
+}
+
+async fn submit_hostname_resource(
+    state: &ConsoleState,
+    principal: &ConsolePrincipal,
+    record: crate::resource::ResourceRecord,
+    description: String,
+) -> ApiResult<Json<Value>> {
+    match &state.mode {
+        ConsoleMode::Local { .. } => {
+            let envelope = rf_core::envelope::Envelope::seal_any(&record, state.operator()?);
+            state.client.post_resource(&state.node, &envelope).await?;
+            Ok(Json(json!({
+                "ok": true,
+                "name": record.name,
+                "version": record.version,
+            })))
+        }
+        ConsoleMode::Public { node, .. } => {
+            let approval = node.management.create_resource(
+                principal.session_id,
+                &record,
+                format!("{description} v{}", record.version),
+            )?;
+            Ok(Json(json!({
+                "ok": true,
+                "pending_approval": true,
+                "name": record.name,
+                "version": record.version,
+                "approval": approval,
+                "approve_node": node.cfg.peer_api_advertise().to_string(),
+            })))
+        }
+    }
 }
 
 #[derive(Deserialize)]

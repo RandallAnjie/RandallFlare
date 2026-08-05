@@ -26,6 +26,7 @@ async fn default_ingress_console_uses_operator_approved_cluster_session() {
     let http = reqwest::Client::new();
     let node = start("admin", &operator, &[]);
     wait_ping(&node.api, Duration::from_secs(15)).await;
+    verify_hostname(&client, &node.api, &operator_any, "admin-worker.test").await;
     let ingress = format!("http://127.0.0.1:{}", node.ingress);
 
     let page = http.get(&ingress).send().await.unwrap();
@@ -474,6 +475,7 @@ async fn durable_flow_webhook_loops_and_resource_nodes() {
     let http = reqwest::Client::new();
     let mut node = start("flow", &operator, &[]);
     wait_ping(&node.api, Duration::from_secs(15)).await;
+    verify_hostname(&client, &node.api, &operator_any, "flow.test").await;
 
     let graph: rf::flow::FlowGraph = serde_json::from_value(serde_json::json!({
         "nodes": [
@@ -731,6 +733,26 @@ async fn wait_ping(api: &str, budget: Duration) {
     }
 }
 
+async fn verify_hostname(client: &PeerClient, node: &str, operator: &AnyKeypair, hostname: &str) {
+    let created_at_ms = rf::node::now_ms();
+    let spec = rf::hostname::HostnameClaimSpec {
+        hostname: hostname.to_string(),
+        challenge: rf::hostname::generate_challenge(),
+        created_at_ms,
+        verified_at_ms: None,
+    };
+    let record =
+        rf::hostname::prepare_claim_after(hostname, Some(spec), Some(created_at_ms), false, None)
+            .unwrap();
+    client
+        .post_resource(
+            node,
+            &rf_core::envelope::Envelope::seal_any(&record, operator),
+        )
+        .await
+        .unwrap();
+}
+
 async fn wait_full_membership(client: &PeerClient, nodes: &[&TestNode], budget: Duration) {
     let deadline = Instant::now() + budget;
     loop {
@@ -818,6 +840,8 @@ async fn module_worker_on_real_workerd() {
 
     let mut n = start("wd", &operator, &[]);
     wait_ping(&n.api, Duration::from_secs(15)).await;
+    verify_hostname(&client, &n.api, &op_any, "api.test").await;
+    verify_hostname(&client, &n.api, &op_any, "pipe.test").await;
 
     let backend_dir =
         std::env::temp_dir().join(format!("rf-e2e-service-{}", rand::random::<u32>()));
@@ -2085,6 +2109,7 @@ async fn durable_object_on_real_workerd() {
     let mut child = spawn_node(&dir, &config);
     let api_addr = format!("127.0.0.1:{api}");
     wait_ping(&api_addr, Duration::from_secs(15)).await;
+    verify_hostname(&client, &api_addr, &op_any, "counter.test").await;
 
     let bundle_dir = dir.join("bundle");
     std::fs::create_dir_all(&bundle_dir).unwrap();
@@ -2187,6 +2212,7 @@ async fn durable_object_routes_and_survives_owner_loss() {
     wait_ping(&b.api, Duration::from_secs(15)).await;
     wait_ping(&c.api, Duration::from_secs(15)).await;
     wait_full_membership(&client, &[&a, &b, &c], Duration::from_secs(20)).await;
+    verify_hostname(&client, &a.api, &op_any, "global-counter.test").await;
 
     let bundle_dir = std::env::temp_dir().join(format!(
         "rf-e2e-do-cluster-bundle-{}",
@@ -2348,6 +2374,7 @@ async fn tls_ingress_serves_with_sni_cert() {
 
     let mut child = spawn_node(&dir, &dir.join("rf.toml"));
     wait_ping(&format!("127.0.0.1:{api}"), Duration::from_secs(15)).await;
+    verify_hostname(&client, &format!("127.0.0.1:{api}"), &op_any, "tls.test").await;
 
     let bundle_dir = make_bundle("tls.test");
     let bundle = rf::deploy::read_bundle(&bundle_dir).unwrap();
@@ -3021,6 +3048,7 @@ async fn two_node_deploy_kv_and_static_stability() {
 
     // Deploy an assets-only worker (a pure static site) to A.
     let op_any = AnyKeypair::Ed(operator.clone());
+    verify_hostname(&client, &a.api, &op_any, "site.test").await;
     let bundle_dir = make_bundle("site.test");
     let bundle = rf::deploy::read_bundle(&bundle_dir).unwrap();
     let version = rf::deploy::deploy(&bundle, &client, &a.api, &op_any)
@@ -3255,6 +3283,7 @@ async fn tag_placement_forwards_public_ingress_to_an_eligible_peer() {
     let b = start("placement-b", &operator, &[a.gossip]);
     wait_ping(&b.api, Duration::from_secs(15)).await;
     wait_full_membership(&client, &[&a, &b], Duration::from_secs(20)).await;
+    verify_hostname(&client, &a.api, &operator_any, "placed.test").await;
 
     let b_id = client.status(&b.api).await.unwrap()["node"]
         .as_str()

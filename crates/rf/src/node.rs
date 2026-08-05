@@ -17,7 +17,7 @@ use rf_core::manifest::{ManifestIngest, ManifestSet, WorkerManifest};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::net::SocketAddr;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use tokio::sync::broadcast;
 
 pub type KvListPage = (Vec<(String, Option<u64>)>, bool, Option<String>);
@@ -107,6 +107,9 @@ pub struct Inner {
     /// Current local share of the signed cluster request/minute budget:
     /// (unix-minute, accepted requests).
     pub quota_request_window: (u64, u64),
+    /// Incremented whenever the signed platform-resource namespace changes.
+    /// Hot ingress paths use it to cache verified custom hostnames.
+    pub platform_resource_generation: u64,
 }
 
 pub struct Node {
@@ -125,6 +128,7 @@ pub struct Node {
     flow_schemas: Mutex<HashSet<String>>,
     email_schemas: Mutex<HashSet<String>>,
     cron_schemas: Mutex<HashSet<String>>,
+    verified_hostname_cache: Mutex<(u64, Arc<BTreeSet<String>>)>,
     /// Serializes cluster-quota preflight with the following local R2 metadata
     /// commit. Cross-node admission remains intentionally conservative and is
     /// backed by the per-bucket D1 quorum.
@@ -179,6 +183,7 @@ impl Node {
             binarybind_port: 0,
             worker_event_tokens: HashMap::new(),
             quota_request_window: (0, 0),
+            platform_resource_generation: 0,
         };
         // Hydrate: static stability means booting entirely from disk.
         for env in store.load_manifests()? {
@@ -194,6 +199,9 @@ impl Node {
         for (ns, key, entry) in store.load_kv()? {
             inner.clock.observe(entry.hlc, now_ms());
             inner.kv.entry(ns).or_default().merge(&key, entry);
+        }
+        if inner.kv.contains_key(crate::resource::RESOURCE_NAMESPACE) {
+            inner.platform_resource_generation = 1;
         }
         let (events, _) = broadcast::channel(256);
         Ok(Self {
@@ -212,6 +220,7 @@ impl Node {
             flow_schemas: Mutex::new(HashSet::new()),
             email_schemas: Mutex::new(HashSet::new()),
             cron_schemas: Mutex::new(HashSet::new()),
+            verified_hostname_cache: Mutex::new((0, Arc::new(BTreeSet::new()))),
             r2_quota_gate: tokio::sync::Mutex::new(()),
             events,
         })
@@ -453,6 +462,10 @@ impl Node {
                 writer,
                 expires_at_ms,
             );
+            if ns == crate::resource::RESOURCE_NAMESPACE {
+                inner.platform_resource_generation =
+                    inner.platform_resource_generation.wrapping_add(1);
+            }
             self.store.put_kv(ns, key, &entry)?;
         }
         self.emit(NodeEvent::Kv(ns.to_string()));
@@ -562,6 +575,10 @@ impl Node {
                     applied += 1;
                 }
             }
+            if applied > 0 && ns == crate::resource::RESOURCE_NAMESPACE {
+                inner.platform_resource_generation =
+                    inner.platform_resource_generation.wrapping_add(1);
+            }
         }
         if applied > 0 {
             self.emit(NodeEvent::Kv(ns.to_string()));
@@ -636,13 +653,24 @@ impl Node {
 
     /// Routing table: hostname → worker.
     pub fn routes(&self) -> BTreeMap<String, String> {
-        let inner = self.inner.lock().unwrap();
-        let mut routes = inner.manifests.routes();
-        for record in inner.manifests.live() {
-            if let Some(hostname) = self.cfg.default_worker_hostname(&record.manifest.name) {
+        let (mut routes, workers) = {
+            let inner = self.inner.lock().unwrap();
+            (
+                inner.manifests.routes(),
+                inner
+                    .manifests
+                    .live()
+                    .map(|record| record.manifest.name.clone())
+                    .collect::<Vec<_>>(),
+            )
+        };
+        let verified = self.verified_custom_hostnames();
+        routes.retain(|hostname, _| verified.contains(hostname));
+        for worker in workers {
+            if let Some(hostname) = self.cfg.default_worker_hostname(&worker) {
                 // A Worker's deterministic default route is reserved for that
                 // Worker, even if another manifest lists it as a custom route.
-                routes.insert(hostname, record.manifest.name.clone());
+                routes.insert(hostname, worker);
             }
         }
         routes
@@ -676,17 +704,45 @@ impl Node {
             .map(|domain| format!("workflow-{workflow}.{domain}"))
     }
 
+    /// Verified custom hostnames, cached by the signed-resource KV generation.
+    /// The loop prevents publishing a stale set under a newer generation if a
+    /// gossip merge races the scan.
+    pub fn verified_custom_hostnames(&self) -> Arc<BTreeSet<String>> {
+        loop {
+            let generation = self.inner.lock().unwrap().platform_resource_generation;
+            {
+                let cache = self.verified_hostname_cache.lock().unwrap();
+                if cache.0 == generation {
+                    return cache.1.clone();
+                }
+            }
+            let verified: Arc<BTreeSet<String>> = Arc::new(
+                crate::hostname::claims(self)
+                    .into_iter()
+                    .filter_map(|(_, spec)| spec.verified_at_ms.map(|_| spec.hostname))
+                    .collect(),
+            );
+            let after = self.inner.lock().unwrap().platform_resource_generation;
+            if after != generation {
+                continue;
+            }
+            *self.verified_hostname_cache.lock().unwrap() = (generation, verified.clone());
+            return verified;
+        }
+    }
+
     pub fn effective_workflow_hostnames(
         &self,
         workflow: &str,
         spec: &crate::workflow::WorkflowSpec,
     ) -> Vec<String> {
         let mut hostnames = Vec::with_capacity(spec.hostnames.len() + 1);
+        let verified = self.verified_custom_hostnames();
         if let Some(default) = self.default_workflow_hostname(workflow) {
             hostnames.push(default);
         }
         for hostname in &spec.hostnames {
-            if !hostnames.contains(hostname) {
+            if verified.contains(hostname) && !hostnames.contains(hostname) {
                 hostnames.push(hostname.clone());
             }
         }
@@ -699,11 +755,12 @@ impl Node {
         spec: &crate::flow::FlowSpec,
     ) -> Vec<String> {
         let mut hostnames = Vec::with_capacity(spec.hostnames.len() + 1);
+        let verified = self.verified_custom_hostnames();
         if let Some(default) = self.default_flow_hostname(flow) {
             hostnames.push(default);
         }
         for hostname in &spec.hostnames {
-            if !hostnames.contains(hostname) {
+            if verified.contains(hostname) && !hostnames.contains(hostname) {
                 hostnames.push(hostname.clone());
             }
         }
@@ -716,11 +773,12 @@ impl Node {
         spec: &crate::pipeline::PipelineSpec,
     ) -> Vec<String> {
         let mut hostnames = Vec::with_capacity(spec.hostnames.len() + 1);
+        let verified = self.verified_custom_hostnames();
         if let Some(default) = self.default_pipeline_hostname(pipeline) {
             hostnames.push(default);
         }
         for hostname in &spec.hostnames {
-            if !hostnames.contains(hostname) {
+            if verified.contains(hostname) && !hostnames.contains(hostname) {
                 hostnames.push(hostname.clone());
             }
         }
@@ -733,11 +791,12 @@ impl Node {
         spec: &crate::r2::BucketSpec,
     ) -> Vec<String> {
         let mut hostnames = Vec::with_capacity(spec.hostnames.len() + 1);
+        let verified = self.verified_custom_hostnames();
         if let Some(default) = self.default_r2_hostname(bucket) {
             hostnames.push(default);
         }
         for hostname in &spec.hostnames {
-            if !hostnames.contains(hostname) {
+            if verified.contains(hostname) && !hostnames.contains(hostname) {
                 hostnames.push(hostname.clone());
             }
         }
@@ -746,11 +805,12 @@ impl Node {
 
     pub fn effective_worker_hostnames(&self, manifest: &WorkerManifest) -> Vec<String> {
         let mut hostnames = Vec::with_capacity(manifest.hostnames.len() + 1);
+        let verified = self.verified_custom_hostnames();
         if let Some(default) = self.default_worker_hostname(&manifest.name) {
             hostnames.push(default);
         }
         for hostname in &manifest.hostnames {
-            if !hostnames.contains(hostname) {
+            if verified.contains(hostname) && !hostnames.contains(hostname) {
                 hostnames.push(hostname.clone());
             }
         }
@@ -1331,12 +1391,26 @@ mod tests {
             .unwrap();
         node.ingest_manifest(&Envelope::seal(&beta, &operator))
             .unwrap();
+        let custom_spec = crate::hostname::HostnameClaimSpec {
+            hostname: "custom.example".into(),
+            challenge: crate::hostname::generate_challenge(),
+            created_at_ms: now_ms(),
+            verified_at_ms: None,
+        };
+        let custom_claim = crate::hostname::prepare_claim_after(
+            "custom.example",
+            Some(custom_spec.clone()),
+            Some(custom_spec.created_at_ms + 1),
+            false,
+            None,
+        )
+        .unwrap();
+        crate::resource::ingest(&node, &Envelope::seal(&custom_claim, &operator)).unwrap();
 
         assert_eq!(
             node.effective_worker_hostnames(&alpha),
             vec![
                 "alpha.workers.example".to_string(),
-                "beta.workers.example".to_string(),
                 "custom.example".to_string(),
             ]
         );
@@ -1344,6 +1418,34 @@ mod tests {
         assert_eq!(routes["alpha.workers.example"], "alpha");
         assert_eq!(routes["beta.workers.example"], "beta");
         assert_eq!(routes["custom.example"], "alpha");
+        let contested = manifest("gamma", &["custom.example"]);
+        let conflict = crate::quota::validate_manifest_admission(&node, &contested)
+            .unwrap_err()
+            .to_string();
+        assert!(conflict.contains("custom.example"));
+        assert!(conflict.contains("Worker alpha"));
+
+        let claim_head = crate::resource::head(
+            &node,
+            crate::hostname::HOSTNAME_CLAIM_KIND,
+            &crate::hostname::claim_name("custom.example"),
+        )
+        .unwrap();
+        let claim_spec = crate::hostname::claim_spec(&claim_head.resource).unwrap();
+        let revoked = crate::hostname::prepare_claim_after(
+            "custom.example",
+            Some(claim_spec),
+            None,
+            true,
+            Some(&claim_head),
+        )
+        .unwrap();
+        crate::resource::ingest(&node, &Envelope::seal(&revoked, &operator)).unwrap();
+        assert!(!node.routes().contains_key("custom.example"));
+        assert_eq!(
+            node.effective_worker_hostnames(&alpha),
+            vec!["alpha.workers.example".to_string()]
+        );
 
         drop(node);
         std::fs::remove_dir_all(data_dir).unwrap();

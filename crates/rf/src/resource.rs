@@ -160,6 +160,7 @@ pub fn ingest(node: &Node, envelope: &Envelope) -> Result<ResourceRecord> {
             | crate::quota::POLICY_KIND
             | crate::r2::BUCKET_KIND
             | crate::binary::BINARY_KIND
+            | crate::hostname::HOSTNAME_CLAIM_KIND
             | crate::storage_policy::STORAGE_POLICY_KIND
     ) {
         // Placement changes affect even assets-only Workers, which have no

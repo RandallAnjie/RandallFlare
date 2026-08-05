@@ -18,7 +18,8 @@ Webhook 令牌、运行历史、步骤明细和审计时间线。也可以用 CL
 - `cron`：采用标准五段 Cron 表达式，由所有节点确定性计算，幂等键防止重复。
 
 配置了 `ingress.default_domain` 后，名为 `order-sync` 的 Flow 自动得到
-`flow-order-sync.<default_domain>`；签名定义里的自定义域名也会生效。Webhook
+`flow-order-sync.<default_domain>`；签名定义里的自定义域名在完成全局 DNS TXT 所有权
+验证后生效。Webhook
 接受 `/`、`/hook` 和 `/v1/run` 三个路径，并使用以下任一种请求头鉴权：
 
 ```text

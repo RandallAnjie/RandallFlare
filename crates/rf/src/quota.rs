@@ -11,7 +11,7 @@ use crate::resource::{self, ResourceRecord, ResourceView};
 use anyhow::{bail, Context, Result};
 use rf_core::manifest::WorkerManifest;
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 pub const POLICY_KIND: &str = "cluster_policy";
 pub const POLICY_NAME: &str = "default";
@@ -133,6 +133,7 @@ pub fn validate_manifest_admission(node: &Node, manifest: &WorkerManifest) -> Re
         return Ok(());
     }
     crate::deploy::validate_service_binding_graph(node, manifest)?;
+    validate_routing_hostname_admission(node, Some(manifest), None)?;
     let quota = policy(node).context("集群配额策略无效；为安全起见拒绝部署")?;
     let bytes = worker_bytes(manifest);
     if bytes > quota.max_worker_bytes {
@@ -186,6 +187,15 @@ pub fn validate_resource_admission(node: &Node, record: &ResourceRecord) -> Resu
         crate::storage_policy::validate_admission(node, record)?;
         return Ok(());
     }
+    if record.kind == crate::hostname::HOSTNAME_CLAIM_KIND {
+        crate::hostname::claim_spec(record)?;
+        return Ok(());
+    }
+    if record.kind == crate::preview::PREVIEW_KIND {
+        crate::preview::preview_spec(record)?;
+        validate_routing_hostname_admission(node, None, Some(record))?;
+        return Ok(());
+    }
     if matches!(
         record.kind.as_str(),
         crate::exit::EXIT_RULE_KIND | crate::exit::DEVICE_KIND
@@ -204,6 +214,7 @@ pub fn validate_resource_admission(node: &Node, record: &ResourceRecord) -> Resu
             | crate::flow::FLOW_KIND
             | crate::workflow::WORKFLOW_KIND
     ) {
+        validate_routing_hostname_admission(node, None, Some(record))?;
         let hostnames = prospective_custom_hostnames(node, None, Some(record))?;
         if hostnames.len() as u64 > quota.max_custom_hostnames as u64 {
             bail!(
@@ -214,6 +225,102 @@ pub fn validate_resource_admission(node: &Node, record: &ResourceRecord) -> Resu
         }
     }
     Ok(())
+}
+
+/// Public hostnames are a single global namespace.  Ingress has a stable
+/// precedence order for recovery from old conflicting data, but new signed
+/// writes must never create an ambiguous route across Workers and services.
+fn validate_routing_hostname_admission(
+    node: &Node,
+    replacement_manifest: Option<&WorkerManifest>,
+    replacement_resource: Option<&ResourceRecord>,
+) -> Result<()> {
+    let mut owners = BTreeMap::<String, String>::new();
+    let replaced_worker = replacement_manifest.map(|manifest| manifest.name.as_str());
+    for manifest in node.live_manifests() {
+        if replaced_worker == Some(manifest.name.as_str()) {
+            continue;
+        }
+        let owner = format!("Worker {}", manifest.name);
+        if let Some(hostname) = node.default_worker_hostname(&manifest.name) {
+            owners.entry(hostname).or_insert_with(|| owner.clone());
+        }
+        for hostname in manifest.hostnames {
+            owners.entry(hostname).or_insert_with(|| owner.clone());
+        }
+    }
+    for view in resource::heads(node, None) {
+        if view.resource.deleted || replaced_by(&view.resource, replacement_resource) {
+            continue;
+        }
+        if let Some((owner, hostnames)) = routing_resource_hostnames(node, &view.resource)? {
+            for hostname in hostnames {
+                owners.entry(hostname).or_insert_with(|| owner.clone());
+            }
+        }
+    }
+
+    let candidate = if let Some(manifest) = replacement_manifest.filter(|item| !item.deleted) {
+        let mut hostnames = manifest.hostnames.clone();
+        if let Some(default) = node.default_worker_hostname(&manifest.name) {
+            hostnames.push(default);
+        }
+        Some((format!("Worker {}", manifest.name), hostnames))
+    } else if let Some(record) = replacement_resource.filter(|item| !item.deleted) {
+        routing_resource_hostnames(node, record)?
+    } else {
+        None
+    };
+    if let Some((candidate_owner, hostnames)) = candidate {
+        for hostname in hostnames {
+            if let Some(current_owner) = owners.get(&hostname) {
+                bail!(
+                    "公开域名 {hostname} 已由 {current_owner} 使用，不能同时分配给 {candidate_owner}"
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+fn routing_resource_hostnames(
+    node: &Node,
+    record: &ResourceRecord,
+) -> Result<Option<(String, Vec<String>)>> {
+    let (label, default, mut hostnames) = match record.kind.as_str() {
+        crate::r2::BUCKET_KIND => (
+            "R2 bucket",
+            node.default_r2_hostname(&record.name),
+            crate::r2::bucket_spec(record)?.hostnames,
+        ),
+        crate::pipeline::PIPELINE_KIND => (
+            "Pipeline",
+            node.default_pipeline_hostname(&record.name),
+            crate::pipeline::pipeline_spec(record)?.hostnames,
+        ),
+        crate::flow::FLOW_KIND => (
+            "Flow",
+            node.default_flow_hostname(&record.name),
+            crate::flow::flow_spec(record)?.hostnames,
+        ),
+        crate::workflow::WORKFLOW_KIND => (
+            "Workflow",
+            node.default_workflow_hostname(&record.name),
+            crate::workflow::workflow_spec(record)?.hostnames,
+        ),
+        crate::preview::PREVIEW_KIND => {
+            let spec = crate::preview::preview_spec(record)?;
+            return Ok(Some((
+                format!("Worker 预览 {}", record.name),
+                vec![spec.hostname],
+            )));
+        }
+        _ => return Ok(None),
+    };
+    if let Some(default) = default {
+        hostnames.push(default);
+    }
+    Ok(Some((format!("{label} {}", record.name), hostnames)))
 }
 
 fn prospective_custom_hostnames(

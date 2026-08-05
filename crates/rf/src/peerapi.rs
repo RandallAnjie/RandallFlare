@@ -93,6 +93,10 @@ pub fn router(api: Api) -> Router {
         .route("/v1/resource", post(resource_post))
         .route("/v1/resource/{kind}/{name}", get(resource_get))
         .route(
+            "/v1/hostname/{hostname}/verification",
+            get(hostname_verification),
+        )
+        .route(
             "/v1/authorize/{code}",
             get(authorization_get).post(authorization_post),
         )
@@ -2373,6 +2377,26 @@ async fn email_verification(
             "verification": verification,
         }))
         .into_response(),
+        Err(error) => (StatusCode::UNPROCESSABLE_ENTITY, error.to_string()).into_response(),
+    }
+}
+
+async fn hostname_verification(
+    State(api): State<Api>,
+    ConnectInfo(remote): ConnectInfo<SocketAddr>,
+    Path(hostname): Path<String>,
+    method: Method,
+    uri: Uri,
+    headers: HeaderMap,
+) -> Response {
+    if let Err(response) = check(&api, &remote, &headers, &method, &uri, b"") {
+        return response.into_response();
+    }
+    let Some((_, spec)) = crate::hostname::claim(&api.node, &hostname) else {
+        return (StatusCode::NOT_FOUND, "域名所有权声明不存在").into_response();
+    };
+    match crate::hostname::query_verification(&spec).await {
+        Ok(verification) => axum::Json(verification).into_response(),
         Err(error) => (StatusCode::UNPROCESSABLE_ENTITY, error.to_string()).into_response(),
     }
 }

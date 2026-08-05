@@ -45,14 +45,14 @@ body.auth-required .shell { visibility: hidden; }
 
 .shell { min-height: 100vh; display: grid; grid-template-columns: 224px minmax(0, 1fr); }
 .sidebar { position: sticky; top: 0; height: 100vh; padding: 22px 14px; border-right: 1px solid var(--line-soft); background: #050505; display: flex; flex-direction: column; }
-.brand { display: flex; gap: 11px; align-items: center; margin: 0 9px 30px; }
+.brand { display: flex; gap: 11px; align-items: center; margin: 0 9px 18px; }
 .brand-mark { width: 32px; height: 32px; display: grid; place-items: center; border: 1px solid #444; border-radius: 6px; background: #fff; color: #000; }
 .brand-mark span { font-weight: 750; }
 .brand strong, .brand small { display: block; }
 .brand strong { font-size: 14px; letter-spacing: -.01em; }
 .brand small { color: var(--muted); margin-top: 3px; font-size: 10px; }
-nav { display: grid; gap: 3px; }
-.nav-item { width: 100%; border: 0; background: transparent; display: grid; grid-template-columns: 22px 1fr auto; gap: 9px; text-align: left; align-items: center; padding: 9px 10px; border-radius: 6px; color: var(--muted); cursor: pointer; font-size: 13px; }
+.sidebar nav { display: grid; align-content: start; gap: 3px; flex: 1 1 auto; min-height: 0; overflow-y: auto; padding-right: 3px; scrollbar-width: thin; scrollbar-color: #333 transparent; }
+.nav-item { width: 100%; border: 0; background: transparent; display: grid; grid-template-columns: 22px 1fr auto; gap: 9px; text-align: left; align-items: center; padding: 6px 10px; border-radius: 6px; color: var(--muted); cursor: pointer; font-size: 13px; }
 .nav-item:hover { background: var(--surface-2); color: var(--text); }
 .nav-item.active { background: var(--surface-3); color: #fff; }
 .nav-glyph { color: #777; font-size: 15px; }
@@ -481,6 +481,7 @@ dialog::backdrop { background: #000c; backdrop-filter: blur(3px); }
 @media (max-width: 760px) {
   .shell { display: block; }
   .sidebar { position: static; height: auto; padding: 14px; border-right: 0; border-bottom: 1px solid var(--line); }
+  .sidebar nav { overflow: visible; padding-right: 0; }
   .brand { margin: 0 0 13px; }
   nav { grid-template-columns: repeat(5, minmax(72px, 1fr)); overflow-x: auto; }
   .nav-item { grid-template-columns: 1fr; justify-items: center; padding: 8px 5px; font-size: 10px; }

@@ -317,6 +317,20 @@ impl PeerClient {
         Ok(())
     }
 
+    pub async fn hostname_verification(
+        &self,
+        base: &str,
+        hostname: &str,
+    ) -> Result<crate::hostname::HostnameVerification> {
+        let raw = self
+            .get(
+                base,
+                &format!("/v1/hostname/{}/verification", component(hostname)),
+            )
+            .await?;
+        Ok(serde_json::from_slice(&raw)?)
+    }
+
     pub async fn status(&self, base: &str) -> Result<serde_json::Value> {
         let raw = self.get(base, "/v1/status").await?;
         Ok(serde_json::from_slice(&raw)?)

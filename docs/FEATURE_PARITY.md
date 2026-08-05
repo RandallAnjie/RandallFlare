@@ -55,7 +55,7 @@ surface yet.
 | browser upload and CLI deploy | done | signed per-file create/edit/rename/delete and binary replacement, bounded ZIP/TAR/TAR.GZ import, and secret-redacted reproducible ZIP/TAR export are done |
 | GitHub source, sandboxed build, webhook deploy | partial | node-local GitHub App JWT/installation auth, global App and per-repository webhooks, Chinese PR Check/comment updates, PAT fallback and strict-known-host SSH deploy keys are implemented; live permission-matrix and failure-injection soak remain |
 | versions, hash-chain audit and rollback | done | historical-version preview aliases, renewal and signed deletion are done |
-| default/custom domains and wildcard TLS | done | custom-domain DNS ownership workflow |
+| default/custom domains and wildcard TLS | done | deterministic defaults stay immediately available; signed global ownership claims, unique DNS TXT challenges, verification-gated ingress/ACME, revocation, CLI/API and Chinese console are implemented for Workers and shared public services; production DNS propagation soak remains |
 | environment, encrypted Secrets, KV bindings, Cron | done | write-only XChaCha20-Poly1305 Secrets, names-only API/console, KV metadata + bulk get, and real scheduled-event Cron with D1 history/retry/DLQ/replay are verified |
 | compatibility date and flags | done | compatibility date plus validated, signed workerd compatibility flags are done; the supported-flag catalogue must track the pinned workerd release |
 | runtime/build/request logs and cluster distribution | done | runtime output and 7-day request history aggregate across live nodes; longer archival/export is optional future work |
@@ -72,7 +72,7 @@ surface yet.
 | Durable Objects | partial | full CF API audit, alarm retry controls, websocket failover soak |
 | R2 objects | partial | native binding + get/head/put/delete/list, metadata, ranges, conditions and delimiter cursors done; streaming multi-GiB IO remains |
 | R2 multipart | partial | create/upload/complete/abort, ETags, cursor-paged active-upload inventory, part inspection, staged-byte accounting and operator abort/GC are implemented across encrypted API, CLI and Chinese console; streaming multi-GiB assembly and provider compatibility soak remain |
-| R2 public/custom domains and CORS | partial | signed hostnames, deterministic defaults, ACME discovery, CORS and Range delivery done; DNS ownership workflow remains |
+| R2 public/custom domains and CORS | partial | signed hostnames, deterministic defaults, shared DNS ownership verification, ACME discovery, CORS and Range delivery are done; provider compatibility and production soak remain |
 | R2 credentials/grants/S3 API | partial | sealed Secret Access Keys, signed revocation/rotation, full-account or per-bucket grants, path-style Signature V4, conditional/ranged GET, multipart create/upload/list-parts/list-uploads/complete/abort are implemented; SDK compatibility matrix and production soak remain |
 | R2 quotas/lifecycle/dedup/replication | partial | atomic bucket quotas, lifecycle, delayed cross-bucket orphan checks, local-majority writes and repair done; multi-node fault soak remains |
 | rclone backend | partial | credential-isolated config, bounded cluster-wide remote probes and verified read/write/delete done; streaming IO and read cache remain |

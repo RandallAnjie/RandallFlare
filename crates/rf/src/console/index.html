@@ -86,6 +86,9 @@
           <button class="nav-item" data-view="binaries">
             <span class="nav-glyph" aria-hidden="true">▣</span><span>Binary Deliver</span><span id="binary-nav-count" class="count">0</span>
           </button>
+          <button class="nav-item" data-view="hostnames">
+            <span class="nav-glyph" aria-hidden="true">◇</span><span>域名与证书</span><span id="hostname-nav-count" class="count">0</span>
+          </button>
           <button class="nav-item" data-view="security">
             <span class="nav-glyph" aria-hidden="true">⌾</span><span>安全与访问</span>
           </button>
@@ -343,7 +346,7 @@
           <div id="project-tab-domains" class="project-tab">
             <div id="domain-tls-summary" class="domain-overview"></div>
             <article class="panel domain-panel">
-              <div class="panel-head"><div><p class="eyebrow">生产路由</p><h2>访问域名</h2><p class="muted compact-copy">默认域名由每个节点确定性生成；自定义域名写入签名清单。证书从集群 KV 同步到每个 HTTPS 节点。</p></div><span id="project-domain-count" class="badge">0 个域名</span></div>
+              <div class="panel-head"><div><p class="eyebrow">生产路由</p><h2>访问域名</h2><p class="muted compact-copy">默认域名由节点确定性生成；自定义域名须经 DNS TXT 所有权验证，随后才会启用路由并进入证书签发队列。</p></div><span id="project-domain-count" class="badge">0 个域名</span></div>
               <div id="project-domain-list" class="domain-list empty-state">尚未绑定域名。</div>
               <form id="project-domain-add-form" class="domain-add-form">
                 <label><span>添加域名</span><input id="project-domain-input" inputmode="url" placeholder="api.example.com" required></label>
@@ -1124,6 +1127,26 @@ Content-Type: text/plain; charset=utf-8
               <article id="binary-current" class="credential-reveal hidden"><p class="eyebrow">当前不可变内容</p><dl id="binary-current-detail" class="detail-list"></dl><p class="form-note">Worker 使用 <code>"binaries": { "FFMPEG": "ffmpeg" }</code> 绑定后，调用 <code>await env.FFMPEG.exec({ args: [...] })</code>。</p></article>
             </article>
           </div>
+        </section>
+
+        <section id="view-hostnames" class="view" aria-labelledby="section-title">
+          <div class="projects-header">
+            <div><p class="eyebrow">全局入口身份</p><h2>域名所有权</h2><p class="muted">Workers、R2、Pipeline、Workflow 与 Flow 共用签名域名目录。只有 DNS TXT 验证通过的自定义域名才会进入路由与自动证书队列。</p></div>
+            <button id="hostname-refresh" class="secondary" type="button">刷新 DNS 状态</button>
+          </div>
+          <article class="panel domain-panel">
+            <div class="panel-head"><div><p class="eyebrow">签名声明</p><h2>已声明域名</h2><p class="muted compact-copy">验证码只用于证明 DNS 控制权，不是密钥；声明与验证结果均由管理员签名并复制到整个集群。</p></div><span id="hostname-count" class="badge">0 个域名</span></div>
+            <div id="hostname-list" class="domain-list empty-state">尚未声明自定义域名。</div>
+            <form id="hostname-form" class="domain-add-form">
+              <label><span>自定义域名</span><input id="hostname-input" inputmode="url" placeholder="api.example.com" required></label>
+              <button class="primary" type="submit">创建所有权声明</button>
+            </form>
+          </article>
+          <article class="panel dns-guide"><div><p class="eyebrow">验证顺序</p><h2>安全接入</h2></div><div class="guidance-list">
+            <div><span>1</span><p><strong>写入业务清单</strong><small>可先在 Worker、R2、Pipeline、Workflow 或 Flow 中填写域名；验证前入口保持隔离。</small></p></div>
+            <div><span>2</span><p><strong>发布所有权 TXT</strong><small>把页面生成的唯一值写入 <code>_randallflare-verify.&lt;域名&gt;</code>。</small></p></div>
+            <div><span>3</span><p><strong>检查并签署</strong><small>任一节点查询 DNS；管理员签署结果后，所有节点独立启用路由和 ACME。</small></p></div>
+          </div></article>
         </section>
 
         <section id="view-security" class="view" aria-labelledby="section-title">

@@ -30,7 +30,8 @@ Workflow 把长时间任务拆成可重放步骤。定义是管理员签名、�
   `X-Workflow-Concurrency-Group` 可选请求头指定命名并发组。
 
 默认 Webhook 域名是 `workflow-<名称>.<ingress.default_domain>`，也可在签名定义中
-增加自定义域名。启用 ACME 后，这些域名进入同一证书发现流程。
+增加自定义域名。域名完成全局 DNS TXT 所有权验证后才会启用入口；启用 ACME 后，
+这些已验证域名进入同一证书发现流程。
 
 ## Webhook 认证
 

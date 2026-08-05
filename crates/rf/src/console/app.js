@@ -78,6 +78,7 @@ const state = {
   binaries: [],
   binaryActive: null,
   binaryContext: { capabilities: {}, current_os_arch: "linux/amd64" },
+  hostnameClaims: [],
   security: null,
   securityDirty: false,
   s3Editing: null,
@@ -102,6 +103,7 @@ const titles = {
   network: ["终端网络", "设备与出口"],
   email: ["去中心化邮件", "邮件路由"],
   binaries: ["安全原生程序", "Binary Deliver"],
+  hostnames: ["全局入口", "域名与证书"],
   security: ["安全边界", "安全与访问"],
 };
 
@@ -533,22 +535,28 @@ function certificateStateClass(status) {
 }
 
 function renderProjectDomains(worker, tls = {}) {
-  const hostnames = worker.hostnames || [];
+  const activeHostnames = worker.hostnames || [];
   const defaultHostname = worker.default_hostname || null;
+  const customHostnames = worker.custom_hostnames || activeHostnames.filter((hostname) => hostname !== defaultHostname);
+  const hostnames = [...new Set([defaultHostname, ...customHostnames].filter(Boolean))];
+  const claims = new Map((worker.hostname_claims || []).map((claim) => [claim.hostname, claim]));
+  const pending = customHostnames.filter((hostname) => !activeHostnames.includes(hostname)).length;
   const certificates = new Map((tls.certificates || []).map((item) => [item.hostname, item]));
   const trusted = (tls.certificates || []).filter((item) => ["active", "installed", "renewing"].includes(item.status)).length;
   const automaticConfigured = Boolean(tls.acme_enabled && tls.include_worker_hostnames);
   const automatic = Boolean(automaticConfigured && tls.acme_ready);
-  $("#project-domain-count").textContent = `${hostnames.length} 个域名`;
+  $("#project-domain-count").textContent = `${activeHostnames.length} 个生效${pending ? ` · ${pending} 个待验证` : ""}`;
   $("#domain-tls-summary").innerHTML = `
-    <article class="domain-metric"><span>路由状态</span><strong>${hostnames.length ? "已发布" : "待配置"}</strong><small>${hostnames.length} 个生效域名${defaultHostname ? " · 含系统默认域名" : ""}</small></article>
+    <article class="domain-metric"><span>路由状态</span><strong>${activeHostnames.length ? "已发布" : "待配置"}</strong><small>${activeHostnames.length} 个生效域名${pending ? ` · ${pending} 个等待 DNS 验证` : ""}</small></article>
     <article class="domain-metric"><span>HTTPS 入口</span><strong>${tls.enabled ? "已启用" : "未启用"}</strong><small>${tls.enabled ? "节点正在监听 HTTPS" : "请先在节点配置 ingress.https"}</small></article>
-    <article class="domain-metric"><span>受信任证书</span><strong>${trusted}/${hostnames.length}</strong><small>${automatic ? "新增域名可由 ACME 自动签发" : automaticConfigured ? "ACME 缺少可用的 DNS 区域或令牌" : tls.acme_enabled ? "ACME 仅管理节点配置中的域名" : "当前节点未配置 ACME"}</small></article>`;
+    <article class="domain-metric"><span>受信任证书</span><strong>${trusted}/${activeHostnames.length}</strong><small>${automatic ? "验证通过后由 ACME 自动签发" : automaticConfigured ? "ACME 缺少可用的 DNS 区域或令牌" : tls.acme_enabled ? "ACME 仅管理节点配置中的域名" : "当前节点未配置 ACME"}</small></article>`;
 
   const list = $("#project-domain-list");
   list.classList.toggle("empty-state", hostnames.length === 0);
   list.innerHTML = hostnames.length ? hostnames.map((hostname) => {
     const isDefault = hostname === defaultHostname;
+    const active = isDefault || activeHostnames.includes(hostname);
+    const claim = claims.get(hostname);
     const cert = certificates.get(hostname) || { status: "unknown", source: "unknown", coverage: "unknown" };
     const url = workerUrl(hostname, Boolean(tls.enabled));
     const source = cert.source === "acme" ? "ACME 自动管理" : cert.source === "manual" ? "手动证书" : "无证书";
@@ -558,12 +566,23 @@ function renderProjectDomains(worker, tls = {}) {
     const expiry = cert.expires_ms
       ? `有效至 ${new Date(cert.expires_ms).toLocaleDateString("zh-CN")}${cert.days_remaining != null ? ` · 剩余 ${cert.days_remaining} 天` : ""}`
       : cert.status === "installed" ? "有效期由手动证书决定" : "尚无有效期信息";
+    const primary = active
+      ? `<a href="${escapeHtml(url)}" target="_blank" rel="noreferrer">${escapeHtml(hostname)}</a>`
+      : `<strong>${escapeHtml(hostname)}</strong>`;
+    const ownership = !active
+      ? claim
+        ? `<span class="status-chip wait">等待 DNS 验证</span><small>TXT ${escapeHtml(claim.txt_name)}</small><small><code>${escapeHtml(claim.txt_value)}</code></small>`
+        : '<span class="status-chip wait">待创建所有权声明</span><small>创建后会生成唯一的 DNS TXT 验证值</small>'
+      : `<span class="status-chip ${certificateStateClass(cert.status)}">${escapeHtml(certificateStatusLabel(cert.status))}</span><small>${escapeHtml(source)} · ${escapeHtml(coverage)}</small><small>${escapeHtml(expiry)}</small>`;
+    const actions = isDefault
+      ? '<span class="badge active">始终可用</span>'
+      : `<div class="table-actions">${!active ? claim ? `<button class="mini-button" type="button" data-verify-domain="${escapeHtml(hostname)}">检查 TXT</button>` : `<button class="mini-button" type="button" data-claim-domain="${escapeHtml(hostname)}">创建验证</button>` : ""}<button class="mini-button danger" type="button" data-remove-domain="${escapeHtml(hostname)}">移除</button></div>`;
     return `<div class="domain-row">
       <span class="domain-icon">↗</span>
-      <div class="domain-primary"><a href="${escapeHtml(url)}" target="_blank" rel="noreferrer">${escapeHtml(hostname)}</a><small>${isDefault ? "系统分配 · " : "自定义域名 · "}${escapeHtml(url)}</small></div>
-      <div class="domain-route"><span class="status-chip ok">${isDefault ? "默认域名" : "路由已发布"}</span><small>Worker v${escapeHtml(worker.version)}</small></div>
-      <div class="domain-certificate"><span class="status-chip ${certificateStateClass(cert.status)}">${escapeHtml(certificateStatusLabel(cert.status))}</span><small>${escapeHtml(source)} · ${escapeHtml(coverage)}</small><small>${escapeHtml(expiry)}</small></div>
-      ${isDefault ? '<span class="badge active">始终可用</span>' : `<button class="mini-button danger" type="button" data-remove-domain="${escapeHtml(hostname)}">移除</button>`}
+      <div class="domain-primary">${primary}<small>${isDefault ? "系统分配" : active ? "自定义域名 · 已验证" : "自定义域名 · 尚未对外发布"}</small></div>
+      <div class="domain-route"><span class="status-chip ${active ? "ok" : "wait"}">${isDefault ? "默认域名" : active ? "路由已发布" : "路由已隔离"}</span><small>Worker v${escapeHtml(worker.version)}</small></div>
+      <div class="domain-certificate">${ownership}</div>
+      ${actions}
     </div>`;
   }).join("") : "尚未绑定域名。添加域名后，所有节点会从同一份签名清单建立路由。";
 
@@ -581,8 +600,9 @@ function renderProjectDomains(worker, tls = {}) {
       : "请在节点的 [acme] 中配置 DNS-01，或把 .crt/.key 证书放入 data_dir/certs；证书会热加载。";
   $("#project-domain-guidance").innerHTML = `
     <div><span>1</span><p><strong>默认域名</strong><small>${defaultHostname ? `每个节点都会独立推导 ${escapeHtml(defaultHostname)}，无需写入清单或申请分配。` : "当前节点尚未配置默认 Worker 域名。"}</small></p></div>
-    <div><span>2</span><p><strong>配置 DNS</strong><small>${escapeHtml(dnsInstruction)}</small></p></div>
-    <div><span>3</span><p><strong>启用 HTTPS</strong><small>${escapeHtml(certificateInstruction)}</small></p></div>`;
+    <div><span>2</span><p><strong>证明所有权</strong><small>自定义域名先发布唯一的 <code>_randallflare-verify</code> TXT；验证前不会进入路由和证书队列。</small></p></div>
+    <div><span>3</span><p><strong>配置流量 DNS</strong><small>${escapeHtml(dnsInstruction)}</small></p></div>
+    <div><span>4</span><p><strong>启用 HTTPS</strong><small>${escapeHtml(certificateInstruction)}</small></p></div>`;
 }
 
 function renderWorkerSecrets(names = []) {
@@ -1002,18 +1022,19 @@ async function loadRequestLogs() {
   }
 }
 
-async function updateWorkerSettings(payload, summary) {
+async function updateWorkerSettings(payload, summary, afterPublish = null) {
   const name = state.activeWorker;
   if (!name) return;
   try {
     const result = await api(`/api/workers/${encodeURIComponent(name)}`, { method: "PATCH", body: JSON.stringify(payload) });
-    if (result.pending_approval) {
-      showApproval(result, summary);
-    } else {
+    const complete = async () => {
       toast(`${name} v${result.version} 已发布`);
       await loadOverview({ quiet: true });
       await openWorkerDetail(name, state.projectTab);
-    }
+      if (afterPublish) await afterPublish();
+    };
+    if (result.pending_approval) showApproval(result, summary, complete);
+    else await complete();
   } catch (error) {
     toast(error.message, true);
   }
@@ -1025,13 +1046,46 @@ async function saveProjectDomains(event) {
   const worker = state.workerDetail?.worker || {};
   const effective = worker.hostnames || [];
   const current = worker.custom_hostnames || effective.filter((item) => item !== worker.default_hostname);
-  if (effective.includes(hostname)) {
+  if (current.includes(hostname) || effective.includes(hostname)) {
     toast(`${hostname} 已绑定到当前 Worker`, true);
     return;
   }
   const hostnames = [...current, hostname];
-  await updateWorkerSettings({ hostnames }, `为 ${state.activeWorker} 添加域名 ${hostname}。`);
+  await updateWorkerSettings(
+    { hostnames },
+    `为 ${state.activeWorker} 添加域名 ${hostname}。`,
+    () => claimProjectDomain(hostname),
+  );
   $("#project-domain-input").value = "";
+}
+
+async function claimProjectDomain(hostname) {
+  try {
+    const result = await api("/api/hostnames", { method: "POST", body: JSON.stringify({ hostname }) });
+    const complete = async () => {
+      toast(result.verified ? `${hostname} 已验证并启用` : `已生成 ${hostname} 的 DNS TXT 验证记录`);
+      await openWorkerDetail(state.activeWorker, "domains");
+    };
+    if (result.pending_approval) showApproval(result, `批准创建 ${hostname} 的 DNS 所有权声明。`, complete);
+    else await complete();
+  } catch (error) {
+    toast(error.message, true);
+  }
+}
+
+async function verifyProjectDomain(hostname) {
+  try {
+    const result = await api(`/api/hostnames/${encodeURIComponent(hostname)}/verification`, { method: "POST" });
+    const complete = async () => {
+      toast(`${hostname} 已通过 DNS 验证，路由现已启用`);
+      await loadOverview({ quiet: true });
+      await openWorkerDetail(state.activeWorker, "domains");
+    };
+    if (result.pending_approval) showApproval(result, `批准 ${hostname} 的 DNS 验证结果并启用路由。`, complete);
+    else await complete();
+  } catch (error) {
+    toast(error.message, true);
+  }
 }
 
 async function removeProjectDomain(hostname) {
@@ -3882,6 +3936,81 @@ function formatDate(at) {
   return Number.isNaN(date.getTime()) ? "—" : date.toLocaleString("zh-CN");
 }
 
+function renderHostnameClaims() {
+  const claims = state.hostnameClaims || [];
+  const verified = claims.filter((claim) => claim.verified).length;
+  $("#hostname-nav-count").textContent = String(claims.length);
+  $("#hostname-count").textContent = `${verified} 个已验证 · ${claims.length - verified} 个待验证`;
+  const list = $("#hostname-list");
+  list.classList.toggle("empty-state", claims.length === 0);
+  list.innerHTML = claims.length ? claims.map((claim) => `
+    <div class="domain-row">
+      <span class="domain-icon">${claim.verified ? "✓" : "…"}</span>
+      <div class="domain-primary"><strong>${escapeHtml(claim.hostname)}</strong><small>签名声明 v${escapeHtml(claim.version)} · ${escapeHtml(shortId(claim.digest, 16))}</small></div>
+      <div class="domain-route"><span class="status-chip ${claim.verified ? "ok" : "wait"}">${claim.verified ? "所有权已验证" : "等待 DNS TXT"}</span><small>${claim.verified_at_ms ? `验证于 ${new Date(claim.verified_at_ms).toLocaleString("zh-CN")}` : "验证前不会参与公开路由"}</small></div>
+      <div class="domain-certificate"><small><strong>TXT ${escapeHtml(claim.txt_name)}</strong></small><small><code>${escapeHtml(claim.txt_value)}</code></small></div>
+      <div class="table-actions">${claim.verified ? "" : `<button class="mini-button" type="button" data-hostname-action="verify" data-hostname="${escapeHtml(claim.hostname)}">检查 TXT</button>`}<button class="mini-button danger" type="button" data-hostname-action="delete" data-hostname="${escapeHtml(claim.hostname)}">撤销</button></div>
+    </div>`).join("") : "尚未声明自定义域名。创建声明后会得到唯一的 DNS TXT 记录。";
+}
+
+async function loadHostnames({ quiet = false } = {}) {
+  try {
+    const data = await api("/api/hostnames");
+    state.hostnameClaims = data.claims || [];
+    renderHostnameClaims();
+    if (!quiet) toast("域名所有权目录已刷新");
+  } catch (error) {
+    $("#hostname-list").innerHTML = `<div class="empty-state">${escapeHtml(error.message)}</div>`;
+    if (!quiet) toast(error.message, true);
+  }
+}
+
+async function saveHostnameClaim(event) {
+  event.preventDefault();
+  const hostname = $("#hostname-input").value.trim().replace(/^https?:\/\//, "").split("/")[0].replace(/\.$/, "").toLowerCase();
+  try {
+    const result = await api("/api/hostnames", { method: "POST", body: JSON.stringify({ hostname }) });
+    const complete = async () => {
+      $("#hostname-form").reset();
+      await loadHostnames({ quiet: true });
+      toast(result.verified ? `${hostname} 已验证` : `已生成 ${hostname} 的 TXT 验证记录`);
+    };
+    if (result.pending_approval) showApproval(result, `批准创建 ${hostname} 的 DNS 所有权声明。`, complete);
+    else await complete();
+  } catch (error) {
+    toast(error.message, true);
+  }
+}
+
+async function verifyHostnameClaim(hostname) {
+  try {
+    const result = await api(`/api/hostnames/${encodeURIComponent(hostname)}/verification`, { method: "POST" });
+    const complete = async () => {
+      await Promise.all([loadHostnames({ quiet: true }), loadOverview({ quiet: true })]);
+      toast(`${hostname} 已通过 DNS 验证并启用`);
+    };
+    if (result.pending_approval) showApproval(result, `批准 ${hostname} 的 DNS 验证结果并启用路由。`, complete);
+    else await complete();
+  } catch (error) {
+    toast(error.message, true);
+  }
+}
+
+async function deleteHostnameClaim(hostname) {
+  if (!window.confirm(`要撤销域名“${hostname}”吗？所有引用它的公开路由和自动证书都会立即停用。`)) return;
+  try {
+    const result = await api(`/api/hostnames/${encodeURIComponent(hostname)}`, { method: "DELETE" });
+    const complete = async () => {
+      await Promise.all([loadHostnames({ quiet: true }), loadOverview({ quiet: true })]);
+      toast(`${hostname} 的所有权已撤销`);
+    };
+    if (result.pending_approval) showApproval(result, `批准撤销 ${hostname} 的所有公开入口。`, complete);
+    else await complete();
+  } catch (error) {
+    toast(error.message, true);
+  }
+}
+
 async function loadSecurity({ quiet = false } = {}) {
   try {
     state.security = await api("/api/security");
@@ -4709,7 +4838,7 @@ async function boot() {
     $("#security-copy").innerHTML = consoleMode === "public"
       ? "此节点不保存<br>任何私钥。"
       : "密钥仅保留在本地<br>控制台进程中。";
-    $$("#deploy-form button, #source-form button, #kv-editor-form button, #d1-create-form button, #d1-exec-form button, #r2-bucket-form button, #r2-upload-form button, #r2-delete-bucket, #storage-form button, #storage-probe, #queue-form button, #queue-send-form button, #queue-delete, #analytics-form button, #analytics-write-form button, #analytics-delete, #pipeline-form button, #pipeline-token-form button, #pipeline-ingest-form button, #pipeline-flush, #pipeline-delete, #workflow-form button, #workflow-token-form button, #workflow-trigger-form button, #workflow-signal-form button, #workflow-delete, #flow-form button, #flow-token-form button, #flow-trigger-form button, #flow-delete, #network-rule-form button, #network-device-form button, #email-domain-form button, #email-route-form button, #email-send-form button, #email-delete, #email-verify, #binary-form button, #binary-new, #project-domain-add-form button, #project-bindings-form button, #project-secret-form button, #project-file-form button, #project-file-new, #project-triggers-form button, #project-cron-fire-form button, #project-cron-dlq button, #project-settings-form button, #project-preview-form button, #project-preview-list button, #project-source-form button, #project-redeploy, #project-delete, #quota-form button, #access-token-form button, #s3-credential-form button")
+    $$("#deploy-form button, #source-form button, #kv-editor-form button, #d1-create-form button, #d1-exec-form button, #r2-bucket-form button, #r2-upload-form button, #r2-delete-bucket, #storage-form button, #storage-probe, #queue-form button, #queue-send-form button, #queue-delete, #analytics-form button, #analytics-write-form button, #analytics-delete, #pipeline-form button, #pipeline-token-form button, #pipeline-ingest-form button, #pipeline-flush, #pipeline-delete, #workflow-form button, #workflow-token-form button, #workflow-trigger-form button, #workflow-signal-form button, #workflow-delete, #flow-form button, #flow-token-form button, #flow-trigger-form button, #flow-delete, #network-rule-form button, #network-device-form button, #email-domain-form button, #email-route-form button, #email-send-form button, #email-delete, #email-verify, #binary-form button, #binary-new, #hostname-form button, #hostname-list button, #project-domain-add-form button, #project-bindings-form button, #project-secret-form button, #project-file-form button, #project-file-new, #project-triggers-form button, #project-cron-fire-form button, #project-cron-dlq button, #project-settings-form button, #project-preview-form button, #project-preview-list button, #project-source-form button, #project-redeploy, #project-delete, #quota-form button, #access-token-form button, #s3-credential-form button")
       .forEach((button) => { button.disabled = state.session.read_only; });
     $("#network-device-transport-warning").classList.toggle("hidden", consoleMode === "local" || credentialWritesAllowed());
     $("#node-policy-form button").disabled = state.session.read_only;
@@ -4729,6 +4858,7 @@ async function boot() {
     await loadNetwork({ quiet: true });
     await loadEmail({ quiet: true });
     await loadBinaries({ quiet: true });
+    await loadHostnames({ quiet: true });
     await loadSecurity({ quiet: true });
   } catch (error) {
     if (consoleMode === "public" && error.status === 401) {
@@ -4747,6 +4877,7 @@ $$(".nav-item").forEach((button) => button.addEventListener("click", () => {
   if (button.dataset.view === "storage") loadStorage({ quiet: true });
   if (button.dataset.view === "network") loadNetwork({ quiet: true });
   if (button.dataset.view === "binaries") loadBinaries({ quiet: true });
+  if (button.dataset.view === "hostnames") loadHostnames({ quiet: true });
   if (button.dataset.view === "security") loadSecurity({ quiet: true });
 }));
 $$('[data-go]').forEach((button) => button.addEventListener("click", () => switchView(button.dataset.go)));
@@ -4762,6 +4893,14 @@ $("#node-policy-form").addEventListener("submit", saveNodePolicy);
 $("#node-policy-form").addEventListener("input", () => { state.nodePolicyDirty = true; });
 $("#node-policy-form").addEventListener("change", () => { state.nodePolicyDirty = true; });
 $("#nodes-refresh").addEventListener("click", () => loadNodes());
+$("#hostname-refresh").addEventListener("click", () => loadHostnames());
+$("#hostname-form").addEventListener("submit", saveHostnameClaim);
+$("#hostname-list").addEventListener("click", (event) => {
+  const button = event.target.closest("button[data-hostname-action]");
+  if (!button) return;
+  if (button.dataset.hostnameAction === "verify") verifyHostnameClaim(button.dataset.hostname);
+  if (button.dataset.hostnameAction === "delete") deleteHostnameClaim(button.dataset.hostname);
+});
 $("#security-refresh").addEventListener("click", () => loadSecurity());
 $("#security-audit-refresh").addEventListener("click", () => loadSecurityAudit());
 $("#quota-form").addEventListener("submit", saveQuota);
@@ -4977,8 +5116,11 @@ $("#workers-table").addEventListener("click", (event) => {
   if (button.dataset.action === "delete-worker") deleteWorker(button.dataset.worker);
 });
 $("#project-domain-list").addEventListener("click", (event) => {
-  const button = event.target.closest("button[data-remove-domain]");
-  if (button) removeProjectDomain(button.dataset.removeDomain);
+  const button = event.target.closest("button");
+  if (!button) return;
+  if (button.dataset.removeDomain) removeProjectDomain(button.dataset.removeDomain);
+  if (button.dataset.claimDomain) claimProjectDomain(button.dataset.claimDomain);
+  if (button.dataset.verifyDomain) verifyProjectDomain(button.dataset.verifyDomain);
 });
 $("#project-secret-list").addEventListener("click", (event) => {
   const button = event.target.closest("button[data-delete-secret]");
@@ -5131,6 +5273,7 @@ setInterval(() => {
       if (state.emailActive) loadEmailMessages();
     });
     if (state.view === "binaries") loadBinaries({ quiet: true });
+    if (state.view === "hostnames") loadHostnames({ quiet: true });
     if (state.view === "security") loadSecurity({ quiet: true });
   }
 }, 10_000);

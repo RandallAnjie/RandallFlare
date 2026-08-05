@@ -132,6 +132,11 @@ enum Cmd {
         #[command(subcommand)]
         cmd: StorageCmd,
     },
+    /// 自定义域名 DNS 所有权声明与验证。
+    Hostname {
+        #[command(subcommand)]
+        cmd: HostnameCmd,
+    },
     /// Decentralized Queue operations.
     Queue {
         #[command(subcommand)]
@@ -594,6 +599,47 @@ enum StorageCmd {
     Probe {
         #[arg(long, env = "RF_NODE")]
         node: String,
+        #[arg(long, env = "RF_CLUSTER_SECRET")]
+        secret: String,
+    },
+}
+
+#[derive(Subcommand)]
+enum HostnameCmd {
+    /// 列出全局域名声明和验证状态。
+    List {
+        #[arg(long, env = "RF_NODE")]
+        node: String,
+        #[arg(long, env = "RF_CLUSTER_SECRET")]
+        secret: String,
+    },
+    /// 创建 DNS TXT 所有权声明；域名在验证前不会参与路由。
+    Claim {
+        hostname: String,
+        #[arg(long, env = "RF_NODE")]
+        node: String,
+        #[arg(long, env = "RF_OPERATOR_KEY")]
+        key: Option<PathBuf>,
+        #[arg(long, env = "RF_CLUSTER_SECRET")]
+        secret: String,
+    },
+    /// 查询 DNS，并在 TXT 完全匹配后签署验证结果。
+    Verify {
+        hostname: String,
+        #[arg(long, env = "RF_NODE")]
+        node: String,
+        #[arg(long, env = "RF_OPERATOR_KEY")]
+        key: Option<PathBuf>,
+        #[arg(long, env = "RF_CLUSTER_SECRET")]
+        secret: String,
+    },
+    /// 撤销一个域名的所有权；路由和自动证书会立即停用。
+    Delete {
+        hostname: String,
+        #[arg(long, env = "RF_NODE")]
+        node: String,
+        #[arg(long, env = "RF_OPERATOR_KEY")]
+        key: Option<PathBuf>,
         #[arg(long, env = "RF_CLUSTER_SECRET")]
         secret: String,
     },
@@ -2271,6 +2317,159 @@ async fn async_main(cli: Cli) -> Result<()> {
                     "{}",
                     serde_json::to_string_pretty(&client.storage_probe(&node).await?)?
                 );
+                Ok(())
+            }
+        },
+        Cmd::Hostname { cmd } => match cmd {
+            HostnameCmd::List { node, secret } => {
+                let client = PeerClient::new(secret_bytes(&secret)?);
+                let claims = client
+                    .resource_heads(&node, Some(rf::hostname::HOSTNAME_CLAIM_KIND))
+                    .await?
+                    .into_iter()
+                    .filter(|view| !view.resource.deleted)
+                    .map(|view| {
+                        let spec = rf::hostname::claim_spec(&view.resource)?;
+                        Ok(serde_json::json!({
+                            "name": view.resource.name,
+                            "version": view.resource.version,
+                            "digest": view.digest,
+                            "hostname": spec.hostname,
+                            "verified": spec.verified_at_ms.is_some(),
+                            "verified_at_ms": spec.verified_at_ms,
+                            "txt_name": spec.txt_name(),
+                            "txt_value": spec.txt_value(),
+                        }))
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                println!("{}", serde_json::to_string_pretty(&claims)?);
+                Ok(())
+            }
+            HostnameCmd::Claim {
+                hostname,
+                node,
+                key,
+                secret,
+            } => {
+                let hostname = hostname.trim_end_matches('.').to_ascii_lowercase();
+                let client = PeerClient::new(secret_bytes(&secret)?);
+                let head = client
+                    .resource_head(
+                        &node,
+                        rf::hostname::HOSTNAME_CLAIM_KIND,
+                        &rf::hostname::claim_name(&hostname),
+                    )
+                    .await?;
+                if let Some(view) = head.as_ref().filter(|view| !view.resource.deleted) {
+                    let spec = rf::hostname::claim_spec(&view.resource)?;
+                    println!(
+                        "域名 {} 已存在所有权声明（v{}）",
+                        hostname, view.resource.version
+                    );
+                    println!("请配置 TXT  {}", spec.txt_name());
+                    println!("TXT 值      {}", spec.txt_value());
+                    return Ok(());
+                }
+                let record =
+                    rf::hostname::prepare_claim_after(&hostname, None, None, false, head.as_ref())?;
+                let spec = rf::hostname::claim_spec(&record)?;
+                client
+                    .post_resource(
+                        &node,
+                        &rf_core::envelope::Envelope::seal_any(&record, &operator_key(key)?),
+                    )
+                    .await?;
+                println!(
+                    "域名 {} 的所有权声明已创建（v{}）",
+                    hostname, record.version
+                );
+                println!("请配置 TXT  {}", spec.txt_name());
+                println!("TXT 值      {}", spec.txt_value());
+                println!("配置生效后运行：rf hostname verify {hostname}");
+                Ok(())
+            }
+            HostnameCmd::Verify {
+                hostname,
+                node,
+                key,
+                secret,
+            } => {
+                let hostname = hostname.trim_end_matches('.').to_ascii_lowercase();
+                let client = PeerClient::new(secret_bytes(&secret)?);
+                let head = client
+                    .resource_head(
+                        &node,
+                        rf::hostname::HOSTNAME_CLAIM_KIND,
+                        &rf::hostname::claim_name(&hostname),
+                    )
+                    .await?
+                    .filter(|view| !view.resource.deleted)
+                    .with_context(|| format!("域名 {hostname} 尚未创建所有权声明"))?;
+                let spec = rf::hostname::claim_spec(&head.resource)?;
+                let verification = client.hostname_verification(&node, &hostname).await?;
+                if !verification.verified {
+                    anyhow::bail!(
+                        "DNS TXT 尚未匹配；请在 {} 配置 {}（当前观测：{}）",
+                        verification.txt_name,
+                        verification.txt_value,
+                        verification.observed.join(", ")
+                    );
+                }
+                if spec.verified_at_ms.is_some() {
+                    println!("域名 {hostname} 已通过验证，无需重复签署");
+                    return Ok(());
+                }
+                let record = rf::hostname::prepare_claim_after(
+                    &hostname,
+                    Some(spec),
+                    Some(verification.checked_at_ms),
+                    false,
+                    Some(&head),
+                )?;
+                client
+                    .post_resource(
+                        &node,
+                        &rf_core::envelope::Envelope::seal_any(&record, &operator_key(key)?),
+                    )
+                    .await?;
+                println!(
+                    "域名 {hostname} 已通过 DNS 验证并启用（v{}）",
+                    record.version
+                );
+                Ok(())
+            }
+            HostnameCmd::Delete {
+                hostname,
+                node,
+                key,
+                secret,
+            } => {
+                let hostname = hostname.trim_end_matches('.').to_ascii_lowercase();
+                let client = PeerClient::new(secret_bytes(&secret)?);
+                let head = client
+                    .resource_head(
+                        &node,
+                        rf::hostname::HOSTNAME_CLAIM_KIND,
+                        &rf::hostname::claim_name(&hostname),
+                    )
+                    .await?
+                    .filter(|view| !view.resource.deleted)
+                    .with_context(|| format!("域名 {hostname} 的所有权声明不存在"))?;
+                let spec = rf::hostname::claim_spec(&head.resource)?;
+                let record = rf::hostname::prepare_claim_after(
+                    &hostname,
+                    Some(spec),
+                    None,
+                    true,
+                    Some(&head),
+                )?;
+                client
+                    .post_resource(
+                        &node,
+                        &rf_core::envelope::Envelope::seal_any(&record, &operator_key(key)?),
+                    )
+                    .await?;
+                println!("域名 {hostname} 的所有权已撤销（v{}）", record.version);
                 Ok(())
             }
         },
