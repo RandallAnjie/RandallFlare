@@ -121,6 +121,8 @@ impl QueueSpec {
 pub struct QueueMessage {
     pub id: String,
     pub body: Value,
+    pub content_type: String,
+    pub body_base64: Option<String>,
     pub produced_at_ms: u64,
     /// Delivery attempt number, starting at one.
     pub attempts: u16,
@@ -130,6 +132,8 @@ pub struct QueueMessage {
 pub struct DeadLetter {
     pub id: String,
     pub body: Value,
+    pub content_type: String,
+    pub body_base64: Option<String>,
     pub produced_at_ms: u64,
     pub dead_letter_at_ms: u64,
     pub attempts: u16,
@@ -148,9 +152,38 @@ pub struct QueueStats {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SendMessage {
+    #[serde(default)]
     pub body: Value,
+    #[serde(default = "default_content_type")]
+    pub content_type: String,
+    #[serde(default)]
+    pub body_base64: Option<String>,
     #[serde(default)]
     pub delay_seconds: u64,
+}
+
+fn default_content_type() -> String {
+    "json".into()
+}
+
+impl Default for SendMessage {
+    fn default() -> Self {
+        Self {
+            body: Value::Null,
+            content_type: default_content_type(),
+            body_base64: None,
+            delay_seconds: 0,
+        }
+    }
+}
+
+struct PendingMessage {
+    id: String,
+    body: Value,
+    content_type: String,
+    body_base64: Option<String>,
+    produced_at_ms: u64,
+    available_at_ms: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -229,10 +262,7 @@ pub fn database_name(queue: &str) -> String {
 }
 
 pub async fn enqueue(node: &Node, queue: &str, messages: Vec<SendMessage>) -> Result<Vec<String>> {
-    let (_, spec) = queue_record(node, queue).context("队列不存在")?;
-    if spec.suspended {
-        bail!("队列已暂停");
-    }
+    queue_record(node, queue).context("队列不存在")?;
     if messages.is_empty() || messages.len() > MAX_BATCH_MESSAGES {
         bail!("每次必须发送 1 至 100 条队列消息");
     }
@@ -242,18 +272,20 @@ pub async fn enqueue(node: &Node, queue: &str, messages: Vec<SendMessage>) -> Re
         if message.delay_seconds > MAX_DELAY_SECONDS {
             bail!("队列消息延迟不得超过 12 小时");
         }
-        validate_body(&message.body)?;
-        entries.push((
-            new_message_id(),
-            message.body,
-            now,
-            now.saturating_add(message.delay_seconds.saturating_mul(1_000)),
-        ));
+        validate_message(&message)?;
+        entries.push(PendingMessage {
+            id: new_message_id(),
+            body: message.body,
+            content_type: message.content_type,
+            body_base64: message.body_base64,
+            produced_at_ms: now,
+            available_at_ms: now.saturating_add(message.delay_seconds.saturating_mul(1_000)),
+        });
     }
     ensure_schema(node, queue).await?;
     insert_messages(node, queue, &entries).await?;
     increment_counter(node, queue, "total_produced", entries.len() as u64).await?;
-    Ok(entries.into_iter().map(|entry| entry.0).collect())
+    Ok(entries.into_iter().map(|entry| entry.id).collect())
 }
 
 /// Atomically lease and acknowledge one ready message for a Flow receive
@@ -292,7 +324,7 @@ pub async fn receive_one(node: &Node, queue: &str) -> Result<Option<QueueMessage
         exec(
             node,
             queue,
-            r#"SELECT id,body_json,produced_at_ms,attempts FROM queue_messages
+            r#"SELECT id,body_json,content_type,body_base64,produced_at_ms,attempts FROM queue_messages
                WHERE lease_id=?1 LIMIT 1"#,
             json!([lease]),
         )
@@ -325,18 +357,32 @@ async fn enqueue_existing(
     queue: &str,
     id: &str,
     body: Value,
+    content_type: &str,
+    body_base64: Option<&str>,
     produced_at_ms: u64,
 ) -> Result<()> {
     queue_record(node, queue).context("死信目标队列不存在")?;
-    validate_body(&body)?;
+    validate_message(&SendMessage {
+        body: body.clone(),
+        content_type: content_type.to_string(),
+        body_base64: body_base64.map(str::to_string),
+        delay_seconds: 0,
+    })?;
     ensure_schema(node, queue).await?;
     let inserted = exec(
         node,
         queue,
         r#"INSERT OR IGNORE INTO queue_messages
-           (id, body_json, produced_at_ms, available_at_ms, attempts)
-           VALUES (?1, ?2, ?3, ?4, 0)"#,
-        json!([id, serde_json::to_string(&body)?, produced_at_ms, now_ms()]),
+           (id, body_json, content_type, body_base64, produced_at_ms, available_at_ms, attempts)
+           VALUES (?1, ?2, ?3, ?4, ?5, ?6, 0)"#,
+        json!([
+            id,
+            serde_json::to_string(&body)?,
+            content_type,
+            body_base64,
+            produced_at_ms,
+            now_ms(),
+        ]),
     )
     .await?["rows_affected"]
         .as_u64()
@@ -347,9 +393,37 @@ async fn enqueue_existing(
     Ok(())
 }
 
-fn validate_body(body: &Value) -> Result<()> {
-    let bytes = serde_json::to_vec(body)?;
-    if bytes.len() > MAX_MESSAGE_BYTES {
+fn validate_message(message: &SendMessage) -> Result<()> {
+    let size = match message.content_type.as_str() {
+        "json" | "v8" => {
+            if message.body_base64.is_some() {
+                bail!("JSON/V8 队列消息不能同时包含 body_base64");
+            }
+            serde_json::to_vec(&message.body)?.len()
+        }
+        "text" => {
+            if message.body_base64.is_some() || !message.body.is_string() {
+                bail!("text 队列消息的 body 必须是字符串");
+            }
+            message.body.as_str().unwrap_or_default().len()
+        }
+        "bytes" => {
+            if !message.body.is_null() {
+                bail!("bytes 队列消息必须使用 body_base64，body 应为 null");
+            }
+            base64::engine::general_purpose::STANDARD
+                .decode(
+                    message
+                        .body_base64
+                        .as_deref()
+                        .context("bytes 队列消息缺少 body_base64")?,
+                )
+                .context("bytes 队列消息的 body_base64 无效")?
+                .len()
+        }
+        _ => bail!("队列消息 content_type 必须是 json、text、bytes 或 v8"),
+    };
+    if size > MAX_MESSAGE_BYTES {
         bail!("队列消息编码后不得超过 128 KiB");
     }
     Ok(())
@@ -359,31 +433,37 @@ fn new_message_id() -> String {
     base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(rand::random::<[u8; 16]>())
 }
 
-async fn insert_messages(
-    node: &Node,
-    queue: &str,
-    entries: &[(String, Value, u64, u64)],
-) -> Result<()> {
+async fn insert_messages(node: &Node, queue: &str, entries: &[PendingMessage]) -> Result<()> {
     let mut sql = String::from(
-        "INSERT INTO queue_messages (id, body_json, produced_at_ms, available_at_ms, attempts) VALUES ",
+        "INSERT INTO queue_messages (id, body_json, content_type, body_base64, produced_at_ms, available_at_ms, attempts) VALUES ",
     );
-    let mut params = Vec::with_capacity(entries.len() * 4);
-    for (index, (id, body, produced, available)) in entries.iter().enumerate() {
+    let mut params = Vec::with_capacity(entries.len() * 6);
+    for (index, entry) in entries.iter().enumerate() {
         if index > 0 {
             sql.push(',');
         }
-        let offset = index * 4;
+        let offset = index * 6;
         sql.push_str(&format!(
-            "(?{},?{},?{},?{},0)",
+            "(?{},?{},?{},?{},?{},?{},0)",
             offset + 1,
             offset + 2,
             offset + 3,
-            offset + 4
+            offset + 4,
+            offset + 5,
+            offset + 6,
         ));
-        params.push(Value::String(id.clone()));
-        params.push(Value::String(serde_json::to_string(body)?));
-        params.push(json!(produced));
-        params.push(json!(available));
+        params.push(Value::String(entry.id.clone()));
+        params.push(Value::String(serde_json::to_string(&entry.body)?));
+        params.push(Value::String(entry.content_type.clone()));
+        params.push(
+            entry
+                .body_base64
+                .clone()
+                .map(Value::String)
+                .unwrap_or(Value::Null),
+        );
+        params.push(json!(entry.produced_at_ms));
+        params.push(json!(entry.available_at_ms));
     }
     exec(node, queue, &sql, Value::Array(params)).await?;
     Ok(())
@@ -424,7 +504,7 @@ pub async fn list_dead_letters(node: &Node, queue: &str, limit: usize) -> Result
         exec(
             node,
             queue,
-            r#"SELECT id, body_json, produced_at_ms, dead_letter_at_ms, attempts, last_error
+            r#"SELECT id, body_json, content_type, body_base64, produced_at_ms, dead_letter_at_ms, attempts, last_error
                FROM queue_dead_letters ORDER BY dead_letter_at_ms DESC LIMIT ?1"#,
             json!([limit.clamp(1, 1_000)]),
         )
@@ -441,7 +521,7 @@ pub async fn redrive_dead_letter(node: &Node, queue: &str, id: &str) -> Result<b
         exec(
             node,
             queue,
-            "SELECT body_json, produced_at_ms FROM queue_dead_letters WHERE id=?1",
+            "SELECT body_json, content_type, body_base64, produced_at_ms FROM queue_dead_letters WHERE id=?1",
             json!([id]),
         )
         .await?,
@@ -450,14 +530,26 @@ pub async fn redrive_dead_letter(node: &Node, queue: &str, id: &str) -> Result<b
         return Ok(false);
     };
     let body: Value = serde_json::from_str(string_field(row, "body_json")?)?;
+    let content_type = string_field(row, "content_type")?;
+    let body_base64 = row
+        .get("body_base64")
+        .and_then(Value::as_str)
+        .map(str::to_string);
     let produced = u64_field(row, "produced_at_ms");
     exec(
         node,
         queue,
         r#"INSERT OR REPLACE INTO queue_messages
-           (id, body_json, produced_at_ms, available_at_ms, attempts, lease_id, lease_until_ms, last_error)
-           VALUES (?1, ?2, ?3, ?4, 0, NULL, NULL, NULL)"#,
-        json!([id, serde_json::to_string(&body)?, produced, now_ms()]),
+           (id, body_json, content_type, body_base64, produced_at_ms, available_at_ms, attempts, lease_id, lease_until_ms, last_error)
+           VALUES (?1, ?2, ?3, ?4, ?5, ?6, 0, NULL, NULL, NULL)"#,
+        json!([
+            id,
+            serde_json::to_string(&body)?,
+            content_type,
+            body_base64,
+            produced,
+            now_ms(),
+        ]),
     )
     .await?;
     exec(
@@ -515,7 +607,7 @@ async fn claim_batch(
         exec(
             node,
             queue,
-            r#"SELECT id, body_json, produced_at_ms, attempts FROM queue_messages
+            r#"SELECT id, body_json, content_type, body_base64, produced_at_ms, attempts FROM queue_messages
                WHERE lease_id=?1 ORDER BY available_at_ms, id"#,
             json!([lease]),
         )
@@ -608,8 +700,8 @@ async fn move_to_dead_letter(
         node,
         queue,
         r#"INSERT OR REPLACE INTO queue_dead_letters
-           (id, body_json, produced_at_ms, dead_letter_at_ms, attempts, last_error)
-           SELECT id, body_json, produced_at_ms, ?3, attempts, ?4
+           (id, body_json, content_type, body_base64, produced_at_ms, dead_letter_at_ms, attempts, last_error)
+           SELECT id, body_json, content_type, body_base64, produced_at_ms, ?3, attempts, ?4
            FROM queue_messages WHERE id=?1 AND lease_id=?2"#,
         json!([message.id, lease, now_ms(), truncate_error(error)]),
     )
@@ -620,6 +712,8 @@ async fn move_to_dead_letter(
             target,
             &message.id,
             message.body.clone(),
+            &message.content_type,
+            message.body_base64.as_deref(),
             message.produced_at_ms,
         )
         .await?;
@@ -725,6 +819,8 @@ async fn ensure_schema(node: &Node, queue: &str) -> Result<()> {
         r#"CREATE TABLE IF NOT EXISTS queue_messages (
              id TEXT PRIMARY KEY,
              body_json TEXT NOT NULL,
+             content_type TEXT NOT NULL DEFAULT 'json',
+             body_base64 TEXT,
              produced_at_ms INTEGER NOT NULL,
              available_at_ms INTEGER NOT NULL,
              attempts INTEGER NOT NULL DEFAULT 0,
@@ -749,6 +845,8 @@ async fn ensure_schema(node: &Node, queue: &str) -> Result<()> {
         r#"CREATE TABLE IF NOT EXISTS queue_dead_letters (
              id TEXT PRIMARY KEY,
              body_json TEXT NOT NULL,
+             content_type TEXT NOT NULL DEFAULT 'json',
+             body_base64 TEXT,
              produced_at_ms INTEGER NOT NULL,
              dead_letter_at_ms INTEGER NOT NULL,
              attempts INTEGER NOT NULL,
@@ -775,7 +873,53 @@ async fn ensure_schema(node: &Node, queue: &str) -> Result<()> {
         json!([]),
     )
     .await?;
+    for (table, column, definition) in [
+        (
+            "queue_messages",
+            "content_type",
+            "TEXT NOT NULL DEFAULT 'json'",
+        ),
+        ("queue_messages", "body_base64", "TEXT"),
+        (
+            "queue_dead_letters",
+            "content_type",
+            "TEXT NOT NULL DEFAULT 'json'",
+        ),
+        ("queue_dead_letters", "body_base64", "TEXT"),
+    ] {
+        ensure_column(node, &database, table, column, definition).await?;
+    }
     node.mark_queue_schema_ready(database);
+    Ok(())
+}
+
+async fn ensure_column(
+    node: &Node,
+    database: &str,
+    table: &str,
+    column: &str,
+    definition: &str,
+) -> Result<()> {
+    let info = exec_database(
+        node,
+        database,
+        &format!("PRAGMA table_info({table})"),
+        json!([]),
+    )
+    .await?;
+    if rows(info)
+        .iter()
+        .any(|row| row.get("name").and_then(Value::as_str) == Some(column))
+    {
+        return Ok(());
+    }
+    exec_database(
+        node,
+        database,
+        &format!("ALTER TABLE {table} ADD COLUMN {column} {definition}"),
+        json!([]),
+    )
+    .await?;
     Ok(())
 }
 
@@ -826,6 +970,11 @@ fn row_to_message(row: &Value) -> Result<QueueMessage> {
     Ok(QueueMessage {
         id: string_field(row, "id")?.to_string(),
         body: serde_json::from_str(string_field(row, "body_json")?)?,
+        content_type: string_field(row, "content_type")?.to_string(),
+        body_base64: row
+            .get("body_base64")
+            .and_then(Value::as_str)
+            .map(str::to_string),
         produced_at_ms: u64_field(row, "produced_at_ms"),
         attempts: u64_field(row, "attempts").min(u16::MAX as u64) as u16,
     })
@@ -835,6 +984,11 @@ fn row_to_dead_letter(row: &Value) -> Result<DeadLetter> {
     Ok(DeadLetter {
         id: string_field(row, "id")?.to_string(),
         body: serde_json::from_str(string_field(row, "body_json")?)?,
+        content_type: string_field(row, "content_type")?.to_string(),
+        body_base64: row
+            .get("body_base64")
+            .and_then(Value::as_str)
+            .map(str::to_string),
         produced_at_ms: u64_field(row, "produced_at_ms"),
         dead_letter_at_ms: u64_field(row, "dead_letter_at_ms"),
         attempts: u64_field(row, "attempts").min(u16::MAX as u64) as u16,
@@ -873,7 +1027,30 @@ mod tests {
 
     #[test]
     fn body_limit_counts_utf8_bytes() {
-        assert!(validate_body(&json!("中".repeat(50_000))).is_err());
-        assert!(validate_body(&json!({"ok": true})).is_ok());
+        assert!(validate_message(&SendMessage {
+            body: json!("中".repeat(50_000)),
+            ..Default::default()
+        })
+        .is_err());
+        assert!(validate_message(&SendMessage {
+            body: json!({"ok": true}),
+            ..Default::default()
+        })
+        .is_ok());
+        let bytes = base64::engine::general_purpose::STANDARD.encode([0, 1, 2, 255]);
+        assert!(validate_message(&SendMessage {
+            body: Value::Null,
+            content_type: "bytes".into(),
+            body_base64: Some(bytes),
+            delay_seconds: 0,
+        })
+        .is_ok());
+        assert!(validate_message(&SendMessage {
+            body: json!("not bytes"),
+            content_type: "bytes".into(),
+            body_base64: None,
+            delay_seconds: 0,
+        })
+        .is_err());
     }
 }

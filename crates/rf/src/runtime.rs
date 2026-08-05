@@ -664,6 +664,28 @@ class RandallFlareD1Statement {
 
 class RandallFlareQueue {
   constructor(service) { this._service = service; }
+  _message(body, options = {}) {
+    const contentType = options.contentType == null ? "v8" : String(options.contentType);
+    const delay_seconds = Number(options.delaySeconds || 0);
+    if (contentType === "bytes") {
+      const bytes = body instanceof Uint8Array ? body : body instanceof ArrayBuffer ? new Uint8Array(body) : null;
+      if (!bytes) throw new TypeError("Queue bytes message expects Uint8Array or ArrayBuffer");
+      return { body: null, content_type: "bytes", body_base64: __rfU8ToBase64(bytes), delay_seconds };
+    }
+    if (contentType === "text") {
+      if (typeof body !== "string") throw new TypeError("Queue text message expects a string");
+      return { body, content_type: "text", delay_seconds };
+    }
+    if (contentType !== "json" && contentType !== "v8") {
+      throw new TypeError("Queue contentType must be json, text, bytes, or v8");
+    }
+    if (body === undefined) throw new TypeError("Queue message body must not be undefined");
+    // workerd does not expose V8's native serializer to user Workers. The v8
+    // mode therefore preserves the JSON-compatible structured-clone subset
+    // and fails closed for values JSON.stringify cannot encode.
+    if (JSON.stringify(body) === undefined) throw new TypeError("Queue v8/json body is not serializable");
+    return { body, content_type: contentType, delay_seconds };
+  }
   async _send(messages) {
     const response = await this._service.fetch("http://queue-binding/", {
       method: "POST",
@@ -673,14 +695,11 @@ class RandallFlareQueue {
     if (!response.ok) throw new Error("QUEUE_ERROR: " + response.status + " " + await response.text());
   }
   async send(body, options = {}) {
-    await this._send([{ body, delay_seconds: Number(options.delaySeconds || 0) }]);
+    await this._send([this._message(body, options)]);
   }
   async sendBatch(messages) {
     if (!Array.isArray(messages)) throw new TypeError("Queue sendBatch() expects an array");
-    await this._send(messages.map((message) => ({
-      body: message.body,
-      delay_seconds: Number(message.delaySeconds || 0),
-    })));
+    await this._send(messages.map((message) => this._message(message.body, message)));
   }
 }
 
@@ -804,6 +823,13 @@ function __rfU8ToBase64(value) {
     output += String.fromCharCode(...value.subarray(offset, offset + 0x8000));
   }
   return btoa(output);
+}
+
+function __rfBase64ToU8(value) {
+  const binary = atob(String(value || ""));
+  const bytes = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+  return bytes;
 }
 
 class RandallFlareBinary {
@@ -1047,7 +1073,7 @@ async function __rfQueueEvent(request, env, context) {
     return {
       id: wire.id,
       timestamp: new Date(wire.produced_at_ms),
-      body: wire.body,
+      body: wire.content_type === "bytes" ? __rfBase64ToU8(wire.body_base64) : wire.body,
       attempts: wire.attempts,
       ack() { state.action = "ack"; state.delay_seconds = 0; state.error = null; },
       retry(options = {}) {

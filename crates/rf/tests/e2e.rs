@@ -934,7 +934,13 @@ export default {
       await env.EVENTS.send({ id: "ack", mode: "ack" });
       await env.EVENTS.send({ id: "retry", mode: "retry-once" });
       await env.EVENTS.send({ id: "dead", mode: "always-retry" });
+      await env.EVENTS.send("纯文本消息", { contentType: "text" });
+      await env.EVENTS.send(new Uint8Array([0, 1, 2, 255]), { contentType: "bytes" });
       return new Response("queued");
+    }
+    if (url.pathname === "/queue-paused") {
+      await env.EVENTS.send({ id: "paused", mode: "ack" });
+      return new Response("queued while paused");
     }
     if (url.pathname === "/analytics") {
       env.METRICS.writeDataPoint({
@@ -974,6 +980,17 @@ export default {
   },
   async queue(batch, env, context) {
     for (const message of batch.messages) {
+      if (message.body instanceof Uint8Array) {
+        context.waitUntil(env.CACHE.put(
+          "queue-bytes",
+          JSON.stringify(Array.from(message.body)),
+        ));
+        continue;
+      }
+      if (typeof message.body === "string") {
+        context.waitUntil(env.CACHE.put("queue-text", message.body));
+        continue;
+      }
       if (message.body.mode === "retry-once" && message.attempts === 1) {
         message.retry({ delaySeconds: 0, error: "first attempt requested retry" });
         continue;
@@ -1658,6 +1675,81 @@ export default {
         );
         tokio::time::sleep(Duration::from_millis(200)).await;
     }
+    // Suspending a queue pauses delivery but deliberately keeps producers
+    // available, so upstream Workers do not fail while an operator drains a
+    // consumer. Resume must deliver the durably staged message.
+    let queue_head = client
+        .resource_head(&n.api, rf::queue::QUEUE_KIND, "events")
+        .await
+        .unwrap()
+        .unwrap();
+    let mut queue_spec = rf::queue::queue_spec(&queue_head.resource).unwrap();
+    queue_spec.suspended = true;
+    let suspended =
+        rf::queue::prepare_queue_after("events", queue_spec.clone(), false, Some(&queue_head))
+            .unwrap();
+    client
+        .post_resource(
+            &n.api,
+            &rf_core::envelope::Envelope::seal_any(&suspended, &op_any),
+        )
+        .await
+        .unwrap();
+    let paused = http
+        .get(format!("http://127.0.0.1:{}/queue-paused", n.ingress))
+        .header("host", "api.test")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(paused.text().await.unwrap(), "queued while paused");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        if client.queue_stats(&n.api, "events").await.unwrap().ready >= 1 {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "paused queue did not accept producer write"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(client
+        .kv_get(&n.api, "ns1", "queue-paused")
+        .await
+        .unwrap()
+        .is_none());
+    queue_spec.suspended = false;
+    let suspended_head = client
+        .resource_head(&n.api, rf::queue::QUEUE_KIND, "events")
+        .await
+        .unwrap()
+        .unwrap();
+    let resumed =
+        rf::queue::prepare_queue_after("events", queue_spec, false, Some(&suspended_head)).unwrap();
+    client
+        .post_resource(
+            &n.api,
+            &rf_core::envelope::Envelope::seal_any(&resumed, &op_any),
+        )
+        .await
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        if client
+            .kv_get(&n.api, "ns1", "queue-paused")
+            .await
+            .unwrap()
+            .is_some()
+        {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "resumed queue did not deliver staged message"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+
     let queued = http
         .get(format!("http://127.0.0.1:{}/queue-send", n.ingress))
         .header("host", "api.test")
@@ -1669,13 +1761,17 @@ export default {
     loop {
         let ack = client.kv_get(&n.api, "ns1", "queue-ack").await.unwrap();
         let retry = client.kv_get(&n.api, "ns1", "queue-retry").await.unwrap();
+        let text = client.kv_get(&n.api, "ns1", "queue-text").await.unwrap();
+        let bytes = client.kv_get(&n.api, "ns1", "queue-bytes").await.unwrap();
         let dead = client
             .queue_dead_letters(&n.api, "events", 10)
             .await
             .unwrap_or_default();
-        if let (Some(ack), Some(retry), Some(dead_message)) = (
+        if let (Some(ack), Some(retry), Some(text), Some(bytes), Some(dead_message)) = (
             ack,
             retry,
+            text,
+            bytes,
             dead.iter().find(|item| item.body["id"] == "dead"),
         ) {
             let ack: serde_json::Value = serde_json::from_slice(&ack).unwrap();
@@ -1683,6 +1779,8 @@ export default {
             assert_eq!(ack["attempts"], 1);
             assert_eq!(ack["queue"], "events");
             assert_eq!(retry["attempts"], 2);
+            assert_eq!(text, "纯文本消息".as_bytes());
+            assert_eq!(bytes, b"[0,1,2,255]");
             assert_eq!(dead_message.attempts, 2);
             assert!(dead_message
                 .last_error

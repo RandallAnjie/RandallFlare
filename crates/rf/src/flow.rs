@@ -1951,6 +1951,7 @@ async fn execute_queue(
         .map(|body| crate::queue::SendMessage {
             body,
             delay_seconds,
+            ..Default::default()
         })
         .collect();
     let ids = crate::queue::enqueue(node, queue, messages).await?;

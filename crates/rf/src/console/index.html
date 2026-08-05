@@ -538,7 +538,8 @@
               <article class="panel">
                 <div class="panel-head"><div><p class="eyebrow">调试投递</p><h2 id="queue-active-name">请选择队列</h2><p id="queue-summary" class="muted compact-copy">选择左侧队列后，可发送测试消息并检查死信。</p></div><button id="queue-delete" class="danger ghost hidden" type="button">删除队列</button></div>
                 <form id="queue-send-form" class="stack-form hidden">
-                  <label><span>JSON 消息体</span><textarea id="queue-message-body" class="code-input" rows="8">{"hello":"RandallFlare"}</textarea></label>
+                  <label><span>消息类型</span><select id="queue-message-type"><option value="json">JSON</option><option value="v8">V8（JSON 兼容子集）</option><option value="text">文本</option><option value="bytes">二进制（Base64）</option></select></label>
+                  <label><span>消息体</span><textarea id="queue-message-body" class="code-input" rows="8">{"hello":"RandallFlare"}</textarea></label>
                   <label><span>延迟投递（秒）</span><input id="queue-message-delay" type="number" min="0" max="43200" value="0"></label>
                   <button class="primary" type="submit">发送消息</button>
                 </form>

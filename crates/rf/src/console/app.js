@@ -1850,17 +1850,22 @@ async function saveQueue(event) {
 async function sendQueueMessage(event) {
   event.preventDefault();
   if (!state.queueActive) return;
-  let body;
-  try {
-    body = JSON.parse($("#queue-message-body").value);
-  } catch (error) {
-    toast(`消息体不是有效 JSON：${error.message}`, true);
-    return;
+  const contentType = $("#queue-message-type").value;
+  let body = null;
+  let bodyBase64 = null;
+  if (contentType === "json" || contentType === "v8") {
+    try { body = JSON.parse($("#queue-message-body").value); }
+    catch (error) { toast(`消息体不是有效 JSON：${error.message}`, true); return; }
+  } else if (contentType === "text") {
+    body = $("#queue-message-body").value;
+  } else {
+    bodyBase64 = $("#queue-message-body").value.trim();
+    try { atob(bodyBase64); } catch { toast("二进制消息体不是有效 Base64", true); return; }
   }
   try {
     const result = await api(`/api/queues/${encodeURIComponent(state.queueActive)}/messages`, {
       method: "POST",
-      body: JSON.stringify({ messages: [{ body, delay_seconds: Number($("#queue-message-delay").value || 0) }] }),
+      body: JSON.stringify({ messages: [{ body, content_type: contentType, body_base64: bodyBase64, delay_seconds: Number($("#queue-message-delay").value || 0) }] }),
     });
     toast(`消息已入队：${shortId(result.message_ids?.[0], 16)}`);
     await loadQueues({ quiet: true });
@@ -1874,7 +1879,7 @@ function renderQueueDeadLetters() {
   const list = $("#queue-dead-list");
   list.classList.toggle("empty-state", state.queueDeadLetters.length === 0);
   list.innerHTML = state.queueDeadLetters.length
-    ? state.queueDeadLetters.map((item) => `<article class="build-row failed"><span class="pipeline-state failed"></span><div><strong>${escapeHtml(shortId(item.id, 22))}</strong><small>${escapeHtml(new Date(item.dead_letter_at_ms).toLocaleString("zh-CN"))} · 尝试 ${escapeHtml(item.attempts)} 次</small><code>${escapeHtml(JSON.stringify(item.body))}</code></div><div><small>${escapeHtml(item.last_error || "处理程序请求重试")}</small></div><button class="mini-button" data-queue-redrive="${escapeHtml(item.id)}">重新入队</button></article>`).join("")
+    ? state.queueDeadLetters.map((item) => `<article class="build-row failed"><span class="pipeline-state failed"></span><div><strong>${escapeHtml(shortId(item.id, 22))}</strong><small>${escapeHtml(new Date(item.dead_letter_at_ms).toLocaleString("zh-CN"))} · ${escapeHtml(item.content_type || "json")} · 尝试 ${escapeHtml(item.attempts)} 次</small><code>${escapeHtml(item.content_type === "bytes" ? item.body_base64 : JSON.stringify(item.body))}</code></div><div><small>${escapeHtml(item.last_error || "处理程序请求重试")}</small></div><button class="mini-button" data-queue-redrive="${escapeHtml(item.id)}">重新入队</button></article>`).join("")
     : "暂无死信。";
 }
 

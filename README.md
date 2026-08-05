@@ -101,11 +101,13 @@ Working today, verified by multi-process fault-injection e2e tests:
   live node and reports physical distribution. See
   [the storage-policy guide](./docs/STORAGE_POLICY.md).
 - **Decentralized Queues**: operator-signed queue definitions and independent
-  D1 micro-quorum ledgers provide delayed JSON messages, batches, visibility
-  leases, bounded retries, durable dead letters and redrive. Workers produce
-  with `env.EVENTS.send()/sendBatch()` and consume with `queue(batch, env,
-  context)`; real-workerd tests cover automatic acknowledgement, retry and
-  dead-letter transitions.
+  D1 micro-quorum ledgers provide delayed JSON/V8-compatible, UTF-8 text and
+  binary messages, batches, visibility leases, bounded retries, durable dead
+  letters and type-preserving redrive. Pausing stops consumption while keeping
+  producer writes durable. Workers produce with `env.EVENTS.send()/sendBatch()`
+  and consume with `queue(batch, env, context)`; real-workerd tests cover
+  automatic acknowledgement, retry, dead-letter transitions and typed bodies.
+  See [the Queues guide](./docs/QUEUES.md).
 - **Decentralized Analytics Engine**: operator-signed datasets retain the
   Cloudflare-shaped `blobs` / `doubles` / `indexes` data-point model in an
   independent D1 micro-quorum. Workers call `env.METRICS.writeDataPoint()`;

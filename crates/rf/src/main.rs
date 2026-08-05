@@ -1,6 +1,7 @@
 //! rf — RandallFlare node daemon + operator CLI in one binary.
 
 use anyhow::{Context, Result};
+use base64::Engine as _;
 use clap::{Parser, Subcommand};
 use rf::config::NodeConfig;
 use rf::node::Node;
@@ -804,10 +805,15 @@ enum QueueCmd {
         #[arg(long, env = "RF_CLUSTER_SECRET")]
         secret: String,
     },
-    /// Send one JSON message.
+    /// Send one JSON, text, bytes or JSON-compatible V8 message.
     Send {
         name: String,
-        body: String,
+        #[arg(required_unless_present = "file", conflicts_with = "file")]
+        body: Option<String>,
+        #[arg(long)]
+        file: Option<PathBuf>,
+        #[arg(long, default_value = "json")]
+        content_type: String,
         #[arg(long, default_value_t = 0)]
         delay_seconds: u64,
         #[arg(long, env = "RF_NODE")]
@@ -2756,11 +2762,34 @@ async fn async_main(cli: Cli) -> Result<()> {
             QueueCmd::Send {
                 name,
                 body,
+                file,
+                content_type,
                 delay_seconds,
                 node,
                 secret,
             } => {
-                let body = serde_json::from_str(&body).context("队列消息体必须是 JSON")?;
+                let raw = match file {
+                    Some(path) => std::fs::read(&path)
+                        .with_context(|| format!("读取队列消息文件 {}", path.display()))?,
+                    None => body.unwrap_or_default().into_bytes(),
+                };
+                let (body, body_base64) = match content_type.as_str() {
+                    "json" | "v8" => (
+                        serde_json::from_slice(&raw).context("队列 JSON/V8 消息体必须是 JSON")?,
+                        None,
+                    ),
+                    "text" => (
+                        serde_json::Value::String(
+                            String::from_utf8(raw).context("队列 text 消息文件必须是 UTF-8")?,
+                        ),
+                        None,
+                    ),
+                    "bytes" => (
+                        serde_json::Value::Null,
+                        Some(base64::engine::general_purpose::STANDARD.encode(raw)),
+                    ),
+                    _ => anyhow::bail!("--content-type 必须是 json、text、bytes 或 v8"),
+                };
                 let client = PeerClient::new(secret_bytes(&secret)?);
                 let ids = client
                     .queue_send(
@@ -2768,6 +2797,8 @@ async fn async_main(cli: Cli) -> Result<()> {
                         &name,
                         &[rf::queue::SendMessage {
                             body,
+                            content_type,
+                            body_base64,
                             delay_seconds,
                         }],
                     )
