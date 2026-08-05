@@ -22,8 +22,10 @@ jobs:
         run: |
           version=$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.name == "rf") | .version')
           test "v${version}" = "${GITHUB_REF_NAME}"
-      - name: Install musl toolchain
-        run: sudo apt-get update && sudo apt-get install -y musl-tools
+      - name: Install musl toolchain and Binary Deliver sandbox
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes musl-tools bubblewrap
       - name: Validate deployment scripts
         run: |
           bash -n infra/*.sh
@@ -37,6 +39,10 @@ jobs:
         run: |
           infra/fetch-workerd.sh --output "$RUNNER_TEMP/workerd-bin/workerd"
           echo "$RUNNER_TEMP/workerd-bin" >> "$GITHUB_PATH"
+          if command -v apparmor_parser >/dev/null; then
+            sudo apparmor_parser -r infra/rf-bwrap.apparmor
+          fi
+          command -v bwrap
       - name: Test release source
         run: cargo test --workspace --all-targets --locked
       - name: Build static release
