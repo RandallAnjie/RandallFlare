@@ -404,7 +404,7 @@ async fn handle_result(node: &Node, request: Request<Body>) -> Result<Response> 
             "对象 key 不能为空",
             Some(bucket),
         ),
-        Some(key) => object_request(node, request, bucket, key, &query).await?,
+        Some(key) => object_request(node, &auth, request, bucket, key, &query).await?,
     };
     Ok(response)
 }
@@ -415,6 +415,11 @@ fn authenticate(
     uri: &axum::http::Uri,
     headers: &HeaderMap,
 ) -> std::result::Result<Authenticated, Box<Response>> {
+    if headers.get(header::AUTHORIZATION).is_none()
+        && parse_query(uri.query().unwrap_or_default()).contains_key("X-Amz-Algorithm")
+    {
+        return authenticate_presigned(node, method, uri, headers);
+    }
     let parsed = headers
         .get(header::AUTHORIZATION)
         .and_then(|value| value.to_str().ok())
@@ -541,6 +546,183 @@ fn authenticate(
     Ok(Authenticated { id, spec })
 }
 
+fn authenticate_presigned(
+    node: &Node,
+    method: &Method,
+    uri: &axum::http::Uri,
+    headers: &HeaderMap,
+) -> std::result::Result<Authenticated, Box<Response>> {
+    let query = parse_query(uri.query().unwrap_or_default());
+    let parameter = |name: &str| {
+        query_one(&query, name).ok_or_else(|| {
+            boxed_s3_error(
+                StatusCode::BAD_REQUEST,
+                "InvalidRequest",
+                "预签名 URL 缺少必要的 X-Amz 参数",
+                None,
+            )
+        })
+    };
+    if parameter("X-Amz-Algorithm")? != "AWS4-HMAC-SHA256"
+        || query.contains_key("X-Amz-Security-Token")
+    {
+        return Err(boxed_s3_error(
+            StatusCode::BAD_REQUEST,
+            "InvalidRequest",
+            "预签名 URL 的算法或临时安全令牌不受支持",
+            None,
+        ));
+    }
+    let credential = parameter("X-Amz-Credential")?;
+    let scope = credential.split('/').collect::<Vec<_>>();
+    if scope.len() != 5 || scope[3] != "s3" || scope[4] != "aws4_request" {
+        return Err(boxed_s3_error(
+            StatusCode::BAD_REQUEST,
+            "InvalidRequest",
+            "预签名 URL 的 Credential scope 无效",
+            None,
+        ));
+    }
+    let signed_headers = parameter("X-Amz-SignedHeaders")?
+        .split(';')
+        .map(str::to_ascii_lowercase)
+        .collect::<Vec<_>>();
+    if signed_headers.is_empty()
+        || signed_headers.windows(2).any(|pair| pair[0] >= pair[1])
+        || !signed_headers.iter().any(|name| name == "host")
+    {
+        return Err(boxed_s3_error(
+            StatusCode::BAD_REQUEST,
+            "InvalidRequest",
+            "预签名 URL 的 SignedHeaders 无效",
+            None,
+        ));
+    }
+    let signature = parameter("X-Amz-Signature")?.to_ascii_lowercase();
+    if signature.len() != 64 || !signature.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err(boxed_s3_error(
+            StatusCode::BAD_REQUEST,
+            "InvalidRequest",
+            "预签名 URL 的 Signature 无效",
+            None,
+        ));
+    }
+    let amz_date = parameter("X-Amz-Date")?;
+    let request_ms = parse_amz_date(amz_date).ok_or_else(|| {
+        boxed_s3_error(
+            StatusCode::BAD_REQUEST,
+            "InvalidRequest",
+            "预签名 URL 的 X-Amz-Date 无效",
+            None,
+        )
+    })?;
+    let expires = parameter("X-Amz-Expires")?
+        .parse::<u64>()
+        .ok()
+        .filter(|seconds| (1..=604_800).contains(seconds))
+        .ok_or_else(|| {
+            boxed_s3_error(
+                StatusCode::BAD_REQUEST,
+                "InvalidRequest",
+                "预签名 URL 的有效期必须介于 1 秒和 7 天之间",
+                None,
+            )
+        })?;
+    let now = now_ms();
+    if request_ms > now.saturating_add(15 * 60 * 1000)
+        || now > request_ms.saturating_add(expires.saturating_mul(1000))
+    {
+        return Err(boxed_s3_error(
+            StatusCode::FORBIDDEN,
+            "AccessDenied",
+            "预签名 URL 尚未生效或已经过期",
+            None,
+        ));
+    }
+    let parsed = ParsedAuthorization {
+        access_key_id: scope[0].to_string(),
+        date_stamp: scope[1].to_string(),
+        region: scope[2].to_string(),
+        signed_headers,
+        signature,
+    };
+    if !amz_date.starts_with(&parsed.date_stamp) {
+        return Err(boxed_s3_error(
+            StatusCode::BAD_REQUEST,
+            "InvalidRequest",
+            "预签名 URL 的日期与 Credential scope 不一致",
+            None,
+        ));
+    }
+    let (id, spec) = resource::heads(node, Some(CREDENTIAL_KIND))
+        .into_iter()
+        .filter(|view| !view.resource.deleted)
+        .find_map(|view| {
+            let spec = credential_spec(&view.resource).ok()?;
+            (spec.access_key_id == parsed.access_key_id && spec.revoked_at_ms.is_none())
+                .then_some((view.resource.name, spec))
+        })
+        .ok_or_else(|| {
+            boxed_s3_error(
+                StatusCode::FORBIDDEN,
+                "InvalidAccessKeyId",
+                "Access Key ID 不存在",
+                None,
+            )
+        })?;
+    let cluster_secret = node.cfg.cluster_secret_bytes().map_err(|_| {
+        boxed_s3_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "ServiceUnavailable",
+            "节点凭据配置不可用",
+            None,
+        )
+    })?;
+    let raw_secret = Zeroizing::new(
+        crate::sealed::open(&cluster_secret, SECRET_PURPOSE, &id, &spec.secret).map_err(|_| {
+            boxed_s3_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "ServiceUnavailable",
+                "节点无法解密凭据",
+                None,
+            )
+        })?,
+    );
+    let expected = expected_presigned_signature(
+        &parsed,
+        std::str::from_utf8(&raw_secret).map_err(|_| {
+            boxed_s3_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "ServiceUnavailable",
+                "节点凭据编码无效",
+                None,
+            )
+        })?,
+        method,
+        uri,
+        headers,
+        amz_date,
+    )
+    .map_err(|_| {
+        boxed_s3_error(
+            StatusCode::BAD_REQUEST,
+            "InvalidRequest",
+            "预签名 URL 规范化失败",
+            None,
+        )
+    })?;
+    if !constant_time_eq(expected.as_bytes(), parsed.signature.as_bytes()) {
+        return Err(boxed_s3_error(
+            StatusCode::FORBIDDEN,
+            "SignatureDoesNotMatch",
+            "预签名 URL 的签名不匹配",
+            None,
+        ));
+    }
+    let _ = node.store.touch_credential(&id, now_ms());
+    Ok(Authenticated { id, spec })
+}
+
 fn boxed_s3_error(
     status: StatusCode,
     code: &str,
@@ -643,6 +825,65 @@ fn expected_signature(
     Ok(hex::encode(hmac(&signing_key, string_to_sign.as_bytes())))
 }
 
+fn expected_presigned_signature(
+    parsed: &ParsedAuthorization,
+    secret: &str,
+    method: &Method,
+    uri: &axum::http::Uri,
+    headers: &HeaderMap,
+    amz_date: &str,
+) -> Result<String> {
+    let mut canonical_headers = String::new();
+    for name in &parsed.signed_headers {
+        let mut values = headers
+            .get_all(name)
+            .iter()
+            .map(|value| value.to_str().unwrap_or_default())
+            .collect::<Vec<_>>()
+            .join(",");
+        if values.is_empty() && name == "host" {
+            values = uri
+                .authority()
+                .map(|authority| authority.as_str().to_string())
+                .unwrap_or_default();
+        }
+        if values.is_empty() {
+            bail!("预签名 URL 声明的请求头不存在：{name}");
+        }
+        canonical_headers.push_str(name);
+        canonical_headers.push(':');
+        canonical_headers.push_str(&collapse_whitespace(&values));
+        canonical_headers.push('\n');
+    }
+    let signed = parsed.signed_headers.join(";");
+    let payload_hash = headers
+        .get("x-amz-content-sha256")
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("UNSIGNED-PAYLOAD");
+    let canonical_request = format!(
+        "{}\n{}\n{}\n{}\n{}\n{}",
+        method.as_str(),
+        uri.path(),
+        canonical_query_presigned(uri.query().unwrap_or_default()),
+        canonical_headers,
+        signed,
+        payload_hash,
+    );
+    let scope = format!("{}/{}/s3/aws4_request", parsed.date_stamp, parsed.region);
+    let string_to_sign = format!(
+        "AWS4-HMAC-SHA256\n{amz_date}\n{scope}\n{}",
+        hex::encode(Sha256::digest(canonical_request.as_bytes()))
+    );
+    let date_key = hmac(
+        format!("AWS4{secret}").as_bytes(),
+        parsed.date_stamp.as_bytes(),
+    );
+    let region_key = hmac(&date_key, parsed.region.as_bytes());
+    let service_key = hmac(&region_key, b"s3");
+    let signing_key = hmac(&service_key, b"aws4_request");
+    Ok(hex::encode(hmac(&signing_key, string_to_sign.as_bytes())))
+}
+
 fn hmac(key: &[u8], value: &[u8]) -> Vec<u8> {
     let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(key).expect("HMAC accepts all key sizes");
     mac.update(value);
@@ -675,6 +916,27 @@ fn canonical_query(raw: &str) -> String {
         let key = aws_encode(&percent_encoding::percent_decode_str(key).collect::<Vec<_>>());
         let value = aws_encode(&percent_encoding::percent_decode_str(value).collect::<Vec<_>>());
         values.push((key, value));
+    }
+    values.sort();
+    values
+        .into_iter()
+        .map(|(key, value)| format!("{key}={value}"))
+        .collect::<Vec<_>>()
+        .join("&")
+}
+
+fn canonical_query_presigned(raw: &str) -> String {
+    let mut values = Vec::new();
+    for component in raw.split('&').filter(|value| !value.is_empty()) {
+        let (key, value) = component.split_once('=').unwrap_or((component, ""));
+        let decoded_key = percent_encoding::percent_decode_str(key).collect::<Vec<_>>();
+        if decoded_key == b"X-Amz-Signature" {
+            continue;
+        }
+        values.push((
+            aws_encode(&decoded_key),
+            aws_encode(&percent_encoding::percent_decode_str(value).collect::<Vec<_>>()),
+        ));
     }
     values.sort();
     values
@@ -844,6 +1106,7 @@ async fn list_multipart_uploads(
 
 async fn object_request(
     node: &Node,
+    auth: &Authenticated,
     request: Request<Body>,
     bucket: &str,
     key: &str,
@@ -920,6 +1183,54 @@ async fn object_request(
             let part_number = query_one(query, "partNumber")
                 .and_then(|value| value.parse::<u32>().ok())
                 .context("S3 partNumber 无效")?;
+            if request.headers().contains_key("x-amz-copy-source") {
+                let (source, file) = match copy_source_object(node, auth, request.headers()).await?
+                {
+                    Ok(source) => source,
+                    Err(response) => return Ok(response),
+                };
+                let (offset, length) = match request
+                    .headers()
+                    .get("x-amz-copy-source-range")
+                    .and_then(|value| value.to_str().ok())
+                {
+                    Some(value) => match byte_range(value, source.size) {
+                        Ok((start, end)) => (start, end - start + 1),
+                        Err(()) => {
+                            return Ok(s3_error(
+                                StatusCode::RANGE_NOT_SATISFIABLE,
+                                "InvalidRange",
+                                "复制源字节范围超出对象边界",
+                                Some(key),
+                            ))
+                        }
+                    },
+                    None => (0, source.size),
+                };
+                if length > crate::r2::MAX_MULTIPART_PART_BYTES as u64 {
+                    return Ok(s3_error(
+                        StatusCode::PAYLOAD_TOO_LARGE,
+                        "EntityTooLarge",
+                        "复制分片不得超过 5 GiB",
+                        Some(key),
+                    ));
+                }
+                let staged = node
+                    .objects
+                    .spool_stream(length, file.stream(offset, length).await?)
+                    .await?;
+                let part =
+                    crate::r2::upload_part_file(node, bucket, key, upload_id, part_number, &staged)
+                        .await?;
+                return Ok(xml_response(
+                    StatusCode::OK,
+                    format!(
+                        "<?xml version=\"1.0\" encoding=\"UTF-8\"?><CopyPartResult><LastModified>{}</LastModified><ETag>&quot;{}&quot;</ETag></CopyPartResult>",
+                        timestamp(now_ms()),
+                        escape_xml(&part.etag)
+                    ),
+                ));
+            }
             let declared = declared_payload_hash(request.headers());
             let body = request.into_body().into_data_stream().map(|result| {
                 result.map_err(|error| std::io::Error::other(format!("S3 上传体读取失败：{error}")))
@@ -964,6 +1275,56 @@ async fn object_request(
             get_object_response(node, bucket, key, method == Method::HEAD, request.headers()).await
         }
         Method::PUT => {
+            if request.headers().contains_key("x-amz-copy-source") {
+                let (source, file) = match copy_source_object(node, auth, request.headers()).await?
+                {
+                    Ok(source) => source,
+                    Err(response) => return Ok(response),
+                };
+                if source.size > crate::r2::MAX_DIRECT_OBJECT_BYTES as u64 {
+                    return Ok(s3_error(
+                        StatusCode::PAYLOAD_TOO_LARGE,
+                        "EntityTooLarge",
+                        "CopyObject 的源对象不得超过 5 GiB；请使用 UploadPartCopy",
+                        Some(key),
+                    ));
+                }
+                let options = match request
+                    .headers()
+                    .get("x-amz-metadata-directive")
+                    .and_then(|value| value.to_str().ok())
+                    .unwrap_or("COPY")
+                {
+                    "COPY" => crate::r2::PutOptions {
+                        content_type: source.content_type.clone(),
+                        custom_metadata: source.custom_metadata.clone(),
+                        http_metadata: source.http_metadata.clone(),
+                    },
+                    "REPLACE" => put_options(request.headers()),
+                    _ => {
+                        return Ok(s3_error(
+                            StatusCode::BAD_REQUEST,
+                            "InvalidArgument",
+                            "x-amz-metadata-directive 必须是 COPY 或 REPLACE",
+                            Some(key),
+                        ))
+                    }
+                };
+                let staged = node
+                    .objects
+                    .spool_stream(source.size, file.stream(0, source.size).await?)
+                    .await?;
+                let object =
+                    crate::r2::put_object_file(node, bucket, key, &staged, options).await?;
+                return Ok(xml_response(
+                    StatusCode::OK,
+                    format!(
+                        "<?xml version=\"1.0\" encoding=\"UTF-8\"?><CopyObjectResult><LastModified>{}</LastModified><ETag>&quot;{}&quot;</ETag></CopyObjectResult>",
+                        timestamp(object.uploaded_at_ms),
+                        escape_xml(&object.etag)
+                    ),
+                ));
+            }
             let options = put_options(request.headers());
             let declared = declared_payload_hash(request.headers());
             let body = request.into_body().into_data_stream().map(|result| {
@@ -993,6 +1354,126 @@ async fn object_request(
             Some(key),
         )),
     }
+}
+
+async fn copy_source_object(
+    node: &Node,
+    auth: &Authenticated,
+    headers: &HeaderMap,
+) -> Result<
+    std::result::Result<
+        (
+            crate::r2::ObjectMeta,
+            crate::objectstore::VerifiedObjectFile,
+        ),
+        Response,
+    >,
+> {
+    let raw = headers
+        .get("x-amz-copy-source")
+        .and_then(|value| value.to_str().ok())
+        .context("x-amz-copy-source 无效")?;
+    let (raw_path, version_query) = raw
+        .split_once('?')
+        .map(|(path, query)| (path, Some(query)))
+        .unwrap_or((raw, None));
+    if version_query.is_some() {
+        return Ok(Err(s3_error(
+            StatusCode::BAD_REQUEST,
+            "InvalidArgument",
+            "RandallFlare 对象不使用中心化版本 ID",
+            Some(raw),
+        )));
+    }
+    let decoded = percent_encoding::percent_decode_str(raw_path)
+        .decode_utf8()
+        .context("x-amz-copy-source 不是有效 UTF-8")?;
+    let decoded = decoded.trim_start_matches('/');
+    let Some((bucket, key)) = decoded.split_once('/') else {
+        return Ok(Err(s3_error(
+            StatusCode::BAD_REQUEST,
+            "InvalidArgument",
+            "x-amz-copy-source 必须包含源 bucket 与对象键",
+            Some(raw),
+        )));
+    };
+    if !rf_core::manifest::valid_name(bucket) || crate::r2::validate_key(key).is_err() {
+        return Ok(Err(s3_error(
+            StatusCode::BAD_REQUEST,
+            "InvalidArgument",
+            "x-amz-copy-source 的 bucket 或对象键无效",
+            Some(raw),
+        )));
+    }
+    if !auth.may(bucket, false) {
+        return Ok(Err(s3_error(
+            StatusCode::FORBIDDEN,
+            "AccessDenied",
+            "此凭据没有复制源 bucket 的读取权限",
+            Some(raw),
+        )));
+    }
+    if crate::r2::bucket_record(node, bucket).is_none() {
+        return Ok(Err(s3_error(
+            StatusCode::NOT_FOUND,
+            "NoSuchBucket",
+            "复制源 bucket 不存在",
+            Some(raw),
+        )));
+    }
+    let Some((metadata, file)) = crate::r2::materialize_object(node, bucket, key).await? else {
+        return Ok(Err(s3_error(
+            StatusCode::NOT_FOUND,
+            "NoSuchKey",
+            "复制源对象不存在",
+            Some(raw),
+        )));
+    };
+    if !copy_source_conditions_match(headers, &metadata) {
+        return Ok(Err(s3_error(
+            StatusCode::PRECONDITION_FAILED,
+            "PreconditionFailed",
+            "复制源对象的前置条件未满足",
+            Some(raw),
+        )));
+    }
+    Ok(Ok((metadata, file)))
+}
+
+fn copy_source_conditions_match(headers: &HeaderMap, metadata: &crate::r2::ObjectMeta) -> bool {
+    if headers
+        .get("x-amz-copy-source-if-match")
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| !etag_header_matches(value, &metadata.etag))
+    {
+        return false;
+    }
+    if headers
+        .get("x-amz-copy-source-if-none-match")
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| etag_header_matches(value, &metadata.etag))
+    {
+        return false;
+    }
+    let uploaded =
+        std::time::UNIX_EPOCH + std::time::Duration::from_millis(metadata.uploaded_at_ms);
+    if headers
+        .get("x-amz-copy-source-if-unmodified-since")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| httpdate::parse_http_date(value).ok())
+        .is_some_and(|limit| uploaded > limit)
+    {
+        return false;
+    }
+    if headers
+        .get("x-amz-copy-source-if-modified-since")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| httpdate::parse_http_date(value).ok())
+        .is_some_and(|limit| uploaded <= limit)
+    {
+        return false;
+    }
+    true
 }
 
 fn declared_payload_hash(headers: &HeaderMap) -> Option<String> {
@@ -1386,6 +1867,94 @@ fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::NodeConfig;
+    use crate::objectstore::StorageLocation;
+    use rf_core::envelope::Envelope;
+    use rf_core::identity::{AnyKeypair, Keypair};
+    use std::sync::Arc;
+
+    fn amz_now() -> (String, String) {
+        let now = time::OffsetDateTime::now_utc();
+        let stamp = format!(
+            "{:04}{:02}{:02}",
+            now.year(),
+            u8::from(now.month()),
+            now.day()
+        );
+        let date = format!(
+            "{stamp}T{:02}{:02}{:02}Z",
+            now.hour(),
+            now.minute(),
+            now.second()
+        );
+        (stamp, date)
+    }
+
+    fn signed_empty_request(
+        access_key: &str,
+        secret: &str,
+        method: Method,
+        uri: &str,
+        extra_headers: &[(&str, &str)],
+    ) -> Request<Body> {
+        let (date_stamp, amz_date) = amz_now();
+        let uri: axum::http::Uri = uri.parse().unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert(header::HOST, HeaderValue::from_static("s3.test"));
+        headers.insert(
+            "x-amz-content-sha256",
+            HeaderValue::from_static(
+                "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            ),
+        );
+        headers.insert("x-amz-date", HeaderValue::from_str(&amz_date).unwrap());
+        for (name, value) in extra_headers {
+            headers.insert(
+                axum::http::HeaderName::from_bytes(name.as_bytes()).unwrap(),
+                HeaderValue::from_str(value).unwrap(),
+            );
+        }
+        let mut signed_headers = headers
+            .keys()
+            .map(|name| name.as_str().to_string())
+            .collect::<Vec<_>>();
+        signed_headers.sort();
+        let mut parsed = ParsedAuthorization {
+            access_key_id: access_key.into(),
+            date_stamp: date_stamp.clone(),
+            region: "auto".into(),
+            signed_headers,
+            signature: String::new(),
+        };
+        parsed.signature = expected_signature(
+            &parsed,
+            secret,
+            &method,
+            &uri,
+            &headers,
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            &amz_date,
+        )
+        .unwrap();
+        headers.insert(
+            header::AUTHORIZATION,
+            HeaderValue::from_str(&format!(
+                "AWS4-HMAC-SHA256 Credential={}/{}/auto/s3/aws4_request, SignedHeaders={}, Signature={}",
+                access_key,
+                date_stamp,
+                parsed.signed_headers.join(";"),
+                parsed.signature
+            ))
+            .unwrap(),
+        );
+        let mut request = Request::builder()
+            .method(method)
+            .uri(uri)
+            .body(Body::empty())
+            .unwrap();
+        *request.headers_mut() = headers;
+        request
+    }
 
     #[test]
     fn authorization_and_dates_are_strict() {
@@ -1402,6 +1971,41 @@ mod tests {
         assert_eq!(
             canonical_query("z=2&a=hello%20world&a=0"),
             "a=0&a=hello%20world&z=2"
+        );
+        assert_eq!(
+            canonical_query_presigned(
+                "X-Amz-Date=20130524T000000Z&X-Amz-Signature=ignored&X-Amz-Algorithm=AWS4-HMAC-SHA256"
+            ),
+            "X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Date=20130524T000000Z"
+        );
+    }
+
+    #[test]
+    fn presigned_signature_matches_the_aws_s3_reference_vector() {
+        let uri: axum::http::Uri = "/test.txt?X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential=AKIAIOSFODNN7EXAMPLE%2F20130524%2Fus-east-1%2Fs3%2Faws4_request&X-Amz-Date=20130524T000000Z&X-Amz-Expires=86400&X-Amz-SignedHeaders=host&X-Amz-Signature=aeeed9bbccd4d02ee5c0109b86d86835f995330da4c265957d157751f604d404".parse().unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::HOST,
+            HeaderValue::from_static("examplebucket.s3.amazonaws.com"),
+        );
+        let parsed = ParsedAuthorization {
+            access_key_id: "AKIAIOSFODNN7EXAMPLE".into(),
+            date_stamp: "20130524".into(),
+            region: "us-east-1".into(),
+            signed_headers: vec!["host".into()],
+            signature: "aeeed9bbccd4d02ee5c0109b86d86835f995330da4c265957d157751f604d404".into(),
+        };
+        assert_eq!(
+            expected_presigned_signature(
+                &parsed,
+                "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
+                &Method::GET,
+                &uri,
+                &headers,
+                "20130524T000000Z",
+            )
+            .unwrap(),
+            parsed.signature
         );
     }
 
@@ -1425,5 +2029,219 @@ mod tests {
         assert!(etag_header_matches("\"abc\", \"def\"", "def"));
         assert!(etag_header_matches("*", "anything"));
         assert!(!etag_header_matches("\"abc\"", "def"));
+
+        let metadata = crate::r2::ObjectMeta {
+            key: "source.bin".into(),
+            sha256: "ab".repeat(32),
+            size: 10,
+            etag: "etag-a".into(),
+            content_type: None,
+            custom_metadata: Default::default(),
+            http_metadata: Default::default(),
+            storage: crate::objectstore::StorageLocation::Local,
+            uploaded_at_ms: 1_000,
+        };
+        let mut copy_headers = HeaderMap::new();
+        copy_headers.insert(
+            "x-amz-copy-source-if-match",
+            HeaderValue::from_static("\"etag-a\""),
+        );
+        assert!(copy_source_conditions_match(&copy_headers, &metadata));
+        copy_headers.insert(
+            "x-amz-copy-source-if-none-match",
+            HeaderValue::from_static("\"etag-a\""),
+        );
+        assert!(!copy_source_conditions_match(&copy_headers, &metadata));
+    }
+
+    #[tokio::test]
+    async fn copy_part_copy_and_presigned_get_round_trip() {
+        let peer_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let peer_addr = peer_listener.local_addr().unwrap();
+        drop(peer_listener);
+        let gossip_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let gossip_addr = gossip_listener.local_addr().unwrap();
+        drop(gossip_listener);
+        let root = std::env::temp_dir().join(format!(
+            "rf-s3-copy-{}-{}",
+            std::process::id(),
+            rand::random::<u32>()
+        ));
+        let operator = AnyKeypair::Ed(Keypair::from_seed([101; 32]));
+        let test_cluster_secret = "ab".repeat(32);
+        let config: NodeConfig = toml::from_str(&format!(
+            r#"
+            data_dir = {root:?}
+            operator = "{}"
+            cluster_secret = "{test_cluster_secret}"
+            [gossip]
+            listen = "{gossip_addr}"
+            [peer_api]
+            listen = "{peer_addr}"
+            [ingress]
+            default_domain = "workers.test"
+            "#,
+            operator.signer_id(),
+        ))
+        .unwrap();
+        let node = Arc::new(Node::open(config, Keypair::from_seed([102; 32])).unwrap());
+        let bucket = crate::r2::prepare_bucket(
+            &node,
+            "copy-bucket",
+            crate::r2::BucketSpec {
+                description: "S3 copy integration".into(),
+                public_access: false,
+                storage: StorageLocation::Local,
+                storage_policy: None,
+                max_bytes: Some(64 * 1024 * 1024),
+                max_objects: Some(20),
+                expire_objects_after_days: None,
+                cors_origins: Vec::new(),
+                hostnames: Vec::new(),
+            },
+            false,
+        )
+        .unwrap();
+        crate::resource::ingest(&node, &Envelope::seal_any(&bucket, &operator)).unwrap();
+        let (credential, access_key, secret) =
+            mint(&node, "copy test".into(), false, BTreeMap::new()).unwrap();
+        crate::resource::ingest(&node, &Envelope::seal_any(&credential, &operator)).unwrap();
+
+        let registry: crate::d1::Registry = Default::default();
+        let leadership: crate::d1::Leadership = Default::default();
+        let durable =
+            crate::durable::Coordinator::new(node.clone(), registry.clone(), leadership.clone());
+        let (_address, server) =
+            crate::peerapi::serve_managed(node.clone(), registry.clone(), durable.clone())
+                .await
+                .unwrap();
+        let manager = crate::d1::spawn_manager(node.clone(), registry.clone(), leadership);
+
+        let source_bytes = b"copy source bytes";
+        crate::r2::put_object(
+            &node,
+            "copy-bucket",
+            "source.bin",
+            source_bytes,
+            crate::r2::PutOptions {
+                content_type: Some("application/source".into()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        let copy = signed_empty_request(
+            &access_key,
+            &secret,
+            Method::PUT,
+            "/s3/copy-bucket/copied.bin",
+            &[("x-amz-copy-source", "/copy-bucket/source.bin")],
+        );
+        let response = handle(node.clone(), copy).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let copied = crate::r2::get_object(&node, "copy-bucket", "copied.bin")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(copied.1, source_bytes);
+        assert_eq!(copied.0.content_type.as_deref(), Some("application/source"));
+
+        let upload = crate::r2::create_multipart_upload(
+            &node,
+            "copy-bucket",
+            "part-copy.bin",
+            crate::r2::PutOptions::default(),
+        )
+        .await
+        .unwrap();
+        let upload_uri = format!(
+            "/s3/copy-bucket/part-copy.bin?partNumber=1&uploadId={}",
+            upload.upload_id
+        );
+        let part_copy = signed_empty_request(
+            &access_key,
+            &secret,
+            Method::PUT,
+            &upload_uri,
+            &[
+                ("x-amz-copy-source", "/copy-bucket/source.bin"),
+                ("x-amz-copy-source-range", "bytes=5-10"),
+            ],
+        );
+        let response = handle(node.clone(), part_copy).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let detail = crate::r2::multipart_upload_detail(&node, "copy-bucket", &upload.upload_id)
+            .await
+            .unwrap();
+        let completed = crate::r2::complete_multipart_upload(
+            &node,
+            "copy-bucket",
+            "part-copy.bin",
+            &upload.upload_id,
+            &[crate::r2::PublishedPart {
+                part_number: 1,
+                etag: detail.parts[0].etag.clone(),
+            }],
+        )
+        .await
+        .unwrap();
+        assert!(completed.etag.ends_with("-1"));
+        assert_eq!(
+            crate::r2::get_object(&node, "copy-bucket", "part-copy.bin")
+                .await
+                .unwrap()
+                .unwrap()
+                .1,
+            b"source"
+        );
+
+        let (date_stamp, amz_date) = amz_now();
+        let base_query = format!(
+            "X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential={}%2F{}%2Fauto%2Fs3%2Faws4_request&X-Amz-Date={}&X-Amz-Expires=60&X-Amz-SignedHeaders=host",
+            access_key, date_stamp, amz_date
+        );
+        let unsigned_uri: axum::http::Uri = format!("/s3/copy-bucket/copied.bin?{base_query}")
+            .parse()
+            .unwrap();
+        let mut presigned_headers = HeaderMap::new();
+        presigned_headers.insert(header::HOST, HeaderValue::from_static("s3.test"));
+        let parsed = ParsedAuthorization {
+            access_key_id: access_key.clone(),
+            date_stamp,
+            region: "auto".into(),
+            signed_headers: vec!["host".into()],
+            signature: String::new(),
+        };
+        let signature = expected_presigned_signature(
+            &parsed,
+            &secret,
+            &Method::GET,
+            &unsigned_uri,
+            &presigned_headers,
+            &amz_date,
+        )
+        .unwrap();
+        let mut request = Request::builder()
+            .method(Method::GET)
+            .uri(format!(
+                "/s3/copy-bucket/copied.bin?{base_query}&X-Amz-Signature={signature}"
+            ))
+            .body(Body::empty())
+            .unwrap();
+        *request.headers_mut() = presigned_headers;
+        let response = handle(node.clone(), request).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            to_bytes(response.into_body(), 1024).await.unwrap(),
+            source_bytes.as_slice()
+        );
+
+        server.abort();
+        manager.abort();
+        drop(durable);
+        drop(registry);
+        drop(node);
+        tokio::task::yield_now().await;
+        let _ = std::fs::remove_dir_all(root);
     }
 }

@@ -116,12 +116,14 @@ aws --endpoint-url "${RF_S3_ENDPOINT}" \
   s3 cp ./archive.bin s3://backups/archive.bin
 ```
 
-The endpoint implements AWS Signature Version 4 header authentication,
+The endpoint implements AWS Signature Version 4 header and query/presigned authentication,
 bucket/object listing, HEAD, conditional and ranged GET, streamed PUT, DELETE,
 and multipart initiate/upload/list-parts/list-uploads/complete/abort. It verifies
 the declared payload SHA-256 before committing data and follows R2 multipart
-part-size and MD5/composite-ETag semantics. Presigned URLs and CopyObject are not
-currently part of the compatibility surface.
+part-size and MD5/composite-ETag semantics. CopyObject preserves metadata by
+default or replaces it on request; UploadPartCopy supports an authenticated
+source range. Presigned URLs are limited to SigV4, a maximum seven-day lifetime,
+active non-STS credentials and the same bucket grants as header-authenticated calls.
 
 An R2 bucket may use local content-addressed storage or a configured rclone
 remote. The S3 protocol is identical in both cases; provider credentials remain
