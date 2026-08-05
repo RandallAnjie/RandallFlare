@@ -1075,6 +1075,49 @@ export default {
         )
         .await
         .unwrap();
+    let email_record = rf::email::prepare_email_domain_after(
+        "mail-e2e",
+        rf::email::EmailDomainSpec {
+            description: "SMTPUTF8 与耐久 DSN 端到端验证".into(),
+            domain: "mail.test".into(),
+            verification_challenge: "email-e2e-verification".into(),
+            mx_hostname: "mx.mail.test".into(),
+            bucket: "pipeline-output".into(),
+            object_prefix: "mail-e2e".into(),
+            routes: vec![rf::email::EmailRoute {
+                id: "catch-all".into(),
+                priority: 100,
+                enabled: true,
+                matcher: rf::email::EmailMatcher::CatchAll,
+                destination: rf::email::EmailDestination::Drop,
+            }],
+            max_message_bytes: 1024 * 1024,
+            inbound_per_minute: 100,
+            outbound_per_minute: 100,
+            retention_days: 30,
+            dkim_selector: "rf".into(),
+            dkim_public_key: "v=DKIM1; k=rsa; p=e2e-public-key".into(),
+            dkim_private_key_env: "RF_EMAIL_DKIM_E2E".into(),
+            suspended: false,
+            suspend_reason: String::new(),
+        },
+        false,
+        None,
+    )
+    .unwrap();
+    client
+        .post_resource(
+            &n.api,
+            &rf_core::envelope::Envelope::seal_any(&email_record, &op_any),
+        )
+        .await
+        .unwrap();
+    let posted_email = client
+        .resource_head(&n.api, rf::email::EMAIL_DOMAIN_KIND, "mail-e2e")
+        .await
+        .unwrap()
+        .expect("email resource must be visible immediately after signed ingest");
+    rf::email::email_domain_spec(&posted_email.resource).unwrap();
     let shell_bytes = std::fs::read("/bin/sh").unwrap();
     let (shell_sha256, shell_size, shell_storage) = client
         .binary_put_blob(
@@ -1733,6 +1776,79 @@ export default {
     assert_eq!(backed_up_name, "安杰");
     drop(backup_db);
     std::fs::remove_file(backup_path).unwrap();
+    assert!(client
+        .email_verification(&n.api, "mail-e2e")
+        .await
+        .unwrap()
+        .is_none());
+    let email_now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64;
+    client
+        .d1_exec(
+            &n.api,
+            &rf::email::database_name("mail-e2e"),
+            r#"INSERT INTO email_verification
+               (singleton,domain,ownership_ok,mx_ok,dkim_ok,spf_present,verified,
+                ownership_json,mx_json,dkim_json,spf_json,checked_at_ms,error)
+               VALUES(1,'mail.test',1,1,1,1,1,'[]','[]','[]','[]',?1,NULL)"#,
+            serde_json::json!([email_now]),
+        )
+        .await
+        .unwrap();
+    let outbound_raw = "From: 张三 <张三@mail.test>\r\nTo: 客户 <客户@example.net>\r\nSubject: SMTPUTF8 delivery\r\nMessage-ID: <smtp-utf8-e2e@mail.test>\r\nContent-Type: text/plain; charset=utf-8\r\n\r\n测试国际化信封地址。\r\n";
+    let queued = client
+        .email_send(
+            &n.api,
+            "mail-e2e",
+            &rf::email::EmailSendMetadata {
+                mail_from: "张三@MAIL.TEST".into(),
+                recipients: vec!["客户@EXAMPLE.NET".into()],
+            },
+            outbound_raw.as_bytes(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(queued.len(), 1);
+    let outbound_id = queued[0].id.clone();
+    client
+        .d1_exec(
+            &n.api,
+            &rf::email::database_name("mail-e2e"),
+            r#"UPDATE email_messages SET status='failed',attempts=5,
+               last_error='550 5.1.1 用户不存在',dsn_status='pending',
+               dsn_next_attempt_ms=0,updated_at_ms=?2 WHERE id=?1"#,
+            serde_json::json!([outbound_id, email_now]),
+        )
+        .await
+        .unwrap();
+    assert!(client.email_process_dsn(&n.api, "mail-e2e").await.unwrap());
+    let failed = client
+        .email_message(&n.api, "mail-e2e", &outbound_id)
+        .await
+        .unwrap();
+    assert_eq!(failed.dsn_status.as_deref(), Some("generated"));
+    assert_eq!(failed.dsn_attempts, 1);
+    let dsn_id = failed.dsn_message_id.unwrap();
+    let dsn = client
+        .email_message(&n.api, "mail-e2e", &dsn_id)
+        .await
+        .unwrap();
+    assert_eq!(dsn.direction, "inbound");
+    assert_eq!(dsn.mail_from, "");
+    assert_eq!(dsn.rcpt_to, "张三@mail.test");
+    let dsn_raw = client
+        .email_message_raw(&n.api, "mail-e2e", &dsn_id)
+        .await
+        .unwrap();
+    let dsn_text = String::from_utf8(dsn_raw).unwrap();
+    assert!(dsn_text.contains("Auto-Submitted: auto-replied"));
+    assert!(dsn_text.contains("Final-Recipient: utf-8; 客户@example.net"));
+    assert!(dsn_text.contains("report-type=global-delivery-status"));
+    assert!(dsn_text.contains("Status: 5.1.1"));
+    assert!(dsn_text.contains("Diagnostic-Code: X-RandallFlare; 550 5.1.1 用户不存在"));
+    assert!(!client.email_process_dsn(&n.api, "mail-e2e").await.unwrap());
     let analytics_response = http
         .get(format!("http://127.0.0.1:{}/analytics", n.ingress))
         .header("host", "api.test")

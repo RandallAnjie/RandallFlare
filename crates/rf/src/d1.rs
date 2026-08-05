@@ -812,7 +812,11 @@ fn run_statements(
     for statement in statements {
         let mut prepared = connection.prepare(&statement.sql)?;
         bind_params(&mut prepared, &statement.params)?;
-        if prepared.readonly() {
+        // SQLite marks DML with RETURNING as mutating, but it still produces
+        // rows and therefore must be stepped with query semantics. The
+        // statement has already reached this function through the replicated
+        // write path, so reading its result does not weaken consistency.
+        if prepared.readonly() || prepared.column_count() > 0 {
             results.push(StatementResult {
                 rows: Some(read_prepared_rows(&mut prepared)?),
                 rows_affected: None,
@@ -953,6 +957,29 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM items", [], |row| row.get(0))
             .unwrap();
         assert_eq!(count, 1, "failed batch must roll back its earlier insert");
+    }
+
+    #[test]
+    fn mutating_returning_statements_commit_and_return_rows() {
+        let connection = rusqlite::Connection::open_in_memory().unwrap();
+        connection
+            .execute_batch("CREATE TABLE jobs (id INTEGER PRIMARY KEY, status TEXT NOT NULL);")
+            .unwrap();
+        let results = run_statements(
+            &connection,
+            &[Statement {
+                sql: "INSERT INTO jobs(status) VALUES('queued') RETURNING id,status".into(),
+                params: vec![],
+            }],
+        )
+        .unwrap();
+        assert_eq!(results[0].rows.as_ref().unwrap()[0]["status"], "queued");
+        assert_eq!(
+            connection
+                .query_row("SELECT COUNT(*) FROM jobs", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            1
+        );
     }
 
     #[test]

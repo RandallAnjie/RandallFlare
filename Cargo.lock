@@ -2019,8 +2019,6 @@ dependencies = [
 [[package]]
 name = "mailin"
 version = "0.6.5"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "261c858a4b0f914d12dd9da38b9e55a7d991cd6c3e369f503344c4f1c2137fc4"
 dependencies = [
  "base64-compat",
  "either",

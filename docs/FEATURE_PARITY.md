@@ -95,11 +95,11 @@ surface yet.
 | Capability | State | Remaining acceptance work |
 | --- | --- | --- |
 | capability-selected MX nodes | partial | explicit node role, signed MX match, capability reporting, bounded SMTP pool and STARTTLS cert loading done; automatic certificate hot-reload, health-weighted placement and multi-MX soak remain |
-| inbound SMTP and routing | partial | RFC 822 limits, verified domains, exact/prefix/catch-all routes, D1 leases, crash recovery, rate limits and terminal retention done; multi-node SMTP fault soak and DSN generation remain |
+| inbound SMTP and routing | partial | RFC 822 limits, SMTPUTF8/8BITMIME, verified domains, exact/prefix/catch-all routes, D1 leases, crash recovery, rate limits, terminal retention and idempotent locally-routed DSN generation are done; multi-node SMTP fault soak remains |
 | authentication results | partial | SPF, DKIM, DMARC and full Authentication-Results are persisted/exposed; ARC and MTA-STS policy remain |
 | raw-message R2 archival | partial | immutable source, metadata hashes, shared-recipient reference-safe retention and local/rclone buckets done; multi-GiB streaming remains |
 | Worker email handler | partial | `email()` event, headers/raw stream, `setReject`, reliable idempotent `forward`, loop protection and `env.MAIL.send()` done; real-SMTP/workerd fault soak remains |
-| outbound SMTP | partial | per-recipient durable queue, fenced leases, bounded exponential retry, direct sorted MX, Null MX, opportunistic TLS, node-local RSA DKIM signing, CLI/API/Flow and delivery console done; bounce/DSN processing, SMTPUTF8 and reputation automation remain |
+| outbound SMTP | partial | per-recipient durable queue, fenced leases, bounded exponential retry, direct sorted MX, Null MX, SMTPUTF8 negotiation, opportunistic TLS, node-local RSA DKIM signing, crash-safe DSN processing with loop protection, CLI/API/Flow and Chinese delivery console are done; reputation automation and multi-MX production soak remain |
 
 ## Delivery order
 

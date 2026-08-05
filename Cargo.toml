@@ -14,3 +14,8 @@ codegen-units = 1
 strip = true
 opt-level = "z"
 panic = "abort"
+
+[patch.crates-io]
+# mailin 0.6.5 does not advertise or parse RFC 6531 SMTPUTF8. Keep the small
+# audited parser patch in-tree until the upstream crate exposes this extension.
+mailin = { path = "vendor/mailin" }

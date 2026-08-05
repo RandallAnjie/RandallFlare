@@ -1406,6 +1406,18 @@ impl PeerClient {
         )?)
     }
 
+    pub async fn email_process_dsn(&self, base: &str, domain: &str) -> Result<bool> {
+        let response = self
+            .post(
+                base,
+                &format!("/v1/email/{}/dsn", component(domain)),
+                vec![],
+            )
+            .await?;
+        let response: serde_json::Value = serde_json::from_slice(&response)?;
+        Ok(response["processed"].as_bool().unwrap_or(false))
+    }
+
     /// Execute SQL against a D1 database, following leader hints
     /// (bounded) — callers can point at ANY cluster node.
     pub async fn d1_exec(

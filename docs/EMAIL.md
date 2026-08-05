@@ -191,7 +191,12 @@ Flow 的 `email` 节点可以使用完整 `raw`，也可以由平台生成纯文
 - 每个收件人拥有独立状态和法定人数租约；节点崩溃后其他合格节点可接管；
 - 出站直接查询收件域 MX，按优先级尝试，并使用机会式 STARTTLS；Null MX 会永久
   拒绝；
+- 入站 SMTP 宣告 `SMTPUTF8` 和 `8BITMIME`；国际化本地部保留原文，域名部统一转为
+  小写。出站只在信封需要时发送 `SMTPUTF8`；远端 MX 不支持时记为永久失败；
 - 临时失败最多尝试五次，退避为 30 秒、2 分钟、8 分钟、32 分钟和 128 分钟；
+- 永久失败或重试耗尽后，平台生成 `multipart/report` / `message/global-delivery-status`
+  DSN，以空逆向路径写回原发件人的本域签名路由。DSN 具有 D1 栅栏租约、稳定消息
+  ID、最多五次重试和完整审计；`Auto-Submitted` 会阻断退信环；
 - SPF、DKIM、DMARC 与完整 `Authentication-Results` 会随入站记录保存；
 - 原文按 `<prefix>/<direction>/<年>/<月>/<日>/<id>.eml` 写入 R2；
 - 达到签名 `retention_days` 后，只有终态记录会被清理；仍被其他收件人引用的共享

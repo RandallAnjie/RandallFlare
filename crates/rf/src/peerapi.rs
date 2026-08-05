@@ -162,6 +162,7 @@ pub fn router(api: Api) -> Router {
             get(email_verification).post(email_verify),
         )
         .route("/v1/email/{domain}/messages", get(email_messages))
+        .route("/v1/email/{domain}/dsn", post(email_dsn))
         .route("/v1/email/{domain}/messages/{id}", get(email_message))
         .route(
             "/v1/email/{domain}/messages/{id}/raw",
@@ -2411,6 +2412,27 @@ async fn email_messages(
     }
     match crate::email::list_messages(&api.node, &domain, query.limit.unwrap_or(100)).await {
         Ok(messages) => axum::Json(serde_json::json!({ "messages": messages })).into_response(),
+        Err(error) => (StatusCode::UNPROCESSABLE_ENTITY, error.to_string()).into_response(),
+    }
+}
+
+async fn email_dsn(
+    State(api): State<Api>,
+    ConnectInfo(remote): ConnectInfo<SocketAddr>,
+    Path(domain): Path<String>,
+    method: Method,
+    uri: Uri,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    if let Err(response) = check(&api, &remote, &headers, &method, &uri, &body) {
+        return response.into_response();
+    }
+    let Some((_, spec)) = crate::email::email_domain_record(&api.node, &domain) else {
+        return (StatusCode::NOT_FOUND, "邮件域不存在").into_response();
+    };
+    match crate::email::process_dsn_once(&api.node, &domain, &spec).await {
+        Ok(processed) => axum::Json(serde_json::json!({ "processed": processed })).into_response(),
         Err(error) => (StatusCode::UNPROCESSABLE_ENTITY, error.to_string()).into_response(),
     }
 }

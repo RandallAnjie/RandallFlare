@@ -35,7 +35,7 @@ use mail_auth::{
 };
 use mailin_embedded::{response, Handler, Response, Server, SslConfig};
 use rustls_pki_types::{pem::PemObject, PrivateKeyDer};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashSet};
@@ -123,8 +123,7 @@ fn default_object_prefix() -> String {
     "mail".into()
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct EmailRoute {
     pub id: String,
     #[serde(default)]
@@ -134,6 +133,47 @@ pub struct EmailRoute {
     #[serde(flatten)]
     pub matcher: EmailMatcher,
     pub destination: EmailDestination,
+}
+
+impl<'de> Deserialize<'de> for EmailRoute {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = Value::deserialize(deserializer)?;
+        let object = value
+            .as_object()
+            .ok_or_else(|| serde::de::Error::custom("邮件路由必须是 JSON 对象"))?;
+        let allowed = ["id", "priority", "enabled", "match", "value", "destination"];
+        if let Some(unknown) = object.keys().find(|key| !allowed.contains(&key.as_str())) {
+            return Err(serde::de::Error::custom(format!(
+                "邮件路由包含未知字段 {unknown}"
+            )));
+        }
+        #[derive(Deserialize)]
+        struct Wire {
+            id: String,
+            #[serde(default)]
+            priority: i32,
+            #[serde(default = "default_true")]
+            enabled: bool,
+            #[serde(flatten)]
+            matcher: EmailMatcher,
+            destination: EmailDestination,
+        }
+        let has_value = object.contains_key("value");
+        let route: Wire = serde_json::from_value(value).map_err(serde::de::Error::custom)?;
+        if matches!(route.matcher, EmailMatcher::CatchAll) && has_value {
+            return Err(serde::de::Error::custom("catch_all 邮件路由不得包含 value"));
+        }
+        Ok(Self {
+            id: route.id,
+            priority: route.priority,
+            enabled: route.enabled,
+            matcher: route.matcher,
+            destination: route.destination,
+        })
+    }
 }
 
 fn default_true() -> bool {
@@ -149,7 +189,7 @@ pub enum EmailMatcher {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum EmailDestination {
     Worker { worker: String },
     Forward { addresses: Vec<String> },
@@ -258,7 +298,7 @@ impl EmailRoute {
             EmailMatcher::Prefix { value } => {
                 if value.is_empty()
                     || value.len() > 64
-                    || !value.bytes().all(valid_local_match_byte)
+                    || !value.chars().all(valid_local_match_char)
                 {
                     bail!("邮件前缀路由无效：{value}");
                 }
@@ -322,6 +362,10 @@ pub struct EmailMessage {
     pub dmarc: Option<String>,
     pub attempts: u16,
     pub last_error: Option<String>,
+    pub dsn_status: Option<String>,
+    pub dsn_message_id: Option<String>,
+    pub dsn_attempts: u16,
+    pub dsn_last_error: Option<String>,
     pub created_at_ms: u64,
     pub updated_at_ms: u64,
 }
@@ -430,6 +474,11 @@ enum InboundOutcome {
     Forwarded(usize),
 }
 
+enum DsnOutcome {
+    Generated(String),
+    Skipped(&'static str),
+}
+
 #[derive(Clone)]
 struct SmtpHandler {
     node: Arc<Node>,
@@ -496,15 +545,21 @@ impl Handler for SmtpHandler {
         self.reset_message();
         self.client_ip = ip;
         self.helo_domain = domain.to_ascii_lowercase();
-        if !from.is_empty() && split_address(from).is_err() {
-            return response::BAD_MAILBOX;
-        }
-        self.mail_from = from.to_ascii_lowercase();
+        self.mail_from = if from.is_empty() {
+            String::new()
+        } else {
+            let Ok(address) = normalize_address(from) else {
+                return response::BAD_MAILBOX;
+            };
+            address
+        };
         response::OK
     }
 
     fn rcpt(&mut self, to: &str) -> Response {
-        let address = to.to_ascii_lowercase();
+        let Ok(address) = normalize_address(to) else {
+            return response::BAD_MAILBOX;
+        };
         let Some((name, spec)) = self.find_recipient_domain(&address) else {
             return Response::custom(550, "5.1.1 收件地址不存在".into());
         };
@@ -823,6 +878,16 @@ pub async fn ingest_inbound(
     envelope: &InboundEnvelope,
     raw: &[u8],
 ) -> Result<Vec<IngestedMessage>> {
+    ingest_inbound_inner(node, domain_name, envelope, raw, None).await
+}
+
+async fn ingest_inbound_inner(
+    node: &Node,
+    domain_name: &str,
+    envelope: &InboundEnvelope,
+    raw: &[u8],
+    idempotency: Option<(&str, u64)>,
+) -> Result<Vec<IngestedMessage>> {
     let (_, spec) = email_domain_record(node, domain_name).context("邮件域不存在")?;
     if spec.suspended {
         bail!("邮件域已暂停：{}", spec.suspend_reason);
@@ -843,14 +908,16 @@ pub async fn ingest_inbound(
     if !verification.verified {
         bail!("邮件域尚未通过所有必需的 DNS 验证");
     }
-    enforce_rate_limit(
-        node,
-        domain_name,
-        "inbound",
-        spec.inbound_per_minute,
-        envelope.recipients.len() as u32,
-    )
-    .await?;
+    if idempotency.is_none() {
+        enforce_rate_limit(
+            node,
+            domain_name,
+            "inbound",
+            spec.inbound_per_minute,
+            envelope.recipients.len() as u32,
+        )
+        .await?;
+    }
     let auth = authenticate_message(&spec.mx_hostname, envelope, raw).await;
     let parsed = mail_parser::MessageParser::default().parse(raw);
     let subject = parsed
@@ -861,8 +928,12 @@ pub async fn ingest_inbound(
         .as_ref()
         .and_then(|message| message.message_id())
         .map(str::to_string);
-    let timestamp = now_ms();
-    let source_id = new_id();
+    let timestamp = idempotency
+        .map(|(_, timestamp)| timestamp)
+        .unwrap_or_else(now_ms);
+    let source_id = idempotency
+        .map(|(key, _)| stable_id(&format!("inbound-source\0{key}")))
+        .unwrap_or_else(new_id);
     let object_key = object_key(&spec, "inbound", timestamp, &source_id);
     let sha256 = hex::encode(Sha256::digest(raw));
     r2::put_object(
@@ -905,11 +976,13 @@ pub async fn ingest_inbound(
             },
             None => ("rejected", None, None),
         };
-        let id = new_id();
-        exec(
+        let id = idempotency
+            .map(|(key, _)| stable_id(&format!("inbound-recipient\0{key}\0{recipient}")))
+            .unwrap_or_else(new_id);
+        let inserted = exec(
             node,
             domain_name,
-            r#"INSERT INTO email_messages
+            r#"INSERT OR IGNORE INTO email_messages
                (id,direction,mail_from,rcpt_to,subject,message_id,object_key,size,sha256,
                 status,route_id,target,auth_results,spf,dkim,dmarc,attempts,
                 created_at_ms,updated_at_ms)
@@ -933,20 +1006,34 @@ pub async fn ingest_inbound(
                 timestamp,
             ]),
         )
-        .await?;
-        append_audit(
-            node,
-            domain_name,
-            "inbound_accepted",
-            json!({ "message_id": id, "recipient": recipient, "status": status }),
-        )
-        .await?;
-        ingested.push(IngestedMessage {
-            id,
-            recipient: recipient.clone(),
-            status: status.into(),
-            route_id,
-        });
+        .await?["rows_affected"]
+            .as_u64()
+            .unwrap_or(0);
+        if inserted == 1 {
+            append_audit(
+                node,
+                domain_name,
+                "inbound_accepted",
+                json!({ "message_id": id, "recipient": recipient, "status": status }),
+            )
+            .await?;
+            ingested.push(IngestedMessage {
+                id,
+                recipient: recipient.clone(),
+                status: status.into(),
+                route_id,
+            });
+        } else {
+            let existing = get_message(node, domain_name, &id)
+                .await?
+                .context("邮件幂等写入冲突后原记录不可见")?;
+            ingested.push(IngestedMessage {
+                id,
+                recipient: existing.rcpt_to,
+                status: existing.status,
+                route_id: existing.route_id,
+            });
+        }
     }
     if ingested.is_empty() {
         bail!("邮件没有属于此域的有效收件人");
@@ -983,7 +1070,8 @@ async fn queue_outbound_inner(
     if raw.is_empty() || raw.len() as u64 > spec.max_message_bytes {
         bail!("出站邮件原文为空或超过此域的大小上限");
     }
-    let (_, sender_domain) = split_address(mail_from)?;
+    let mail_from = normalize_address(mail_from)?;
+    let (_, sender_domain) = split_address(&mail_from)?;
     if sender_domain != spec.domain {
         bail!("信封发件地址必须属于当前邮件域");
     }
@@ -994,7 +1082,7 @@ async fn queue_outbound_inner(
     let mut seen = HashSet::new();
     for recipient in recipients {
         split_address(recipient)?;
-        let recipient = recipient.to_ascii_lowercase();
+        let recipient = normalize_address(recipient)?;
         if seen.insert(recipient.clone()) {
             unique_recipients.push(recipient);
         }
@@ -1485,6 +1573,16 @@ pub fn spawn_driver(node: Arc<Node>) {
                         }
                     }
                 }
+                for _ in 0..8 {
+                    match process_dsn_once(&node, name, &spec).await {
+                        Ok(true) => {}
+                        Ok(false) => break,
+                        Err(error) => {
+                            tracing::warn!(domain = %spec.domain, "生成邮件 DSN 失败：{error:#}");
+                            break;
+                        }
+                    }
+                }
                 if !node.cfg.email.outbound
                     || spec.dkim_private_key_env.is_empty()
                     || std::env::var_os(&spec.dkim_private_key_env).is_none()
@@ -1662,6 +1760,9 @@ async fn recover_outbound_leases(node: &Node, name: &str) -> Result<()> {
              next_attempt_ms=CASE WHEN attempts>=?1 THEN NULL ELSE ?2 END,
              last_error=CASE WHEN attempts>=?1 THEN '投递节点失联，且已达到最大重试次数'
                              ELSE '投递节点失联，租约已恢复' END,
+             dsn_status=CASE WHEN attempts>=?1 THEN COALESCE(dsn_status,'pending')
+                             ELSE dsn_status END,
+             dsn_next_attempt_ms=CASE WHEN attempts>=?1 THEN ?2 ELSE dsn_next_attempt_ms END,
              lease_token=NULL,lease_until_ms=NULL,leased_by=NULL,updated_at_ms=?2
            WHERE direction='outbound' AND status='sending'
              AND lease_until_ms IS NOT NULL AND lease_until_ms<?2"#,
@@ -1737,6 +1838,11 @@ async fn finish_outbound(
         r#"UPDATE email_messages SET
              status=?1,next_attempt_ms=?2,last_error=?3,smtp_response=?4,
              delivered_at_ms=?5,lease_token=NULL,lease_until_ms=NULL,leased_by=NULL,
+             dsn_status=CASE
+               WHEN ?1='failed' THEN COALESCE(dsn_status,'pending')
+               WHEN ?1='delivered' THEN 'not_needed'
+               ELSE dsn_status END,
+             dsn_next_attempt_ms=CASE WHEN ?1='failed' THEN ?6 ELSE dsn_next_attempt_ms END,
              updated_at_ms=?6
            WHERE id=?7 AND status='sending' AND lease_token=?8"#,
         json!([
@@ -1773,6 +1879,261 @@ async fn finish_outbound(
     )
     .await?;
     Ok(())
+}
+
+/// Turn one terminal outbound failure into a locally routed RFC 3464-style
+/// delivery-status notification. A fenced D1 lease prevents noisy duplicate
+/// work, while the deterministic inbound ID makes crash replay harmless even
+/// if a node dies after archiving the DSN but before committing the lease.
+pub async fn process_dsn_once(
+    node: &Node,
+    domain_name: &str,
+    spec: &EmailDomainSpec,
+) -> Result<bool> {
+    ensure_schema(node, domain_name).await?;
+    let now = now_ms();
+    let lease = new_id();
+    let result = exec(
+        node,
+        domain_name,
+        &format!(
+            r#"UPDATE email_messages SET
+                 dsn_status='generating',dsn_attempts=dsn_attempts+1,
+                 dsn_lease_token=?1,dsn_lease_until_ms=?2,updated_at_ms=?3
+               WHERE id=(
+                 SELECT id FROM email_messages
+                 WHERE direction='outbound' AND status='failed' AND dsn_attempts<?4
+                   AND (
+                     (COALESCE(dsn_status,'pending')='pending'
+                      AND COALESCE(dsn_next_attempt_ms,0)<=?3)
+                     OR (dsn_status='generating' AND dsn_lease_until_ms<=?3)
+                   )
+                 ORDER BY updated_at_ms,id LIMIT 1
+               )
+               RETURNING {MESSAGE_FIELDS}"#
+        ),
+        json!([
+            lease,
+            now.saturating_add(OUTBOUND_LEASE_MS),
+            now,
+            OUTBOUND_MAX_ATTEMPTS,
+        ]),
+    )
+    .await?;
+    let Some(row) = rows(result).into_iter().next() else {
+        return Ok(false);
+    };
+    let message = row_to_message(&row)?;
+    let outcome = generate_delivery_status(node, domain_name, spec, &message).await;
+    let (status, dsn_message_id, next_attempt, last_error, event) = match outcome {
+        Ok(DsnOutcome::Generated(id)) => ("generated", Some(id), None, None, "dsn_generated"),
+        Ok(DsnOutcome::Skipped(reason)) => (
+            "skipped",
+            None,
+            None,
+            Some(reason.to_string()),
+            "dsn_skipped",
+        ),
+        Err(error) if message.dsn_attempts >= OUTBOUND_MAX_ATTEMPTS => (
+            "failed",
+            None,
+            None,
+            Some(format!("{error:#}")),
+            "dsn_failed",
+        ),
+        Err(error) => (
+            "pending",
+            None,
+            Some(now.saturating_add(outbound_retry_delay_ms(message.dsn_attempts))),
+            Some(format!("{error:#}")),
+            "dsn_retry_scheduled",
+        ),
+    };
+    let updated = exec(
+        node,
+        domain_name,
+        r#"UPDATE email_messages SET dsn_status=?1,dsn_message_id=?2,
+             dsn_next_attempt_ms=?3,dsn_last_error=?4,
+             dsn_lease_token=NULL,dsn_lease_until_ms=NULL,updated_at_ms=?5
+           WHERE id=?6 AND dsn_status='generating' AND dsn_lease_token=?7"#,
+        json!([
+            status,
+            dsn_message_id,
+            next_attempt,
+            last_error,
+            now_ms(),
+            message.id,
+            lease,
+        ]),
+    )
+    .await?["rows_affected"]
+        .as_u64()
+        .unwrap_or(0);
+    if updated != 1 {
+        bail!("邮件 DSN 生成租约已失效");
+    }
+    append_audit(
+        node,
+        domain_name,
+        event,
+        json!({
+            "message_id": message.id,
+            "recipient": message.rcpt_to,
+            "dsn_message_id": dsn_message_id,
+            "attempt": message.dsn_attempts,
+            "status": status,
+        }),
+    )
+    .await?;
+    Ok(true)
+}
+
+async fn generate_delivery_status(
+    node: &Node,
+    domain_name: &str,
+    spec: &EmailDomainSpec,
+    message: &EmailMessage,
+) -> Result<DsnOutcome> {
+    if message.mail_from.is_empty() {
+        return Ok(DsnOutcome::Skipped("空逆向路径不生成 DSN"));
+    }
+    let (_, original) = r2::get_object(node, &spec.bucket, &message.object_key)
+        .await?
+        .context("生成 DSN 时找不到原始邮件对象")?;
+    if is_automatic_message(&original) {
+        return Ok(DsnOutcome::Skipped(
+            "自动提交邮件不再生成 DSN，以阻断退信环",
+        ));
+    }
+    let sender = normalize_address(&message.mail_from)?;
+    let (_, sender_domain) = split_address(&sender)?;
+    if sender_domain != spec.domain {
+        bail!("DSN 原始发件人不属于当前签名邮件域");
+    }
+    let boundary = format!("rf-dsn-{}", stable_id(&message.id));
+    let diagnostic = header_safe(message.last_error.as_deref().unwrap_or("远端 MX 拒绝投递"));
+    let original_message_id = header_safe(message.message_id.as_deref().unwrap_or("unknown"));
+    let recipient_kind = if message.rcpt_to.is_ascii() {
+        "rfc822"
+    } else {
+        "utf-8"
+    };
+    let (report_type, delivery_status_type) =
+        if message.mail_from.is_ascii() && message.rcpt_to.is_ascii() && diagnostic.is_ascii() {
+            ("delivery-status", "message/delivery-status")
+        } else {
+            ("global-delivery-status", "message/global-delivery-status")
+        };
+    let enhanced_status = enhanced_status(&diagnostic);
+    let raw = format!(
+        "From: Mail Delivery Subsystem <mailer-daemon@{domain}>\r\n\
+         To: {sender}\r\n\
+         Subject: Delivery Status Notification (Failure)\r\n\
+         Message-ID: <dsn-{id}@{domain}>\r\n\
+         Auto-Submitted: auto-replied\r\n\
+         X-RandallFlare-DSN-Of: {id}\r\n\
+         MIME-Version: 1.0\r\n\
+         Content-Type: multipart/report; report-type={report_type}; boundary=\"{boundary}\"\r\n\
+         \r\n\
+         --{boundary}\r\n\
+         Content-Type: text/plain; charset=utf-8\r\n\
+         Content-Transfer-Encoding: 8bit\r\n\
+         \r\n\
+         您的邮件未能投递到 {recipient}。\r\n\
+         详细原因：{diagnostic}\r\n\
+         \r\n\
+         --{boundary}\r\n\
+         Content-Type: {delivery_status_type}\r\n\
+         \r\n\
+         Reporting-MTA: dns; {mx}\r\n\
+         Original-Envelope-Id: {id}\r\n\
+         Original-Message-ID: {original_message_id}\r\n\
+         \r\n\
+         Final-Recipient: {recipient_kind}; {recipient}\r\n\
+         Action: failed\r\n\
+         Status: {enhanced_status}\r\n\
+         Diagnostic-Code: X-RandallFlare; {diagnostic}\r\n\
+         \r\n\
+         --{boundary}--\r\n",
+        domain = spec.domain,
+        sender = sender,
+        id = message.id,
+        recipient = message.rcpt_to,
+        diagnostic = diagnostic,
+        mx = spec.mx_hostname,
+        original_message_id = original_message_id,
+        recipient_kind = recipient_kind,
+        report_type = report_type,
+        delivery_status_type = delivery_status_type,
+        enhanced_status = enhanced_status,
+        boundary = boundary,
+    )
+    .into_bytes();
+    let envelope = InboundEnvelope {
+        helo_domain: spec.mx_hostname.clone(),
+        client_ip: IpAddr::V4(Ipv4Addr::LOCALHOST),
+        mail_from: String::new(),
+        recipients: vec![sender],
+    };
+    let key = format!("dsn:{}", message.id);
+    let generated = ingest_inbound_inner(
+        node,
+        domain_name,
+        &envelope,
+        &raw,
+        Some((&key, message.created_at_ms)),
+    )
+    .await?;
+    let id = generated
+        .first()
+        .map(|message| message.id.clone())
+        .context("DSN 写入后没有生成收件人记录")?;
+    Ok(DsnOutcome::Generated(id))
+}
+
+fn is_automatic_message(raw: &[u8]) -> bool {
+    String::from_utf8_lossy(raw)
+        .lines()
+        .take_while(|line| !line.trim().is_empty())
+        .find_map(|line| {
+            line.split_once(':').and_then(|(name, value)| {
+                name.eq_ignore_ascii_case("auto-submitted")
+                    .then(|| value.trim())
+            })
+        })
+        .is_some_and(|value| !value.eq_ignore_ascii_case("no"))
+}
+
+fn header_safe(value: &str) -> String {
+    value
+        .chars()
+        .map(|character| {
+            if matches!(character, '\r' | '\n') || character.is_control() {
+                ' '
+            } else {
+                character
+            }
+        })
+        .take(2_000)
+        .collect::<String>()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn enhanced_status(diagnostic: &str) -> &str {
+    diagnostic
+        .split_ascii_whitespace()
+        .find(|value| {
+            let bytes = value.as_bytes();
+            bytes.len() == 5
+                && matches!(bytes[0], b'4' | b'5')
+                && bytes[1] == b'.'
+                && bytes[2].is_ascii_digit()
+                && bytes[3] == b'.'
+                && bytes[4].is_ascii_digit()
+        })
+        .unwrap_or("5.0.0")
 }
 
 fn sign_dkim(spec: &EmailDomainSpec, raw: &[u8]) -> Result<Vec<u8>> {
@@ -1894,6 +2255,7 @@ async fn deliver_direct_smtp(
 
     let mut errors = Vec::new();
     let mut all_permanent = true;
+    let requires_smtp_utf8 = !mail_from.is_ascii() || !recipient.is_ascii();
     for (_, exchange) in exchanges {
         let tls = match TlsParameters::new(exchange.clone()) {
             Ok(parameters) => Tls::Opportunistic(parameters),
@@ -1912,8 +2274,13 @@ async fn deliver_direct_smtp(
         match transport.send_raw(&envelope, raw).await {
             Ok(response) => return Ok(format!("{exchange}: {response:?}")),
             Err(error) => {
-                all_permanent &= error.is_permanent();
-                errors.push(format!("{exchange}: {error}"));
+                let detail = error.to_string();
+                let smtp_utf8_rejected = requires_smtp_utf8
+                    && detail
+                        .to_ascii_lowercase()
+                        .contains("does not support smtputf8");
+                all_permanent &= error.is_permanent() || smtp_utf8_rejected;
+                errors.push(format!("{exchange}: {detail}"));
             }
         }
     }
@@ -2211,6 +2578,13 @@ async fn ensure_schema(node: &Node, name: &str) -> Result<()> {
              last_error TEXT,
              smtp_response TEXT,
              delivered_at_ms INTEGER,
+             dsn_status TEXT,
+             dsn_message_id TEXT,
+             dsn_attempts INTEGER NOT NULL DEFAULT 0,
+             dsn_next_attempt_ms INTEGER,
+             dsn_last_error TEXT,
+             dsn_lease_token TEXT,
+             dsn_lease_until_ms INTEGER,
              created_at_ms INTEGER NOT NULL,
              updated_at_ms INTEGER NOT NULL
            )"#,
@@ -2233,7 +2607,55 @@ async fn ensure_schema(node: &Node, name: &str) -> Result<()> {
     ] {
         exec_database(node, &database, sql, json!([])).await?;
     }
+    for (column, definition) in [
+        ("dsn_status", "TEXT"),
+        ("dsn_message_id", "TEXT"),
+        ("dsn_attempts", "INTEGER NOT NULL DEFAULT 0"),
+        ("dsn_next_attempt_ms", "INTEGER"),
+        ("dsn_last_error", "TEXT"),
+        ("dsn_lease_token", "TEXT"),
+        ("dsn_lease_until_ms", "INTEGER"),
+    ] {
+        ensure_column(node, &database, "email_messages", column, definition).await?;
+    }
+    exec_database(
+        node,
+        &database,
+        "CREATE INDEX IF NOT EXISTS email_messages_dsn_ready ON email_messages(direction,status,dsn_status,dsn_next_attempt_ms,updated_at_ms)",
+        json!([]),
+    )
+    .await?;
     node.mark_email_schema_ready(database);
+    Ok(())
+}
+
+async fn ensure_column(
+    node: &Node,
+    database: &str,
+    table: &str,
+    column: &str,
+    definition: &str,
+) -> Result<()> {
+    let info = exec_database(
+        node,
+        database,
+        &format!("PRAGMA table_info({table})"),
+        json!([]),
+    )
+    .await?;
+    if rows(info)
+        .iter()
+        .any(|row| row.get("name").and_then(Value::as_str) == Some(column))
+    {
+        return Ok(());
+    }
+    exec_database(
+        node,
+        database,
+        &format!("ALTER TABLE {table} ADD COLUMN {column} {definition}"),
+        json!([]),
+    )
+    .await?;
     Ok(())
 }
 
@@ -2252,7 +2674,7 @@ async fn exec_database(node: &Node, database: &str, sql: &str, params: Value) ->
     client.d1_exec(&base, database, sql, params).await
 }
 
-const MESSAGE_FIELDS: &str = "id,direction,mail_from,rcpt_to,subject,message_id,object_key,size,sha256,status,route_id,target,auth_results,spf,dkim,dmarc,attempts,last_error,created_at_ms,updated_at_ms";
+const MESSAGE_FIELDS: &str = "id,direction,mail_from,rcpt_to,subject,message_id,object_key,size,sha256,status,route_id,target,auth_results,spf,dkim,dmarc,attempts,last_error,dsn_status,dsn_message_id,dsn_attempts,dsn_last_error,created_at_ms,updated_at_ms";
 
 fn rows(result: Value) -> Vec<Value> {
     result["rows"].as_array().cloned().unwrap_or_default()
@@ -2278,6 +2700,10 @@ fn row_to_message(row: &Value) -> Result<EmailMessage> {
         dmarc: optional_string_field(row, "dmarc"),
         attempts: u64_field(row, "attempts") as u16,
         last_error: optional_string_field(row, "last_error"),
+        dsn_status: optional_string_field(row, "dsn_status"),
+        dsn_message_id: optional_string_field(row, "dsn_message_id"),
+        dsn_attempts: u64_field(row, "dsn_attempts") as u16,
+        dsn_last_error: optional_string_field(row, "dsn_last_error"),
         created_at_ms: u64_field(row, "created_at_ms"),
         updated_at_ms: u64_field(row, "updated_at_ms"),
     })
@@ -2336,16 +2762,27 @@ fn split_address(address: &str) -> Result<(&str, &str)> {
     let (local, domain) = address.rsplit_once('@').context("邮件地址缺少 @")?;
     if local.is_empty()
         || local.len() > 64
-        || !local.bytes().all(valid_local_match_byte)
-        || !valid_domain(domain)
-        || domain != domain.to_ascii_lowercase()
+        || local.starts_with('.')
+        || local.ends_with('.')
+        || local.contains("..")
+        || !local.chars().all(valid_local_match_char)
+        || !valid_domain(&domain.to_ascii_lowercase())
     {
         bail!("邮件地址格式无效");
     }
     Ok((local, domain))
 }
 
-fn valid_local_match_byte(byte: u8) -> bool {
+fn normalize_address(address: &str) -> Result<String> {
+    let (local, domain) = split_address(address)?;
+    Ok(format!("{local}@{}", domain.to_ascii_lowercase()))
+}
+
+fn valid_local_match_char(character: char) -> bool {
+    if !character.is_ascii() {
+        return !character.is_control() && !character.is_whitespace();
+    }
+    let byte = character as u8;
     byte.is_ascii_alphanumeric()
         || matches!(
             byte,
@@ -2488,12 +2925,34 @@ mod tests {
         let spec = spec();
         spec.validate().unwrap();
         let encoded = serde_json::to_string(&spec).unwrap();
+        let decoded: EmailDomainSpec = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(decoded, spec);
         assert!(encoded.contains("RF_EMAIL_DKIM_MAIL_EXAMPLE_COM"));
         assert!(!encoded.contains("PRIVATE KEY"));
         assert_eq!(
             spec.ownership_txt_name(),
             "_randallflare-verify.mail.example.com"
         );
+    }
+
+    #[test]
+    fn route_wire_format_rejects_unknown_fields_without_breaking_flattened_matcher() {
+        let route: EmailRoute = serde_json::from_value(json!({
+            "id": "fallback",
+            "priority": 100,
+            "enabled": true,
+            "match": "catch_all",
+            "destination": { "type": "drop" }
+        }))
+        .unwrap();
+        assert!(matches!(route.matcher, EmailMatcher::CatchAll));
+        assert!(serde_json::from_value::<EmailRoute>(json!({
+            "id": "bad",
+            "match": "catch_all",
+            "unexpected": true,
+            "destination": { "type": "drop" }
+        }))
+        .is_err());
     }
 
     #[test]
@@ -2541,6 +3000,33 @@ mod tests {
         assert_eq!(outbound_retry_delay_ms(99), 7_680_000);
         assert_eq!(stable_id("same"), stable_id("same"));
         assert_ne!(stable_id("same"), stable_id("other"));
+    }
+
+    #[test]
+    fn smtp_utf8_addresses_preserve_local_part_and_normalize_domain() {
+        assert_eq!(
+            normalize_address("张三@MAIL.EXAMPLE.COM").unwrap(),
+            "张三@mail.example.com"
+        );
+        assert!("张三@mail.example.com".parse::<Address>().is_ok());
+        assert!(split_address("bad..local@mail.example.com").is_err());
+        assert!(split_address(" bad@mail.example.com").is_err());
+    }
+
+    #[test]
+    fn automatic_submission_detection_blocks_dsn_loops() {
+        assert!(is_automatic_message(
+            b"From: daemon@example.com\r\nAuto-Submitted: auto-replied\r\n\r\nbody"
+        ));
+        assert!(!is_automatic_message(
+            b"From: sender@example.com\r\nAuto-Submitted: no\r\n\r\nbody"
+        ));
+        assert_eq!(
+            header_safe("550 failed\r\nInjected: bad"),
+            "550 failed Injected: bad"
+        );
+        assert_eq!(enhanced_status("550 5.1.1 user unknown"), "5.1.1");
+        assert_eq!(enhanced_status("connection refused"), "5.0.0");
     }
 
     #[test]

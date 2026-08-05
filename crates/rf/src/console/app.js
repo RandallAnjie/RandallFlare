@@ -3291,6 +3291,13 @@ function emailStatusLabel(status) {
   }[status] || status || "未知";
 }
 
+function emailDsnStatusLabel(status) {
+  return {
+    pending: "等待生成", generating: "正在生成", generated: "已生成并入站路由",
+    skipped: "已跳过（环路保护）", failed: "生成失败", not_needed: "无需退信",
+  }[status] || status || "尚未触发";
+}
+
 function emailRouteSummary(route) {
   const matcher = route.match === "exact" ? `精确 ${route.value}`
     : route.match === "prefix" ? `前缀 ${route.value}` : "兜底";
@@ -3542,7 +3549,7 @@ async function openEmailMessage(id) {
     state.emailMessageActive = id;
     $("#email-message-panel").classList.remove("hidden");
     $("#email-message-title").textContent = message.subject || "（无主题）";
-    const fields = [["方向", message.direction === "inbound" ? "入站" : "出站"], ["状态", emailStatusLabel(message.status)], ["信封发件人", message.mail_from || "空"], ["信封收件人", message.rcpt_to], ["大小", formatBytes(message.size)], ["尝试次数", message.attempts], ["SPF / DKIM / DMARC", [message.spf, message.dkim, message.dmarc].filter(Boolean).join(" / ") || "无"], ["R2 对象", message.object_key], ["SHA-256", message.sha256], ["最后错误", message.last_error || "无"]];
+    const fields = [["方向", message.direction === "inbound" ? "入站" : "出站"], ["状态", emailStatusLabel(message.status)], ["信封发件人", message.mail_from || "空"], ["信封收件人", message.rcpt_to], ["大小", formatBytes(message.size)], ["尝试次数", message.attempts], ["投递状态通知（DSN）", emailDsnStatusLabel(message.dsn_status)], ["DSN 记录", message.dsn_message_id || "无"], ["DSN 尝试 / 错误", `${message.dsn_attempts || 0} / ${message.dsn_last_error || "无"}`], ["SPF / DKIM / DMARC", [message.spf, message.dkim, message.dmarc].filter(Boolean).join(" / ") || "无"], ["R2 对象", message.object_key], ["SHA-256", message.sha256], ["最后错误", message.last_error || "无"]];
     $("#email-message-detail").innerHTML = fields.map(([key, value]) => `<div><dt>${escapeHtml(key)}</dt><dd class="${key === "R2 对象" || key === "SHA-256" ? "mono" : ""}">${escapeHtml(value)}</dd></div>`).join("");
     const download = $("#email-message-download");
     download.href = `/api/email/${encodeURIComponent(state.emailActive)}/messages/${encodeURIComponent(id)}/raw`;
