@@ -72,6 +72,13 @@ impl StagedObjectFile {
     pub async fn stream(&self) -> Result<ObjectByteStream> {
         stream_file(&self.path, 0, self.size, None).await
     }
+
+    pub async fn stream_range(&self, offset: u64, length: u64) -> Result<ObjectByteStream> {
+        if offset > self.size || length > self.size.saturating_sub(offset) {
+            bail!("临时上传文件范围超出边界");
+        }
+        stream_file(&self.path, offset, length, None).await
+    }
 }
 
 /// Consume exactly `length` plaintext bytes from a stream while preserving any
@@ -1147,6 +1154,21 @@ mod tests {
         assert_eq!(staged.md5(), expected_md5);
         let path = staged.path().to_path_buf();
         assert!(path.is_file());
+        let range = staged
+            .stream_range(777_777, 234_567)
+            .await
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap()
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>();
+        assert_eq!(range, bytes[777_777..1_012_344]);
+        assert!(staged
+            .stream_range(staged.size().saturating_sub(1), 2)
+            .await
+            .is_err());
         let received = staged
             .stream()
             .await

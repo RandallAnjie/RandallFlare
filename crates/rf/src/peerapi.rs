@@ -1838,13 +1838,27 @@ async fn d1_export(
     {
         return (StatusCode::SERVICE_UNAVAILABLE, "driver gone").into_response();
     }
-    match tokio::time::timeout(std::time::Duration::from_secs(120), response_rx).await {
+    match tokio::time::timeout(std::time::Duration::from_secs(600), response_rx).await {
         Ok(Ok(Ok(result))) => match result.data {
-            Some(data) => (
-                [(axum::http::header::CONTENT_TYPE, "application/vnd.sqlite3")],
-                data,
-            )
-                .into_response(),
+            Some(export) => match export.stream().await {
+                Ok(stream) => Response::builder()
+                    .status(StatusCode::OK)
+                    .header(axum::http::header::CONTENT_TYPE, "application/vnd.sqlite3")
+                    .header(transport::STREAM_HEADER, transport::STREAM_VERSION)
+                    .body(Body::from_stream(stream))
+                    .unwrap_or_else(|error| {
+                        (
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            format!("failed to build D1 export response: {error}"),
+                        )
+                            .into_response()
+                    }),
+                Err(error) => (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("failed to stream D1 export: {error}"),
+                )
+                    .into_response(),
+            },
             None => (
                 StatusCode::MISDIRECTED_REQUEST,
                 axum::Json(serde_json::json!({ "leader_hint": result.leader_hint })),

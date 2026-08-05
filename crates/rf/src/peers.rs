@@ -1902,16 +1902,39 @@ impl PeerClient {
     }
 
     pub async fn d1_export(&self, base: &str, db: &str) -> Result<Vec<u8>> {
+        let mut stream = self.d1_export_stream(base, db).await?;
+        let mut bytes = Vec::new();
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk.context("reading authenticated D1 export stream")?;
+            if bytes.len().saturating_add(chunk.len()) > crate::binary::MAX_BINARY_BYTES {
+                bail!(
+                    "D1 export exceeds the 200 MiB buffered download limit; use `rf d1 backup` to stream it into R2/rclone"
+                );
+            }
+            bytes.extend_from_slice(&chunk);
+        }
+        Ok(bytes)
+    }
+
+    pub async fn d1_export_stream(
+        &self,
+        base: &str,
+        db: &str,
+    ) -> Result<crate::objectstore::ObjectByteStream> {
         let mut target = base.to_string();
         let mut candidates = vec![target.clone()];
         let mut candidate_cursor = 0usize;
         let mut candidates_loaded = false;
         for _ in 0..25 {
             match self
-                .get(&target, &format!("/v1/d1/{}/export", component(db)))
+                .get_stream(
+                    &target,
+                    &format!("/v1/d1/{}/export", component(db)),
+                    Duration::from_secs(610),
+                )
                 .await
             {
-                Ok(raw) => return Ok(raw),
+                Ok(stream) => return Ok(stream),
                 Err(error) => {
                     if let Some(http_error) = error.downcast_ref::<PeerHttpError>() {
                         if http_error.status == 421 {
@@ -1946,7 +1969,7 @@ impl PeerClient {
                 }
             }
         }
-        bail!("no leader found for D1 export {db} after retries")
+        bail!("no leader found for streaming D1 export {db} after retries")
     }
 
     pub async fn d1_backup(

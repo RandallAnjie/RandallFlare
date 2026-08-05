@@ -21,9 +21,13 @@ use rf_core::identity::PublicId;
 use rf_core::quorum::{Action, Entry, Msg, Raft};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
+use tokio::io::AsyncReadExt as _;
 use tokio::sync::{mpsc, oneshot};
+
+pub const MAX_D1_EXPORT_BYTES: u64 = 10 * 1024 * 1024 * 1024;
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct DbMeta {
@@ -62,8 +66,56 @@ pub struct StatementResult {
 }
 
 pub struct SnapshotResult {
-    pub data: Option<Vec<u8>>,
+    pub data: Option<D1ExportFile>,
     pub leader_hint: Option<String>,
+}
+
+pub struct D1ExportFile {
+    path: PathBuf,
+    size: u64,
+}
+
+impl D1ExportFile {
+    pub fn size(&self) -> u64 {
+        self.size
+    }
+
+    pub async fn stream(self) -> Result<crate::objectstore::ObjectByteStream> {
+        let file = tokio::fs::File::open(&self.path)
+            .await
+            .context("opening portable D1 export")?;
+        let remaining = self.size;
+        let stream = futures_util::stream::try_unfold(
+            (file, self, remaining),
+            |(mut file, guard, remaining)| async move {
+                if remaining == 0 {
+                    return Ok(None);
+                }
+                let length =
+                    remaining.min(crate::transport::STREAM_PLAINTEXT_CHUNK as u64) as usize;
+                let mut buffer = vec![0; length];
+                let read = file.read(&mut buffer).await?;
+                if read == 0 {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::UnexpectedEof,
+                        "portable D1 export was truncated while streaming",
+                    ));
+                }
+                buffer.truncate(read);
+                Ok(Some((
+                    axum::body::Bytes::from(buffer),
+                    (file, guard, remaining - read as u64),
+                )))
+            },
+        );
+        Ok(Box::pin(stream))
+    }
+}
+
+impl Drop for D1ExportFile {
+    fn drop(&mut self) {
+        remove_sqlite_files(&self.path);
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -642,15 +694,17 @@ impl Driver {
 
     /// Create a portable SQLite backup for an operator download. The Raft
     /// apply marker is stripped from the copy, never from the live database.
-    fn export_snapshot(&mut self) -> Result<Vec<u8>> {
+    fn export_snapshot(&mut self) -> Result<D1ExportFile> {
         let path = self
             .path
             .with_extension(format!("export-{}.sqlite", rand::random::<u64>()));
-        let result = portable_sqlite_backup(&self.sql, &path);
-        let _ = std::fs::remove_file(&path);
-        let _ = std::fs::remove_file(path.with_extension("sqlite-wal"));
-        let _ = std::fs::remove_file(path.with_extension("sqlite-shm"));
-        result
+        match portable_sqlite_backup_file(&self.sql, &path) {
+            Ok(size) => Ok(D1ExportFile { path, size }),
+            Err(error) => {
+                remove_sqlite_files(&path);
+                Err(error)
+            }
+        }
     }
 
     /// Replace the local database with a shipped snapshot.
@@ -831,10 +885,7 @@ fn run_statements(
     Ok(results)
 }
 
-fn portable_sqlite_backup(
-    connection: &rusqlite::Connection,
-    path: &std::path::Path,
-) -> Result<Vec<u8>> {
+fn portable_sqlite_backup_file(connection: &rusqlite::Connection, path: &Path) -> Result<u64> {
     connection
         .backup(rusqlite::MAIN_DB, path, None)
         .context("creating D1 SQLite backup")?;
@@ -845,11 +896,23 @@ fn portable_sqlite_backup(
          VACUUM;",
     )?;
     drop(exported);
-    let bytes = std::fs::read(path)?;
-    if bytes.len() > crate::binary::MAX_BINARY_BYTES {
-        anyhow::bail!("D1 export exceeds the 200 MiB transfer limit");
+    let size = std::fs::metadata(path)?.len();
+    if size == 0 || size > MAX_D1_EXPORT_BYTES {
+        anyhow::bail!("D1 export must be between 1 byte and 10 GiB");
     }
-    Ok(bytes)
+    Ok(size)
+}
+
+fn remove_sqlite_files(path: &Path) {
+    let _ = std::fs::remove_file(path);
+    let _ = std::fs::remove_file(path.with_extension("sqlite-wal"));
+    let _ = std::fs::remove_file(path.with_extension("sqlite-shm"));
+}
+
+#[cfg(test)]
+fn portable_sqlite_backup(connection: &rusqlite::Connection, path: &Path) -> Result<Vec<u8>> {
+    portable_sqlite_backup_file(connection, path)?;
+    Ok(std::fs::read(path)?)
 }
 
 fn run_query(
@@ -1019,5 +1082,30 @@ mod tests {
         drop(exported);
         drop(source);
         let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[tokio::test]
+    async fn portable_export_file_streams_and_cleans_up_after_eof() {
+        use futures_util::StreamExt as _;
+
+        let path = std::env::temp_dir().join(format!(
+            "rf-d1-stream-{}-{}.sqlite",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        let bytes = vec![0x5a; crate::transport::STREAM_PLAINTEXT_CHUNK * 2 + 17];
+        std::fs::write(&path, &bytes).unwrap();
+        let export = D1ExportFile {
+            path: path.clone(),
+            size: bytes.len() as u64,
+        };
+        let mut stream = export.stream().await.unwrap();
+        let mut received = Vec::new();
+        while let Some(chunk) = stream.next().await {
+            received.extend_from_slice(&chunk.unwrap());
+        }
+        drop(stream);
+        assert_eq!(received, bytes);
+        assert!(!path.exists());
     }
 }

@@ -13,7 +13,6 @@ use crate::storage_policy::D1BackupPolicy;
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
-use sha2::{Digest, Sha256};
 use std::sync::Arc;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -86,14 +85,19 @@ async fn backup_to_key(
     scheduled_at_ms: Option<u64>,
 ) -> Result<D1Backup> {
     let client = PeerClient::new(node.cfg.cluster_secret_bytes()?);
-    let bytes = client
-        .d1_export(&loopback_peer_api(node), database)
+    let stream = client
+        .d1_export_stream(&loopback_peer_api(node), database)
         .await
         .context("从 D1 leader 创建在线备份失败")?;
-    if bytes.is_empty() {
+    let staged = node
+        .objects
+        .spool_stream(crate::d1::MAX_D1_EXPORT_BYTES, stream)
+        .await
+        .context("接收并校验 D1 leader 的流式备份失败")?;
+    if staged.size() == 0 {
         bail!("D1 leader 返回了空备份");
     }
-    let sha256 = hex::encode(Sha256::digest(&bytes));
+    let sha256 = hex::encode(staged.sha256());
     let custom_metadata = Map::from_iter([
         ("rf-d1-database".into(), Value::String(database.into())),
         ("rf-d1-backup-sha256".into(), Value::String(sha256.clone())),
@@ -107,7 +111,7 @@ async fn backup_to_key(
         node,
         bucket,
         key,
-        &bytes,
+        &staged,
         PutOptions {
             content_type: Some("application/vnd.sqlite3".into()),
             custom_metadata,
@@ -119,7 +123,7 @@ async fn backup_to_key(
         database: database.into(),
         bucket: bucket.into(),
         object_key: key.into(),
-        size: bytes.len() as u64,
+        size: staged.size(),
         sha256,
         created_at_ms,
         scheduled_at_ms,
@@ -130,39 +134,48 @@ async fn upload(
     node: &Node,
     bucket: &str,
     key: &str,
-    bytes: &[u8],
+    staged: &crate::objectstore::StagedObjectFile,
     options: PutOptions,
 ) -> Result<()> {
-    if bytes.len() <= r2::MAX_BUFFERED_OBJECT_BYTES {
-        r2::put_object(node, bucket, key, bytes, options).await?;
+    if staged.size() <= r2::MAX_DIRECT_OBJECT_BYTES as u64 {
+        r2::put_object_file(node, bucket, key, staged, options).await?;
         return Ok(());
     }
     let multipart = r2::create_multipart_upload(node, bucket, key, options).await?;
-    let mut parts = Vec::new();
-    for (index, chunk) in bytes
-        .chunks(r2::MAX_BUFFERED_MULTIPART_PART_BYTES)
-        .enumerate()
-    {
-        match r2::upload_part(
-            node,
-            bucket,
-            key,
-            &multipart.upload_id,
-            index as u32 + 1,
-            chunk,
-        )
-        .await
-        {
-            Ok(part) => parts.push(r2::PublishedPart {
+    let parts = async {
+        let mut parts = Vec::new();
+        let mut offset = 0u64;
+        let mut part_number = 1u32;
+        while offset < staged.size() {
+            let length = (staged.size() - offset).min(r2::MAX_BUFFERED_MULTIPART_PART_BYTES as u64);
+            let stream = staged.stream_range(offset, length).await?;
+            let part_file = node.objects.spool_stream(length, stream).await?;
+            let part = r2::upload_part_file(
+                node,
+                bucket,
+                key,
+                &multipart.upload_id,
+                part_number,
+                &part_file,
+            )
+            .await?;
+            parts.push(r2::PublishedPart {
                 part_number: part.part_number,
                 etag: part.etag,
-            }),
-            Err(error) => {
-                let _ = r2::abort_multipart_upload(node, bucket, key, &multipart.upload_id).await;
-                return Err(error);
-            }
+            });
+            offset += length;
+            part_number += 1;
         }
+        Ok::<_, anyhow::Error>(parts)
     }
+    .await;
+    let parts = match parts {
+        Ok(parts) => parts,
+        Err(error) => {
+            let _ = r2::abort_multipart_upload(node, bucket, key, &multipart.upload_id).await;
+            return Err(error);
+        }
+    };
     r2::complete_multipart_upload(node, bucket, key, &multipart.upload_id, &parts).await?;
     Ok(())
 }
