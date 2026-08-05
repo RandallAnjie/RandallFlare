@@ -1319,9 +1319,11 @@ export default {
         .await
         .unwrap();
 
-    // Runtime reconciles on the manifest event; workerd needs a
-    // moment to boot. Poll through ingress.
-    let deadline = Instant::now() + Duration::from_secs(30);
+    // Runtime reconciles on the manifest event. This scenario deliberately
+    // wires every durable binding, so a cold two-core CI runner may need to
+    // elect several single-node D1 groups before workerd can boot. Keep
+    // polling the real ingress rather than weakening the readiness check.
+    let deadline = Instant::now() + Duration::from_secs(120);
     loop {
         let ok = http
             .get(format!("http://127.0.0.1:{}/", n.ingress))
