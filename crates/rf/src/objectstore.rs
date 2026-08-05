@@ -35,6 +35,10 @@ impl VerifiedObjectFile {
         self.size
     }
 
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
     pub async fn stream(self, offset: u64, length: u64) -> Result<ObjectByteStream> {
         if offset > self.size || length > self.size.saturating_sub(offset) {
             bail!("对象流范围超出文件边界");
@@ -263,7 +267,11 @@ impl ObjectStore {
         match location {
             StorageLocation::Local => {
                 let target = self.local_path(expected);
-                if target.is_file() {
+                if target.is_file()
+                    && hash_file(&target).await.is_ok_and(|(digest, target_size)| {
+                        digest == *expected && target_size == size
+                    })
+                {
                     return Ok(size);
                 }
                 tokio::fs::create_dir_all(target.parent().context("对象路径没有父目录")?).await?;
@@ -392,6 +400,67 @@ impl ObjectStore {
             path,
             remove_on_drop: true,
             size: bytes.len() as u64,
+        })
+    }
+
+    /// Spool an authenticated peer stream without buffering the object in
+    /// memory. Size and SHA-256 are checked before the file guard is returned;
+    /// every failure removes the partial file.
+    pub async fn materialize_stream_verified(
+        &self,
+        expected: &[u8; 32],
+        expected_size: u64,
+        mut stream: ObjectByteStream,
+    ) -> Result<VerifiedObjectFile> {
+        use futures_util::StreamExt as _;
+
+        let spool_dir = self.local_root.join(".read-spool");
+        tokio::fs::create_dir_all(&spool_dir).await?;
+        let path = spool_dir.join(format!(
+            "{}-{}-{}.tmp",
+            hex::encode(expected),
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        let transfer = async {
+            let mut file = tokio::fs::OpenOptions::new()
+                .create_new(true)
+                .write(true)
+                .open(&path)
+                .await?;
+            let mut hasher = Sha256::new();
+            let mut size = 0u64;
+            while let Some(chunk) = stream.next().await {
+                let chunk = chunk?;
+                size = size
+                    .checked_add(chunk.len() as u64)
+                    .context("peer 对象大小溢出")?;
+                if size > expected_size {
+                    bail!("peer 返回的对象超过多数派元数据大小");
+                }
+                hasher.update(&chunk);
+                file.write_all(&chunk).await?;
+            }
+            file.flush().await?;
+            file.sync_data().await?;
+            drop(file);
+            Ok::<_, anyhow::Error>((hasher.finalize().into(), size))
+        };
+        let (actual, size): ([u8; 32], u64) = match transfer.await {
+            Ok(result) => result,
+            Err(error) => {
+                let _ = tokio::fs::remove_file(&path).await;
+                return Err(error);
+            }
+        };
+        if size != expected_size || actual != *expected {
+            let _ = tokio::fs::remove_file(&path).await;
+            bail!("peer 返回的对象大小或 SHA-256 与多数派元数据不一致");
+        }
+        Ok(VerifiedObjectFile {
+            path,
+            remove_on_drop: true,
+            size,
         })
     }
 
@@ -821,6 +890,18 @@ mod tests {
                 .unwrap(),
             streamed
         );
+        std::fs::write(store.local_path(&streamed_sha), b"corrupt replica").unwrap();
+        store
+            .put_file_verified(&StorageLocation::Local, &streamed_sha, &source)
+            .await
+            .unwrap();
+        assert_eq!(
+            store
+                .get(&StorageLocation::Local, &streamed_sha)
+                .await
+                .unwrap(),
+            streamed
+        );
         assert!(store
             .put_file_verified(&StorageLocation::Local, &[0; 32], &source)
             .await
@@ -843,6 +924,56 @@ mod tests {
         );
         store.delete(&StorageLocation::Local, &sha).await.unwrap();
         assert!(!store.exists(&StorageLocation::Local, &sha).await.unwrap());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn peer_streams_spool_verify_and_clean_partial_files() {
+        let (store, root) = store();
+        let bytes: Vec<u8> = (0..2 * 1024 * 1024 + 313)
+            .map(|index| (index % 251) as u8)
+            .collect();
+        let digest: [u8; 32] = Sha256::digest(&bytes).into();
+        let chunks = bytes
+            .chunks(173_111)
+            .map(|chunk| Ok(axum::body::Bytes::copy_from_slice(chunk)))
+            .collect::<Vec<std::result::Result<_, std::io::Error>>>();
+        let verified = store
+            .materialize_stream_verified(
+                &digest,
+                bytes.len() as u64,
+                Box::pin(futures_util::stream::iter(chunks)),
+            )
+            .await
+            .unwrap();
+        let path = verified.path().to_path_buf();
+        assert!(path.is_file());
+        let received = verified
+            .stream(1_000_000, 512_345)
+            .await
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap()
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>();
+        assert_eq!(received, bytes[1_000_000..1_512_345]);
+        assert!(!path.exists());
+
+        let truncated = vec![Ok(axum::body::Bytes::copy_from_slice(&bytes[..1024]))];
+        assert!(store
+            .materialize_stream_verified(
+                &digest,
+                bytes.len() as u64,
+                Box::pin(futures_util::stream::iter(truncated)),
+            )
+            .await
+            .is_err());
+        assert_eq!(
+            std::fs::read_dir(root.join(".read-spool")).unwrap().count(),
+            0
+        );
         std::fs::remove_dir_all(root).unwrap();
     }
 

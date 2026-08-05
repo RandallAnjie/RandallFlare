@@ -16,6 +16,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashSet};
+use std::time::Duration;
 use tokio::io::AsyncWriteExt;
 
 pub const BUCKET_KIND: &str = "r2_bucket";
@@ -1019,26 +1020,16 @@ pub async fn get_object(
     bucket: &str,
     key: &str,
 ) -> Result<Option<(ObjectMeta, Vec<u8>)>> {
-    let Some(meta) = head_object(node, bucket, key).await? else {
+    let Some((meta, file)) = materialize_object(node, bucket, key).await? else {
         return Ok(None);
     };
-    let sha: [u8; 32] = hex::decode(&meta.sha256)?
-        .try_into()
-        .map_err(|_| anyhow::anyhow!("R2 对象摘要长度无效"))?;
-    let bytes = match node.objects.get(&meta.storage, &sha).await {
-        Ok(bytes) => bytes,
-        Err(local_error) if meta.storage == StorageLocation::Local => {
-            repair_local_blob(node, bucket, &sha)
-                .await
-                .with_context(|| {
-                    format!("本地 R2 对象缺失，且集群修复失败；原始错误：{local_error:#}")
-                })?
-        }
-        Err(remote_error) if !node.objects.supports(&meta.storage) => {
-            repair_remote_blob(node, bucket, key, &meta, remote_error).await?
-        }
-        Err(error) => return Err(error),
-    };
+    let bytes = tokio::fs::read(file.path()).await?;
+    if bytes.len() as u64 != meta.size {
+        bail!("R2 对象在校验后读取期间发生截断");
+    }
+    if hex::encode(Sha256::digest(&bytes)) != meta.sha256 {
+        bail!("R2 对象在校验后读取期间发生内容变化");
+    }
     Ok(Some((meta, bytes)))
 }
 
@@ -1056,20 +1047,14 @@ pub async fn materialize_object(
     let file = match node.objects.materialize_verified(&meta.storage, &sha).await {
         Ok(file) => file,
         Err(local_error) if meta.storage == StorageLocation::Local => {
-            repair_local_blob(node, bucket, &sha)
+            repair_local_file(node, bucket, key, &meta)
                 .await
                 .with_context(|| {
                     format!("本地 R2 对象缺失，且集群修复失败；原始错误：{local_error:#}")
-                })?;
-            node.objects
-                .materialize_verified(&StorageLocation::Local, &sha)
-                .await?
+                })?
         }
-        Err(remote_error) if !node.objects.supports(&meta.storage) => {
-            let bytes = repair_remote_blob(node, bucket, key, &meta, remote_error).await?;
-            node.objects
-                .materialize_bytes_verified(&sha, &bytes)
-                .await?
+        Err(remote_error) if meta.storage != StorageLocation::Local => {
+            borrow_remote_file(node, bucket, key, &meta, remote_error).await?
         }
         Err(error) => return Err(error),
     };
@@ -1189,40 +1174,103 @@ fn storage_peer_errors(errors: &[String]) -> String {
     }
 }
 
-async fn repair_remote_blob(
+async fn borrow_remote_file(
     node: &Node,
     bucket: &str,
     key: &str,
     expected: &ObjectMeta,
     original: anyhow::Error,
-) -> Result<Vec<u8>> {
+) -> Result<crate::objectstore::VerifiedObjectFile> {
+    let candidates = node
+        .peers()
+        .into_iter()
+        .filter(|(_, peer)| peer.capabilities.contains("rclone"))
+        .filter_map(|(id, peer)| peer.api_addr.map(|address| (id, address.to_string())))
+        .collect();
+    borrow_file_from_candidates(
+        node,
+        bucket,
+        key,
+        expected,
+        candidates,
+        vec![format!("本机：{original:#}")],
+    )
+    .await
+}
+
+async fn repair_local_file(
+    node: &Node,
+    bucket: &str,
+    key: &str,
+    expected: &ObjectMeta,
+) -> Result<crate::objectstore::VerifiedObjectFile> {
+    let group = d1::ensure_database(node, &metadata_database(bucket))?;
+    let peers = node.peers();
+    let candidates = group
+        .into_iter()
+        .filter(|member| *member != node.id())
+        .filter_map(|member| {
+            peers
+                .get(&member.to_string())
+                .and_then(|peer| peer.api_addr)
+                .map(|address| (member.to_string(), address.to_string()))
+        })
+        .collect();
+    let downloaded =
+        borrow_file_from_candidates(node, bucket, key, expected, candidates, Vec::new()).await?;
+    let digest: [u8; 32] = hex::decode(&expected.sha256)?
+        .try_into()
+        .map_err(|_| anyhow::anyhow!("R2 对象摘要长度无效"))?;
+    let stored_size = node
+        .objects
+        .put_file_verified(&StorageLocation::Local, &digest, downloaded.path())
+        .await?;
+    if stored_size != expected.size {
+        bail!("修复后的 R2 对象大小不一致");
+    }
+    drop(downloaded);
+    node.objects
+        .materialize_verified(&StorageLocation::Local, &digest)
+        .await
+}
+
+async fn borrow_file_from_candidates(
+    node: &Node,
+    bucket: &str,
+    key: &str,
+    expected: &ObjectMeta,
+    candidates: Vec<(String, String)>,
+    mut errors: Vec<String>,
+) -> Result<crate::objectstore::VerifiedObjectFile> {
+    let digest: [u8; 32] = hex::decode(&expected.sha256)?
+        .try_into()
+        .map_err(|_| anyhow::anyhow!("R2 对象摘要长度无效"))?;
     let client = PeerClient::new(node.cfg.cluster_secret_bytes()?);
-    let mut errors = vec![format!("本机：{original:#}")];
-    for (id, peer) in node.peers() {
-        if !peer.capabilities.contains("rclone") {
-            continue;
-        }
-        let Some(address) = peer.api_addr else {
-            continue;
-        };
-        match client.r2_get(&address.to_string(), bucket, key).await {
-            Ok(Some((meta, bytes)))
-                if meta.sha256 == expected.sha256
-                    && meta.size == expected.size
-                    && meta.storage == expected.storage =>
-            {
-                let actual = hex::encode(Sha256::digest(&bytes));
-                if actual == expected.sha256 {
-                    return Ok(bytes);
+    let header_timeout =
+        Duration::from_secs(node.cfg.storage.rclone_timeout_seconds.saturating_add(30));
+    for (id, address) in candidates {
+        match client
+            .r2_stream_object(&address, bucket, key, &expected.sha256, header_timeout)
+            .await
+        {
+            Ok(Some(stream)) => {
+                match node
+                    .objects
+                    .materialize_stream_verified(&digest, expected.size, stream)
+                    .await
+                {
+                    Ok(file) => return Ok(file),
+                    Err(error) => errors.push(format!("{id}: 流校验失败：{error:#}")),
                 }
-                errors.push(format!("{id}: 返回内容摘要不一致"));
             }
-            Ok(Some(_)) => errors.push(format!("{id}: 返回对象元数据不一致")),
             Ok(None) => errors.push(format!("{id}: 对象不存在")),
             Err(error) => errors.push(format!("{id}: {error:#}")),
         }
     }
-    bail!("rclone 对象读取失败，集群借用也失败：{}", errors.join("；"))
+    bail!(
+        "R2 对象的加密节点流式借用失败{}",
+        storage_peer_errors(&errors)
+    )
 }
 
 pub async fn delete_object(node: &Node, bucket: &str, key: &str) -> Result<bool> {
@@ -1929,37 +1977,6 @@ async fn replicate_local_blob(
     Ok(())
 }
 
-async fn repair_local_blob(node: &Node, bucket: &str, sha: &[u8; 32]) -> Result<Vec<u8>> {
-    let group = d1::ensure_database(node, &metadata_database(bucket))?;
-    let peers = node.peers();
-    let client = PeerClient::new(node.cfg.cluster_secret_bytes()?);
-    for member in group {
-        if member == node.id() {
-            continue;
-        }
-        let Some(api) = peers
-            .get(&member.to_string())
-            .and_then(|peer| peer.api_addr)
-            .map(|address| address.to_string())
-        else {
-            continue;
-        };
-        match client.r2_fetch_blob(&api, sha).await {
-            Ok(Some(bytes)) if Sha256::digest(&bytes).as_slice() == sha => {
-                let stored = node.objects.put(&StorageLocation::Local, &bytes).await?;
-                if &stored != sha {
-                    bail!("修复后的 R2 对象摘要不一致");
-                }
-                return Ok(bytes);
-            }
-            Ok(Some(_)) => tracing::warn!("R2 repair peer {member} sent corrupt bytes"),
-            Ok(None) => {}
-            Err(error) => tracing::debug!("R2 repair from {member} failed: {error:#}"),
-        }
-    }
-    bail!("数据组中没有可用的 R2 对象副本")
-}
-
 async fn exec(node: &Node, bucket: &str, sql: &str, params: Value) -> Result<Value> {
     exec_database(node, &metadata_database(bucket), sql, params).await
 }
@@ -2090,6 +2107,7 @@ fn escape_like(prefix: &str) -> String {
 mod tests {
     use super::*;
     use crate::config::NodeConfig;
+    use futures_util::TryStreamExt;
     use rf_core::envelope::Envelope;
     use rf_core::identity::{AnyKeypair, Keypair};
     use std::sync::Arc;
@@ -2232,7 +2250,7 @@ mod tests {
                 public_access: false,
                 storage: StorageLocation::Local,
                 storage_policy: None,
-                max_bytes: Some(1024 * 1024),
+                max_bytes: Some(8 * 1024 * 1024),
                 max_objects: Some(10),
                 expire_objects_after_days: None,
                 cors_origins: vec![],
@@ -2387,6 +2405,74 @@ mod tests {
             .unwrap();
         assert_eq!(fetched.content_type, options.content_type);
         assert_eq!(bytes, b"hello R2");
+        let streamed = client
+            .r2_stream_object(
+                &base,
+                "e2e-bucket",
+                "metrics%_exact.txt",
+                &fetched.sha256,
+                Duration::from_secs(5),
+            )
+            .await
+            .unwrap()
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap()
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>();
+        assert_eq!(streamed, b"hello R2");
+        assert!(client
+            .r2_stream_object(
+                &base,
+                "e2e-bucket",
+                "metrics%_exact.txt",
+                &"0".repeat(64),
+                Duration::from_secs(5),
+            )
+            .await
+            .is_err());
+        let large_streamed = vec![0x6du8; 2 * 1024 * 1024 + 257];
+        let large_metadata = client
+            .r2_put(
+                &base,
+                "e2e-bucket",
+                "encrypted-stream.bin",
+                &large_streamed,
+                &PutOptions::default(),
+            )
+            .await
+            .unwrap();
+        let large_chunks = client
+            .r2_stream_object(
+                &base,
+                "e2e-bucket",
+                "encrypted-stream.bin",
+                &large_metadata.sha256,
+                Duration::from_secs(5),
+            )
+            .await
+            .unwrap()
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        assert_eq!(
+            large_chunks
+                .iter()
+                .map(|chunk| chunk.len())
+                .collect::<Vec<_>>(),
+            vec![1024 * 1024, 1024 * 1024, 257]
+        );
+        assert_eq!(
+            large_chunks.into_iter().flatten().collect::<Vec<_>>(),
+            large_streamed
+        );
+        assert!(client
+            .r2_delete(&base, "e2e-bucket", "encrypted-stream.bin")
+            .await
+            .unwrap());
         assert!(client
             .r2_delete(&base, "e2e-bucket", "metrics%_exact.txt")
             .await
@@ -2475,6 +2561,38 @@ mod tests {
                 .1,
             b"hello multipart"
         );
+        let r2bind_port = crate::r2bind::serve(node.clone()).await.unwrap();
+        let binding_response = reqwest::Client::new()
+            .get(format!("http://127.0.0.1:{r2bind_port}/"))
+            .header(crate::r2bind::BUCKET_HEADER, "e2e-bucket")
+            .header(
+                "cf-r2-request",
+                serde_json::json!({
+                    "version": 1,
+                    "method": "get",
+                    "object": "large/report.txt",
+                    "range": { "offset": "6", "length": "9" }
+                })
+                .to_string(),
+            )
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(binding_response.status(), reqwest::StatusCode::OK);
+        let metadata_size = binding_response
+            .headers()
+            .get("cf-r2-metadata-size")
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .parse::<usize>()
+            .unwrap();
+        let binding_body = binding_response.bytes().await.unwrap();
+        let binding_metadata: Value =
+            serde_json::from_slice(&binding_body[..metadata_size]).unwrap();
+        assert_eq!(binding_metadata["range"]["offset"], 6);
+        assert_eq!(binding_metadata["range"]["length"], 9);
+        assert_eq!(&binding_body[metadata_size..], b"multipart");
         assert!(complete_multipart_upload(
             &node,
             "e2e-bucket",

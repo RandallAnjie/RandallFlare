@@ -8,12 +8,13 @@
 use crate::node::Node;
 use crate::r2::{self, ObjectMeta, PublishedPart, PutOptions};
 use anyhow::{bail, Context, Result};
-use axum::body::Bytes;
+use axum::body::{Body, Bytes};
 use axum::extract::{ConnectInfo, DefaultBodyLimit, State};
 use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::Router;
+use futures_util::StreamExt;
 use serde_json::{json, Map, Value};
 use sha2::{Digest, Sha256};
 use std::net::SocketAddr;
@@ -132,8 +133,8 @@ async fn binding_get(
             let Some(key) = request.get("object").and_then(Value::as_str) else {
                 return r2_error_message(StatusCode::BAD_REQUEST, 10001, "R2 get 缺少对象键");
             };
-            match r2::get_object(&node, &bucket, key).await {
-                Ok(Some((metadata, bytes))) => {
+            match r2::head_object(&node, &bucket, key).await {
+                Ok(Some(metadata)) => {
                     if !condition_matches(request.get("onlyIf"), Some(&metadata)) {
                         return metadata_response_status(
                             StatusCode::NOT_MODIFIED,
@@ -141,14 +142,31 @@ async fn binding_get(
                             &[],
                         );
                     }
-                    match requested_range(&request, bytes.len()) {
-                        Ok(Some((offset, length))) => metadata_response(
-                            object_json(&metadata, Some((offset, length))),
-                            &bytes[offset..offset + length],
-                        ),
-                        Ok(None) => metadata_response(object_json(&metadata, None), &bytes),
-                        Err(error) => r2_error(StatusCode::RANGE_NOT_SATISFIABLE, 10039, error),
-                    }
+                    let range = match requested_range(&request, metadata.size) {
+                        Ok(Some(range)) => Some(range),
+                        Ok(None) => None,
+                        Err(error) => {
+                            return r2_error(StatusCode::RANGE_NOT_SATISFIABLE, 10039, error)
+                        }
+                    };
+                    let (offset, length) = range.unwrap_or((0, metadata.size));
+                    let file = match r2::materialize_object(&node, &bucket, key).await {
+                        Ok(Some((current, file))) if current.sha256 == metadata.sha256 => file,
+                        Ok(Some(_)) => {
+                            return r2_error_message(
+                                StatusCode::CONFLICT,
+                                10001,
+                                "R2 对象在读取期间发生变化，请重试",
+                            )
+                        }
+                        Ok(None) => return object_not_found(key),
+                        Err(error) => return backend_error(error),
+                    };
+                    let stream = match file.stream(offset, length).await {
+                        Ok(stream) => stream,
+                        Err(error) => return backend_error(error),
+                    };
+                    metadata_response_stream(object_json(&metadata, range), stream)
                 }
                 Ok(None) => object_not_found(key),
                 Err(error) => backend_error(error),
@@ -434,7 +452,7 @@ fn published_parts(request: &Value) -> Result<Vec<PublishedPart>> {
         .collect()
 }
 
-fn object_json(metadata: &ObjectMeta, range: Option<(usize, usize)>) -> Value {
+fn object_json(metadata: &ObjectMeta, range: Option<(u64, u64)>) -> Value {
     let mut http_fields = metadata.http_metadata.clone();
     if let Some(content_type) = &metadata.content_type {
         http_fields.insert("contentType".into(), Value::String(content_type.clone()));
@@ -522,7 +540,7 @@ fn etag_matches_object(condition: &Value, object: Option<&ObjectMeta>) -> bool {
             .is_some_and(|etag| etag.trim_matches('"') == object.etag)
 }
 
-fn requested_range(request: &Value, size: usize) -> Result<Option<(usize, usize)>> {
+fn requested_range(request: &Value, size: u64) -> Result<Option<(u64, u64)>> {
     let range = request.get("range").and_then(Value::as_object);
     let header = request.get("rangeHeader").and_then(Value::as_str);
     if range.is_none() && header.is_none() {
@@ -533,14 +551,13 @@ fn requested_range(request: &Value, size: usize) -> Result<Option<(usize, usize)
     }
     let (offset, length) = if let Some(range) = range {
         if let Some(suffix) = range.get("suffix").and_then(json_u64) {
-            let length = (suffix as usize).min(size);
+            let length = suffix.min(size);
             (size - length, length)
         } else {
-            let offset = range.get("offset").and_then(json_u64).unwrap_or(0) as usize;
+            let offset = range.get("offset").and_then(json_u64).unwrap_or(0);
             let length = range
                 .get("length")
                 .and_then(json_u64)
-                .map(|length| length as usize)
                 .unwrap_or_else(|| size.saturating_sub(offset));
             (offset, length)
         }
@@ -562,22 +579,22 @@ fn json_u64(value: &Value) -> Option<u64> {
         .or_else(|| value.as_str().and_then(|value| value.parse().ok()))
 }
 
-fn parse_range_header(header: &str, size: usize) -> Result<(usize, usize)> {
+fn parse_range_header(header: &str, size: u64) -> Result<(u64, u64)> {
     let value = header.strip_prefix("bytes=").context("R2 Range 标头无效")?;
     if value.contains(',') {
         bail!("R2 仅支持单个字节范围");
     }
     let (start, end) = value.split_once('-').context("R2 Range 标头无效")?;
     if start.is_empty() {
-        let suffix = end.parse::<usize>()?;
+        let suffix = end.parse::<u64>()?;
         let length = suffix.min(size);
         return Ok((size - length, length));
     }
-    let start = start.parse::<usize>()?;
+    let start = start.parse::<u64>()?;
     let end = if end.is_empty() {
         size - 1
     } else {
-        end.parse::<usize>()?.min(size - 1)
+        end.parse::<u64>()?.min(size - 1)
     };
     if end < start {
         bail!("R2 Range 结束位置小于开始位置");
@@ -598,6 +615,22 @@ fn metadata_response_status(status: StatusCode, metadata: Value, bytes: &[u8]) -
     response.headers_mut().insert(
         METADATA_SIZE_HEADER,
         HeaderValue::from_str(&metadata.len().to_string()).unwrap(),
+    );
+    response
+}
+
+fn metadata_response_stream(
+    metadata: Value,
+    stream: crate::objectstore::ObjectByteStream,
+) -> Response {
+    let metadata = serde_json::to_vec(&metadata).expect("R2 metadata is serializable");
+    let metadata_size = metadata.len();
+    let prefix =
+        futures_util::stream::once(async move { Ok::<_, std::io::Error>(Bytes::from(metadata)) });
+    let mut response = Response::new(Body::from_stream(prefix.chain(stream)));
+    response.headers_mut().insert(
+        METADATA_SIZE_HEADER,
+        HeaderValue::from_str(&metadata_size.to_string()).unwrap(),
     );
     response
 }

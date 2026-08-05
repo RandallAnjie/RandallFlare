@@ -1002,6 +1002,34 @@ export default {
       });
       return Response.json(result);
     }
+    if (url.pathname === "/r2-stream") {
+      const size = 2 * 1024 * 1024 + 257;
+      const input = new Uint8Array(size);
+      input.fill(90);
+      input[0] = 17;
+      input[input.length - 1] = 23;
+      await env.OUTPUTS.put("native/stream.bin", input, {
+        httpMetadata: { contentType: "application/octet-stream" },
+        customMetadata: { source: "real-workerd" },
+      });
+      const head = await env.OUTPUTS.head("native/stream.bin");
+      const ranged = await env.OUTPUTS.get("native/stream.bin", {
+        range: { offset: 1024 * 1024 - 17, length: 4096 },
+      });
+      const rangeBytes = new Uint8Array(await ranged.arrayBuffer());
+      const full = await env.OUTPUTS.get("native/stream.bin");
+      const fullBytes = new Uint8Array(await full.arrayBuffer());
+      return Response.json({
+        headSize: head.size,
+        headSource: head.customMetadata.source,
+        contentType: head.httpMetadata.contentType,
+        rangeSize: rangeBytes.length,
+        rangeFirst: rangeBytes[0],
+        fullSize: fullBytes.length,
+        fullFirst: fullBytes[0],
+        fullLast: fullBytes[fullBytes.length - 1],
+      });
+    }
     if (url.pathname === "/secret") return new Response(env.API_TOKEN);
     if (url.pathname === "/workflow-trigger") {
       const instance = await env.ORDER_WORKFLOW.create({
@@ -1354,6 +1382,28 @@ export default {
     assert_eq!(binary_response["stdout"], "stdout:signed-sandbox");
     assert_eq!(binary_response["uploads"][0]["key"], "binary/result.txt");
     assert!(binary_response["uploads"][0]["error"].is_null());
+    let r2_stream_response: serde_json::Value = http
+        .get(format!("http://127.0.0.1:{}/r2-stream", n.ingress))
+        .header("host", "api.test")
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(r2_stream_response["headSize"], 2 * 1024 * 1024 + 257);
+    assert_eq!(r2_stream_response["headSource"], "real-workerd");
+    assert_eq!(
+        r2_stream_response["contentType"],
+        "application/octet-stream"
+    );
+    assert_eq!(r2_stream_response["rangeSize"], 4096);
+    assert_eq!(r2_stream_response["rangeFirst"], 90);
+    assert_eq!(r2_stream_response["fullSize"], 2 * 1024 * 1024 + 257);
+    assert_eq!(r2_stream_response["fullFirst"], 17);
+    assert_eq!(r2_stream_response["fullLast"], 23);
     let (_, binary_output) = client
         .r2_get(&n.api, "pipeline-output", "binary/result.txt")
         .await
@@ -3311,6 +3361,7 @@ async fn two_node_deploy_kv_and_static_stability() {
     wait_ping(&a.api, Duration::from_secs(15)).await;
     let mut b = start("b", &operator, &[a.gossip]);
     wait_ping(&b.api, Duration::from_secs(15)).await;
+    wait_full_membership(&client, &[&a, &b], Duration::from_secs(20)).await;
 
     // A captured request is valid only for its intended node. The
     // original node also returns replay rejection through the same
@@ -3432,6 +3483,86 @@ async fn two_node_deploy_kv_and_static_stability() {
         .unwrap();
     assert_eq!(missing.status(), 404);
     assert!(missing.text().await.unwrap().contains("custom 404"));
+
+    // A local R2 replica removed from A is repaired from B through the
+    // sequence-bound encrypted object stream, then served without buffering
+    // the multi-frame response in ingress.
+    let bucket_record = rf::resource::prepare_after(
+        rf::r2::BUCKET_KIND,
+        "repair-stream",
+        serde_json::to_value(rf::r2::BucketSpec {
+            description: "跨节点流式修复".into(),
+            public_access: true,
+            storage: rf::objectstore::StorageLocation::Local,
+            storage_policy: None,
+            max_bytes: Some(8 * 1024 * 1024),
+            max_objects: Some(10),
+            expire_objects_after_days: None,
+            cors_origins: Vec::new(),
+            hostnames: Vec::new(),
+        })
+        .unwrap(),
+        false,
+        None,
+    )
+    .unwrap();
+    client
+        .post_resource(
+            &a.api,
+            &rf_core::envelope::Envelope::seal_any(&bucket_record, &op_any),
+        )
+        .await
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        if client
+            .resource_head(&b.api, rf::r2::BUCKET_KIND, "repair-stream")
+            .await
+            .ok()
+            .flatten()
+            .is_some()
+        {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "R2 bucket resource never converged to node B"
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    let repair_bytes = vec![0x39u8; 2 * 1024 * 1024 + 333];
+    let repair_metadata = client
+        .r2_put(
+            &a.api,
+            "repair-stream",
+            "large.bin",
+            &repair_bytes,
+            &rf::r2::PutOptions::default(),
+        )
+        .await
+        .unwrap();
+    let local_replica = a
+        ._dir
+        .join("data/objects")
+        .join(&repair_metadata.sha256[..2])
+        .join(&repair_metadata.sha256);
+    std::fs::remove_file(&local_replica).unwrap();
+    let repaired = http
+        .get(format!("http://127.0.0.1:{}/large.bin", a.ingress))
+        .header("host", "r2-repair-stream.workers.test")
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .bytes()
+        .await
+        .unwrap();
+    assert_eq!(repaired.as_ref(), repair_bytes);
+    assert!(
+        local_replica.is_file(),
+        "node A did not retain repaired replica"
+    );
 
     // KV: write on A, converge to B.
     client

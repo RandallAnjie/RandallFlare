@@ -13,10 +13,29 @@ use rf_core::envelope::Envelope;
 use rf_core::kv::KvEntry;
 use sha2::Digest;
 use std::collections::{BTreeMap, HashMap};
+use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 const MAX_PEER_RESPONSE: usize = crate::binary::MAX_BINARY_BYTES + 1024 * 1024 + 16;
+const PEER_STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
+const MAX_PEER_STREAM_BUFFER: usize = (crate::transport::MAX_STREAM_FRAME + 4) * 8;
+
+type HttpByteStream = Pin<
+    Box<
+        dyn futures_util::Stream<Item = std::result::Result<axum::body::Bytes, reqwest::Error>>
+            + Send,
+    >,
+>;
+
+struct PeerResponseStreamState {
+    wire: HttpByteStream,
+    buffered: Vec<u8>,
+    sequence: u64,
+    secret: [u8; 32],
+    request_nonce: String,
+    status: u16,
+}
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq)]
 pub struct KvListItem {
@@ -83,6 +102,7 @@ fn peer_api_candidates(base: &str, status: &serde_json::Value) -> Vec<String> {
 #[derive(Clone)]
 pub struct PeerClient {
     http: reqwest::Client,
+    streaming_http: reqwest::Client,
     secret: [u8; 32],
     targets: Arc<Mutex<HashMap<String, String>>>,
 }
@@ -100,8 +120,15 @@ impl PeerClient {
             .connect_timeout(Duration::from_secs(5))
             .build()
             .expect("reqwest client");
+        // Large peer streams have a bounded header wait and per-chunk idle
+        // timeout at the call site, but deliberately no whole-body deadline.
+        let streaming_http = reqwest::Client::builder()
+            .connect_timeout(Duration::from_secs(5))
+            .build()
+            .expect("streaming reqwest client");
         Self {
             http,
+            streaming_http,
             secret,
             targets: Default::default(),
         }
@@ -157,6 +184,161 @@ impl PeerClient {
             .await
             .with_context(|| format!("GET {base}{path}"))?;
         self.decode_response("GET", path, &nonce, resp).await
+    }
+
+    async fn get_stream(
+        &self,
+        base: &str,
+        path: &str,
+        header_timeout: Duration,
+    ) -> Result<crate::objectstore::ObjectByteStream> {
+        let target = self.target_id(base).await?;
+        let ts = crate::node::now_ms();
+        let mac = auth::mac_hex(&self.secret, ts, "GET", path, b"");
+        let (request_nonce, body) = transport::seal(
+            &self.secret,
+            &transport::request_aad(&ts.to_string(), "GET", path, &target),
+            b"",
+        )?;
+        let response = tokio::time::timeout(
+            header_timeout,
+            self.streaming_http
+                .get(format!("http://{base}{path}"))
+                .header(auth::TS_HEADER, ts.to_string())
+                .header(auth::MAC_HEADER, mac)
+                .header(transport::ENC_HEADER, transport::VERSION)
+                .header(transport::NONCE_HEADER, &request_nonce)
+                .header(transport::TARGET_HEADER, target)
+                .body(body)
+                .send(),
+        )
+        .await
+        .with_context(|| format!("GET {base}{path} response-header timeout"))?
+        .with_context(|| format!("GET {base}{path}"))?;
+        let status = response.status();
+        if !status.is_success() {
+            return match self
+                .decode_response("GET", path, &request_nonce, response)
+                .await
+            {
+                Ok(_) => bail!("peer rejected object stream without an error"),
+                Err(error) => Err(error),
+            };
+        }
+        if response
+            .headers()
+            .get(transport::ENC_HEADER)
+            .and_then(|value| value.to_str().ok())
+            != Some(transport::VERSION)
+            || response
+                .headers()
+                .get(transport::STREAM_HEADER)
+                .and_then(|value| value.to_str().ok())
+                != Some(transport::STREAM_VERSION)
+        {
+            bail!("peer object response was not an authenticated stream");
+        }
+        let state = PeerResponseStreamState {
+            wire: Box::pin(response.bytes_stream()),
+            buffered: Vec::new(),
+            sequence: 0,
+            secret: self.secret,
+            request_nonce,
+            status: status.as_u16(),
+        };
+        let decoded = futures_util::stream::try_unfold(state, |mut state| async move {
+            loop {
+                if state.buffered.len() >= 4 {
+                    let frame_len = u32::from_be_bytes(
+                        state.buffered[..4]
+                            .try_into()
+                            .expect("four-byte frame prefix"),
+                    ) as usize;
+                    if !(8 + 24 + 16..=transport::MAX_STREAM_FRAME).contains(&frame_len) {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            "invalid encrypted peer stream frame length",
+                        ));
+                    }
+                    if state.buffered.len() >= 4 + frame_len {
+                        let frame = state.buffered[4..4 + frame_len].to_vec();
+                        state.buffered.drain(..4 + frame_len);
+                        let plaintext = transport::open_stream_frame(
+                            &state.secret,
+                            &state.request_nonce,
+                            state.status,
+                            state.sequence,
+                            &frame,
+                        )
+                        .map_err(|error| {
+                            std::io::Error::new(std::io::ErrorKind::InvalidData, error.to_string())
+                        })?;
+                        state.sequence = state.sequence.checked_add(1).ok_or_else(|| {
+                            std::io::Error::new(
+                                std::io::ErrorKind::InvalidData,
+                                "encrypted peer stream sequence exhausted",
+                            )
+                        })?;
+                        if plaintext.is_empty() {
+                            if !state.buffered.is_empty() {
+                                return Err(std::io::Error::new(
+                                    std::io::ErrorKind::InvalidData,
+                                    "encrypted peer stream contains bytes after EOF",
+                                ));
+                            }
+                            let end =
+                                tokio::time::timeout(PEER_STREAM_IDLE_TIMEOUT, state.wire.next())
+                                    .await
+                                    .map_err(|_| {
+                                        std::io::Error::new(
+                                            std::io::ErrorKind::TimedOut,
+                                            "encrypted peer stream did not close after EOF",
+                                        )
+                                    })?;
+                            return match end {
+                                None => Ok(None),
+                                Some(Ok(_)) => Err(std::io::Error::new(
+                                    std::io::ErrorKind::InvalidData,
+                                    "encrypted peer stream contains a frame after EOF",
+                                )),
+                                Some(Err(error)) => Err(std::io::Error::other(error.to_string())),
+                            };
+                        }
+                        return Ok(Some((axum::body::Bytes::from(plaintext), state)));
+                    }
+                }
+                let next = tokio::time::timeout(PEER_STREAM_IDLE_TIMEOUT, state.wire.next())
+                    .await
+                    .map_err(|_| {
+                        std::io::Error::new(
+                            std::io::ErrorKind::TimedOut,
+                            "encrypted peer stream idle timeout",
+                        )
+                    })?;
+                match next {
+                    Some(Ok(chunk)) => {
+                        if state.buffered.len().saturating_add(chunk.len()) > MAX_PEER_STREAM_BUFFER
+                        {
+                            return Err(std::io::Error::new(
+                                std::io::ErrorKind::InvalidData,
+                                "encrypted peer stream buffer exceeded its bound",
+                            ));
+                        }
+                        state.buffered.extend_from_slice(&chunk);
+                    }
+                    Some(Err(error)) => {
+                        return Err(std::io::Error::other(error.to_string()));
+                    }
+                    None => {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::UnexpectedEof,
+                            "encrypted peer stream ended without authenticated EOF",
+                        ));
+                    }
+                }
+            }
+        });
+        Ok(Box::pin(decoded))
     }
 
     pub async fn post(&self, base: &str, path: &str, body: Vec<u8>) -> Result<Vec<u8>> {
@@ -747,6 +929,27 @@ impl PeerClient {
         let path = format!("/v1/r2/{}/object/{}", component(bucket), component(key));
         match self.get(base, &path).await {
             Ok(raw) => Ok(Some(crate::r2::decode_get_response(&raw)?)),
+            Err(error) if peer_http_status(&error) == Some(404) => Ok(None),
+            Err(error) => Err(error),
+        }
+    }
+
+    pub async fn r2_stream_object(
+        &self,
+        base: &str,
+        bucket: &str,
+        key: &str,
+        sha256: &str,
+        header_timeout: Duration,
+    ) -> Result<Option<crate::objectstore::ObjectByteStream>> {
+        let path = format!(
+            "/v1/r2/{}/stream/{}/{}",
+            component(bucket),
+            component(sha256),
+            component(key)
+        );
+        match self.get_stream(base, &path, header_timeout).await {
+            Ok(stream) => Ok(Some(stream)),
             Err(error) if peer_http_status(&error) == Some(404) => Ok(None),
             Err(error) => Err(error),
         }

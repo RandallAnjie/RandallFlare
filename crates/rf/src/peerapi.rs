@@ -15,6 +15,7 @@ use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, post};
 use axum::Router;
+use futures_util::StreamExt;
 use rf_core::envelope::Envelope;
 use serde::Deserialize;
 use std::collections::HashMap;
@@ -185,6 +186,7 @@ pub fn router(api: Api) -> Router {
         .route("/v1/r2-blob", post(r2_blob_put))
         .route("/v1/binary-blob", post(binary_blob_put))
         .route("/v1/r2/{bucket}/meta/{*key}", get(r2_head))
+        .route("/v1/r2/{bucket}/stream/{sha}/{*key}", get(r2_stream))
         .route(
             "/v1/r2/{bucket}/multipart/{upload_id}/part/{part}/{*key}",
             post(r2_multipart_part),
@@ -321,6 +323,68 @@ async fn encrypted_transport(
     }
     let status = response.status();
     let (mut parts, body) = response.into_parts();
+    if parts
+        .headers
+        .get(transport::STREAM_HEADER)
+        .and_then(|value| value.to_str().ok())
+        == Some(transport::STREAM_VERSION)
+    {
+        parts.headers.remove(axum::http::header::CONTENT_LENGTH);
+        parts.headers.insert(
+            transport::ENC_HEADER,
+            axum::http::HeaderValue::from_static(transport::VERSION),
+        );
+        let source = Box::pin(body.into_data_stream());
+        let secret = api.secret;
+        let status = status.as_u16();
+        let encrypted = futures_util::stream::try_unfold(
+            (source, 0u64, false),
+            move |(mut source, sequence, finished)| {
+                let request_nonce = nonce.clone();
+                async move {
+                    if finished {
+                        return Ok(None);
+                    }
+                    loop {
+                        match source.next().await {
+                            Some(Ok(chunk)) if chunk.is_empty() => continue,
+                            Some(Ok(chunk)) => {
+                                let frame = transport::seal_stream_frame(
+                                    &secret,
+                                    &request_nonce,
+                                    status,
+                                    sequence,
+                                    &chunk,
+                                )
+                                .map_err(|error| std::io::Error::other(error.to_string()))?;
+                                let next = sequence.checked_add(1).ok_or_else(|| {
+                                    std::io::Error::other(
+                                        "encrypted peer stream sequence exhausted",
+                                    )
+                                })?;
+                                return Ok(Some((Bytes::from(frame), (source, next, false))));
+                            }
+                            Some(Err(error)) => {
+                                return Err(std::io::Error::other(error.to_string()));
+                            }
+                            None => {
+                                let frame = transport::seal_stream_frame(
+                                    &secret,
+                                    &request_nonce,
+                                    status,
+                                    sequence,
+                                    b"",
+                                )
+                                .map_err(|error| std::io::Error::other(error.to_string()))?;
+                                return Ok(Some((Bytes::from(frame), (source, sequence, true))));
+                            }
+                        }
+                    }
+                }
+            },
+        );
+        return Response::from_parts(parts, Body::from_stream(encrypted));
+    }
     let plaintext = match to_bytes(body, MAX_PEER_PAYLOAD).await {
         Ok(v) => v,
         Err(_) => {
@@ -2840,6 +2904,67 @@ async fn r2_head(
         Ok(None) => (StatusCode::NOT_FOUND, "R2 对象不存在").into_response(),
         Err(error) => r2_error(error),
     }
+}
+
+/// Stream one exact object revision to another node. The outer transport
+/// converts this body into independently authenticated, sequence-bound frames;
+/// this handler never invokes peer repair, preventing borrow cycles.
+async fn r2_stream(
+    State(api): State<Api>,
+    ConnectInfo(remote): ConnectInfo<SocketAddr>,
+    Path((bucket, sha256, key)): Path<(String, String, String)>,
+    method: Method,
+    uri: Uri,
+    headers: HeaderMap,
+) -> Response {
+    if headers
+        .get(transport::ENC_HEADER)
+        .and_then(|value| value.to_str().ok())
+        != Some(transport::VERSION)
+    {
+        return (
+            StatusCode::UPGRADE_REQUIRED,
+            "encrypted R2 object stream required",
+        )
+            .into_response();
+    }
+    if let Err(response) = check(&api, &remote, &headers, &method, &uri, b"") {
+        return response.into_response();
+    }
+    let digest: [u8; 32] = match hex::decode(&sha256)
+        .ok()
+        .and_then(|bytes| bytes.try_into().ok())
+    {
+        Some(digest) => digest,
+        None => return (StatusCode::BAD_REQUEST, "R2 对象摘要无效").into_response(),
+    };
+    let metadata = match r2::head_object(&api.node, &bucket, &key).await {
+        Ok(Some(metadata)) if metadata.sha256 == sha256 => metadata,
+        Ok(Some(_)) => return (StatusCode::CONFLICT, "R2 对象版本已改变").into_response(),
+        Ok(None) => return (StatusCode::NOT_FOUND, "R2 对象不存在").into_response(),
+        Err(error) => return r2_error(error),
+    };
+    let file = match api
+        .node
+        .objects
+        .materialize_verified(&metadata.storage, &digest)
+        .await
+    {
+        Ok(file) if file.size() == metadata.size => file,
+        Ok(_) => return r2_error(anyhow::anyhow!("R2 对象大小与多数派元数据不一致")),
+        Err(error) => return r2_error(error),
+    };
+    let stream = match file.stream(0, metadata.size).await {
+        Ok(stream) => stream,
+        Err(error) => return r2_error(error),
+    };
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(transport::STREAM_HEADER, transport::STREAM_VERSION)
+        .body(Body::from_stream(stream))
+        .unwrap_or_else(|error| {
+            (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()).into_response()
+        })
 }
 
 async fn r2_get(
