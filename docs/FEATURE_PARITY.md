@@ -45,7 +45,7 @@ surface yet.
 | node tags, placement requirements, drain/suspend | partial | signed policies, system/custom/region tags, Worker constraints, encrypted exact-revision peer fallback, preview placement, DNS draining, capability-aware initial DO quorums and Chinese node UI are implemented and two-node tested; existing-DO owner migration and multi-VPS production soak remain |
 | topology, quotas, request metrics, DLQ | partial | placement topology, privacy-bounded request history, aggregation, status trends and DLQs are done; signed Worker/hostname/R2/outbound quotas and deterministic per-live-node request admission are implemented; partition/fault soak remains |
 | access tokens and scoped API credentials | partial | one-way signed tokens, exact read/write scopes, expiry/revocation, last-used telemetry, cookie-isolated `/api/v1` and Chinese UI are implemented; CLI management and production soak remain |
-| device/exit networking | planned | capability-tagged exits and encrypted tunnel enrolment |
+| device/exit networking | partial | one-way signed enrolment, capability-tagged exits, TLS SOCKS tunnels, local HTTP/SOCKS split routing, server-side policy replay and Chinese console are implemented; SOCKS5 UDP and OS TUN adapters remain |
 
 ### Workers (including Pages)
 
@@ -53,7 +53,7 @@ surface yet.
 | --- | --- | --- |
 | modules + static assets in one deploy unit | done | — |
 | browser upload and CLI deploy | done | signed per-file create/edit/rename/delete and binary replacement are done; ZIP/TAR import and export remain |
-| GitHub source, sandboxed build, webhook deploy | done | signed PR preview builds are done; GitHub App auth, PR checks/comments and SSH deploy keys remain |
+| GitHub source, sandboxed build, webhook deploy | partial | node-local GitHub App JWT/installation auth, global App and per-repository webhooks, Chinese PR Check/comment updates, PAT fallback and strict-known-host SSH deploy keys are implemented; live permission-matrix and failure-injection soak remain |
 | versions, hash-chain audit and rollback | done | historical-version preview aliases, renewal and signed deletion are done |
 | default/custom domains and wildcard TLS | done | custom-domain DNS ownership workflow |
 | environment, encrypted Secrets, KV bindings, Cron | done | write-only XChaCha20-Poly1305 Secrets, names-only API/console, KV metadata + bulk get, and real scheduled-event Cron with D1 history/retry/DLQ/replay are verified |

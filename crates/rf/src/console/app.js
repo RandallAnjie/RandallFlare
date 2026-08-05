@@ -410,13 +410,14 @@ function buildTriggerLabel(trigger) {
 function renderSources(data) {
   state.sources = data.sources || [];
   const capabilities = data.capabilities || {};
+  state.capabilities = capabilities;
   const cap = $("#build-capabilities");
   const gitReady = Boolean(capabilities.git);
   const sandboxReady = Boolean(capabilities.sandbox);
   cap.innerHTML = `
     <div><span class="dot ${gitReady ? "online" : "offline"}"></span><p><strong>${gitReady ? "构建节点已就绪" : "Git 不可用"}</strong><small>Git ${gitReady ? "可用" : "缺失"}</small></p></div>
     <div><span class="dot ${sandboxReady ? "online" : "pending"}"></span><p><strong>${sandboxReady ? "构建沙箱已启用" : "仅支持零配置构建"}</strong><small>bwrap ${sandboxReady ? "可用" : "未配置"}</small></p></div>
-    <div><span class="dot ${capabilities.github_token_configured ? "online" : "pending"}"></span><p><strong>${capabilities.github_token_configured ? "可访问私有仓库" : "仅公开仓库"}</strong><small>节点令牌${capabilities.github_token_configured ? "已配置" : "未配置"}</small></p></div>`;
+    <div><span class="dot ${capabilities.github_app_configured || capabilities.github_token_configured || capabilities.github_ssh_configured ? "online" : "pending"}"></span><p><strong>${capabilities.github_app_configured ? "GitHub App 已就绪" : capabilities.github_ssh_configured ? "SSH 部署密钥已就绪" : capabilities.github_token_configured ? "可访问私有仓库" : "仅公开仓库"}</strong><small>${capabilities.github_app_configured ? "短期安装令牌 · PR 检查与评论回写" : capabilities.github_ssh_configured ? "固定主机指纹 · 只读仓库密钥" : `节点令牌${capabilities.github_token_configured ? "已配置" : "未配置"}`}</small></p></div>`;
   if (state.overview?.workers) renderWorkers(state.overview.workers);
 }
 
@@ -805,7 +806,9 @@ function renderWorkerDetail(data) {
   $("#project-source-disconnect").classList.toggle("hidden", !source);
   $("#project-source-status").innerHTML = source ? `
     <div class="source-connection"><span class="dot online"></span><p><strong>已连接</strong><small>代码源 v${escapeHtml(source.version)} · ${source.webhook ? "自动构建已启用" : "仅手动构建"}${source.preview_pull_requests ? " · PR 预览已启用" : ""}</small></p></div>
-    ${source.webhook ? `<div class="webhook-grid"><span>回调地址</span><code>${escapeHtml(`${location.origin}${source.webhook_path}`)}</code><span>密钥</span><code>${escapeHtml(source.webhook_secret || "不可用")}</code><span>事件</span><code>${source.preview_pull_requests ? "推送与 Pull Request" : "仅推送"}</code></div>` : ""}` : '<div class="source-connection"><span class="dot pending"></span><p><strong>尚未连接</strong><small>填写右侧表单即可启用 GitHub 构建。</small></p></div>';
+    ${source.webhook ? (state.capabilities?.github_app_configured
+      ? `<div class="webhook-grid"><span>GitHub App 回调</span><code>${escapeHtml(`${location.origin}${state.capabilities.github_app_webhook_path}`)}</code><span>鉴权</span><code>节点环境中的 App Webhook 密钥</code><span>事件</span><code>${source.preview_pull_requests ? "推送、Pull Request 与 Checks" : "仅推送"}</code></div>`
+      : `<div class="webhook-grid"><span>仓库回调地址</span><code>${escapeHtml(`${location.origin}${source.webhook_path}`)}</code><span>密钥</span><code>${escapeHtml(source.webhook_secret || "不可用")}</code><span>事件</span><code>${source.preview_pull_requests ? "推送与 Pull Request" : "仅推送"}</code></div>`) : ""}` : '<div class="source-connection"><span class="dot pending"></span><p><strong>尚未连接</strong><small>填写右侧表单即可启用 GitHub 构建。</small></p></div>';
   $("#project-identifiers").innerHTML = `
     <div><dt>Worker 名称</dt><dd class="mono">${escapeHtml(worker.name)}</dd></div>
     <div><dt>当前版本</dt><dd class="mono">v${escapeHtml(worker.version)}</dd></div>

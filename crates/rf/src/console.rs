@@ -494,6 +494,7 @@ pub fn router(state: ConsoleState) -> Router {
         .route("/api/auth/challenge", post(auth_challenge))
         .route("/api/auth/challenge/{id}", get(auth_poll))
         .route("/api/webhooks/github/{name}", post(github_webhook))
+        .route("/api/webhooks/github-app", post(github_app_webhook))
         .route("/s3", any(s3_endpoint))
         .route("/s3/{*path}", any(s3_endpoint))
         .merge(token_api)
@@ -4469,6 +4470,10 @@ async fn source_list(State(state): State<ConsoleState>) -> ApiResult<Json<Value>
             "sandbox": crate::build::configured_binary(node.cfg.build.sandbox.as_deref(), "bwrap"),
             "github_token_configured": std::env::var_os(&node.cfg.build.github_token_env).is_some(),
             "github_token_env": node.cfg.build.github_token_env,
+            "github_app_configured": crate::github::app_configured(node),
+            "github_app_webhook_path": "/api/webhooks/github-app",
+            "github_ssh_configured": node.cfg.build.github_ssh_key.as_deref().is_some_and(|path| path.is_file())
+                && node.cfg.build.github_known_hosts.as_deref().is_some_and(|path| path.is_file()),
             "timeout_seconds": node.cfg.build.timeout_seconds,
         }
     })))
@@ -4770,12 +4775,110 @@ async fn github_webhook(
         .and_then(|value| value.to_str().ok())
         .filter(|value| !value.is_empty() && value.len() <= 128)
         .unwrap_or("unknown");
+    let installation_id = payload
+        .pointer("/installation/id")
+        .and_then(Value::as_u64)
+        .filter(|value| *value > 0);
+    let result = dispatch_github_payload(
+        node,
+        &name,
+        source,
+        event,
+        &payload,
+        delivery,
+        installation_id,
+    )?;
+    Ok(Json(result))
+}
+
+async fn github_app_webhook(
+    State(state): State<ConsoleState>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> ApiResult<Json<Value>> {
+    if body.len() > 2 * 1024 * 1024 {
+        return Err(ApiError::bad_request("GitHub App Webhook 请求过大"));
+    }
+    let node = state.public_node()?.clone();
+    let secret = crate::github::webhook_secret(&node)?;
+    let signature = headers
+        .get("x-hub-signature-256")
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default();
+    if !crate::github::verify_webhook(secret.as_bytes(), signature, &body) {
+        return Err(ApiError::unauthorized("GitHub App Webhook 签名无效"));
+    }
+    let event = headers
+        .get("x-github-event")
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default();
+    if event == "ping" {
+        return Ok(Json(json!({ "ok": true, "pong": true })));
+    }
+    let payload: Value = serde_json::from_slice(&body)
+        .map_err(|_| ApiError::bad_request("GitHub App Webhook 的 JSON 数据无效"))?;
+    let delivery = headers
+        .get("x-github-delivery")
+        .and_then(|value| value.to_str().ok())
+        .filter(|value| !value.is_empty() && value.len() <= 128)
+        .unwrap_or("unknown");
+    let repository = payload
+        .pointer("/repository/clone_url")
+        .and_then(Value::as_str)
+        .and_then(|value| crate::build::normalize_github_repository(value).ok())
+        .ok_or_else(|| ApiError::bad_request("GitHub App Webhook 缺少有效的仓库身份"))?;
+    let installation_id = payload
+        .pointer("/installation/id")
+        .and_then(Value::as_u64)
+        .filter(|value| *value > 0)
+        .ok_or_else(|| ApiError::bad_request("GitHub App Webhook 缺少安装 ID"))?;
+    let sources = crate::build::live_sources(&node)
+        .into_iter()
+        .filter(|record| {
+            record.source.webhook
+                && crate::github::repository_slug(&record.source.repository).ok()
+                    == crate::github::repository_slug(&repository).ok()
+        })
+        .collect::<Vec<_>>();
+    if sources.is_empty() {
+        return Err(ApiError::not_found(
+            "此仓库尚未连接任何启用 Webhook 的 Worker",
+        ));
+    }
+    let mut results = Vec::with_capacity(sources.len());
+    for source in sources {
+        let name = source.source.worker.clone();
+        let result = dispatch_github_payload(
+            node.clone(),
+            &name,
+            source,
+            event,
+            &payload,
+            delivery,
+            Some(installation_id),
+        )?;
+        results.push(json!({ "worker": name, "result": result }));
+    }
+    Ok(Json(json!({ "ok": true, "workers": results })))
+}
+
+fn dispatch_github_payload(
+    node: Arc<Node>,
+    name: &str,
+    source: crate::build::SourceRecord,
+    event: &str,
+    payload: &Value,
+    delivery: &str,
+    installation_id: Option<u64>,
+) -> ApiResult<Value> {
     let repository = payload
         .pointer("/repository/clone_url")
         .and_then(Value::as_str)
         .and_then(|value| crate::build::normalize_github_repository(value).ok())
         .ok_or_else(|| ApiError::bad_request("GitHub Webhook 缺少有效的仓库身份"))?;
-    if repository != source.source.repository {
+    if crate::github::repository_slug(&repository)?
+        != crate::github::repository_slug(&source.source.repository)?
+    {
         return Err(ApiError::bad_request("Webhook 仓库与 Worker 代码源不一致"));
     }
 
@@ -4786,36 +4889,32 @@ async fn github_webhook(
                 .and_then(Value::as_str)
                 .unwrap_or_default();
             if git_ref != format!("refs/heads/{}", source.source.branch) {
-                return Ok(Json(json!({ "ok": true, "ignored": "branch" })));
+                return Ok(json!({ "ok": true, "ignored": "branch" }));
             }
             if payload.get("deleted").and_then(Value::as_bool) == Some(true) {
-                return Ok(Json(json!({ "ok": true, "ignored": "deleted branch" })));
+                return Ok(json!({ "ok": true, "ignored": "deleted branch" }));
             }
             let commit =
-                webhook_commit(&payload, "/after", "GitHub 推送事件缺少有效的 after 提交值")?;
+                webhook_commit(payload, "/after", "GitHub 推送事件缺少有效的 after 提交值")?;
             (format!("github:{delivery}"), commit, None, None, 0)
         }
         "pull_request" => {
             if !source.source.preview_pull_requests {
-                return Ok(Json(
-                    json!({ "ok": true, "ignored": "pull request previews disabled" }),
-                ));
+                return Ok(json!({ "ok": true, "ignored": "pull request previews disabled" }));
             }
             let action = payload
                 .get("action")
                 .and_then(Value::as_str)
                 .unwrap_or_default();
             if !matches!(action, "opened" | "reopened" | "synchronize") {
-                return Ok(Json(
-                    json!({ "ok": true, "ignored": "pull request action" }),
-                ));
+                return Ok(json!({ "ok": true, "ignored": "pull request action" }));
             }
             if payload
                 .pointer("/pull_request/base/ref")
                 .and_then(Value::as_str)
                 != Some(source.source.branch.as_str())
             {
-                return Ok(Json(json!({ "ok": true, "ignored": "base branch" })));
+                return Ok(json!({ "ok": true, "ignored": "base branch" }));
             }
             let number = payload
                 .get("number")
@@ -4823,7 +4922,7 @@ async fn github_webhook(
                 .filter(|number| *number > 0 && *number <= 1_000_000_000)
                 .ok_or_else(|| ApiError::bad_request("Pull Request 编号无效"))?;
             let commit = webhook_commit(
-                &payload,
+                payload,
                 "/pull_request/head/sha",
                 "Pull Request 缺少有效的 head 提交值",
             )?;
@@ -4851,29 +4950,42 @@ async fn github_webhook(
             ))
         }
     };
-    if let Some(job) = crate::build::build_jobs(&node, Some(&name))
+    if let Some(job) = crate::build::build_jobs(&node, Some(name))
         .into_iter()
         .find(|job| job.trigger == trigger)
     {
-        return Ok(Json(json!({ "ok": true, "duplicate": true, "job": job })));
+        return Ok(json!({ "ok": true, "duplicate": true, "job": job }));
     }
-    let job = if let (Some(reference), Some(preview_source)) = (requested_ref, preview_source) {
-        crate::build::start_preview_build(
-            node,
-            &name,
-            trigger,
-            None,
-            crate::build::PreviewBuildRequest {
-                commit,
-                git_ref: reference,
-                source: preview_source,
-                ttl_days,
-            },
-        )?
+    let pull_request = preview_source.as_ref().and_then(|source| match source {
+        crate::preview::PreviewSource::PullRequest { number, .. } => Some(*number),
+        _ => None,
+    });
+    let preview = if let (Some(reference), Some(preview_source)) = (requested_ref, preview_source) {
+        Some(crate::build::PreviewBuildRequest {
+            commit: commit.clone(),
+            git_ref: reference,
+            source: preview_source,
+            ttl_days,
+        })
     } else {
-        crate::build::start_build(node, &name, trigger, None, Some(commit))?
+        None
     };
-    Ok(Json(json!({ "ok": true, "job": job })))
+    let job = crate::build::start_github_build(
+        node,
+        name,
+        trigger,
+        commit,
+        None,
+        preview,
+        crate::github::GithubContext {
+            repository,
+            installation_id,
+            pull_request,
+            check_run_id: None,
+            comment_id: None,
+        },
+    )?;
+    Ok(json!({ "ok": true, "job": job }))
 }
 
 fn webhook_commit(payload: &Value, pointer: &str, message: &'static str) -> ApiResult<String> {
@@ -8058,6 +8170,61 @@ mod tests {
         ] {
             assert!(!public_sql_is_read_only(sql), "expected rejected: {sql}");
         }
+    }
+
+    #[test]
+    fn github_dispatch_binds_repository_and_ignores_unconfigured_branches() {
+        let (_, node, _) = public_state(true);
+        let source = crate::build::SourceRecord {
+            source: crate::build::WorkerSource {
+                schema: 1,
+                worker: "demo".into(),
+                version: 1,
+                prev: None,
+                deleted: false,
+                repository: "https://github.com/example/demo.git".into(),
+                branch: "main".into(),
+                root: ".".into(),
+                build_command: String::new(),
+                output_dir: ".".into(),
+                use_github_token: false,
+                webhook: true,
+                preview_pull_requests: true,
+            },
+            digest: hex::encode([3; 32]),
+        };
+        let payload = json!({
+            "repository": { "clone_url": "https://github.com/example/demo.git" },
+            "ref": "refs/heads/not-main",
+            "after": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        });
+        let result = dispatch_github_payload(
+            node.clone(),
+            "demo",
+            source.clone(),
+            "push",
+            &payload,
+            "delivery",
+            Some(42),
+        )
+        .unwrap();
+        assert_eq!(result["ignored"], "branch");
+
+        let wrong = json!({
+            "repository": { "clone_url": "https://github.com/example/other.git" },
+            "ref": "refs/heads/main",
+            "after": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        });
+        assert!(dispatch_github_payload(
+            node,
+            "demo",
+            source,
+            "push",
+            &wrong,
+            "delivery",
+            Some(42),
+        )
+        .is_err());
     }
 
     #[tokio::test]

@@ -255,6 +255,11 @@ enabled = true
 git = "/usr/bin/git"
 sandbox = "/usr/bin/bwrap"          # mandatory for custom build commands
 github_token_env = "RF_GITHUB_TOKEN" # optional, private repositories only
+github_app_id_env = "RF_GITHUB_APP_ID"
+github_app_private_key_env = "RF_GITHUB_APP_PRIVATE_KEY_B64"
+github_app_webhook_secret_env = "RF_GITHUB_APP_WEBHOOK_SECRET"
+# github_ssh_key = "/etc/rf-github-deploy-key"       # mode 0600
+# github_known_hosts = "/etc/rf-github-known-hosts" # pinned github.com keys
 timeout_seconds = 1200
 
 [storage]                            # optional rclone-backed R2 buckets
@@ -360,12 +365,34 @@ directory as-is; it must contain `rf.json`. A custom command always executes in
 `bubblewrap` with only the checkout writable and no RandallFlare credentials in
 its environment.
 
-For a private repository, put a read-only contents token in the environment of
-the node that will build it:
+For a private repository, prefer a GitHub App with read-only Contents and
+read/write Checks plus Issues permissions. Put its App ID, base64-encoded PEM
+private key and webhook HMAC secret in the build node environment:
+
+```bash
+RF_GITHUB_APP_ID=123456
+RF_GITHUB_APP_PRIVATE_KEY_B64="$(base64 -w0 app.private-key.pem)"
+RF_GITHUB_APP_WEBHOOK_SECRET="$(openssl rand -hex 32)"
+```
+
+Set the App callback to
+`https://<management-domain>/api/webhooks/github-app` and subscribe to Push and
+Pull request events. Installation tokens are minted per build, held only in
+zeroizing memory, and are never persisted or replicated. PR previews update a
+Check Run and one stable Chinese status comment without publishing the
+RandallFlare approval code.
+
+As a compatibility fallback, a read-only personal token can still be placed in
+the environment of the build node:
 
 ```bash
 RF_GITHUB_TOKEN=github_pat_…
 ```
+
+For a repository-scoped SSH deploy key, use a `git@github.com:owner/repo.git`
+source and configure both `build.github_ssh_key` and
+`build.github_known_hosts`. RandallFlare requires the key file to be mode 0600,
+sets `IdentitiesOnly`, and always keeps strict host-key verification enabled.
 
 The console shows a per-Worker webhook URL and derived HMAC secret. Configure a
 GitHub repository webhook for the push event and, when Pull Request previews

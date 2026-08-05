@@ -8,6 +8,7 @@
 //! wide. GitHub is therefore a source host, never a control plane.
 
 use crate::deploy::{self, Bundle};
+use crate::github::GithubContext;
 use crate::management::{ApprovalState, CreatedApproval};
 use crate::node::{now_ms, Node};
 use anyhow::{bail, Context, Result};
@@ -112,7 +113,10 @@ impl WorkerSource {
         if self.deleted {
             return Ok(());
         }
-        normalize_github_repository(&self.repository)?;
+        let repository = normalize_github_repository(&self.repository)?;
+        if repository.starts_with("ssh://") && !self.use_github_token {
+            bail!("SSH 仓库必须启用节点私有仓库凭据");
+        }
         validate_branch(&self.branch)?;
         validate_relative(&self.root, true, "仓库根目录")?;
         validate_relative(&self.output_dir, true, "输出目录")?;
@@ -176,6 +180,10 @@ pub struct BuildJob {
     pub preview: Option<PreviewBuildTarget>,
     #[serde(default)]
     pub preview_url: Option<String>,
+    /// GitHub delivery context contains public identifiers only. App/private
+    /// tokens remain node-local and are never serialized here.
+    #[serde(default)]
+    pub github: Option<GithubContext>,
     #[serde(default)]
     pub approval: Option<CreatedApproval>,
     #[serde(default)]
@@ -427,10 +435,13 @@ pub fn start_build(
         node,
         worker,
         trigger.into(),
-        session_id,
-        requested_commit,
-        None,
-        None,
+        BuildTarget {
+            session_id,
+            requested_commit,
+            requested_ref: None,
+            preview: None,
+            github: None,
+        },
     )
 }
 
@@ -449,22 +460,77 @@ pub fn start_preview_build(
         node,
         worker,
         trigger.into(),
-        session_id,
-        Some(request.commit),
-        Some(request.git_ref),
-        Some(target),
+        BuildTarget {
+            session_id,
+            requested_commit: Some(request.commit),
+            requested_ref: Some(request.git_ref),
+            preview: Some(target),
+            github: None,
+        },
     )
+}
+
+/// Start a verified GitHub webhook build. The public delivery context lets the
+/// build node mint its own short-lived installation token and report PR state;
+/// it never contains a credential.
+pub fn start_github_build(
+    node: Arc<Node>,
+    worker: &str,
+    trigger: impl Into<String>,
+    requested_commit: String,
+    requested_ref: Option<String>,
+    preview: Option<PreviewBuildRequest>,
+    github: GithubContext,
+) -> Result<BuildJob> {
+    let (reference, target) = if let Some(request) = preview {
+        if request.commit != requested_commit {
+            bail!("GitHub 预览提交上下文不一致");
+        }
+        (
+            Some(request.git_ref),
+            Some(PreviewBuildTarget {
+                source: request.source,
+                ttl_days: request.ttl_days,
+            }),
+        )
+    } else {
+        (requested_ref, None)
+    };
+    start_build_target(
+        node,
+        worker,
+        trigger.into(),
+        BuildTarget {
+            session_id: None,
+            requested_commit: Some(requested_commit),
+            requested_ref: reference,
+            preview: target,
+            github: Some(github),
+        },
+    )
+}
+
+struct BuildTarget {
+    session_id: Option<[u8; 32]>,
+    requested_commit: Option<String>,
+    requested_ref: Option<String>,
+    preview: Option<PreviewBuildTarget>,
+    github: Option<GithubContext>,
 }
 
 fn start_build_target(
     node: Arc<Node>,
     worker: &str,
     trigger: String,
-    session_id: Option<[u8; 32]>,
-    requested_commit: Option<String>,
-    requested_ref: Option<String>,
-    preview: Option<PreviewBuildTarget>,
+    target: BuildTarget,
 ) -> Result<BuildJob> {
+    let BuildTarget {
+        session_id,
+        requested_commit,
+        requested_ref,
+        preview,
+        github,
+    } = target;
     if !node.cfg.build.enabled {
         bail!("此节点尚未启用 Git 构建");
     }
@@ -506,6 +572,7 @@ fn start_build_target(
         version: None,
         preview,
         preview_url: None,
+        github,
         approval: None,
         error: None,
         log: vec!["构建任务已进入此节点的队列".into()],
@@ -580,7 +647,48 @@ async fn run_build(
     std::fs::create_dir(&workspace)?;
     let checkout = workspace.join("repo");
 
-    set_state(&node, &job, BuildState::Cloning, "正在克隆 GitHub 仓库").await?;
+    // GitHub App installation tokens are valid for about one hour and live
+    // only in this task. They are reused for clone plus PR status updates and
+    // zeroized when the build exits. A legacy PAT remains the fallback when
+    // no App is configured.
+    let github_context = job.lock().await.github.clone();
+    let needs_github_api = github_context
+        .as_ref()
+        .is_some_and(|context| context.pull_request.is_some());
+    let ssh_repository = source.repository.starts_with("ssh://");
+    let app_token = if crate::github::app_configured(&node)
+        && ((!ssh_repository && source.use_github_token) || needs_github_api)
+    {
+        let hint = github_context
+            .as_ref()
+            .and_then(|context| context.installation_id);
+        Some(
+            crate::github::installation_token(&node, &source.repository, hint)
+                .await
+                .context("获取 GitHub App 安装令牌失败")?,
+        )
+    } else {
+        None
+    };
+    let pat_token = if source.use_github_token && !ssh_repository && app_token.is_none() {
+        Some(node_github_pat(&node)?)
+    } else {
+        None
+    };
+    let api_token = app_token.as_ref().map(|token| token.as_str());
+    let clone_token = app_token
+        .as_ref()
+        .map(|token| token.as_str())
+        .or_else(|| pat_token.as_ref().map(|token| token.as_str()));
+
+    set_state(
+        &node,
+        &job,
+        BuildState::Cloning,
+        "正在克隆 GitHub 仓库",
+        api_token,
+    )
+    .await?;
     let mut clone = Command::new(&git);
     clone
         .arg("clone")
@@ -592,7 +700,7 @@ async fn run_build(
         .arg(&source.repository)
         .arg(&checkout);
     sanitized_env(&mut clone, &workspace);
-    apply_git_auth(&mut clone, &node, &source)?;
+    apply_git_auth(&mut clone, &node, &source, clone_token)?;
     run_logged(
         &node,
         &job,
@@ -629,7 +737,7 @@ async fn run_build(
             .arg("origin")
             .arg(requested_ref.as_deref().unwrap_or(&requested));
         sanitized_env(&mut fetch, &workspace);
-        apply_git_auth(&mut fetch, &node, &source)?;
+        apply_git_auth(&mut fetch, &node, &source, clone_token)?;
         run_logged(
             &node,
             &job,
@@ -671,7 +779,14 @@ async fn run_build(
         bail!("仓库根目录不存在：{}", source.root);
     }
     if !source.build_command.trim().is_empty() {
-        set_state(&node, &job, BuildState::Building, "正在沙箱中执行构建命令").await?;
+        set_state(
+            &node,
+            &job,
+            BuildState::Building,
+            "正在沙箱中执行构建命令",
+            api_token,
+        )
+        .await?;
         let sandbox = configured_binary(node.cfg.build.sandbox.as_deref(), "bwrap")
             .context("自定义构建命令要求此节点安装 bubblewrap（bwrap）")?;
         let command = sandbox_command(&sandbox, &checkout, &source.root, &source.build_command)?;
@@ -689,6 +804,7 @@ async fn run_build(
             &job,
             BuildState::Building,
             "零配置构建：直接使用仓库文件",
+            api_token,
         )
         .await?;
     }
@@ -698,6 +814,7 @@ async fn run_build(
         &job,
         BuildState::Packaging,
         "正在验证 rf.json 并封装不可变内容块",
+        api_token,
     )
     .await?;
     let output_root = join_relative(&project_root, &source.output_dir)?;
@@ -770,6 +887,7 @@ async fn run_build(
             &format!("构建产物已就绪；管理员审批码为 {}", approval.code),
         );
         persist_job(&node, &current)?;
+        report_github(&node, &mut current, api_token).await;
     }
 
     loop {
@@ -781,7 +899,7 @@ async fn run_build(
                 } else {
                     "已提交签名部署清单；集群分发已经开始"
                 };
-                set_state(&node, &job, BuildState::Deployed, message).await?;
+                set_state(&node, &job, BuildState::Deployed, message, api_token).await?;
                 break;
             }
             poll if poll.state == ApprovalState::Failed => {
@@ -809,19 +927,19 @@ async fn git_revision(git: &Path, checkout: &Path, workspace: &Path) -> Result<S
     Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
 }
 
-fn apply_git_auth(command: &mut Command, node: &Node, source: &WorkerSource) -> Result<()> {
+fn apply_git_auth(
+    command: &mut Command,
+    node: &Node,
+    source: &WorkerSource,
+    token: Option<&str>,
+) -> Result<()> {
     if !source.use_github_token {
         return Ok(());
     }
-    let token = std::env::var(&node.cfg.build.github_token_env).with_context(|| {
-        format!(
-            "此源码配置需要 GitHub 令牌，但节点尚未设置环境变量 {}",
-            node.cfg.build.github_token_env
-        )
-    })?;
-    if token.is_empty() || token.as_bytes().contains(&b'\n') {
-        bail!("节点本地的 GitHub 令牌为空或格式有误");
+    if source.repository.starts_with("ssh://") {
+        return apply_git_ssh_auth(command, node);
     }
+    let token = token.ok_or_else(|| anyhow::anyhow!("此源码配置需要私有仓库凭据"))?;
     let basic = base64::engine::general_purpose::STANDARD.encode(format!("x-access-token:{token}"));
     command
         .env("GIT_CONFIG_COUNT", "1")
@@ -833,17 +951,73 @@ fn apply_git_auth(command: &mut Command, node: &Node, source: &WorkerSource) -> 
     Ok(())
 }
 
+fn apply_git_ssh_auth(command: &mut Command, node: &Node) -> Result<()> {
+    let key = node
+        .cfg
+        .build
+        .github_ssh_key
+        .as_deref()
+        .filter(|path| path.is_file())
+        .ok_or_else(|| anyhow::anyhow!("此 SSH 仓库要求节点配置 build.github_ssh_key"))?;
+    let known_hosts = node
+        .cfg
+        .build
+        .github_known_hosts
+        .as_deref()
+        .filter(|path| path.is_file())
+        .ok_or_else(|| anyhow::anyhow!("此 SSH 仓库要求节点配置 build.github_known_hosts"))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        if std::fs::metadata(key)?.permissions().mode() & 0o077 != 0 {
+            bail!("GitHub SSH deploy key 权限过宽，必须禁止组用户和其他用户访问");
+        }
+    }
+    command
+        .env(
+            "GIT_SSH_COMMAND",
+            format!(
+                "ssh -i {} -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile={}",
+                shell_quote(key),
+                shell_quote(known_hosts)
+            ),
+        )
+        .env("GIT_SSH_VARIANT", "ssh");
+    Ok(())
+}
+
+fn shell_quote(path: &Path) -> String {
+    let value = path.to_string_lossy();
+    format!("'{}'", value.replace('\'', "'\\''"))
+}
+
+fn node_github_pat(node: &Node) -> Result<zeroize::Zeroizing<String>> {
+    let token = std::env::var(&node.cfg.build.github_token_env).with_context(|| {
+        format!(
+            "此源码配置需要 GitHub 凭据，但节点既未配置 GitHub App，也未设置环境变量 {}",
+            node.cfg.build.github_token_env
+        )
+    })?;
+    if token.is_empty() || token.as_bytes().contains(&b'\n') {
+        bail!("节点本地的 GitHub 令牌为空或格式有误");
+    }
+    Ok(zeroize::Zeroizing::new(token))
+}
+
 async fn set_state(
     node: &Node,
     job: &Arc<Mutex<BuildJob>>,
     state: BuildState,
     message: &str,
+    github_token: Option<&str>,
 ) -> Result<()> {
     let mut current = job.lock().await;
     current.state = state;
     current.updated_at_ms = now_ms();
     append_log(&mut current, message);
-    persist_job(node, &current)
+    persist_job(node, &current)?;
+    report_github(node, &mut current, github_token).await;
+    Ok(())
 }
 
 async fn fail_job(node: &Node, job: &Arc<Mutex<BuildJob>>, error: String) {
@@ -854,6 +1028,37 @@ async fn fail_job(node: &Node, job: &Arc<Mutex<BuildJob>>, error: String) {
     append_log(&mut current, &format!("错误：{error}"));
     if let Err(persist_error) = persist_job(node, &current) {
         tracing::error!(job = %current.id, "无法保存失败构建的状态：{persist_error}");
+    }
+    let context = current.github.clone();
+    if crate::github::app_configured(node) && context.is_some() {
+        let hint = context.and_then(|value| value.installation_id);
+        match crate::github::installation_token(node, &current.repository, hint).await {
+            Ok(token) => report_github(node, &mut current, Some(&token)).await,
+            Err(report_error) => {
+                tracing::warn!(job = %current.id, "无法回写 GitHub 构建失败状态：{report_error}")
+            }
+        }
+    }
+}
+
+async fn report_github(node: &Node, job: &mut BuildJob, token: Option<&str>) {
+    if job
+        .github
+        .as_ref()
+        .and_then(|context| context.pull_request)
+        .is_none()
+    {
+        return;
+    }
+    let Some(token) = token else {
+        return;
+    };
+    let result = crate::github::sync_pull_request(node, token, job).await;
+    if let Err(error) = persist_job(node, job) {
+        tracing::warn!(job = %job.id, "无法保存 GitHub Pull Request 状态标识：{error}");
+    }
+    if let Err(error) = result {
+        tracing::warn!(job = %job.id, "无法回写 GitHub Pull Request 状态：{error}");
     }
 }
 
@@ -1114,10 +1319,16 @@ fn validate_branch(branch: &str) -> Result<()> {
 
 pub fn normalize_github_repository(repository: &str) -> Result<String> {
     let value = repository.trim().trim_end_matches('/');
-    let path = value
-        .strip_prefix("https://github.com/")
-        .ok_or_else(|| anyhow::anyhow!("仓库地址必须是 https://github.com URL"))?
-        .trim_end_matches(".git");
+    let (scheme, path) = if let Some(path) = value.strip_prefix("https://github.com/") {
+        ("https", path)
+    } else if let Some(path) = value.strip_prefix("git@github.com:") {
+        ("ssh", path)
+    } else if let Some(path) = value.strip_prefix("ssh://git@github.com/") {
+        ("ssh", path)
+    } else {
+        bail!("仓库地址必须是 GitHub HTTPS 或 SSH URL");
+    };
+    let path = path.trim_end_matches(".git");
     let mut parts = path.split('/');
     let owner = parts.next().unwrap_or_default();
     let repo = parts.next().unwrap_or_default();
@@ -1133,12 +1344,17 @@ pub fn normalize_github_repository(repository: &str) -> Result<String> {
     {
         bail!("仓库地址必须明确指定一个 GitHub 所有者与仓库名");
     }
-    Ok(format!("https://github.com/{owner}/{repo}.git"))
+    Ok(if scheme == "ssh" {
+        format!("ssh://git@github.com/{owner}/{repo}.git")
+    } else {
+        format!("https://github.com/{owner}/{repo}.git")
+    })
 }
 
 fn github_slug(repository: &str) -> &str {
     repository
         .strip_prefix("https://github.com/")
+        .or_else(|| repository.strip_prefix("ssh://git@github.com/"))
         .unwrap_or(repository)
         .trim_end_matches(".git")
 }
@@ -1251,9 +1467,44 @@ mod tests {
             normalize_github_repository("https://github.com/RandallAnjie/RandallFlare/").unwrap(),
             "https://github.com/RandallAnjie/RandallFlare.git"
         );
-        assert!(normalize_github_repository("git@github.com:a/b.git").is_err());
+        assert_eq!(
+            normalize_github_repository("git@github.com:a/b.git").unwrap(),
+            "ssh://git@github.com/a/b.git"
+        );
+        assert_eq!(
+            normalize_github_repository("ssh://git@github.com/a/b").unwrap(),
+            "ssh://git@github.com/a/b.git"
+        );
         assert!(normalize_github_repository("https://example.com/a/b").is_err());
         assert!(normalize_github_repository("https://github.com/a/b/extra").is_err());
+    }
+
+    #[test]
+    fn ssh_paths_are_shell_quoted_without_disabling_host_verification() {
+        assert_eq!(shell_quote(Path::new("/tmp/key file")), "'/tmp/key file'");
+        assert_eq!(
+            shell_quote(Path::new("/tmp/key'file")),
+            "'/tmp/key'\\''file'"
+        );
+        let (node, _, data_dir) = node();
+        let source = WorkerSource {
+            schema: SOURCE_SCHEMA,
+            worker: "demo".into(),
+            version: 1,
+            prev: None,
+            deleted: false,
+            repository: "ssh://git@github.com/example/demo.git".into(),
+            branch: "main".into(),
+            root: ".".into(),
+            build_command: String::new(),
+            output_dir: ".".into(),
+            use_github_token: false,
+            webhook: false,
+            preview_pull_requests: false,
+        };
+        assert!(source.validate().is_err());
+        drop(node);
+        std::fs::remove_dir_all(data_dir).unwrap();
     }
 
     #[test]

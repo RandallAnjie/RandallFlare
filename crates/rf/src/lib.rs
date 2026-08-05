@@ -23,6 +23,7 @@ pub mod emailbind;
 pub mod exit;
 pub mod exitproxy;
 pub mod flow;
+pub mod github;
 pub mod gossip;
 pub mod ingress;
 pub mod keys;

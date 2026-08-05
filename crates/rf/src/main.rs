@@ -3914,6 +3914,9 @@ fn doctor(config: PathBuf, json: bool) -> Result<()> {
         "git": git,
         "build_sandbox": sandbox,
         "github_token_configured": std::env::var_os(&cfg.build.github_token_env).is_some(),
+        "github_app_configured": rf::github::app_configured_build(&cfg.build),
+        "github_ssh_configured": cfg.build.github_ssh_key.as_deref().is_some_and(|path| path.is_file())
+            && cfg.build.github_known_hosts.as_deref().is_some_and(|path| path.is_file()),
         "object_storage": {
             "local_dir": cfg.storage.local_dir,
             "rclone": rclone_version,

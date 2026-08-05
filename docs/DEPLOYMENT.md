@@ -182,10 +182,13 @@ offline/emergency administration.
 The Workers page also provides GitHub repository connection, sandboxed builds,
 push and Pull Request webhooks, signed preview environments, live
 build/runtime/request logs, cluster-wide rollout status, and signed rollback.
-For a private repository, add a read-only `RF_GITHUB_TOKEN` to
-`/etc/rf.env`; it remains local to this node and is stripped from the build
-sandbox. Repository configuration and every produced Manifest still require a
-one-time operator signature.
+私有仓库优先使用 GitHub App：在 `/etc/rf.env` 中配置
+`RF_GITHUB_APP_ID`、base64 编码 PEM 私钥的
+`RF_GITHUB_APP_PRIVATE_KEY_B64` 与 `RF_GITHUB_APP_WEBHOOK_SECRET`，并把 App
+回调指向 `https://管理域名/api/webhooks/github-app`。节点只在内存中签发短期安装
+令牌，PR Check Run 与一条固定评论会随构建更新；审批码不会发送给 GitHub。兼容模式
+仍可只设置只读 `RF_GITHUB_TOKEN`。所有凭据均留在本节点并从构建沙箱中剥离，仓库
+配置和每个产出的 Manifest 仍须经过一次管理员签名。
 
 多 VPS 集群可在“节点与调度”中为成员签名区域与能力标签，并在 Worker 设置中填写
 所需标签。排空节点会先退出轮转 DNS；如果请求仍抵达该节点，入口会通过加密 Peer

@@ -2741,6 +2741,7 @@ dependencies = [
  "redb",
  "reqwest",
  "rf-core",
+ "ring",
  "rusqlite",
  "rustls",
  "rustls-pemfile",

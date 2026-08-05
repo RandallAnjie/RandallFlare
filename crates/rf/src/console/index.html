@@ -213,17 +213,17 @@
                 <p class="muted">连接仓库后，RandallFlare 会在沙箱中构建，并将经过签名的内容全量分发到所有节点。</p>
                 <form id="source-form" class="source-form">
                   <label><span>Worker 名称</span><input id="source-worker" pattern="[a-z0-9-]{1,63}" placeholder="api" required><small id="source-default-domain" class="input-note">填写名称后即可预览默认域名</small></label>
-                  <label class="wide"><span>仓库地址</span><input id="source-repository" type="url" placeholder="https://github.com/owner/repository" required></label>
+                  <label class="wide"><span>仓库地址</span><input id="source-repository" type="text" placeholder="https://github.com/owner/repository 或 git@github.com:owner/repository.git" required></label>
                   <label><span>生产分支</span><input id="source-branch" value="main" required></label>
                   <label><span>根目录</span><input id="source-root" value="." required></label>
                   <label class="wide"><span>构建命令 <em>可选 · 在 bubblewrap 沙箱中运行</em></span><input id="source-command" class="code-input" placeholder="npm ci && npm run build"></label>
                   <label><span>产物目录</span><input id="source-output" value="." required></label>
-                  <label class="check-label"><input id="source-private" type="checkbox"><span>使用当前节点的私有仓库令牌</span></label>
+                  <label class="check-label"><input id="source-private" type="checkbox"><span>使用当前节点的私有仓库凭据（优先 GitHub App）</span></label>
                   <label class="check-label"><input id="source-webhook" type="checkbox" checked><span>GitHub 推送时自动构建</span></label>
                   <label class="check-label"><input id="source-pr-previews" type="checkbox" checked><span>为 Pull Request 构建独立预览</span></label>
                   <button class="primary wide" type="submit">导入并连接仓库</button>
                 </form>
-                <p class="form-note">私有仓库令牌仅从当前节点的 <code>RF_GITHUB_TOKEN</code> 读取，不会写入清单，也不会在集群中复制。</p>
+                <p class="form-note">私库凭据仅从当前节点环境读取：优先使用 GitHub App 的短期安装令牌，未配置 App 时回退到 <code>RF_GITHUB_TOKEN</code>。任何凭据都不会写入清单或在集群中复制。</p>
               </article>
 
               <div id="import-divider" class="method-divider"><span>或者</span></div>
@@ -373,7 +373,7 @@
           </div>
 
           <div id="project-tab-source" class="project-tab">
-            <article id="project-source-panel" class="panel settings-panel"><div class="settings-copy"><p class="eyebrow">Git 集成</p><h2>代码源</h2><p class="muted">编辑仓库、分支与构建命令。源码配置也由管理员签名并在集群内复制。</p><div id="project-source-status" class="source-status"></div></div><form id="project-source-form" class="settings-form"><label><span>仓库地址</span><input id="project-source-repository" type="url" required></label><div class="form-grid"><label><span>分支</span><input id="project-source-branch" required></label><label><span>项目目录</span><input id="project-source-root" required></label></div><label><span>构建命令</span><input id="project-source-command" class="code-input"></label><label><span>产物目录</span><input id="project-source-output" required></label><label class="check-label"><input id="project-source-private" type="checkbox"><span>使用私有仓库令牌</span></label><label class="check-label"><input id="project-source-webhook" type="checkbox"><span>GitHub 推送时自动构建</span></label><label class="check-label"><input id="project-source-pr-previews" type="checkbox"><span>为 Pull Request 构建独立预览</span></label><div class="button-row"><button class="primary" type="submit">保存 Git 配置</button><button id="project-source-disconnect" class="danger ghost hidden" type="button">断开连接</button></div></form></article>
+              <article id="project-source-panel" class="panel settings-panel"><div class="settings-copy"><p class="eyebrow">Git 集成</p><h2>代码源</h2><p class="muted">编辑仓库、分支与构建命令。源码配置也由管理员签名并在集群内复制。</p><div id="project-source-status" class="source-status"></div></div><form id="project-source-form" class="settings-form"><label><span>仓库地址</span><input id="project-source-repository" type="text" placeholder="HTTPS 或 GitHub SSH 地址" required></label><div class="form-grid"><label><span>分支</span><input id="project-source-branch" required></label><label><span>项目目录</span><input id="project-source-root" required></label></div><label><span>构建命令</span><input id="project-source-command" class="code-input"></label><label><span>产物目录</span><input id="project-source-output" required></label><label class="check-label"><input id="project-source-private" type="checkbox"><span>使用私有仓库凭据（优先 GitHub App，也支持 SSH 部署密钥）</span></label><label class="check-label"><input id="project-source-webhook" type="checkbox"><span>GitHub 推送时自动构建</span></label><label class="check-label"><input id="project-source-pr-previews" type="checkbox"><span>为 Pull Request 构建独立预览并回写检查</span></label><div class="button-row"><button class="primary" type="submit">保存 Git 配置</button><button id="project-source-disconnect" class="danger ghost hidden" type="button">断开连接</button></div></form></article>
           </div>
 
           <div id="project-tab-settings" class="project-tab">

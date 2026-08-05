@@ -187,6 +187,24 @@ pub struct BuildConfig {
     /// GitHub token. Its value is never persisted or replicated.
     #[serde(default = "default_github_token_env")]
     pub github_token_env: String,
+    /// Node-local GitHub App ID. When the three App variables are present,
+    /// installation tokens take precedence over a long-lived PAT.
+    #[serde(default = "default_github_app_id_env")]
+    pub github_app_id_env: String,
+    /// Base64-encoded PKCS#1/PKCS#8 PEM private key. The encoded value lives
+    /// only in this node's environment and is zeroized after JWT signing.
+    #[serde(default = "default_github_app_private_key_env")]
+    pub github_app_private_key_env: String,
+    /// GitHub App webhook HMAC secret. It is accepted only by the global App
+    /// webhook endpoint and is never persisted or replicated.
+    #[serde(default = "default_github_app_webhook_secret_env")]
+    pub github_app_webhook_secret_env: String,
+    /// Optional node-local read-only SSH deploy key and pinned known_hosts.
+    /// Both paths are required together; key contents never enter resources.
+    #[serde(default)]
+    pub github_ssh_key: Option<PathBuf>,
+    #[serde(default)]
+    pub github_known_hosts: Option<PathBuf>,
     /// Hard wall-clock limit for clone + build.
     #[serde(default = "default_build_timeout")]
     pub timeout_seconds: u64,
@@ -199,6 +217,11 @@ impl Default for BuildConfig {
             git: None,
             sandbox: None,
             github_token_env: default_github_token_env(),
+            github_app_id_env: default_github_app_id_env(),
+            github_app_private_key_env: default_github_app_private_key_env(),
+            github_app_webhook_secret_env: default_github_app_webhook_secret_env(),
+            github_ssh_key: None,
+            github_known_hosts: None,
             timeout_seconds: default_build_timeout(),
         }
     }
@@ -210,6 +233,18 @@ fn default_true() -> bool {
 
 fn default_github_token_env() -> String {
     "RF_GITHUB_TOKEN".into()
+}
+
+fn default_github_app_id_env() -> String {
+    "RF_GITHUB_APP_ID".into()
+}
+
+fn default_github_app_private_key_env() -> String {
+    "RF_GITHUB_APP_PRIVATE_KEY_B64".into()
+}
+
+fn default_github_app_webhook_secret_env() -> String {
+    "RF_GITHUB_APP_WEBHOOK_SECRET".into()
 }
 
 fn default_build_timeout() -> u64 {
@@ -513,14 +548,28 @@ impl NodeConfig {
         if self.build.timeout_seconds == 0 || self.build.timeout_seconds > 6 * 60 * 60 {
             anyhow::bail!("build.timeout_seconds must be between 1 and 21600");
         }
-        if self.build.github_token_env.trim().is_empty()
-            || !self
-                .build
-                .github_token_env
-                .chars()
-                .all(|c| c.is_ascii_alphanumeric() || c == '_')
-        {
-            anyhow::bail!("build.github_token_env must be a valid environment variable name");
+        for (label, value) in [
+            ("build.github_token_env", &self.build.github_token_env),
+            ("build.github_app_id_env", &self.build.github_app_id_env),
+            (
+                "build.github_app_private_key_env",
+                &self.build.github_app_private_key_env,
+            ),
+            (
+                "build.github_app_webhook_secret_env",
+                &self.build.github_app_webhook_secret_env,
+            ),
+        ] {
+            if value.trim().is_empty()
+                || !value.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+            {
+                anyhow::bail!("{label} must be a valid environment variable name");
+            }
+        }
+        if self.build.github_ssh_key.is_some() != self.build.github_known_hosts.is_some() {
+            anyhow::bail!(
+                "build.github_ssh_key and build.github_known_hosts must be configured together"
+            );
         }
         if self.storage.rclone_binary.is_some() != self.storage.rclone_config.is_some() {
             anyhow::bail!(
