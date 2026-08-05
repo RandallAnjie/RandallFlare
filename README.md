@@ -434,6 +434,8 @@ my-worker/
 
 export RF_NODE=any-node:7382 RF_CLUSTER_SECRET=…
 rf deploy ./my-worker            # deploy to one node = deploy to all
+# The console also imports ZIP/TAR/TAR.GZ and exports reproducible archives.
+# Exported rf.json files retain bindings but intentionally omit write-only Secrets.
 rf status
 rf kv put ns1 greeting hello
 rf kv list ns1 --prefix greet

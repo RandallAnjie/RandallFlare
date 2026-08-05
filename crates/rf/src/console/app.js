@@ -3998,6 +3998,21 @@ function updateDeployFileStatus() {
   const firstPath = selected[0].webkitRelativePath || selected[0].name;
   const directory = firstPath.includes("/") ? firstPath.split("/")[0] : "所选目录";
   $("#deploy-file-status").textContent = `${directory} · ${selected.length} 个文件`;
+  if ($("#deploy-archive").files?.length) {
+    $("#deploy-archive").value = "";
+    $("#deploy-archive-status").textContent = "尚未选择压缩包";
+  }
+}
+
+function updateDeployArchiveStatus() {
+  const file = $("#deploy-archive").files?.[0];
+  $("#deploy-archive-status").textContent = file
+    ? `${file.name} · ${formatBytes(file.size)}`
+    : "尚未选择压缩包";
+  if (file && $("#deploy-files").files?.length) {
+    $("#deploy-files").value = "";
+    $("#deploy-file-status").textContent = "尚未选择目录";
+  }
 }
 
 async function browserBundleFiles() {
@@ -4018,6 +4033,50 @@ async function browserBundleFiles() {
     files.push({ path, data_base64: bytesToBase64(bytes) });
   }
   return files;
+}
+
+async function browserDeployPayload() {
+  const archive = $("#deploy-archive").files?.[0];
+  if (!archive) return { files: await browserBundleFiles() };
+  if (archive.size <= 0 || archive.size > 64 * 1024 * 1024) {
+    throw new Error("Worker 压缩包必须在 1 字节至 64 MiB 之间");
+  }
+  const lower = archive.name.toLowerCase();
+  if (!lower.endsWith(".zip") && !lower.endsWith(".tar") && !lower.endsWith(".tar.gz") && !lower.endsWith(".tgz")) {
+    throw new Error("只支持 ZIP、TAR、TAR.GZ 或 TGZ Worker 包");
+  }
+  const bytes = new Uint8Array(await archive.arrayBuffer());
+  return { archive: { filename: archive.name, data_base64: bytesToBase64(bytes) } };
+}
+
+async function downloadWorkerArchive(format) {
+  const worker = state.activeWorker;
+  if (!worker) return;
+  setBusy(true);
+  try {
+    const headers = new Headers();
+    if (consoleMode === "local") headers.set("x-rf-console-token", token);
+    const response = await fetch(`/api/workers/${encodeURIComponent(worker)}/export?format=${encodeURIComponent(format)}`, { headers });
+    if (!response.ok) {
+      const type = response.headers.get("content-type") || "";
+      const payload = type.includes("application/json") ? await response.json() : await response.text();
+      throw new Error(payload?.error || payload || `导出失败（HTTP ${response.status}）`);
+    }
+    const blob = await response.blob();
+    const extension = format === "tar.gz" ? "tar.gz" : format;
+    const link = document.createElement("a");
+    link.href = URL.createObjectURL(blob);
+    link.download = `${worker}.${extension}`;
+    document.body.appendChild(link);
+    link.click();
+    link.remove();
+    setTimeout(() => URL.revokeObjectURL(link.href), 0);
+    toast(`${worker} 的可复现 ${format.toUpperCase()} 包已导出；Secret 仍保持不可读取`);
+  } catch (error) {
+    toast(error.message, true);
+  } finally {
+    setBusy(false);
+  }
 }
 
 function showApproval(result, fallbackSummary, onComplete = null) {
@@ -4145,7 +4204,7 @@ async function deployWorker(event) {
   event.preventDefault();
   try {
     const payload = consoleMode === "public"
-      ? { files: await browserBundleFiles() }
+      ? await browserDeployPayload()
       : { path: $("#deploy-path").value.trim() };
     const result = await api("/api/workers/deploy", {
       method: "POST",
@@ -4390,6 +4449,10 @@ $("#refresh").addEventListener("click", async () => {
 $("#deploy-form").addEventListener("submit", deployWorker);
 $("#deploy-file-picker").addEventListener("click", () => $("#deploy-files").click());
 $("#deploy-files").addEventListener("change", updateDeployFileStatus);
+$("#deploy-archive-picker").addEventListener("click", () => $("#deploy-archive").click());
+$("#deploy-archive").addEventListener("change", updateDeployArchiveStatus);
+$("#project-export-zip").addEventListener("click", () => downloadWorkerArchive("zip"));
+$("#project-export-tar").addEventListener("click", () => downloadWorkerArchive("tar.gz"));
 $("#source-form").addEventListener("submit", connectSource);
 $("#source-webhook").addEventListener("change", () => {
   $("#source-pr-previews").disabled = !$("#source-webhook").checked;

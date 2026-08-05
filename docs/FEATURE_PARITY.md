@@ -52,7 +52,7 @@ surface yet.
 | Capability | State | Remaining acceptance work |
 | --- | --- | --- |
 | modules + static assets in one deploy unit | done | — |
-| browser upload and CLI deploy | done | signed per-file create/edit/rename/delete and binary replacement are done; ZIP/TAR import and export remain |
+| browser upload and CLI deploy | done | signed per-file create/edit/rename/delete and binary replacement, bounded ZIP/TAR/TAR.GZ import, and secret-redacted reproducible ZIP/TAR export are done |
 | GitHub source, sandboxed build, webhook deploy | partial | node-local GitHub App JWT/installation auth, global App and per-repository webhooks, Chinese PR Check/comment updates, PAT fallback and strict-known-host SSH deploy keys are implemented; live permission-matrix and failure-injection soak remain |
 | versions, hash-chain audit and rollback | done | historical-version preview aliases, renewal and signed deletion are done |
 | default/custom domains and wildcard TLS | done | custom-domain DNS ownership workflow |

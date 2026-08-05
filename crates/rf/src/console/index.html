@@ -230,13 +230,17 @@
 
               <article class="panel import-panel deploy-panel">
                 <div class="panel-head"><div><p class="eyebrow">手动部署</p><h2>上传 Worker 包</h2></div><span class="badge">rf.json</span></div>
-                <p class="muted">选择包含 <code>rf.json</code> 的完整产物目录。浏览器只会上传本次部署所需的文件；发布后会按清单中的 Worker 名称自动分配默认域名。</p>
+                <p class="muted">选择包含 <code>rf.json</code> 的完整产物目录，或上传 ZIP / TAR 压缩包。浏览器只会上传本次部署所需的文件；发布后会按清单中的 Worker 名称自动分配默认域名。</p>
                 <form id="deploy-form">
-                  <div id="deploy-local-fields"><label for="deploy-path">本地 Worker 包路径</label><input id="deploy-path" name="path" type="text" placeholder="/absolute/path/to/worker" autocomplete="off"></div>
+                  <div id="deploy-local-fields"><label for="deploy-path">本地 Worker 目录或压缩包路径</label><input id="deploy-path" name="path" type="text" placeholder="/absolute/path/to/worker-or-archive" autocomplete="off"></div>
                   <div id="deploy-public-fields" class="hidden">
                     <label>Worker 包目录</label>
                     <input id="deploy-files" name="files" type="file" webkitdirectory multiple hidden>
                     <div class="file-picker"><button id="deploy-file-picker" class="secondary" type="button">选择目录</button><span id="deploy-file-status">尚未选择目录</span></div>
+                    <div class="method-divider compact"><span>或者上传可复现压缩包</span></div>
+                    <label>ZIP / TAR 包</label>
+                    <input id="deploy-archive" name="archive" type="file" accept=".zip,.tar,.tar.gz,.tgz,application/zip,application/x-tar,application/gzip" hidden>
+                    <div class="file-picker"><button id="deploy-archive-picker" class="secondary" type="button">选择压缩包</button><span id="deploy-archive-status">尚未选择压缩包</span></div>
                   </div>
                   <button class="secondary" type="submit">上传并准备部署</button>
                 </form>
@@ -260,7 +264,7 @@
           <button id="project-back" class="back-button" type="button">← 返回所有项目</button>
           <div class="project-detail-head">
             <div class="project-identity"><span class="project-avatar">W</span><div><p class="eyebrow">Worker 项目</p><h2 id="project-title">—</h2><p id="project-subtitle" class="muted">正在加载项目…</p></div></div>
-            <div class="project-actions"><a id="project-open" class="secondary-link hidden" target="_blank" rel="noreferrer">访问项目 ↗</a><button id="project-redeploy" class="primary" type="button">重新部署</button></div>
+            <div class="project-actions"><a id="project-open" class="secondary-link hidden" target="_blank" rel="noreferrer">访问项目 ↗</a><button id="project-export-zip" class="secondary" type="button">导出 ZIP</button><button id="project-export-tar" class="secondary" type="button">导出 TAR.GZ</button><button id="project-redeploy" class="primary" type="button">重新部署</button></div>
           </div>
           <nav class="project-tabs" aria-label="项目详情">
             <button class="active" data-project-tab="overview" type="button">概览</button>

@@ -349,6 +349,7 @@ pub fn router(state: ConsoleState) -> Router {
             axum::routing::patch(s3_credential_update).delete(s3_credential_revoke),
         )
         .route("/api/workers/deploy", post(worker_deploy))
+        .route("/api/workers/{name}/export", get(worker_export))
         .route(
             "/api/workers/{name}",
             get(worker_get).patch(worker_update).delete(worker_delete),
@@ -2990,12 +2991,21 @@ struct DeployRequest {
     path: Option<PathBuf>,
     #[serde(default)]
     files: Vec<UploadedFile>,
+    #[serde(default)]
+    archive: Option<UploadedArchive>,
 }
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct UploadedFile {
     path: String,
+    data_base64: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct UploadedArchive {
+    filename: String,
     data_base64: String,
 }
 
@@ -3016,10 +3026,20 @@ async fn worker_deploy(
                     requested.display()
                 ))
             })?;
-            if !path.is_dir() {
-                return Err(ApiError::bad_request("Worker 路径不是目录"));
-            }
-            let bundle = deploy::read_bundle(&path)?;
+            let bundle = if path.is_dir() {
+                deploy::read_bundle(&path)?
+            } else if path.is_file() {
+                let bytes = std::fs::read(&path).map_err(|error| {
+                    ApiError::bad_request(format!("无法读取 Worker 压缩包：{error}"))
+                })?;
+                let filename = path
+                    .file_name()
+                    .and_then(|value| value.to_str())
+                    .ok_or_else(|| ApiError::bad_request("Worker 压缩包文件名无效"))?;
+                deploy::read_bundle_archive(&bytes, filename)?
+            } else {
+                return Err(ApiError::bad_request("Worker 路径不是目录或压缩包"));
+            };
             let name = bundle.spec.name.clone();
             let version = deploy::deploy(&bundle, &state.client, &state.node, &operator).await?;
             Ok(Json(
@@ -3027,25 +3047,38 @@ async fn worker_deploy(
             ))
         }
         ConsoleMode::Public { node, .. } => {
-            if request.files.is_empty() || request.files.len() > MAX_CONSOLE_FILES {
-                return Err(ApiError::bad_request(format!(
-                    "上传内容必须包含 1 至 {MAX_CONSOLE_FILES} 个文件"
-                )));
-            }
             use base64::Engine as _;
-            let mut total = 0usize;
-            let mut files = Vec::with_capacity(request.files.len());
-            for file in request.files {
-                let bytes = base64::engine::general_purpose::STANDARD
-                    .decode(&file.data_base64)
-                    .map_err(|_| ApiError::bad_request("上传文件不是有效的 Base64 数据"))?;
-                total = total.saturating_add(bytes.len());
-                if total > MAX_CONSOLE_UPLOAD {
-                    return Err(ApiError::bad_request("Worker 上传内容超过 64 MiB"));
-                }
-                files.push((file.path, bytes));
+            if request.archive.is_some() && !request.files.is_empty() {
+                return Err(ApiError::bad_request("目录与压缩包不能同时上传"));
             }
-            let bundle = deploy::read_bundle_files(files)?;
+            let bundle = if let Some(archive) = request.archive {
+                if archive.filename.is_empty() || archive.filename.len() > 255 {
+                    return Err(ApiError::bad_request("Worker 压缩包文件名无效"));
+                }
+                let bytes = base64::engine::general_purpose::STANDARD
+                    .decode(&archive.data_base64)
+                    .map_err(|_| ApiError::bad_request("Worker 压缩包不是有效的 Base64 数据"))?;
+                deploy::read_bundle_archive(&bytes, &archive.filename)?
+            } else {
+                if request.files.is_empty() || request.files.len() > MAX_CONSOLE_FILES {
+                    return Err(ApiError::bad_request(format!(
+                        "上传内容必须包含 1 至 {MAX_CONSOLE_FILES} 个文件"
+                    )));
+                }
+                let mut total = 0usize;
+                let mut files = Vec::with_capacity(request.files.len());
+                for file in request.files {
+                    let bytes = base64::engine::general_purpose::STANDARD
+                        .decode(&file.data_base64)
+                        .map_err(|_| ApiError::bad_request("上传文件不是有效的 Base64 数据"))?;
+                    total = total.saturating_add(bytes.len());
+                    if total > MAX_CONSOLE_UPLOAD {
+                        return Err(ApiError::bad_request("Worker 上传内容超过 64 MiB"));
+                    }
+                    files.push((file.path, bytes));
+                }
+                deploy::read_bundle_files(files)?
+            };
             let manifest = deploy::prepare_manifest(&bundle, &state.client, &state.node).await?;
             let approval = node.management.create_manifest(
                 principal.session_id,
@@ -3068,6 +3101,71 @@ async fn worker_deploy(
             })))
         }
     }
+}
+
+#[derive(Deserialize)]
+struct WorkerExportQuery {
+    #[serde(default = "default_worker_export_format")]
+    format: String,
+}
+
+fn default_worker_export_format() -> String {
+    "zip".into()
+}
+
+async fn worker_export(
+    State(state): State<ConsoleState>,
+    Path(name): Path<String>,
+    Query(query): Query<WorkerExportQuery>,
+) -> ApiResult<Response> {
+    let (manifest, _) = current_manifest(&state, &name).await?;
+    let format = match query.format.as_str() {
+        "zip" => deploy::ExportFormat::Zip,
+        "tar" => deploy::ExportFormat::Tar,
+        "tar.gz" | "tgz" => deploy::ExportFormat::TarGz,
+        _ => return Err(ApiError::bad_request("导出格式只允许 zip、tar 或 tar.gz")),
+    };
+    let mut blobs = BTreeMap::new();
+    for (sha256, size) in manifest
+        .modules
+        .iter()
+        .map(|module| (module.sha256, module.size))
+        .chain(
+            manifest
+                .assets
+                .iter()
+                .map(|asset| (asset.sha256, asset.size)),
+        )
+    {
+        if blobs.contains_key(&sha256) {
+            continue;
+        }
+        let bytes = state.client.fetch_blob(&state.node, &sha256).await?;
+        if bytes.len() as u64 != size || crate::blob::sha256_hex(&bytes) != hex::encode(sha256) {
+            return Err(ApiError::upstream("导出内容块的大小或 SHA-256 不匹配"));
+        }
+        blobs.insert(sha256, bytes);
+    }
+    let files = deploy::export_bundle_files(&manifest, blobs)?;
+    let bytes = deploy::write_bundle_archive(&files, format)?;
+    let (extension, content_type) = match format {
+        deploy::ExportFormat::Zip => ("zip", "application/zip"),
+        deploy::ExportFormat::Tar => ("tar", "application/x-tar"),
+        deploy::ExportFormat::TarGz => ("tar.gz", "application/gzip"),
+    };
+    let mut response = bytes.into_response();
+    response
+        .headers_mut()
+        .insert(header::CONTENT_TYPE, HeaderValue::from_static(content_type));
+    response.headers_mut().insert(
+        header::CONTENT_DISPOSITION,
+        HeaderValue::from_str(&format!("attachment; filename=\"{name}.{extension}\""))
+            .map_err(|_| ApiError::upstream("导出文件名无效"))?,
+    );
+    response
+        .headers_mut()
+        .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    Ok(response)
 }
 
 #[derive(Debug, Deserialize)]

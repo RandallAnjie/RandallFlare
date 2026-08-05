@@ -49,6 +49,8 @@ instant-acme = "0.8.5"
 rusqlite = { version = "0.40.1", features = ["bundled"] }
 zstd = "0.13"
 flate2 = "1"
+tar = "0.4"
+zip = { version = "4", default-features = false, features = ["deflate"] }
 jsonschema = { version = "0.33", default-features = false }
 time = { version = "0.3.54", features = ["formatting"] }
 mailin-embedded = { version = "0.8.3", default-features = false, features = ["rtls"] }
