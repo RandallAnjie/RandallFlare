@@ -211,7 +211,12 @@ losing acknowledged state (real three-node workerd e2e).
 Native alarms retain `retryCount`/`isRetry` across process recovery. Ordinary
 and hibernatable DO WebSockets preserve the real HTTP upgrade; cross-node
 connections use an authenticated, sequence-bound XChaCha20-Poly1305 tunnel and
-reconnect to restored state after owner loss. See
+reconnect to restored state after owner loss. The pinned `workerd 2026-08-04`
+test matrix covers namespace/ID/stub RPC, asynchronous and synchronous KV,
+SQLite cursors and transactions, state/concurrency methods, alarm controls and
+the Hibernation metadata/automatic-response surface. Cloudflare-only
+jurisdiction enforcement and 30-day PITR are recorded as explicit differences,
+not simulated guarantees. See
 [the Durable Objects guide](./docs/DURABLE_OBJECTS.md).
 
 ## Build

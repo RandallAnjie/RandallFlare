@@ -2317,16 +2317,94 @@ async fn durable_object_on_real_workerd() {
     std::fs::create_dir_all(&bundle_dir).unwrap();
     std::fs::write(
         bundle_dir.join("rf.json"),
-        r#"{"name":"counter","main":"index.js","hostnames":["counter.test"],
+        r#"{"name":"counter","main":"index.js","hostnames":["counter.test"],"compatibility_date":"2026-07-31",
             "durable_objects":{"COUNTER":{"class_name":"Counter","enable_sql":true}}}"#,
     )
     .unwrap();
     std::fs::write(
         bundle_dir.join("index.js"),
-        r#"export class Counter {
-  constructor(ctx) { this.ctx = ctx; }
+        r#"import { DurableObject } from "cloudflare:workers";
+
+export class Counter extends DurableObject {
+  constructor(ctx, env) { super(ctx, env); this.ctx = ctx; }
+  echo(value) { return { value, id: this.ctx.id.toString(), name: this.ctx.id.name }; }
   async fetch(req) {
     const path = new URL(req.url).pathname;
+    if (path === "/surface") {
+      const storage = this.ctx.storage;
+      await this.ctx.blockConcurrencyWhile(async () => {
+        await storage.put({
+          "api:a": { nested: [1, 2, 3] },
+          "api:b": new Uint8Array([4, 5, 6])
+        });
+      });
+      const batch = await storage.get(["api:b", "missing", "api:a"], { noCache: true });
+      const listed = await storage.list({ prefix: "api:", reverse: true, limit: 2 });
+      await storage.transaction(async txn => {
+        await txn.put("api:transaction", { committed: true });
+      });
+      await storage.transaction(async txn => {
+        await txn.put("api:rollback", true);
+        txn.rollback();
+      });
+      await storage.put("api:unconfirmed", "flushed", { allowUnconfirmed: true });
+      await storage.sync();
+
+      const syncKv = storage.kv;
+      syncKv.put("api:sync", { kind: "sync-kv" });
+      const syncValue = syncKv.get("api:sync");
+      const syncList = Array.from(syncKv.list({ prefix: "api:s", limit: 5 }));
+      const syncDeleted = syncKv.delete("api:sync");
+
+      const sql = storage.sql;
+      sql.exec("CREATE TABLE IF NOT EXISTS api_surface (id INTEGER PRIMARY KEY, value TEXT NOT NULL)");
+      const transactionValue = storage.transactionSync(() => {
+        sql.exec("INSERT INTO api_surface(id,value) VALUES(1,?) ON CONFLICT(id) DO UPDATE SET value=excluded.value", "native");
+        return "committed";
+      });
+      const cursor = sql.exec("SELECT id,value FROM api_surface ORDER BY id");
+      const columns = Array.from(cursor.columnNames);
+      const rows = cursor.toArray();
+      const rowsRead = cursor.rowsRead;
+      const one = sql.exec("SELECT value FROM api_surface WHERE id=?", 1).one();
+      const raw = sql.exec("SELECT id,value FROM api_surface ORDER BY id").raw().toArray();
+      const writeCursor = sql.exec("UPDATE api_surface SET value=value WHERE id=1");
+      writeCursor.toArray();
+
+      const alarmAt = Date.now() + 60_000;
+      await storage.setAlarm(alarmAt);
+      const alarmScheduled = await storage.getAlarm();
+      await storage.deleteAlarm();
+      const alarmDeleted = (await storage.getAlarm()) === null;
+      let pitr;
+      try { pitr = await storage.getCurrentBookmark(); }
+      catch (error) { pitr = String(error); }
+
+      const deleted = await storage.delete(["api:a", "api:b"]);
+      return Response.json({
+        state: {
+          id: this.ctx.id.toString(), name: this.ctx.id.name,
+          exports: typeof this.ctx.exports, waitUntil: typeof this.ctx.waitUntil,
+          abort: typeof this.ctx.abort
+        },
+        asyncKv: {
+          batchSize: batch.size,
+          typedArray: batch.get("api:b") instanceof Uint8Array,
+          listKeys: Array.from(listed.keys()),
+          transaction: await storage.get("api:transaction"),
+          rolledBack: (await storage.get("api:rollback")) === undefined,
+          unconfirmed: await storage.get("api:unconfirmed"), deleted
+        },
+        syncKv: { value: syncValue, keys: syncList.map(([key]) => key), deleted: syncDeleted },
+        sql: {
+          transactionValue, columns, rows, one, raw,
+          rowsRead, rowsWritten: writeCursor.rowsWritten,
+          databaseSize: sql.databaseSize
+        },
+        alarms: { alarmAt, alarmScheduled, alarmDeleted },
+        pitr
+      });
+    }
     if (path === "/schedule") {
       await this.ctx.storage.setAlarm(Date.now() + 1500);
       return new Response("scheduled");
@@ -2334,6 +2412,15 @@ async fn durable_object_on_real_workerd() {
     if (path === "/alarm") {
       const done = await this.ctx.storage.get("alarmDone");
       return new Response(done ? JSON.stringify(done) : "pending", { status: done ? 200 : 202 });
+    }
+    if (path === "/delete-all") {
+      await this.ctx.storage.put("temporary", true);
+      await this.ctx.storage.setAlarm(Date.now() + 60_000);
+      await this.ctx.storage.deleteAll();
+      return Response.json({
+        valueDeleted: (await this.ctx.storage.get("temporary")) === undefined,
+        alarmDeleted: (await this.ctx.storage.getAlarm()) === null
+      });
     }
     const old = (await this.ctx.storage.get("count")) || 0;
     const value = old + 1;
@@ -2350,9 +2437,29 @@ async fn durable_object_on_real_workerd() {
 }
 
 export default {
-  fetch(req, env) {
+  async fetch(req, env) {
+    const path = new URL(req.url).pathname;
     const id = env.COUNTER.idFromName("global");
-    return env.COUNTER.get(id).fetch(req);
+    if (path === "/namespace") {
+      const restored = env.COUNTER.idFromString(id.toString());
+      const unique = env.COUNTER.newUniqueId();
+      let jurisdictionRestriction = "supported";
+      try { env.COUNTER.newUniqueId({ jurisdiction: "eu" }); }
+      catch (error) { jurisdictionRestriction = String(error).includes("not implemented") ? "not-implemented" : "error"; }
+      const byName = env.COUNTER.getByName("global", { locationHint: "weur" });
+      return Response.json({
+        equals: id.equals(restored),
+        name: id.name,
+        idLength: id.toString().length,
+        uniqueLength: unique.toString().length,
+        jurisdictionRestriction,
+        stubMatches: byName.id.equals(id),
+        stubName: byName.name
+      });
+    }
+    const stub = env.COUNTER.get(id, { locationHint: "weur" });
+    if (path === "/rpc") return Response.json(await stub.echo({ rpc: true }));
+    return stub.fetch(req);
   }
 };"#,
     )
@@ -2381,6 +2488,79 @@ export default {
         tokio::time::sleep(Duration::from_millis(300)).await;
     }
     assert_eq!(call("/").await.unwrap().text().await.unwrap(), "2");
+    let namespace_response = call("/namespace").await.unwrap();
+    let namespace_status = namespace_response.status();
+    let namespace_body = namespace_response.text().await.unwrap();
+    if namespace_status != 200 {
+        let logs = client
+            .worker_runtime_logs(&api_addr, "counter", 100)
+            .await
+            .unwrap();
+        panic!(
+            "Durable Object namespace surface failed ({namespace_status}): {namespace_body}\n{logs:#?}"
+        );
+    }
+    let namespace: serde_json::Value = serde_json::from_str(&namespace_body)
+        .unwrap_or_else(|error| panic!("invalid namespace JSON ({error}): {namespace_body}"));
+    assert_eq!(namespace["equals"], true);
+    assert_eq!(namespace["name"], "global");
+    assert_eq!(namespace["idLength"], 64);
+    assert_eq!(namespace["uniqueLength"], 64);
+    assert_eq!(namespace["jurisdictionRestriction"], "not-implemented");
+    assert_eq!(namespace["stubMatches"], true);
+    assert_eq!(namespace["stubName"], "global");
+    let rpc = call("/rpc")
+        .await
+        .unwrap()
+        .json::<serde_json::Value>()
+        .await
+        .unwrap();
+    assert_eq!(rpc["value"]["rpc"], true);
+    assert_eq!(rpc["name"], "global");
+    let surface = call("/surface")
+        .await
+        .unwrap()
+        .json::<serde_json::Value>()
+        .await
+        .unwrap();
+    assert_eq!(surface["state"]["name"], "global");
+    assert_eq!(surface["state"]["exports"], "object");
+    assert_eq!(surface["state"]["waitUntil"], "function");
+    assert_eq!(surface["state"]["abort"], "function");
+    assert_eq!(surface["asyncKv"]["batchSize"], 2);
+    assert_eq!(surface["asyncKv"]["typedArray"], true);
+    assert_eq!(
+        surface["asyncKv"]["listKeys"],
+        serde_json::json!(["api:b", "api:a"])
+    );
+    assert_eq!(surface["asyncKv"]["transaction"]["committed"], true);
+    assert_eq!(surface["asyncKv"]["rolledBack"], true);
+    assert_eq!(surface["asyncKv"]["unconfirmed"], "flushed");
+    assert_eq!(surface["asyncKv"]["deleted"], 2);
+    assert_eq!(surface["syncKv"]["value"]["kind"], "sync-kv");
+    assert_eq!(surface["syncKv"]["keys"], serde_json::json!(["api:sync"]));
+    assert_eq!(surface["syncKv"]["deleted"], true);
+    assert_eq!(surface["sql"]["transactionValue"], "committed");
+    assert_eq!(
+        surface["sql"]["columns"],
+        serde_json::json!(["id", "value"])
+    );
+    assert_eq!(surface["sql"]["rows"][0]["value"], "native");
+    assert_eq!(surface["sql"]["one"]["value"], "native");
+    assert_eq!(surface["sql"]["raw"], serde_json::json!([[1, "native"]]));
+    assert_eq!(surface["sql"]["rowsRead"], 1);
+    assert!(surface["sql"]["rowsWritten"].as_u64().is_some());
+    assert!(surface["sql"]["databaseSize"].as_u64().unwrap_or(0) > 0);
+    assert_eq!(
+        surface["alarms"]["alarmAt"],
+        surface["alarms"]["alarmScheduled"]
+    );
+    assert_eq!(surface["alarms"]["alarmDeleted"], true);
+    let pitr = surface["pitr"].as_str().unwrap_or_default();
+    assert_eq!(
+        pitr,
+        "00000000-00000000-00000000-00000000000000000000000000000000"
+    );
     assert_eq!(
         call("/schedule").await.unwrap().text().await.unwrap(),
         "scheduled"
@@ -2408,6 +2588,14 @@ export default {
     assert_eq!(alarm_info["retryCount"], 2);
     assert_eq!(alarm_info["isRetry"], true);
     assert_eq!(call("/").await.unwrap().text().await.unwrap(), "3");
+    let delete_all = call("/delete-all")
+        .await
+        .unwrap()
+        .json::<serde_json::Value>()
+        .await
+        .unwrap();
+    assert_eq!(delete_all["valueDeleted"], true);
+    assert_eq!(delete_all["alarmDeleted"], true);
     child.kill().unwrap();
     child.wait().unwrap();
 }
@@ -2447,13 +2635,16 @@ async fn durable_object_routes_and_survives_owner_loss() {
     std::fs::write(
         bundle_dir.join("rf.json"),
         r#"{"name":"global-counter","main":"index.js","hostnames":["global-counter.test"],
+            "compatibility_date":"2026-07-31",
             "durable_objects":{"COUNTER":{"class_name":"Counter"}}}"#,
     )
     .unwrap();
     std::fs::write(
         bundle_dir.join("index.js"),
-        r#"export class Counter {
-	  constructor(ctx) { this.ctx = ctx; }
+        r#"import { DurableObject } from "cloudflare:workers";
+
+export class Counter extends DurableObject {
+	  constructor(ctx, env) { super(ctx, env); this.ctx = ctx; }
 	  async fetch(req) {
 	    const path = new URL(req.url).pathname;
 	    if (path === "/ws") {
@@ -2461,6 +2652,8 @@ async fn durable_object_routes_and_survives_owner_loss() {
 	      const [client, server] = Object.values(pair);
 	      this.ctx.acceptWebSocket(server, ["counter"]);
 	      server.serializeAttachment({ kind: "counter" });
+	      this.ctx.setWebSocketAutoResponse(new WebSocketRequestResponsePair("ping", "pong"));
+	      this.ctx.setHibernatableWebSocketEventTimeout(60_000);
 	      return new Response(null, { status: 101, webSocket: client });
 	    }
 	    let value = (await this.ctx.storage.get("count")) || 0;
@@ -2478,6 +2671,20 @@ async fn durable_object_routes_and_survives_owner_loss() {
 	    return new Response(String(value));
   }
 	  async webSocketMessage(ws, message) {
+	    if (String(message) === "meta") {
+	      const pair = this.ctx.getWebSocketAutoResponse();
+	      const timestamp = this.ctx.getWebSocketAutoResponseTimestamp(ws);
+	      ws.send(JSON.stringify({
+	        tags: this.ctx.getTags(ws),
+	        attachment: ws.deserializeAttachment(),
+	        sockets: this.ctx.getWebSockets("counter").length,
+	        autoResponseConfigured: pair !== null,
+	        autoResponseInspection: typeof pair?.getRequest,
+	        autoResponseAt: timestamp?.getTime() || null,
+	        eventTimeout: this.ctx.getHibernatableWebSocketEventTimeout()
+	      }));
+	      return;
+	    }
 	    if (String(message) !== "inc") {
 	      ws.send("unsupported");
 	      return;
@@ -2546,6 +2753,26 @@ export default {
         "global-counter.test",
         "/ws",
     );
+    websocket.send_text("meta");
+    let websocket_meta_body = websocket.read_text();
+    let websocket_meta: serde_json::Value = serde_json::from_str(&websocket_meta_body)
+        .unwrap_or_else(|error| {
+            panic!("invalid DO WebSocket metadata ({error}): {websocket_meta_body}")
+        });
+    assert_eq!(websocket_meta["tags"], serde_json::json!(["counter"]));
+    assert_eq!(websocket_meta["attachment"]["kind"], "counter");
+    assert_eq!(websocket_meta["sockets"], 1);
+    assert_eq!(websocket_meta["autoResponseConfigured"], true);
+    // The 2026-08-04 standalone workerd returns the pair but does not expose
+    // the documented getRequest()/getResponse() inspection helpers yet.
+    assert_eq!(websocket_meta["autoResponseInspection"], "undefined");
+    assert_eq!(websocket_meta["autoResponseAt"], serde_json::Value::Null);
+    assert_eq!(websocket_meta["eventTimeout"], 60_000);
+    websocket.send_text("ping");
+    assert_eq!(websocket.read_text(), "pong");
+    websocket.send_text("meta");
+    let websocket_meta: serde_json::Value = serde_json::from_str(&websocket.read_text()).unwrap();
+    assert!(websocket_meta["autoResponseAt"].as_u64().unwrap_or(0) > 0);
     websocket.send_text("inc");
     assert_eq!(websocket.read_text(), "4");
     websocket.close();

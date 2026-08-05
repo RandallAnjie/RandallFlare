@@ -27,7 +27,34 @@ WebSocket Hibernation API；RandallFlare 负责它们在多节点环境中的唯
 身份，不能在已有数据上随意更换。`enable_sql` 打开原生 SQLite 存储；普通 Storage
 API 同样可用。
 
-## 2. 一致性与所有权
+## 2. 原生 API 兼容范围
+
+发布流程固定并校验 `workerd 2026-08-04`。真实运行时端到端测试不只验证“计数器能
+运行”，还逐项执行下列接口：
+
+| 接口面 | 已验证能力 |
+| --- | --- |
+| Namespace、ID 与 Stub | `idFromName()`、`idFromString()`、`newUniqueId()`、`get()`、`getByName()`、`toString()`、`equals()`、`id`、`name`、location hint、HTTP fetch 与原生 RPC |
+| State 与并发 | `ctx.id`、`ctx.exports`、`waitUntil()`、`blockConcurrencyWhile()`；`abort()` 由运行时暴露，但独立 workerd 不允许真正执行 |
+| 异步 KV | 单键/批量 `get()`、`put()`、`delete()`、有序 `list()`、事务提交/回滚、`allowUnconfirmed`、`sync()` 与原子 `deleteAll()` |
+| 同步 KV | SQLite 对象上的 `storage.kv.get/put/delete/list` |
+| SQLite | 参数绑定、游标/迭代器、`columnNames`、`toArray()`、`one()`、`raw()`、读写计数、`databaseSize` 与 `transactionSync()` |
+| Alarm | `setAlarm()`、`getAlarm()`、`deleteAlarm()`、重试元数据、进程重启和所有者故障接管 |
+| WebSocket Hibernation | 接纳、标签筛选、序列化附件、自动响应及时间戳、事件超时、跨节点加密隧道和故障后重连 |
+
+有三项平台语义不会被虚假模拟：
+
+- 独立 workerd 接受 jurisdiction API 的形状，却明确不实现 Cloudflare 法域限制；
+  RandallFlare 的实际放置由签名节点标签、Worker placement 条件和 DO 仲裁组决定。
+- 独立 workerd 的 PITR bookmark 是全零哨兵，不保存 Cloudflare 平台的 30 天变更日志。
+  RandallFlare 提供的是多数派快照与故障接管，不把它冒充为任意时间点恢复。
+- 固定版 workerd 能设置、读取并实际执行 WebSocket 自动响应，但返回的 pair 尚未实现
+  文档中的 `getRequest()`/`getResponse()` 检查方法。
+
+这些差异也锁进端到端测试，升级 workerd 时会显式失败并要求重新审计，而不会静默改变
+应用语义。
+
+## 3. 一致性与所有权
 
 每个包含 Durable Object 的生产 Worker 拥有独立的 D1 三节点微仲裁组。当前 Raft
 epoch 只有一个节点获准启动该 Worker 的 workerd 实例；其他公网入口会把请求转给
@@ -46,7 +73,7 @@ alarm、`waitUntil()` 与 WebSocket 消息可能在普通 HTTP 响应之后继�
 allow_local_durable_objects = true
 ```
 
-## 3. Alarm
+## 4. Alarm
 
 原生 `storage.setAlarm()`、`getAlarm()` 与 `deleteAlarm()` 的数据和对象 SQLite 一起
 进入多数派快照。所有者进程在 alarm 到期前退出时，新所有者恢复 workerd 存储后会
@@ -57,15 +84,18 @@ alarm handler 抛出未捕获异常时，当前固定版 workerd 使用指数退
 需要超出自动预算长期重试时，应在最后一次尝试前写入业务状态并重新
 `setAlarm()`，而不是依赖无限自动重试。
 
-## 4. WebSocket 与 Hibernation
+## 5. WebSocket 与 Hibernation
 
 普通 Worker WebSocket 和 Durable Object WebSocket 都保留原始 HTTP/1.1 Upgrade；
 RandallFlare 不解码、重编码应用帧，因此文本、二进制、ping/pong、关闭帧与子协议都
 由浏览器和 workerd 直接协商。DO 可以使用推荐的 Hibernation API：
 
 ```js
-export class Room {
+import { DurableObject } from "cloudflare:workers";
+
+export class Room extends DurableObject {
   constructor(ctx, env) {
+    super(ctx, env);
     this.ctx = ctx;
     this.env = env;
   }
@@ -75,6 +105,9 @@ export class Room {
     const [client, server] = Object.values(pair);
     this.ctx.acceptWebSocket(server, ["room"]);
     server.serializeAttachment({ joinedAt: Date.now() });
+    this.ctx.setWebSocketAutoResponse(
+      new WebSocketRequestResponsePair("ping", "pong"),
+    );
     return new Response(null, { status: 101, webSocket: client });
   }
 
@@ -95,7 +128,7 @@ Poly1305 信封；101 之后的长连接按 32 KiB 分帧，每帧使用独立�
 多数派快照。RandallFlare 的三节点端到端测试覆盖了“非所有者入口连接 → WebSocket
 写状态 → 所有者退出 → 新所有者恢复 → 重连继续写入”的完整路径。
 
-## 5. 运维边界
+## 6. 运维边界
 
 - placement 标签决定新建 DO 仲裁组的候选节点；已有仲裁组的在线迁移仍应按节点维护
   流程逐台执行，不能同时停止多数派。
