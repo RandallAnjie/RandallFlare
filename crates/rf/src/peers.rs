@@ -1099,6 +1099,7 @@ impl PeerClient {
         base: &str,
         workflow: &str,
         instance_key: Option<&str>,
+        concurrency_group: Option<&str>,
         input: serde_json::Value,
     ) -> Result<crate::workflow::WorkflowInstance> {
         let raw = self
@@ -1107,6 +1108,7 @@ impl PeerClient {
                 &format!("/v1/workflow/{}/instances", component(workflow)),
                 serde_json::to_vec(&serde_json::json!({
                     "instance_key": instance_key,
+                    "concurrency_group": concurrency_group,
                     "input": input,
                 }))?,
             )

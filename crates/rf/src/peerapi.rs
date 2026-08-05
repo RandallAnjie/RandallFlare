@@ -2016,6 +2016,8 @@ async fn pipeline_flush(
 struct WorkflowCreateReq {
     instance_key: Option<String>,
     #[serde(default)]
+    concurrency_group: Option<String>,
+    #[serde(default)]
     input: serde_json::Value,
 }
 
@@ -2034,10 +2036,11 @@ async fn workflow_create(
     let Ok(request) = serde_json::from_slice::<WorkflowCreateReq>(&body) else {
         return (StatusCode::BAD_REQUEST, "Workflow 创建请求无效").into_response();
     };
-    match crate::workflow::create_instance(
+    match crate::workflow::create_instance_in_group(
         &api.node,
         &workflow,
         request.instance_key.as_deref(),
+        request.concurrency_group.as_deref(),
         request.input,
     )
     .await

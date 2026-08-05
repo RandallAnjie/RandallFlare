@@ -694,6 +694,7 @@
                   </div>
                   <label><span>单次推进超时（秒）</span><input id="workflow-timeout" type="number" min="30" max="43200" value="1500" required></label>
                   <label><span>最大并发实例 <em>0 表示不限</em></span><input id="workflow-concurrency" type="number" min="0" max="1000" value="32" required></label>
+                  <label><span>每个命名并发组 <em>0 表示不限</em></span><input id="workflow-group-concurrency" type="number" min="0" max="1000" value="1" required><small>触发时可指定组名；同一组最多同时运行该数量，限额会随实例冻结。</small></label>
                   <label><span>Cron（UTC，可选）</span><input id="workflow-cron" class="code-input" placeholder="0 * * * *"></label>
                   <label class="check-label"><input id="workflow-webhook-enabled" type="checkbox"><span>启用带令牌的 Webhook 触发</span></label>
                   <label><span>Webhook 自定义域名 <em>每行一个；自动包含 workflow-&lt;name&gt; 默认域名</em></span><textarea id="workflow-hostnames" class="code-input" rows="3" placeholder="workflow.example.com"></textarea></label>
@@ -727,6 +728,7 @@
                 <div class="panel-head"><div><p class="eyebrow">调试触发</p><h2>创建实例</h2><p class="muted compact-copy">幂等键可安全重试；同一 Workflow 下重复键只返回原实例。</p></div></div>
                 <form id="workflow-trigger-form" class="stack-form hidden">
                   <label><span>幂等键 <em>可选</em></span><input id="workflow-instance-key" class="code-input" placeholder="order-20260805-001"></label>
+                  <label><span>命名并发组 <em>可选</em></span><input id="workflow-instance-group" class="code-input" maxlength="256" placeholder="customer:10001"><small>例如按客户、仓库或账户串行化任务。</small></label>
                   <label><span>输入（JSON）</span><textarea id="workflow-input" class="code-input" rows="6">{"orderId":"demo-1"}</textarea></label>
                   <button class="secondary" type="submit">触发实例</button>
                 </form>

@@ -875,6 +875,12 @@ async fn module_worker_on_real_workerd() {
 
 export class OrderWorkflow extends WorkflowEntrypoint {
   async run(input, step) {
+    if (input.holdMs) {
+      return await step.do("hold-group-slot", async () => {
+        await new Promise((resolve) => setTimeout(resolve, input.holdMs));
+        return { held: true, label: input.label };
+      });
+    }
     const prepared = await step.do("prepare-order", async () => {
       const count = Number(await this.env.CACHE.get("workflow-prepare-count") || "0") + 1;
       await this.env.CACHE.put("workflow-prepare-count", String(count));
@@ -974,7 +980,11 @@ export default {
     }
     if (url.pathname === "/secret") return new Response(env.API_TOKEN);
     if (url.pathname === "/workflow-trigger") {
-      const instance = await env.ORDER_WORKFLOW.create({ id: "order-e2e", params: { orderId: "RF-1001" } });
+      const instance = await env.ORDER_WORKFLOW.create({
+        id: "order-e2e",
+        concurrencyGroup: "customer:RF-1001",
+        params: { orderId: "RF-1001" }
+      });
       return Response.json({ id: instance.id, status: await instance.status() });
     }
     return new Response("module worker up");
@@ -1410,6 +1420,58 @@ export default {
         .await
         .unwrap();
     assert_eq!(webhook_trigger["id"], workflow_instance);
+    let grouped_a = client
+        .workflow_create(
+            &n.api,
+            "order-flow",
+            Some("grouped-a"),
+            Some("customer:serial"),
+            serde_json::json!({ "holdMs": 1_500, "label": "a" }),
+        )
+        .await
+        .unwrap();
+    let grouped_b = client
+        .workflow_create(
+            &n.api,
+            "order-flow",
+            Some("grouped-b"),
+            Some("customer:serial"),
+            serde_json::json!({ "holdMs": 1_500, "label": "b" }),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        grouped_a.concurrency_group.as_deref(),
+        Some("customer:serial")
+    );
+    assert_eq!(grouped_a.concurrency_group_limit, 1);
+    let grouped_deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let a = client
+            .workflow_instance(&n.api, "order-flow", &grouped_a.id)
+            .await
+            .unwrap();
+        let b = client
+            .workflow_instance(&n.api, "order-flow", &grouped_b.id)
+            .await
+            .unwrap();
+        let statuses = [
+            a["instance"]["status"].as_str(),
+            b["instance"]["status"].as_str(),
+        ];
+        if statuses.contains(&Some("running")) {
+            assert!(
+                statuses.contains(&Some("queued")),
+                "same named group must keep the second instance queued: {statuses:?}"
+            );
+            break;
+        }
+        assert!(
+            Instant::now() < grouped_deadline,
+            "named concurrency group never entered a running/queued state: {statuses:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
     let deadline = Instant::now() + Duration::from_secs(20);
     loop {
         let detail = client
@@ -1422,6 +1484,8 @@ export default {
             assert_eq!(detail["instance"]["entrypoint"], "OrderWorkflow");
             assert_eq!(detail["instance"]["instance_retries"], 3);
             assert_eq!(detail["instance"]["instance_timeout_seconds"], 120);
+            assert_eq!(detail["instance"]["concurrency_group"], "customer:RF-1001");
+            assert_eq!(detail["instance"]["concurrency_group_limit"], 1);
             assert_eq!(
                 client
                     .kv_get(&n.api, "ns1", "workflow-prepare-count")

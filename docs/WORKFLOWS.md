@@ -13,13 +13,21 @@ Workflow 把长时间任务拆成可重放步骤。定义是管理员签名、�
 `max_concurrent_instances` 在认领实例的同一条 D1 条件更新中检查。`0` 表示不额外
 限制；非零值限制 `running` 实例数，不会把耐久睡眠或等待信号的实例算作占用者。
 
+`max_concurrent_instances_per_group` 对调用方选择的命名并发组施加第二层限制。
+例如，所有客户仍可全局并发，但同一 `customer:10001` 组只能有一个实例在运行。
+组名和当时的组限额一起冻结在实例行，后续修改定义不会改变已创建实例的排队语义。
+全局限额和组限额在同一条 D1 比较并更新中原子执行，多节点竞争不会超发。
+
 ## 触发方式
 
 - 手动、CLI 和 Worker 绑定：调用 `create({ id, params })`；幂等键重复时返回原实例。
+- 命名并发组：Worker 调用 `create({ id, concurrencyGroup, params })`；CLI 使用
+  `rf workflow trigger ... --concurrency-group customer:10001`。
 - Cron：保存标准五字段 UTC 表达式。所有节点都可计算时间，但
   `cron:v<定义版本>:<分钟>` 的 D1 唯一键保证每个定义版本每分钟至多创建一次。
 - Webhook：`POST /`、`POST /hook` 或 `POST /v1/run`，正文必须是最大 4 MiB 的 JSON。
   `Idempotency-Key` 请求头会成为实例幂等键。
+  `X-Workflow-Concurrency-Group` 可选请求头指定命名并发组。
 
 默认 Webhook 域名是 `workflow-<名称>.<ingress.default_domain>`，也可在签名定义中
 增加自定义域名。启用 ACME 后，这些域名进入同一证书发现流程。

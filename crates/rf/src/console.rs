@@ -1973,6 +1973,7 @@ async fn public_api_workflow_trigger(
             &state.node,
             &workflow,
             request.instance_key.as_deref(),
+            request.concurrency_group.as_deref(),
             request.input,
         )
         .await?;
@@ -7572,6 +7573,8 @@ struct WorkflowRequest {
     hostnames: Vec<String>,
     #[serde(default = "workflow_default_concurrency")]
     max_concurrent_instances: u16,
+    #[serde(default = "workflow_default_group_concurrency")]
+    max_concurrent_instances_per_group: u16,
 }
 
 fn workflow_default_entrypoint() -> String {
@@ -7594,6 +7597,10 @@ fn workflow_default_concurrency() -> u16 {
     32
 }
 
+fn workflow_default_group_concurrency() -> u16 {
+    1
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct WorkflowTokenRequest {
@@ -7605,6 +7612,8 @@ struct WorkflowTokenRequest {
 #[serde(deny_unknown_fields)]
 struct WorkflowTriggerRequest {
     instance_key: Option<String>,
+    #[serde(default)]
+    concurrency_group: Option<String>,
     #[serde(default)]
     input: Value,
 }
@@ -7684,6 +7693,7 @@ async fn workflow_apply(
         hostnames: request.hostnames,
         tokens,
         max_concurrent_instances: request.max_concurrent_instances,
+        max_concurrent_instances_per_group: request.max_concurrent_instances_per_group,
     };
     let record =
         crate::workflow::prepare_workflow_after(&request.name, spec, false, head.as_ref())?;
@@ -7821,6 +7831,7 @@ async fn workflow_trigger(
             &state.node,
             &name,
             request.instance_key.as_deref(),
+            request.concurrency_group.as_deref(),
             request.input,
         )
         .await?;

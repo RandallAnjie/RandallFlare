@@ -46,6 +46,10 @@ fn default_max_concurrent_instances() -> u16 {
     32
 }
 
+fn default_max_concurrent_instances_per_group() -> u16 {
+    1
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct WorkflowToken {
@@ -87,6 +91,11 @@ pub struct WorkflowSpec {
     pub tokens: Vec<WorkflowToken>,
     #[serde(default = "default_max_concurrent_instances")]
     pub max_concurrent_instances: u16,
+    /// Limit for each caller-selected concurrency group. Instances without a
+    /// group are governed only by `max_concurrent_instances`. Zero disables
+    /// the per-group limit.
+    #[serde(default = "default_max_concurrent_instances_per_group")]
+    pub max_concurrent_instances_per_group: u16,
 }
 
 fn default_entrypoint() -> String {
@@ -119,6 +128,9 @@ impl WorkflowSpec {
         }
         if self.max_concurrent_instances > 1_000 {
             bail!("Workflow 最大并发实例数不得超过 1000；0 表示不额外限制");
+        }
+        if self.max_concurrent_instances_per_group > 1_000 {
+            bail!("Workflow 每个命名并发组的并发数不得超过 1000；0 表示不额外限制");
         }
         if self.hostnames.len() > 64 {
             bail!("Workflow 自定义域名不得超过 64 个");
@@ -167,6 +179,7 @@ impl Default for WorkflowSpec {
             hostnames: vec![],
             tokens: vec![],
             max_concurrent_instances: default_max_concurrent_instances(),
+            max_concurrent_instances_per_group: default_max_concurrent_instances_per_group(),
         }
     }
 }
@@ -175,6 +188,8 @@ impl Default for WorkflowSpec {
 pub struct WorkflowInstance {
     pub id: String,
     pub instance_key: Option<String>,
+    pub concurrency_group: Option<String>,
+    pub concurrency_group_limit: u16,
     pub input: Value,
     pub output: Option<Value>,
     pub status: String,
@@ -358,11 +373,22 @@ pub async fn create_instance(
     instance_key: Option<&str>,
     input: Value,
 ) -> Result<WorkflowInstance> {
+    create_instance_in_group(node, workflow, instance_key, None, input).await
+}
+
+pub async fn create_instance_in_group(
+    node: &Node,
+    workflow: &str,
+    instance_key: Option<&str>,
+    concurrency_group: Option<&str>,
+    input: Value,
+) -> Result<WorkflowInstance> {
     let (view, spec) = workflow_record(node, workflow).context("Workflow 不存在")?;
     if spec.suspended {
         bail!("Workflow 已暂停：{}", spec.suspend_reason);
     }
     validate_instance_key(instance_key)?;
+    validate_concurrency_group(concurrency_group)?;
     validate_json_size(&input, MAX_INPUT_BYTES, "Workflow 输入")?;
     ensure_schema(node, workflow).await?;
     if let Some(key) = instance_key {
@@ -377,13 +403,16 @@ pub async fn create_instance(
         node,
         workflow,
         r#"INSERT OR IGNORE INTO workflow_instances
-           (id, instance_key, input_json, status, sleep_until_ms, retry_count,
+           (id, instance_key, concurrency_group, concurrency_group_limit,
+            input_json, status, sleep_until_ms, retry_count,
             started_at_ms, updated_at_ms, definition_version, entrypoint,
             instance_retries, instance_timeout_seconds)
-           VALUES (?1,?2,?3,'queued',?4,0,?4,?4,?5,?6,?7,?8)"#,
+           VALUES (?1,?2,?3,?4,?5,'queued',?6,0,?6,?6,?7,?8,?9,?10)"#,
         json!([
             id,
             instance_key,
+            concurrency_group,
+            spec.max_concurrent_instances_per_group,
             input_json,
             now,
             view.resource.version,
@@ -407,7 +436,17 @@ pub async fn create_instance(
         bail!("Workflow 实例 ID 冲突");
     };
     if inserted == 1 {
-        append_event(node, workflow, &instance.id, "created", json!({})).await?;
+        append_event(
+            node,
+            workflow,
+            &instance.id,
+            "created",
+            json!({
+                "concurrency_group": instance.concurrency_group,
+                "concurrency_group_limit": instance.concurrency_group_limit,
+            }),
+        )
+        .await?;
     }
     Ok(instance)
 }
@@ -1123,7 +1162,7 @@ async fn claim_one(
         exec(
             node,
             workflow,
-            r#"SELECT id FROM workflow_instances
+            r#"SELECT id,concurrency_group,concurrency_group_limit FROM workflow_instances
                WHERE status IN ('queued','waiting')
                  AND sleep_until_ms IS NOT NULL AND sleep_until_ms<=?1
                ORDER BY sleep_until_ms,started_at_ms LIMIT 1"#,
@@ -1137,6 +1176,8 @@ async fn claim_one(
         return Ok(None);
     };
     let id = string_field(&candidate, "id")?.to_string();
+    let concurrency_group = optional_string_field(&candidate, "concurrency_group");
+    let concurrency_group_limit = u64_field(&candidate, "concurrency_group_limit") as u16;
     let lease = new_id("lease");
     let claimed = exec(
         node,
@@ -1145,13 +1186,18 @@ async fn claim_one(
            lease_token=?2, lease_until_ms=?3, updated_at_ms=?4
            WHERE id=?1 AND status IN ('queued','waiting')
              AND sleep_until_ms IS NOT NULL AND sleep_until_ms<=?4
-             AND (?5=0 OR (SELECT COUNT(*) FROM workflow_instances WHERE status='running')<?5)"#,
+             AND (?5=0 OR (SELECT COUNT(*) FROM workflow_instances WHERE status='running')<?5)
+             AND (?6 IS NULL OR ?7=0 OR
+                  (SELECT COUNT(*) FROM workflow_instances
+                   WHERE status='running' AND concurrency_group=?6)<?7)"#,
         json!([
             id,
             lease,
             now.saturating_add(LEASE_MS),
             now,
             max_concurrent_instances,
+            concurrency_group,
+            concurrency_group_limit,
         ]),
     )
     .await?["rows_affected"]
@@ -1168,7 +1214,11 @@ async fn claim_one(
         workflow,
         &id,
         "advance_claimed",
-        json!({ "node": node.id().to_string() }),
+        json!({
+            "node": node.id().to_string(),
+            "concurrency_group": instance.concurrency_group,
+            "concurrency_group_limit": instance.concurrency_group_limit,
+        }),
     )
     .await?;
     Ok(Some(Claim { instance, lease }))
@@ -1524,6 +1574,8 @@ async fn ensure_schema(node: &Node, workflow: &str) -> Result<()> {
         r#"CREATE TABLE IF NOT EXISTS workflow_instances (
              id TEXT PRIMARY KEY,
              instance_key TEXT UNIQUE,
+             concurrency_group TEXT,
+             concurrency_group_limit INTEGER NOT NULL DEFAULT 0,
              input_json TEXT NOT NULL,
              output_json TEXT,
              status TEXT NOT NULL,
@@ -1582,6 +1634,29 @@ async fn ensure_schema(node: &Node, workflow: &str) -> Result<()> {
     ] {
         exec_database(node, &database, sql, json!([])).await?;
     }
+    ensure_column(
+        node,
+        &database,
+        "workflow_instances",
+        "concurrency_group",
+        "TEXT",
+    )
+    .await?;
+    ensure_column(
+        node,
+        &database,
+        "workflow_instances",
+        "concurrency_group_limit",
+        "INTEGER NOT NULL DEFAULT 0",
+    )
+    .await?;
+    exec_database(
+        node,
+        &database,
+        "CREATE INDEX IF NOT EXISTS workflow_instances_group_running ON workflow_instances(concurrency_group,status)",
+        json!([]),
+    )
+    .await?;
     ensure_column(
         node,
         &database,
@@ -1679,7 +1754,7 @@ async fn exec_database(node: &Node, database: &str, sql: &str, params: Value) ->
     client.d1_exec(&base, database, sql, params).await
 }
 
-const INSTANCE_FIELDS: &str = "id,instance_key,input_json,output_json,status,waiting_for,sleep_until_ms,last_error,retry_count,started_at_ms,finished_at_ms,updated_at_ms,definition_version,entrypoint,instance_retries,instance_timeout_seconds";
+const INSTANCE_FIELDS: &str = "id,instance_key,concurrency_group,concurrency_group_limit,input_json,output_json,status,waiting_for,sleep_until_ms,last_error,retry_count,started_at_ms,finished_at_ms,updated_at_ms,definition_version,entrypoint,instance_retries,instance_timeout_seconds";
 
 fn rows(result: Value) -> Vec<Value> {
     result["rows"].as_array().cloned().unwrap_or_default()
@@ -1689,6 +1764,8 @@ fn row_to_instance(row: &Value) -> Result<WorkflowInstance> {
     Ok(WorkflowInstance {
         id: string_field(row, "id")?.into(),
         instance_key: optional_string_field(row, "instance_key"),
+        concurrency_group: optional_string_field(row, "concurrency_group"),
+        concurrency_group_limit: u64_field(row, "concurrency_group_limit") as u16,
         input: json_string_field(row, "input_json")?.context("Workflow 输入为空")?,
         output: json_string_field(row, "output_json")?,
         status: string_field(row, "status")?.into(),
@@ -1776,6 +1853,20 @@ fn validate_instance_key(key: Option<&str>) -> Result<()> {
         key.is_empty() || key.len() > 256 || key.bytes().any(|byte| byte.is_ascii_control())
     }) {
         bail!("Workflow 幂等键必须介于 1 和 256 个字符之间，且不得包含控制字符");
+    }
+    Ok(())
+}
+
+fn validate_concurrency_group(group: Option<&str>) -> Result<()> {
+    let Some(group) = group else {
+        return Ok(());
+    };
+    if group.is_empty()
+        || group.len() > 256
+        || group.trim() != group
+        || group.chars().any(char::is_control)
+    {
+        bail!("Workflow 命名并发组必须是 1..256 字节的非空、无控制字符文本");
     }
     Ok(())
 }
@@ -1874,6 +1965,9 @@ mod tests {
     fn instance_keys_and_names_are_bounded() {
         assert!(validate_instance_key(Some("order-123")).is_ok());
         assert!(validate_instance_key(Some("")).is_err());
+        assert!(validate_concurrency_group(Some("customer:张三")).is_ok());
+        assert!(validate_concurrency_group(Some(" bad ")).is_err());
+        assert!(validate_concurrency_group(Some("bad\ngroup")).is_err());
         assert!(validate_step_name("charge-card").is_ok());
         assert!(validate_step_name("bad\nname").is_err());
     }

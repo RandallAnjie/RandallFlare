@@ -62,6 +62,8 @@ enum BindingRequest {
         #[serde(default)]
         id: Option<String>,
         #[serde(default)]
+        concurrency_group: Option<String>,
+        #[serde(default)]
         params: Value,
     },
     Status {
@@ -107,9 +109,19 @@ async fn binding_inner(
     let request: BindingRequest =
         serde_json::from_slice(body).context("Workflow binding 请求无效")?;
     match request {
-        BindingRequest::Create { id, params } => {
-            let instance =
-                crate::workflow::create_instance(node, workflow, id.as_deref(), params).await?;
+        BindingRequest::Create {
+            id,
+            concurrency_group,
+            params,
+        } => {
+            let instance = crate::workflow::create_instance_in_group(
+                node,
+                workflow,
+                id.as_deref(),
+                concurrency_group.as_deref(),
+                params,
+            )
+            .await?;
             Ok(json!({ "id": instance.id, "status": instance.status }))
         }
         BindingRequest::Status { id } => {

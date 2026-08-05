@@ -2437,6 +2437,7 @@ function fillWorkflowForm(workflow) {
   $("#workflow-retries").value = spec.instance_retries ?? 3;
   $("#workflow-timeout").value = spec.instance_timeout_seconds || 1500;
   $("#workflow-concurrency").value = spec.max_concurrent_instances ?? 32;
+  $("#workflow-group-concurrency").value = spec.max_concurrent_instances_per_group ?? 1;
   $("#workflow-cron").value = spec.cron || "";
   $("#workflow-webhook-enabled").checked = Boolean(spec.webhook_enabled);
   $("#workflow-hostnames").value = (spec.hostnames || []).join("\n");
@@ -2496,7 +2497,7 @@ function renderWorkflowInstances() {
   const list = $("#workflow-instances");
   list.classList.toggle("empty-state", state.workflowInstances.length === 0);
   list.innerHTML = state.workflowInstances.length
-    ? state.workflowInstances.map((instance) => `<button class="build-row" type="button" data-workflow-instance="${escapeHtml(instance.id)}"><span class="pipeline-state ${workflowStatusClass(instance.status)}"></span><div><strong>${escapeHtml(instance.instance_key || shortId(instance.id, 22))}</strong><small>${escapeHtml(new Date(instance.started_at_ms).toLocaleString("zh-CN"))}${instance.waiting_for ? ` · 等待 ${escapeHtml(instance.waiting_for)}` : ""}</small><code>${escapeHtml(instance.id)}</code></div><span class="badge">${escapeHtml(workflowStatusLabel(instance.status))}</span></button>`).join("")
+    ? state.workflowInstances.map((instance) => `<button class="build-row" type="button" data-workflow-instance="${escapeHtml(instance.id)}"><span class="pipeline-state ${workflowStatusClass(instance.status)}"></span><div><strong>${escapeHtml(instance.instance_key || shortId(instance.id, 22))}</strong><small>${escapeHtml(new Date(instance.started_at_ms).toLocaleString("zh-CN"))}${instance.concurrency_group ? ` · 并发组 ${escapeHtml(instance.concurrency_group)} (${escapeHtml(instance.concurrency_group_limit || "不限")})` : ""}${instance.waiting_for ? ` · 等待 ${escapeHtml(instance.waiting_for)}` : ""}</small><code>${escapeHtml(instance.id)}</code></div><span class="badge">${escapeHtml(workflowStatusLabel(instance.status))}</span></button>`).join("")
     : "暂无实例。";
 }
 
@@ -2574,7 +2575,7 @@ async function openWorkflowInstance(id) {
     $("#workflow-instance-panel").classList.remove("hidden");
     $("#workflow-instance-title").textContent = instance.instance_key || shortId(instance.id, 28);
     $("#workflow-instance-status").textContent = workflowStatusLabel(instance.status);
-    $("#workflow-instance-meta").textContent = `${instance.id} · 定义 v${instance.definition_version} · ${instance.entrypoint} · ${new Date(instance.started_at_ms).toLocaleString("zh-CN")}${instance.last_error ? ` · ${instance.last_error}` : ""}`;
+    $("#workflow-instance-meta").textContent = `${instance.id} · 定义 v${instance.definition_version} · ${instance.entrypoint}${instance.concurrency_group ? ` · 并发组 ${instance.concurrency_group} / ${instance.concurrency_group_limit || "不限"}` : ""} · ${new Date(instance.started_at_ms).toLocaleString("zh-CN")}${instance.last_error ? ` · ${instance.last_error}` : ""}`;
     const actions = [];
     if (["queued", "running", "waiting"].includes(instance.status)) actions.push(["pause", "暂停"], ["terminate", "终止"]);
     if (instance.status === "paused") actions.push(["resume", "恢复"], ["terminate", "终止"]);
@@ -2599,6 +2600,7 @@ async function saveWorkflow(event) {
     webhook_enabled: $("#workflow-webhook-enabled").checked,
     hostnames: $("#workflow-hostnames").value.split(/\r?\n/).map((value) => value.trim().toLowerCase()).filter(Boolean),
     max_concurrent_instances: Number($("#workflow-concurrency").value),
+    max_concurrent_instances_per_group: Number($("#workflow-group-concurrency").value),
   };
   try {
     const result = await api("/api/workflows", { method: "POST", body: JSON.stringify(payload) });
@@ -2640,7 +2642,11 @@ async function triggerWorkflow(event) {
   catch (error) { toast(`输入不是有效 JSON：${error.message}`, true); return; }
   try {
     const data = await api(`/api/workflows/${encodeURIComponent(state.workflowActive)}/instances`, {
-      method: "POST", body: JSON.stringify({ instance_key: $("#workflow-instance-key").value.trim() || null, input }),
+      method: "POST", body: JSON.stringify({
+        instance_key: $("#workflow-instance-key").value.trim() || null,
+        concurrency_group: $("#workflow-instance-group").value.trim() || null,
+        input,
+      }),
     });
     toast(`Workflow 实例 ${shortId(data.instance.id, 20)} 已触发`);
     await loadWorkflows({ quiet: true });

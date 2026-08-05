@@ -780,7 +780,12 @@ class RandallFlareWorkflowBinding {
   async create(options = {}) {
     const response = await this._service.fetch("http://workflow-binding/binding", {
       method: "POST", headers: { "content-type": "application/json" },
-      body: JSON.stringify({ op: "create", id: options.id == null ? null : String(options.id), params: options.params ?? {} }),
+      body: JSON.stringify({
+        op: "create",
+        id: options.id == null ? null : String(options.id),
+        concurrency_group: options.concurrencyGroup == null ? null : String(options.concurrencyGroup),
+        params: options.params ?? {},
+      }),
     });
     if (!response.ok) throw new Error("WORKFLOW_ERROR: " + response.status + " " + await response.text());
     const out = await response.json();

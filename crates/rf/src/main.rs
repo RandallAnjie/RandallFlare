@@ -1113,6 +1113,9 @@ enum WorkflowCmd {
         hostnames: Vec<String>,
         #[arg(long, default_value_t = 32)]
         max_concurrent_instances: u16,
+        /// Maximum running instances sharing one --concurrency-group; 0 disables.
+        #[arg(long, default_value_t = 1)]
+        max_concurrent_instances_per_group: u16,
         #[arg(long)]
         suspended: bool,
         #[arg(long, default_value = "")]
@@ -1164,6 +1167,8 @@ enum WorkflowCmd {
         input: String,
         #[arg(long)]
         idempotency_key: Option<String>,
+        #[arg(long)]
+        concurrency_group: Option<String>,
         #[arg(long, env = "RF_NODE")]
         node: String,
         #[arg(long, env = "RF_CLUSTER_SECRET")]
@@ -3300,6 +3305,7 @@ async fn async_main(cli: Cli) -> Result<()> {
                 webhook,
                 hostnames,
                 max_concurrent_instances,
+                max_concurrent_instances_per_group,
                 suspended,
                 suspend_reason,
                 node,
@@ -3329,6 +3335,7 @@ async fn async_main(cli: Cli) -> Result<()> {
                     hostnames,
                     tokens,
                     max_concurrent_instances,
+                    max_concurrent_instances_per_group,
                 };
                 let record =
                     rf::workflow::prepare_workflow_after(&name, spec, false, head.as_ref())?;
@@ -3411,12 +3418,19 @@ async fn async_main(cli: Cli) -> Result<()> {
                 name,
                 input,
                 idempotency_key,
+                concurrency_group,
                 node,
                 secret,
             } => {
                 let input = serde_json::from_str(&input).context("Workflow 输入必须是有效 JSON")?;
                 let instance = PeerClient::new(secret_bytes(&secret)?)
-                    .workflow_create(&node, &name, idempotency_key.as_deref(), input)
+                    .workflow_create(
+                        &node,
+                        &name,
+                        idempotency_key.as_deref(),
+                        concurrency_group.as_deref(),
+                        input,
+                    )
                     .await?;
                 println!("{}", serde_json::to_string_pretty(&instance)?);
                 Ok(())

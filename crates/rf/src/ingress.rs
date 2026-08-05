@@ -580,6 +580,11 @@ async fn serve_workflow_ingress(
         .get("idempotency-key")
         .and_then(|value| value.to_str().ok())
         .map(str::to_string);
+    let concurrency_group = req
+        .headers()
+        .get("x-workflow-concurrency-group")
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_string);
     let body = match axum::body::to_bytes(req.into_body(), crate::workflow::MAX_INPUT_BYTES).await {
         Ok(body) => body,
         Err(_) => {
@@ -604,13 +609,23 @@ async fn serve_workflow_ingress(
             }
         }
     };
-    match crate::workflow::create_instance(node, workflow, instance_key.as_deref(), input).await {
+    match crate::workflow::create_instance_in_group(
+        node,
+        workflow,
+        instance_key.as_deref(),
+        concurrency_group.as_deref(),
+        input,
+    )
+    .await
+    {
         Ok(instance) => (
             StatusCode::ACCEPTED,
             axum::Json(serde_json::json!({
                 "id": instance.id,
                 "status": instance.status,
                 "definitionVersion": instance.definition_version,
+                "concurrencyGroup": instance.concurrency_group,
+                "concurrencyGroupLimit": instance.concurrency_group_limit,
                 "startedAtMs": instance.started_at_ms,
             })),
         )
