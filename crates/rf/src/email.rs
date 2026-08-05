@@ -671,19 +671,19 @@ pub fn spawn_smtp_server(node: Arc<Node>) -> Result<Option<std::thread::JoinHand
     let cert_dir = node.cfg.data_dir.join("certs");
     let cert_path = cert_dir.join(format!("{mx_hostname}.crt"));
     let key_path = cert_dir.join(format!("{mx_hostname}.key"));
-    let ssl = if cert_path.is_file() && key_path.is_file() {
-        tracing::info!(%mx_hostname, "SMTP STARTTLS 已启用");
-        SslConfig::SelfSigned {
-            cert_path: cert_path.to_string_lossy().into_owned(),
-            key_path: key_path.to_string_lossy().into_owned(),
-        }
+    let ssl = SslConfig::Reloading {
+        cert_path: cert_path.to_string_lossy().into_owned(),
+        key_path: key_path.to_string_lossy().into_owned(),
+        chain_path: None,
+    };
+    if cert_path.is_file() && key_path.is_file() {
+        tracing::info!(%mx_hostname, "SMTP STARTTLS 已启用并将自动热加载证书");
     } else {
         tracing::warn!(
             %mx_hostname,
-            "SMTP 证书尚未物化，STARTTLS 暂不可用；证书就绪后重启此邮件节点"
+            "SMTP 证书尚未物化，STARTTLS 暂不宣告；证书就绪后会自动启用"
         );
-        SslConfig::None
-    };
+    }
     let runtime = tokio::runtime::Handle::current();
     let max_sessions = node.cfg.email.max_sessions;
     let handler = SmtpHandler::new(node, runtime, mx_hostname.clone());

@@ -94,7 +94,7 @@ surface yet.
 
 | Capability | State | Remaining acceptance work |
 | --- | --- | --- |
-| capability-selected MX nodes | partial | explicit node role, signed MX match, capability reporting, bounded SMTP pool and STARTTLS cert loading done; automatic certificate hot-reload, health-weighted placement and multi-MX soak remain |
+| capability-selected MX nodes | partial | explicit node role, signed MX match, capability reporting, bounded SMTP pool, deferred STARTTLS enablement and per-connection certificate hot-reload are implemented and real-rustls tested; health-weighted placement and multi-MX soak remain |
 | inbound SMTP and routing | partial | RFC 822 limits, SMTPUTF8/8BITMIME, verified domains, exact/prefix/catch-all routes, D1 leases, crash recovery, rate limits, terminal retention and idempotent locally-routed DSN generation are done; multi-node SMTP fault soak remains |
 | authentication results | partial | SPF, DKIM, DMARC and full Authentication-Results are persisted/exposed; ARC and MTA-STS policy remain |
 | raw-message R2 archival | partial | immutable source, metadata hashes, shared-recipient reference-safe retention and local/rclone buckets done; multi-GiB streaming remains |

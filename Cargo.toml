@@ -19,3 +19,6 @@ panic = "abort"
 # mailin 0.6.5 does not advertise or parse RFC 6531 SMTPUTF8. Keep the small
 # audited parser patch in-tree until the upstream crate exposes this extension.
 mailin = { path = "vendor/mailin" }
+# The upstream embedded server snapshots STARTTLS material at process start.
+# RandallFlare needs ACME materialization and renewal without SMTP downtime.
+mailin-embedded = { path = "vendor/mailin-embedded" }

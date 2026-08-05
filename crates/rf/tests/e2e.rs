@@ -5,7 +5,7 @@
 //!  2. KV written on node A reads on node B (anti-entropy)
 //!  3. static stability: node A dies, node B keeps serving
 
-use std::io::Write;
+use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -2333,6 +2333,132 @@ export default {
         node.child.kill().ok();
         node.child.wait().ok();
     }
+}
+
+fn smtp_response<S: Read>(reader: &mut BufReader<S>) -> Vec<String> {
+    let mut lines = Vec::new();
+    loop {
+        let mut line = String::new();
+        reader.read_line(&mut line).unwrap();
+        assert!(
+            !line.is_empty(),
+            "SMTP connection closed before a complete response"
+        );
+        let terminal = line.as_bytes().get(3) == Some(&b' ');
+        lines.push(line.trim_end().to_string());
+        if terminal {
+            return lines;
+        }
+    }
+}
+
+fn smtp_command<S: Read + Write>(reader: &mut BufReader<S>, command: &str) -> Vec<String> {
+    reader.get_mut().write_all(command.as_bytes()).unwrap();
+    reader.get_mut().flush().unwrap();
+    smtp_response(reader)
+}
+
+fn smtp_capabilities(address: std::net::SocketAddr) -> Vec<String> {
+    let stream = std::net::TcpStream::connect_timeout(&address, Duration::from_secs(2)).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(3)))
+        .unwrap();
+    stream
+        .set_write_timeout(Some(Duration::from_secs(3)))
+        .unwrap();
+    let mut reader = BufReader::new(stream);
+    assert!(smtp_response(&mut reader)[0].starts_with("220 "));
+    smtp_command(&mut reader, "EHLO client.test\r\n")
+}
+
+fn smtp_starttls(
+    address: std::net::SocketAddr,
+    hostname: &'static str,
+    trusted: rustls_pki_types::CertificateDer<'static>,
+) {
+    let stream = std::net::TcpStream::connect_timeout(&address, Duration::from_secs(2)).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(3)))
+        .unwrap();
+    stream
+        .set_write_timeout(Some(Duration::from_secs(3)))
+        .unwrap();
+    let mut reader = BufReader::new(stream);
+    smtp_response(&mut reader);
+    let capabilities = smtp_command(&mut reader, "EHLO client.test\r\n");
+    assert!(capabilities.iter().any(|line| line.contains("STARTTLS")));
+    assert!(smtp_command(&mut reader, "STARTTLS\r\n")[0].starts_with("220 "));
+
+    rustls::crypto::ring::default_provider()
+        .install_default()
+        .ok();
+    let mut roots = rustls::RootCertStore::empty();
+    roots.add(trusted).unwrap();
+    let config = rustls::ClientConfig::builder()
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+    let name = rustls_pki_types::ServerName::try_from(hostname).unwrap();
+    let connection = rustls::ClientConnection::new(std::sync::Arc::new(config), name).unwrap();
+    let mut reader = BufReader::new(rustls::StreamOwned::new(connection, reader.into_inner()));
+    let response = smtp_command(&mut reader, "EHLO tls-client.test\r\n");
+    assert!(response[0].starts_with("250-"));
+    smtp_command(&mut reader, "QUIT\r\n");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn smtp_starttls_materializes_and_rotates_without_restart() {
+    let _scenario = E2E_LOCK.lock().await;
+    let operator = Keypair::from_seed([57u8; 32]);
+    let dir =
+        std::env::temp_dir().join(format!("rf-e2e-smtp-hot-reload-{}", rand::random::<u32>()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let (gossip, api, ingress, smtp) = (free_port(), free_port(), free_port(), free_port());
+    let config = write_config(
+        &dir,
+        &operator,
+        gossip,
+        api,
+        ingress,
+        &[],
+        "smtp-hot-reload",
+    );
+    let mut text = std::fs::read_to_string(&config).unwrap();
+    text.push_str(&format!(
+        "\n[email]\nenabled = true\nsmtp_listen = \"127.0.0.1:{smtp}\"\nmx_hostname = \"mx.test\"\noutbound = false\n"
+    ));
+    std::fs::write(&config, text).unwrap();
+    let mut child = spawn_node(&dir, &config);
+    wait_ping(&format!("127.0.0.1:{api}"), Duration::from_secs(15)).await;
+    let smtp_address = format!("127.0.0.1:{smtp}").parse().unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        if std::net::TcpStream::connect_timeout(&smtp_address, Duration::from_millis(200)).is_ok() {
+            break;
+        }
+        assert!(Instant::now() < deadline, "SMTP listener did not start");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    let initial = smtp_capabilities(smtp_address);
+    assert!(!initial.iter().any(|line| line.contains("STARTTLS")));
+
+    let certs = dir.join("data").join("certs");
+    std::fs::create_dir_all(&certs).unwrap();
+    let first = rcgen::generate_simple_self_signed(vec!["mx.test".to_string()]).unwrap();
+    std::fs::write(certs.join("mx.test.crt"), first.cert.pem()).unwrap();
+    std::fs::write(certs.join("mx.test.key"), first.signing_key.serialize_pem()).unwrap();
+    smtp_starttls(smtp_address, "mx.test", first.cert.der().clone());
+
+    let second = rcgen::generate_simple_self_signed(vec!["mx.test".to_string()]).unwrap();
+    std::fs::write(certs.join("mx.test.crt"), second.cert.pem()).unwrap();
+    std::fs::write(
+        certs.join("mx.test.key"),
+        second.signing_key.serialize_pem(),
+    )
+    .unwrap();
+    smtp_starttls(smtp_address, "mx.test", second.cert.der().clone());
+
+    child.kill().unwrap();
+    child.wait().unwrap();
 }
 
 /// HTTPS ingress: drop a PEM pair into <data>/certs, boot, serve an

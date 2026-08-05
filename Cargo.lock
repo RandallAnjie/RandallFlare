@@ -2030,8 +2030,6 @@ dependencies = [
 [[package]]
 name = "mailin-embedded"
 version = "0.8.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c60f4b1d7bed01be9f6fa08ad92c50f1d53c61e1461a058b94197046bfc5844f"
 dependencies = [
  "bufstream-fresh",
  "cfg-if",

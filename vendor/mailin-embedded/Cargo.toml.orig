@@ -1,0 +1,29 @@
+[package]
+name = "mailin-embedded"
+version = "0.8.3"
+authors = ["alienscience <saul@alienscience.org.uk>"]
+description = "An SMTP server that can be embedded in other programs"
+repository = 'https://code.alienscience.org/alienscience/mailin'
+readme = "README.md"
+keywords = ["smtp", "server", "email"]
+categories = ["email", "network-programming"]
+license = "MIT OR Apache-2.0"
+edition = "2021"
+
+[package.metadata.docs.rs]
+features = ["rtls"]
+
+[features]
+default = ["rtls"]
+ossl = ["openssl"]
+rtls = ["rustls", "rustls-pemfile"]
+
+[dependencies]
+mailin = { path = "../mailin", version = "0.6.5" }
+cfg-if = "1"
+scoped_threadpool = "0.1"
+log = "0.4"
+bufstream-fresh = "0.3"
+rustls = { version = "0.23", optional = true }
+rustls-pemfile = { version = "2", optional = true }
+openssl = { version = "0.10", optional = true }

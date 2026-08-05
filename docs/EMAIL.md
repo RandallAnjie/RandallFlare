@@ -26,9 +26,11 @@ max_sessions = 64
 ```
 
 `mx_hostname` 同时是 SMTP EHLO 名称、域名验证所要求的 MX 目标，以及 STARTTLS
-证书文件名。证书在进程启动时载入；首次物化或替换证书后应重启邮件节点。
-可以把 MX 主机名加入 `[acme].hostnames`，也可以通过受信任的外部 ACME 客户端把
-证书放入上述目录。
+证书文件名。邮件节点会在每个新 SMTP 连接上检查并载入当前证书：证书与私钥
+组合无效时不宣告 STARTTLS；首次物化后自动启用，续期或替换后也无需重启。建议 ACME
+客户端用同目录临时文件加原子重命名替换 `.crt` 与 `.key`，避免连接恰好读到半份
+更新。可以把 MX 主机名加入 `[acme].hostnames`，也可以通过受信任的外部 ACME
+客户端把证书放入上述目录。
 
 DKIM 私钥绝不能进入 TOML、签名资源、浏览器或 Git。邮件域定义只保存形如
 `RF_EMAIL_DKIM_SUPPORT` 的环境变量名；PEM（RSA PKCS#1 或 PKCS#8）仅写入获准
