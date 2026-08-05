@@ -102,6 +102,7 @@ pub fn router(api: Api) -> Router {
         )
         .route("/v1/worker/{name}", get(worker_get))
         .route("/v1/worker-dispatch", post(worker_dispatch))
+        .route("/v1/worker-tunnel", post(worker_tunnel))
         .route("/v1/log/{name}", get(log_get))
         .route(
             "/v1/observability/{worker}/requests",
@@ -219,6 +220,11 @@ async fn encrypted_transport(
         .get(transport::ENC_HEADER)
         .and_then(|v| v.to_str().ok())
         == Some(transport::VERSION);
+    let tunnel_upgrade = request
+        .headers()
+        .get(axum::http::header::UPGRADE)
+        .and_then(|value| value.to_str().ok())
+        == Some(crate::durable::TUNNEL_UPGRADE);
     let remote = request
         .extensions()
         .get::<ConnectInfo<SocketAddr>>()
@@ -310,6 +316,9 @@ async fn encrypted_transport(
         next.run(Request::from_parts(parts, Body::from(plaintext)))
             .await
     };
+    if tunnel_upgrade && response.status() == StatusCode::SWITCHING_PROTOCOLS {
+        return response;
+    }
     let status = response.status();
     let (mut parts, body) = response.into_parts();
     let plaintext = match to_bytes(body, MAX_PEER_PAYLOAD).await {
@@ -1291,6 +1300,164 @@ async fn worker_dispatch(
             }),
         Err(error) => (StatusCode::BAD_GATEWAY, error).into_response(),
     }
+}
+
+async fn worker_tunnel(
+    State(api): State<Api>,
+    ConnectInfo(remote): ConnectInfo<SocketAddr>,
+    mut request: Request<Body>,
+) -> Response {
+    if request
+        .headers()
+        .get(transport::ENC_HEADER)
+        .and_then(|value| value.to_str().ok())
+        != Some(transport::VERSION)
+        || request
+            .headers()
+            .get(axum::http::header::UPGRADE)
+            .and_then(|value| value.to_str().ok())
+            != Some(crate::durable::TUNNEL_UPGRADE)
+    {
+        return (
+            StatusCode::UPGRADE_REQUIRED,
+            "encrypted Worker tunnel required",
+        )
+            .into_response();
+    }
+    let session = match request
+        .headers()
+        .get(transport::NONCE_HEADER)
+        .and_then(|value| value.to_str().ok())
+    {
+        Some(session) => session.to_string(),
+        None => return (StatusCode::BAD_REQUEST, "missing tunnel session").into_response(),
+    };
+    let method = request.method().clone();
+    let uri = request.uri().clone();
+    let headers = request.headers().clone();
+    let peer_upgrade = hyper::upgrade::on(&mut request);
+    let body = match to_bytes(request.into_body(), MAX_PEER_PAYLOAD).await {
+        Ok(body) => body,
+        Err(_) => {
+            return (StatusCode::PAYLOAD_TOO_LARGE, "tunnel metadata too large").into_response()
+        }
+    };
+    if let Err(response) = check(&api, &remote, &headers, &method, &uri, &body) {
+        return response.into_response();
+    }
+    let Ok(dispatch) = postcard::from_bytes::<crate::ingress::WorkerTunnelRequest>(&body) else {
+        return (StatusCode::BAD_REQUEST, "bad Worker tunnel request").into_response();
+    };
+    let manifest = if dispatch.preview {
+        crate::preview::active_previews(&api.node)
+            .into_iter()
+            .find(|(view, spec)| {
+                view.resource.name == dispatch.runtime_id
+                    && view.resource.version == dispatch.revision
+                    && spec.worker == dispatch.worker
+                    && spec.manifest.version == dispatch.manifest_version
+            })
+            .map(|(_, spec)| spec.manifest)
+    } else {
+        api.node.manifest(&dispatch.worker).filter(|manifest| {
+            dispatch.runtime_id == dispatch.worker
+                && dispatch.revision == manifest.version
+                && dispatch.manifest_version == manifest.version
+        })
+    };
+    let Some(manifest) = manifest else {
+        return (StatusCode::CONFLICT, "Worker revision changed").into_response();
+    };
+    let should_fence = !dispatch.preview && !crate::deploy::durable_objects(&manifest).is_empty();
+    if dispatch.fenced_durable != should_fence {
+        return (
+            StatusCode::MISDIRECTED_REQUEST,
+            "Durable Object tunnel fencing mismatch",
+        )
+            .into_response();
+    }
+    if should_fence {
+        if !api.durable.is_owner(&dispatch.worker) {
+            return (
+                StatusCode::MISDIRECTED_REQUEST,
+                "this node is not the Durable Object owner",
+            )
+                .into_response();
+        }
+    } else if !crate::placement::eligible(&api.node, &api.node.id_hex(), &manifest) {
+        return (
+            StatusCode::MISDIRECTED_REQUEST,
+            "Worker is not placed on this node",
+        )
+            .into_response();
+    }
+    if manifest.blob_refs().any(|sha| !api.node.blobs.has(&sha)) {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Worker blobs are not ready",
+        )
+            .into_response();
+    }
+    let Some(port) = api.node.worker_port(&dispatch.runtime_id) else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Worker runtime is not ready",
+        )
+            .into_response();
+    };
+    let (upstream_headers, upstream) = match crate::durable::open_worker_websocket(
+        &api.worker_http,
+        &dispatch.request,
+        port,
+    )
+    .await
+    {
+        Ok(upstream) => upstream,
+        Err(error) => return (StatusCode::BAD_GATEWAY, error.to_string()).into_response(),
+    };
+    let (proof_nonce, proof) = match transport::seal(
+        &api.secret,
+        &transport::response_aad(&session, 101),
+        crate::durable::TUNNEL_PROOF,
+    ) {
+        Ok(proof) => proof,
+        Err(error) => {
+            return (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()).into_response()
+        }
+    };
+    use base64::Engine as _;
+    let proof = base64::engine::general_purpose::STANDARD.encode(proof);
+    let mut builder = Response::builder().status(StatusCode::SWITCHING_PROTOCOLS);
+    for (name, value) in &upstream_headers {
+        if name != axum::http::header::CONTENT_LENGTH {
+            builder = builder.header(name, value);
+        }
+    }
+    builder = builder
+        .header(transport::ENC_HEADER, transport::VERSION)
+        .header(transport::NONCE_HEADER, proof_nonce)
+        .header(crate::durable::TUNNEL_PROOF_HEADER, proof);
+    let response = match builder.body(Body::empty()) {
+        Ok(response) => response,
+        Err(error) => {
+            return (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()).into_response()
+        }
+    };
+    let secret = api.secret;
+    tokio::spawn(async move {
+        match peer_upgrade.await {
+            Ok(peer) => {
+                let peer = hyper_util::rt::TokioIo::new(peer);
+                if let Err(error) =
+                    crate::durable::relay_tunnel_owner(peer, upstream, secret, session).await
+                {
+                    tracing::debug!("Worker 加密隧道已结束：{error:#}");
+                }
+            }
+            Err(error) => tracing::debug!("节点间 Worker 隧道升级失败：{error}"),
+        }
+    });
+    response
 }
 
 async fn do_proxy(

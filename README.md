@@ -203,6 +203,11 @@ is acknowledged, rf checkpoints and compresses the DO SQLite directory and
 commits it to a majority. Killing the owner elects another node, restores
 the committed snapshot on its independent disk, and continues without
 losing acknowledged state (real three-node workerd e2e).
+Native alarms retain `retryCount`/`isRetry` across process recovery. Ordinary
+and hibernatable DO WebSockets preserve the real HTTP upgrade; cross-node
+connections use an authenticated, sequence-bound XChaCha20-Poly1305 tunnel and
+reconnect to restored state after owner loss. See
+[the Durable Objects guide](./docs/DURABLE_OBJECTS.md).
 
 ## Build
 

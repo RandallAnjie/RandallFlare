@@ -257,6 +257,285 @@ async fn serve_observed_worker(
     response
 }
 
+fn is_websocket_upgrade(req: &Request) -> bool {
+    req.method() == Method::GET
+        && req
+            .headers()
+            .get(axum::http::header::CONNECTION)
+            .and_then(|value| value.to_str().ok())
+            .is_some_and(|value| {
+                value
+                    .split(',')
+                    .any(|token| token.trim().eq_ignore_ascii_case("upgrade"))
+            })
+        && req
+            .headers()
+            .get(axum::http::header::UPGRADE)
+            .and_then(|value| value.to_str().ok())
+            .is_some_and(|value| value.eq_ignore_ascii_case("websocket"))
+}
+
+fn websocket_request_to_wire(
+    req: &Request,
+) -> std::result::Result<crate::durable::ProxyRequest, Box<Response>> {
+    if req
+        .headers()
+        .get(axum::http::header::CONTENT_LENGTH)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value != "0")
+    {
+        return Err(Box::new(
+            (StatusCode::BAD_REQUEST, "WebSocket 握手不能包含请求体").into_response(),
+        ));
+    }
+    let authority = request_authority(req)
+        .map(str::as_bytes)
+        .map(ToOwned::to_owned);
+    let path_and_query = req
+        .uri()
+        .path_and_query()
+        .map(|value| value.as_str().to_string())
+        .unwrap_or_else(|| "/".into());
+    let mut headers = req
+        .headers()
+        .iter()
+        .map(|(name, value)| (name.to_string(), value.as_bytes().to_vec()))
+        .collect::<Vec<_>>();
+    if !req.headers().contains_key(axum::http::header::HOST) {
+        if let Some(authority) = authority {
+            headers.push(("host".into(), authority));
+        }
+    }
+    if path_and_query.len() > MAX_FORWARDED_TARGET_BYTES
+        || headers.len() > MAX_FORWARDED_HEADERS
+        || headers.iter().fold(0usize, |total, (name, value)| {
+            total.saturating_add(name.len()).saturating_add(value.len())
+        }) > MAX_FORWARDED_HEADER_BYTES
+    {
+        return Err(Box::new(
+            (
+                StatusCode::REQUEST_HEADER_FIELDS_TOO_LARGE,
+                "WebSocket 请求头或请求目标过大",
+            )
+                .into_response(),
+        ));
+    }
+    Ok(crate::durable::ProxyRequest {
+        method: "GET".into(),
+        path_and_query,
+        headers,
+        body: vec![],
+    })
+}
+
+fn websocket_upgrade_response(headers: &axum::http::HeaderMap) -> Response {
+    let mut builder = Response::builder().status(StatusCode::SWITCHING_PROTOCOLS);
+    for (name, value) in headers {
+        if matches!(
+            name.as_str(),
+            crate::transport::ENC_HEADER
+                | crate::transport::NONCE_HEADER
+                | crate::transport::TARGET_HEADER
+                | crate::auth::TS_HEADER
+                | crate::auth::MAC_HEADER
+                | crate::durable::TUNNEL_PROOF_HEADER
+                | "content-length"
+        ) {
+            continue;
+        }
+        builder = builder.header(name, value);
+    }
+    builder
+        .body(Body::empty())
+        .unwrap_or_else(|_| StatusCode::BAD_GATEWAY.into_response())
+}
+
+async fn serve_worker_websocket(
+    ingress: &Ingress,
+    mut req: Request,
+    manifest: &WorkerManifest,
+    runtime_id: &str,
+    durable_coordinator: bool,
+) -> Response {
+    let wire = match websocket_request_to_wire(&req) {
+        Ok(wire) => wire,
+        Err(response) => return *response,
+    };
+    let browser_upgrade = hyper::upgrade::on(&mut req);
+    let fenced_durable = durable_coordinator
+        && runtime_id == manifest.name
+        && !crate::deploy::durable_objects(manifest).is_empty();
+
+    if fenced_durable && ingress.durable.is_owner(&manifest.name) {
+        let Some(port) = ingress.node.worker_port(&manifest.name) else {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "Durable Object 所有者运行时正在启动\n",
+            )
+                .into_response();
+        };
+        return match crate::durable::open_worker_websocket(&ingress.http, &wire, port).await {
+            Ok((headers, mut upstream)) => {
+                tokio::spawn(async move {
+                    match browser_upgrade.await {
+                        Ok(browser) => {
+                            let mut browser = hyper_util::rt::TokioIo::new(browser);
+                            if let Err(error) =
+                                tokio::io::copy_bidirectional(&mut browser, &mut upstream).await
+                            {
+                                tracing::debug!("本地 Worker WebSocket 已结束：{error}");
+                            }
+                        }
+                        Err(error) => tracing::debug!("浏览器 WebSocket 升级失败：{error}"),
+                    }
+                });
+                websocket_upgrade_response(&headers)
+            }
+            Err(error) => (StatusCode::BAD_GATEWAY, error.to_string()).into_response(),
+        };
+    }
+
+    let revision = if runtime_id == manifest.name {
+        manifest.version
+    } else {
+        crate::resource::head(&ingress.node, crate::preview::PREVIEW_KIND, runtime_id)
+            .map(|view| view.resource.version)
+            .unwrap_or(0)
+    };
+    let local_eligible =
+        crate::placement::eligible(&ingress.node, &ingress.node.id_hex(), manifest);
+    if !fenced_durable && local_eligible && local_worker_ready(&ingress.node, manifest, runtime_id)
+    {
+        let port = ingress
+            .node
+            .worker_port(runtime_id)
+            .expect("local_worker_ready checked the module runtime");
+        return match crate::durable::open_worker_websocket(&ingress.http, &wire, port).await {
+            Ok((headers, mut upstream)) => {
+                tokio::spawn(async move {
+                    match browser_upgrade.await {
+                        Ok(browser) => {
+                            let mut browser = hyper_util::rt::TokioIo::new(browser);
+                            if let Err(error) =
+                                tokio::io::copy_bidirectional(&mut browser, &mut upstream).await
+                            {
+                                tracing::debug!("本地 Worker WebSocket 已结束：{error}");
+                            }
+                        }
+                        Err(error) => tracing::debug!("浏览器 WebSocket 升级失败：{error}"),
+                    }
+                });
+                websocket_upgrade_response(&headers)
+            }
+            Err(error) => (StatusCode::BAD_GATEWAY, error.to_string()).into_response(),
+        };
+    }
+
+    let dispatch = WorkerTunnelRequest {
+        worker: manifest.name.clone(),
+        runtime_id: runtime_id.to_string(),
+        manifest_version: manifest.version,
+        revision,
+        preview: runtime_id != manifest.name,
+        fenced_durable,
+        request: wire,
+    };
+    let body = match postcard::to_stdvec(&dispatch) {
+        Ok(body) => body,
+        Err(error) => {
+            return (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()).into_response()
+        }
+    };
+    let mut candidates = if fenced_durable {
+        let mut ids = Vec::new();
+        if let Some(leader) = ingress.durable.leader(&manifest.name) {
+            ids.push(leader);
+        }
+        if let Some(raw) = ingress.node.kv_get(
+            crate::acme::NS,
+            &crate::d1::kv_key(&crate::durable::Coordinator::db_name(&manifest.name)),
+        ) {
+            if let Ok(meta) = serde_json::from_slice::<crate::d1::DbMeta>(&raw) {
+                ids.extend(meta.group);
+            }
+        }
+        ids.into_iter()
+            .filter(|id| *id != ingress.node.id())
+            .filter_map(|id| {
+                ingress
+                    .node
+                    .peers()
+                    .get(&id.to_string())
+                    .and_then(|peer| peer.api_addr)
+                    .map(|api| ([0u8; 32], id.to_string(), api))
+            })
+            .collect::<Vec<_>>()
+    } else {
+        ingress
+            .node
+            .peers()
+            .into_iter()
+            .filter(|(id, peer)| {
+                crate::placement::eligible(&ingress.node, id, manifest)
+                    && peer.api_addr.is_some()
+                    && peer.deployments.get(runtime_id).is_some_and(|status| {
+                        status.version == revision
+                            && matches!(status.state.as_str(), "ready" | "running")
+                    })
+            })
+            .filter_map(|(id, peer)| {
+                peer.api_addr
+                    .map(|api| (placement_score(runtime_id, &id), id, api))
+            })
+            .collect::<Vec<_>>()
+    };
+    candidates.sort_by_key(|candidate| std::cmp::Reverse(candidate.0));
+    let mut last_error = None;
+    for (_, id, api) in candidates {
+        match ingress
+            .peers
+            .open_tunnel(&api.to_string(), "/v1/worker-tunnel", body.clone())
+            .await
+        {
+            Ok(tunnel) => {
+                let headers = tunnel.headers.clone();
+                let secret = match ingress.node.cfg.cluster_secret_bytes() {
+                    Ok(secret) => secret,
+                    Err(error) => {
+                        return (StatusCode::INTERNAL_SERVER_ERROR, error.to_string())
+                            .into_response()
+                    }
+                };
+                tokio::spawn(async move {
+                    match browser_upgrade.await {
+                        Ok(browser) => {
+                            let browser = hyper_util::rt::TokioIo::new(browser);
+                            if let Err(error) = crate::durable::relay_tunnel_ingress(
+                                browser,
+                                tunnel.stream,
+                                secret,
+                                tunnel.session,
+                            )
+                            .await
+                            {
+                                tracing::debug!("跨节点 Worker WebSocket 已结束：{error:#}");
+                            }
+                        }
+                        Err(error) => tracing::debug!("浏览器 WebSocket 升级失败：{error}"),
+                    }
+                });
+                return websocket_upgrade_response(&headers);
+            }
+            Err(error) => last_error = Some(format!("节点 {id} 不可用：{error}")),
+        }
+    }
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        last_error.unwrap_or_else(|| "没有可用的 Worker WebSocket 目标节点".into()),
+    )
+        .into_response()
+}
+
 async fn serve_worker(
     ingress: &Ingress,
     req: Request,
@@ -265,6 +544,10 @@ async fn serve_worker(
     runtime_id: &str,
     durable_coordinator: bool,
 ) -> Response {
+    if !manifest.main.is_empty() && is_websocket_upgrade(&req) {
+        return serve_worker_websocket(ingress, req, manifest, runtime_id, durable_coordinator)
+            .await;
+    }
     // Durable Objects already have a fenced owner and their own encrypted
     // forwarding path. Do not send them through the stateless placement path.
     if durable_coordinator && !crate::deploy::durable_objects(manifest).is_empty() {
@@ -397,6 +680,17 @@ pub(crate) struct WorkerDispatchRequest {
     pub manifest_version: u64,
     pub revision: u64,
     pub preview: bool,
+    pub request: crate::durable::ProxyRequest,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub(crate) struct WorkerTunnelRequest {
+    pub worker: String,
+    pub runtime_id: String,
+    pub manifest_version: u64,
+    pub revision: u64,
+    pub preview: bool,
+    pub fenced_durable: bool,
     pub request: crate::durable::ProxyRequest,
 }
 
@@ -1227,5 +1521,75 @@ mod tests {
             body: vec![],
         };
         assert!(wire_to_request(excessive_headers).is_err());
+    }
+
+    #[test]
+    fn websocket_upgrade_detection_and_wire_metadata_are_strict() {
+        let request = Request::builder()
+            .method(Method::GET)
+            .uri("/room?name=main")
+            .header(axum::http::header::HOST, "chat.example")
+            .header(axum::http::header::CONNECTION, "keep-alive, Upgrade")
+            .header(axum::http::header::UPGRADE, "websocket")
+            .header("sec-websocket-key", "test-key")
+            .body(Body::empty())
+            .unwrap();
+        assert!(is_websocket_upgrade(&request));
+        let wire = websocket_request_to_wire(&request).unwrap();
+        assert_eq!(wire.path_and_query, "/room?name=main");
+        assert!(wire
+            .headers
+            .iter()
+            .any(|(name, value)| name == "upgrade" && value == b"websocket"));
+
+        let post = Request::builder()
+            .method(Method::POST)
+            .header(axum::http::header::CONNECTION, "upgrade")
+            .header(axum::http::header::UPGRADE, "websocket")
+            .body(Body::empty())
+            .unwrap();
+        assert!(!is_websocket_upgrade(&post));
+
+        let body_claim = Request::builder()
+            .method(Method::GET)
+            .header(axum::http::header::CONNECTION, "upgrade")
+            .header(axum::http::header::UPGRADE, "websocket")
+            .header(axum::http::header::CONTENT_LENGTH, "1")
+            .body(Body::empty())
+            .unwrap();
+        assert!(websocket_request_to_wire(&body_claim).is_err());
+    }
+
+    #[test]
+    fn websocket_response_does_not_expose_peer_transport_headers() {
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(
+            axum::http::header::CONNECTION,
+            HeaderValue::from_static("upgrade"),
+        );
+        headers.insert(
+            axum::http::header::UPGRADE,
+            HeaderValue::from_static("websocket"),
+        );
+        headers.insert(
+            crate::transport::NONCE_HEADER,
+            HeaderValue::from_static("secret-session-metadata"),
+        );
+        headers.insert(
+            crate::durable::TUNNEL_PROOF_HEADER,
+            HeaderValue::from_static("proof"),
+        );
+        let response = websocket_upgrade_response(&headers);
+        assert_eq!(response.status(), StatusCode::SWITCHING_PROTOCOLS);
+        assert_eq!(
+            response.headers().get(axum::http::header::UPGRADE),
+            Some(&HeaderValue::from_static("websocket"))
+        );
+        assert!(!response
+            .headers()
+            .contains_key(crate::transport::NONCE_HEADER));
+        assert!(!response
+            .headers()
+            .contains_key(crate::durable::TUNNEL_PROOF_HEADER));
     }
 }

@@ -2087,6 +2087,114 @@ export default {
 
 /// Native workerd Durable Object API plus quorum snapshot persistence
 /// across a complete rf/workerd restart.
+struct TestWebSocket {
+    stream: std::net::TcpStream,
+}
+
+impl TestWebSocket {
+    fn connect(address: std::net::SocketAddr, host: &str, path: &str) -> Self {
+        let mut stream =
+            std::net::TcpStream::connect_timeout(&address, Duration::from_secs(3)).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        stream
+            .set_write_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let request = format!(
+            "GET {path} HTTP/1.1\r\nHost: {host}\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n"
+        );
+        stream.write_all(request.as_bytes()).unwrap();
+        stream.flush().unwrap();
+        let mut response = Vec::new();
+        let mut byte = [0u8; 1];
+        while !response.ends_with(b"\r\n\r\n") {
+            stream.read_exact(&mut byte).unwrap();
+            response.push(byte[0]);
+            assert!(response.len() <= 16 * 1024, "WebSocket response too large");
+        }
+        let response = String::from_utf8(response).unwrap();
+        assert!(
+            response.starts_with("HTTP/1.1 101 "),
+            "WebSocket handshake failed: {response}"
+        );
+        assert!(response.to_ascii_lowercase().contains("upgrade: websocket"));
+        Self { stream }
+    }
+
+    fn send_text(&mut self, text: &str) {
+        let bytes = text.as_bytes();
+        assert!(bytes.len() < 126);
+        let mask = [0x12, 0x34, 0x56, 0x78];
+        let mut frame = vec![0x81, 0x80 | bytes.len() as u8];
+        frame.extend_from_slice(&mask);
+        frame.extend(
+            bytes
+                .iter()
+                .enumerate()
+                .map(|(index, byte)| byte ^ mask[index % mask.len()]),
+        );
+        self.stream.write_all(&frame).unwrap();
+        self.stream.flush().unwrap();
+    }
+
+    fn read_text(&mut self) -> String {
+        loop {
+            let mut header = [0u8; 2];
+            self.stream.read_exact(&mut header).unwrap();
+            let opcode = header[0] & 0x0f;
+            let masked = header[1] & 0x80 != 0;
+            let mut length = u64::from(header[1] & 0x7f);
+            if length == 126 {
+                let mut extended = [0u8; 2];
+                self.stream.read_exact(&mut extended).unwrap();
+                length = u64::from(u16::from_be_bytes(extended));
+            } else if length == 127 {
+                let mut extended = [0u8; 8];
+                self.stream.read_exact(&mut extended).unwrap();
+                length = u64::from_be_bytes(extended);
+            }
+            assert!(length <= 1024 * 1024, "WebSocket test frame too large");
+            let mut mask = [0u8; 4];
+            if masked {
+                self.stream.read_exact(&mut mask).unwrap();
+            }
+            let mut payload = vec![0u8; length as usize];
+            self.stream.read_exact(&mut payload).unwrap();
+            if masked {
+                for (index, byte) in payload.iter_mut().enumerate() {
+                    *byte ^= mask[index % mask.len()];
+                }
+            }
+            match opcode {
+                0x1 => return String::from_utf8(payload).unwrap(),
+                0x9 => {
+                    assert!(payload.len() < 126);
+                    let mut pong = vec![0x8a, 0x80 | payload.len() as u8];
+                    let pong_mask = [0x9a, 0xbc, 0xde, 0xf0];
+                    pong.extend_from_slice(&pong_mask);
+                    pong.extend(
+                        payload
+                            .iter()
+                            .enumerate()
+                            .map(|(index, byte)| byte ^ pong_mask[index % pong_mask.len()]),
+                    );
+                    self.stream.write_all(&pong).unwrap();
+                    self.stream.flush().unwrap();
+                }
+                other => panic!("unexpected WebSocket opcode {other}"),
+            }
+        }
+    }
+
+    fn close(mut self) {
+        self.stream
+            .write_all(&[0x88, 0x82, 1, 2, 3, 4, 0x03 ^ 1, 0xe8 ^ 2])
+            .ok();
+        self.stream.flush().ok();
+    }
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn durable_object_on_real_workerd() {
     let _scenario = E2E_LOCK.lock().await;
@@ -2123,11 +2231,27 @@ async fn durable_object_on_real_workerd() {
         bundle_dir.join("index.js"),
         r#"export class Counter {
   constructor(ctx) { this.ctx = ctx; }
-  async fetch() {
+  async fetch(req) {
+    const path = new URL(req.url).pathname;
+    if (path === "/schedule") {
+      await this.ctx.storage.setAlarm(Date.now() + 1500);
+      return new Response("scheduled");
+    }
+    if (path === "/alarm") {
+      const done = await this.ctx.storage.get("alarmDone");
+      return new Response(done ? JSON.stringify(done) : "pending", { status: done ? 200 : 202 });
+    }
     const old = (await this.ctx.storage.get("count")) || 0;
     const value = old + 1;
     await this.ctx.storage.put("count", value);
     return new Response(String(value));
+  }
+  async alarm(info) {
+    if ((info?.retryCount || 0) < 2) throw new Error("exercise alarm retry");
+    await this.ctx.storage.put("alarmDone", {
+      retryCount: info.retryCount,
+      isRetry: info.isRetry
+    });
   }
 }
 
@@ -2144,14 +2268,14 @@ export default {
         .await
         .unwrap();
 
-    let call = || {
-        http.get(format!("http://127.0.0.1:{ingress}/"))
+    let call = |path: &str| {
+        http.get(format!("http://127.0.0.1:{ingress}{path}"))
             .header("host", "counter.test")
             .send()
     };
     let deadline = Instant::now() + Duration::from_secs(30);
     loop {
-        if let Ok(resp) = call().await {
+        if let Ok(resp) = call("/").await {
             if resp.status() == 200 && resp.text().await.unwrap() == "1" {
                 break;
             }
@@ -2162,27 +2286,34 @@ export default {
         );
         tokio::time::sleep(Duration::from_millis(300)).await;
     }
-    assert_eq!(call().await.unwrap().text().await.unwrap(), "2");
+    assert_eq!(call("/").await.unwrap().text().await.unwrap(), "2");
+    assert_eq!(
+        call("/schedule").await.unwrap().text().await.unwrap(),
+        "scheduled"
+    );
 
-    // Restart rf/workerd and prove local SQLite state survives.
+    // Restart before the alarm is due. The native workerd alarm row must be
+    // part of the quorum snapshot and retain Cloudflare retry metadata.
     child.kill().unwrap();
     child.wait().unwrap();
     let mut child = spawn_node(&dir, &config);
     wait_ping(&api_addr, Duration::from_secs(15)).await;
     let deadline = Instant::now() + Duration::from_secs(30);
-    loop {
-        if let Ok(resp) = call().await {
+    let alarm_info = loop {
+        if let Ok(resp) = call("/alarm").await {
             if resp.status() == 200 {
-                assert_eq!(resp.text().await.unwrap(), "3");
-                break;
+                break resp.json::<serde_json::Value>().await.unwrap();
             }
         }
         assert!(
             Instant::now() < deadline,
-            "Durable Object did not recover after restart"
+            "Durable Object alarm did not recover and exhaust its retries after restart"
         );
         tokio::time::sleep(Duration::from_millis(300)).await;
-    }
+    };
+    assert_eq!(alarm_info["retryCount"], 2);
+    assert_eq!(alarm_info["isRetry"], true);
+    assert_eq!(call("/").await.unwrap().text().await.unwrap(), "3");
     child.kill().unwrap();
     child.wait().unwrap();
 }
@@ -2231,6 +2362,13 @@ async fn durable_object_routes_and_survives_owner_loss() {
 	  constructor(ctx) { this.ctx = ctx; }
 	  async fetch(req) {
 	    const path = new URL(req.url).pathname;
+	    if (path === "/ws") {
+	      const pair = new WebSocketPair();
+	      const [client, server] = Object.values(pair);
+	      this.ctx.acceptWebSocket(server, ["counter"]);
+	      server.serializeAttachment({ kind: "counter" });
+	      return new Response(null, { status: 101, webSocket: client });
+	    }
 	    let value = (await this.ctx.storage.get("count")) || 0;
 	    if (path === "/inc") {
 	      value++;
@@ -2245,6 +2383,16 @@ async fn durable_object_routes_and_survives_owner_loss() {
 	    }
 	    return new Response(String(value));
   }
+	  async webSocketMessage(ws, message) {
+	    if (String(message) !== "inc") {
+	      ws.send("unsupported");
+	      return;
+	    }
+	    let value = (await this.ctx.storage.get("count")) || 0;
+	    value++;
+	    await this.ctx.storage.put("count", value);
+	    ws.send(String(value));
+	  }
 }
 export default {
   fetch(req, env) {
@@ -2283,9 +2431,35 @@ export default {
         assert_eq!(response.text().await.unwrap(), expected);
     }
 
+    // Connect through a node that does not own this Worker. The public 101
+    // and all later WebSocket frames must traverse the authenticated,
+    // encrypted owner tunnel while workerd runs the native hibernation API.
+    let nodes_before_failure = [&a, &b, &c];
+    let mut owner_before_failure = None;
+    for (index, node) in nodes_before_failure.iter().enumerate() {
+        let status = client.status(&node.api).await.unwrap();
+        if status["workers"].as_array().unwrap().iter().any(|worker| {
+            worker["name"] == "global-counter" && worker["durable_owned_here"] == true
+        }) {
+            owner_before_failure = Some(index);
+            break;
+        }
+    }
+    let owner_before_failure = owner_before_failure.expect("one node reports itself as DO owner");
+    let websocket_ingress = nodes_before_failure[(owner_before_failure + 1) % 3].ingress;
+    let mut websocket = TestWebSocket::connect(
+        format!("127.0.0.1:{websocket_ingress}").parse().unwrap(),
+        "global-counter.test",
+        "/ws",
+    );
+    websocket.send_text("inc");
+    assert_eq!(websocket.read_text(), "4");
+    websocket.close();
+    tokio::time::sleep(Duration::from_secs(2)).await;
+
     // The response is committed before this waitUntil mutation runs.
     // No later request reaches the object before the owner dies, so
-    // recovery of 13 proves the periodic background checkpointer
+    // recovery of 14 proves the periodic background checkpointer
     // replicated state changed by alarms/WebSockets/waitUntil work.
     let response = call(b.ingress, "/background").await.unwrap();
     assert_eq!(response.status(), 200);
@@ -2315,7 +2489,7 @@ export default {
     loop {
         if let Ok(resp) = call(nodes[survivor_idx].ingress, "/value").await {
             if resp.status() == 200 {
-                assert_eq!(resp.text().await.unwrap(), "13");
+                assert_eq!(resp.text().await.unwrap(), "14");
                 break;
             }
         }
@@ -2325,9 +2499,19 @@ export default {
         );
         tokio::time::sleep(Duration::from_millis(300)).await;
     }
+    let mut websocket = TestWebSocket::connect(
+        format!("127.0.0.1:{}", nodes[survivor_idx].ingress)
+            .parse()
+            .unwrap(),
+        "global-counter.test",
+        "/ws",
+    );
+    websocket.send_text("inc");
+    assert_eq!(websocket.read_text(), "15");
+    websocket.close();
     let response = call(nodes[survivor_idx].ingress, "/inc").await.unwrap();
     assert_eq!(response.status(), 200);
-    assert_eq!(response.text().await.unwrap(), "14");
+    assert_eq!(response.text().await.unwrap(), "16");
 
     for mut node in nodes {
         node.child.kill().ok();

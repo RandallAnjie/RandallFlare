@@ -6,6 +6,7 @@
 use crate::auth;
 use crate::transport;
 use anyhow::{bail, Context, Result};
+use base64::Engine;
 use futures_util::StreamExt;
 use percent_encoding::{utf8_percent_encode, NON_ALPHANUMERIC};
 use rf_core::envelope::Envelope;
@@ -84,6 +85,12 @@ pub struct PeerClient {
     http: reqwest::Client,
     secret: [u8; 32],
     targets: Arc<Mutex<HashMap<String, String>>>,
+}
+
+pub struct PeerTunnel {
+    pub headers: reqwest::header::HeaderMap,
+    pub stream: reqwest::Upgraded,
+    pub session: String,
 }
 
 impl PeerClient {
@@ -174,6 +181,78 @@ impl PeerClient {
             .await
             .with_context(|| format!("POST {base}{path}"))?;
         self.decode_response("POST", path, &nonce, resp).await
+    }
+
+    /// Establish an authenticated, encrypted-upgrade tunnel to another node.
+    /// The initial metadata uses the normal peer envelope. After the 101,
+    /// callers exchange independently authenticated tunnel frames.
+    pub async fn open_tunnel(&self, base: &str, path: &str, body: Vec<u8>) -> Result<PeerTunnel> {
+        let target = self.target_id(base).await?;
+        let ts = crate::node::now_ms();
+        let mac = auth::mac_hex(&self.secret, ts, "POST", path, &body);
+        let (session, ciphertext) = transport::seal(
+            &self.secret,
+            &transport::request_aad(&ts.to_string(), "POST", path, &target),
+            &body,
+        )?;
+        let response = self
+            .http
+            .post(format!("http://{base}{path}"))
+            .version(reqwest::Version::HTTP_11)
+            .header(auth::TS_HEADER, ts.to_string())
+            .header(auth::MAC_HEADER, mac)
+            .header(transport::ENC_HEADER, transport::VERSION)
+            .header(transport::NONCE_HEADER, &session)
+            .header(transport::TARGET_HEADER, target)
+            .header(reqwest::header::CONNECTION, "upgrade")
+            .header(reqwest::header::UPGRADE, crate::durable::TUNNEL_UPGRADE)
+            .body(ciphertext)
+            .send()
+            .await
+            .with_context(|| format!("opening encrypted tunnel {base}{path}"))?;
+        if response.status() != reqwest::StatusCode::SWITCHING_PROTOCOLS {
+            return match self.decode_response("POST", path, &session, response).await {
+                Ok(_) => bail!("peer rejected encrypted tunnel without an error"),
+                Err(error) => Err(error.context("peer rejected encrypted tunnel")),
+            };
+        }
+        if response
+            .headers()
+            .get(transport::ENC_HEADER)
+            .and_then(|value| value.to_str().ok())
+            != Some(transport::VERSION)
+        {
+            bail!("peer tunnel response was not authenticated");
+        }
+        let proof_nonce = response
+            .headers()
+            .get(transport::NONCE_HEADER)
+            .and_then(|value| value.to_str().ok())
+            .context("peer tunnel response omitted its proof nonce")?;
+        let proof = response
+            .headers()
+            .get(crate::durable::TUNNEL_PROOF_HEADER)
+            .and_then(|value| value.to_str().ok())
+            .context("peer tunnel response omitted its proof")?;
+        let proof = base64::engine::general_purpose::STANDARD
+            .decode(proof)
+            .context("peer tunnel proof was not base64")?;
+        let proof = transport::open(
+            &self.secret,
+            proof_nonce,
+            &transport::response_aad(&session, 101),
+            &proof,
+        )?;
+        if proof != crate::durable::TUNNEL_PROOF {
+            bail!("peer tunnel response proof was invalid");
+        }
+        let headers = response.headers().clone();
+        let stream = response.upgrade().await.context("upgrading peer tunnel")?;
+        Ok(PeerTunnel {
+            headers,
+            stream,
+            session,
+        })
     }
 
     async fn delete(&self, base: &str, path: &str) -> Result<Vec<u8>> {
