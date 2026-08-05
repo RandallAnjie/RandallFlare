@@ -397,6 +397,14 @@
                 <button class="secondary" type="submit">加载</button>
               </form>
               <div id="kv-keys" class="key-list empty-state">请选择要查看的命名空间。</div>
+              <div class="button-row">
+                <button id="kv-prev" class="secondary compact hidden" type="button">← 上一页</button>
+                <button id="kv-next" class="secondary compact hidden" type="button">下一页 →</button>
+                <button id="kv-export" class="secondary compact" type="button">导出 JSON</button>
+                <button id="kv-import-picker" class="secondary compact" type="button">导入 JSON</button>
+                <input id="kv-import" type="file" accept=".json,application/json" hidden>
+              </div>
+              <p id="kv-page-meta" class="form-note">每页最多显示 100 个键；导出保留二进制值、TTL 与 metadata。</p>
             </article>
             <article class="panel editor-panel">
               <p class="eyebrow">值编辑器</p>
@@ -404,15 +412,22 @@
               <form id="kv-editor-form">
                 <label for="kv-key">键</label>
                 <input id="kv-key" required autocomplete="off">
-                <label for="kv-value">UTF-8 值</label>
+                <label for="kv-encoding">值编码</label>
+                <select id="kv-encoding"><option value="text">UTF-8 文本</option><option value="base64">Base64（二进制）</option></select>
+                <label for="kv-value">值</label>
                 <textarea id="kv-value" rows="12" required></textarea>
+                <div class="form-grid">
+                  <label><span>TTL（秒）</span><input id="kv-ttl" type="number" min="60" placeholder="留空则不过期"></label>
+                  <label><span>绝对过期时间</span><input id="kv-expiration" type="datetime-local"><small>TTL 与绝对时间只能填写一个。</small></label>
+                </div>
+                <label><span>metadata（JSON）</span><textarea id="kv-metadata" class="code-input" rows="4" placeholder="{&quot;contentType&quot;:&quot;application/json&quot;}"></textarea><small>最多 1,024 字节；Worker 可通过 getWithMetadata() 读取。</small></label>
                 <div class="button-row">
                   <button class="primary" type="submit">保存</button>
                   <button id="kv-new" class="secondary" type="button">清空</button>
                   <button id="kv-delete" class="danger ghost hidden" type="button">删除</button>
                 </div>
               </form>
-              <p class="form-note">以 <code>__rf</code> 开头的系统命名空间受保护，不能在控制台中写入。</p>
+              <p class="form-note">单值最大 25 MiB。以 <code>__rf</code> 开头的系统命名空间受保护，不能在控制台中写入。</p>
             </article>
           </div>
         </section>

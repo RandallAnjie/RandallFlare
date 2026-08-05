@@ -80,6 +80,11 @@ not unsigned JSON. Admission rechecks the signature, hash-chain relationship,
 resource validation, and cluster quota before replication. `d1:read` accepts
 only SELECT, read-only WITH/EXPLAIN, and a conservative read-only PRAGMA
 whitelist. KV writes can never address the internal `__rf` namespace.
+KV list responses include `entries`, `list_complete` and `cursor`; the legacy
+`keys` array remains for compatibility. `prefix`, `cursor` and `limit` are
+bounded by the node. Browser-admin JSON import/export is documented in
+[去中心化 KV](./KV.md) and is not exposed to bearer tokens as an unbounded
+bulk bypass.
 
 ## S3-compatible R2 credentials
 

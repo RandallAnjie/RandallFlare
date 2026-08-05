@@ -24,7 +24,8 @@ Working today, verified by multi-process fault-injection e2e tests:
 - **One product: workers.** A worker = ES modules + an optional
   static asset tree; assets serve natively from every node
 - KV: last-write-wins CRDT with HLC, tombstones, TTL, ~gossip-window
-  propagation (CF KV consistency contract)
+  propagation (CF KV consistency contract), metadata/bulk reads, cursor
+  pagination, and binary-safe bounded console import/export
 - Claim engine (抢单): signed, HLC-ordered, deterministically
   adjudicated leases — used for cron ticks and DNS reconciliation
 - **Durable Cron triggers**: signed five-field schedules are claim-deduplicated
@@ -471,6 +472,8 @@ new manifest. Nodes decrypt it only into a mode-`0600` temporary workerd config
 and remove that plaintext file as soon as workerd is listening.
 Use HTTPS for the public console; the UI disables Secret writes on public HTTP.
 See [Worker bindings and encrypted Secrets](./docs/WORKERS.md).
+KV consistency, metadata, paging and migration are documented in
+[去中心化 KV](./docs/KV.md).
 
 Binary Deliver definitions are signed and hash chained while their bytes are
 content addressed on local replicas or an operator-selected rclone remote.

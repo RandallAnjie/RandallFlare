@@ -43,6 +43,9 @@ const MAX_CONSOLE_FILES: usize = 2048;
 const MAX_EDITOR_CHANGES: usize = 256;
 const MAX_EDITOR_FILE: usize = 25 * 1024 * 1024;
 const MAX_EDITOR_READ: usize = 5 * 1024 * 1024;
+const MAX_KV_VALUE: usize = 25 * 1024 * 1024;
+const MAX_KV_TRANSFER: usize = 64 * 1024 * 1024;
+const MAX_KV_TRANSFER_ENTRIES: usize = 10_000;
 
 #[derive(Clone)]
 enum ConsoleMode {
@@ -394,6 +397,8 @@ pub fn router(state: ConsoleState) -> Router {
         .route("/api/approvals/{id}", get(approval_status))
         .route("/api/kv", get(kv_list))
         .route("/api/kv/value", get(kv_get).put(kv_put).delete(kv_delete))
+        .route("/api/kv/export", get(kv_export))
+        .route("/api/kv/import", post(kv_import))
         .route("/api/d1/create", post(d1_create))
         .route("/api/d1/exec", post(d1_exec))
         .route("/api/r2/buckets", get(r2_bucket_list).post(r2_bucket_apply))
@@ -1268,11 +1273,23 @@ async fn public_api_kv_list(
 ) -> ApiResult<Json<Value>> {
     require_api_scope(&principal, "kv:read")?;
     validate_kv(&namespace, None, false)?;
-    let keys = state
+    let page = state
         .client
-        .kv_list(&state.node, &namespace, &query.prefix)
+        .kv_list_page(
+            &state.node,
+            &namespace,
+            &query.prefix,
+            query.cursor.as_deref(),
+            query.limit.unwrap_or(1000),
+        )
         .await?;
-    Ok(Json(json!({ "namespace": namespace, "keys": keys })))
+    Ok(Json(json!({
+        "namespace": namespace,
+        "keys": page.entries.iter().map(|entry| entry.key.clone()).collect::<Vec<_>>(),
+        "entries": page.entries,
+        "list_complete": page.list_complete,
+        "cursor": page.cursor,
+    })))
 }
 
 async fn public_api_kv_get(
@@ -1298,8 +1315,8 @@ async fn public_api_kv_put(
 ) -> ApiResult<Json<Value>> {
     require_api_scope(&principal, "kv:write")?;
     validate_kv(&namespace, Some(&key), true)?;
-    if body.len() > MAX_CONSOLE_VALUE {
-        return Err(ApiError::bad_request("KV 值不得超过 1 MiB"));
+    if body.len() > MAX_KV_VALUE {
+        return Err(ApiError::bad_request("KV 值不得超过 25 MiB"));
     }
     state
         .client
@@ -5377,6 +5394,8 @@ struct KvQuery {
     namespace: String,
     #[serde(default)]
     prefix: String,
+    cursor: Option<String>,
+    limit: Option<usize>,
 }
 
 #[derive(Deserialize)]
@@ -5390,7 +5409,42 @@ struct KvValueQuery {
 struct KvWriteRequest {
     namespace: String,
     key: String,
-    value: String,
+    #[serde(default)]
+    value: Option<String>,
+    #[serde(default)]
+    value_base64: Option<String>,
+    #[serde(default)]
+    expiration_ttl: Option<u64>,
+    #[serde(default)]
+    expiration: Option<u64>,
+    #[serde(default)]
+    metadata: Option<Value>,
+}
+
+#[derive(Debug, serde::Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct KvTransferEntry {
+    key: String,
+    value_base64: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    expiration: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    metadata: Option<Value>,
+}
+
+#[derive(Debug, serde::Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct KvTransfer {
+    #[serde(default = "kv_transfer_version")]
+    version: u8,
+    namespace: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    prefix: String,
+    entries: Vec<KvTransferEntry>,
+}
+
+fn kv_transfer_version() -> u8 {
+    1
 }
 
 fn validate_kv(namespace: &str, key: Option<&str>, writing: bool) -> ApiResult<()> {
@@ -5413,14 +5467,22 @@ async fn kv_list(
     Query(query): Query<KvQuery>,
 ) -> ApiResult<Json<Value>> {
     validate_kv(&query.namespace, None, false)?;
-    let keys = state
+    let page = state
         .client
-        .kv_list(&state.node, &query.namespace, &query.prefix)
+        .kv_list_page(
+            &state.node,
+            &query.namespace,
+            &query.prefix,
+            query.cursor.as_deref(),
+            query.limit.unwrap_or(100),
+        )
         .await?;
     Ok(Json(json!({
         "namespace": query.namespace,
         "prefix": query.prefix,
-        "keys": keys,
+        "entries": page.entries,
+        "list_complete": page.list_complete,
+        "cursor": page.cursor,
     })))
 }
 
@@ -5431,16 +5493,21 @@ async fn kv_get(
     validate_kv(&query.namespace, Some(&query.key), false)?;
     let value = state
         .client
-        .kv_get(&state.node, &query.namespace, &query.key)
+        .kv_get_with_metadata(&state.node, &query.namespace, &query.key)
         .await?
         .ok_or_else(|| ApiError::not_found("未找到该 KV 键"))?;
-    let utf8 = String::from_utf8(value.clone()).ok();
     use base64::Engine as _;
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(&value.value_base64)
+        .map_err(|_| ApiError::upstream("节点返回了无效的 KV Base64 数据"))?;
+    let utf8 = String::from_utf8(bytes).ok();
     Ok(Json(json!({
         "namespace": query.namespace,
         "key": query.key,
         "text": utf8,
-        "base64": base64::engine::general_purpose::STANDARD.encode(value),
+        "base64": value.value_base64,
+        "expiration": value.expires_at_ms.map(|millis| millis / 1000),
+        "metadata": value.metadata,
     })))
 }
 
@@ -5450,16 +5517,18 @@ async fn kv_put(
 ) -> ApiResult<Json<Value>> {
     state.require_mutation()?;
     validate_kv(&request.namespace, Some(&request.key), true)?;
-    if request.value.len() > MAX_CONSOLE_VALUE {
-        return Err(ApiError::bad_request("控制台写入的 KV 值最大为 1 MiB"));
-    }
+    let value = decode_kv_write_value(request.value, request.value_base64)?;
+    validate_kv_value_and_metadata(&value, request.metadata.as_ref())?;
+    let expires_at_ms = kv_expiration_ms(request.expiration_ttl, request.expiration)?;
     state
         .client
-        .kv_put(
+        .kv_put_with_metadata(
             &state.node,
             &request.namespace,
             &request.key,
-            request.value.into_bytes(),
+            value,
+            expires_at_ms,
+            request.metadata.as_ref(),
         )
         .await?;
     Ok(Json(json!({ "ok": true })))
@@ -5476,6 +5545,213 @@ async fn kv_delete(
         .kv_delete(&state.node, &query.namespace, &query.key)
         .await?;
     Ok(Json(json!({ "ok": true })))
+}
+
+fn decode_kv_write_value(
+    value: Option<String>,
+    value_base64: Option<String>,
+) -> ApiResult<Vec<u8>> {
+    match (value, value_base64) {
+        (Some(value), None) => Ok(value.into_bytes()),
+        (None, Some(encoded)) => {
+            use base64::Engine as _;
+            base64::engine::general_purpose::STANDARD
+                .decode(encoded)
+                .map_err(|_| ApiError::bad_request("KV 值不是有效的 Base64 数据"))
+        }
+        (Some(_), Some(_)) => Err(ApiError::bad_request(
+            "KV 写入只能提供 value 或 value_base64 之一",
+        )),
+        (None, None) => Err(ApiError::bad_request("KV 写入缺少值")),
+    }
+}
+
+fn validate_kv_value_and_metadata(value: &[u8], metadata: Option<&Value>) -> ApiResult<()> {
+    if value.len() > MAX_KV_VALUE {
+        return Err(ApiError::bad_request("KV 单个值最大为 25 MiB"));
+    }
+    if metadata.is_some_and(|metadata| {
+        serde_json::to_vec(metadata)
+            .map(|raw| raw.len() > 1024)
+            .unwrap_or(true)
+    }) {
+        return Err(ApiError::bad_request("KV metadata 最大为 1,024 字节"));
+    }
+    Ok(())
+}
+
+fn kv_expiration_ms(
+    ttl_seconds: Option<u64>,
+    expiration_seconds: Option<u64>,
+) -> ApiResult<Option<u64>> {
+    if ttl_seconds.is_some() && expiration_seconds.is_some() {
+        return Err(ApiError::bad_request(
+            "expirationTtl 与 expiration 不能同时设置",
+        ));
+    }
+    let now = crate::node::now_ms();
+    if let Some(ttl) = ttl_seconds {
+        if ttl < 60 {
+            return Err(ApiError::bad_request("KV TTL 至少为 60 秒"));
+        }
+        return Ok(Some(now.saturating_add(ttl.saturating_mul(1000))));
+    }
+    if let Some(expiration) = expiration_seconds {
+        let expiration = expiration.saturating_mul(1000);
+        if expiration < now.saturating_add(60_000) {
+            return Err(ApiError::bad_request("KV 绝对过期时间至少在 60 秒之后"));
+        }
+        return Ok(Some(expiration));
+    }
+    Ok(None)
+}
+
+async fn kv_export(
+    State(state): State<ConsoleState>,
+    Query(query): Query<KvQuery>,
+) -> ApiResult<Response> {
+    validate_kv(&query.namespace, None, false)?;
+    let mut entries = Vec::new();
+    let mut cursor = None;
+    let mut total = 0usize;
+    loop {
+        let page = state
+            .client
+            .kv_list_page(
+                &state.node,
+                &query.namespace,
+                &query.prefix,
+                cursor.as_deref(),
+                1_000,
+            )
+            .await?;
+        for item in page.entries {
+            if entries.len() >= MAX_KV_TRANSFER_ENTRIES {
+                return Err(ApiError::bad_request("KV 导出最多包含 10,000 个键"));
+            }
+            let Some(value) = state
+                .client
+                .kv_get_with_metadata(&state.node, &query.namespace, &item.key)
+                .await?
+            else {
+                continue;
+            };
+            use base64::Engine as _;
+            let raw_len = base64::engine::general_purpose::STANDARD
+                .decode(&value.value_base64)
+                .map_err(|_| ApiError::upstream("节点返回了无效的 KV Base64 数据"))?
+                .len();
+            total = total.saturating_add(raw_len);
+            if total > MAX_KV_TRANSFER {
+                return Err(ApiError::bad_request("KV 导出值总量最大为 64 MiB"));
+            }
+            entries.push(KvTransferEntry {
+                key: item.key,
+                value_base64: value.value_base64,
+                expiration: value.expires_at_ms.map(|millis| millis / 1000),
+                metadata: value.metadata,
+            });
+        }
+        if page.list_complete {
+            break;
+        }
+        let next = page
+            .cursor
+            .filter(|next| cursor.as_ref() != Some(next))
+            .ok_or_else(|| ApiError::upstream("KV 节点返回了无进展游标"))?;
+        cursor = Some(next);
+    }
+    let transfer = KvTransfer {
+        version: kv_transfer_version(),
+        namespace: query.namespace,
+        prefix: query.prefix,
+        entries,
+    };
+    let bytes = serde_json::to_vec_pretty(&transfer)?;
+    let mut response = bytes.into_response();
+    response.headers_mut().insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("application/json; charset=utf-8"),
+    );
+    response.headers_mut().insert(
+        header::CONTENT_DISPOSITION,
+        HeaderValue::from_static("attachment; filename=randallflare-kv.json"),
+    );
+    response
+        .headers_mut()
+        .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    Ok(response)
+}
+
+async fn kv_import(
+    State(state): State<ConsoleState>,
+    Json(transfer): Json<KvTransfer>,
+) -> ApiResult<Json<Value>> {
+    state.require_mutation()?;
+    validate_kv(&transfer.namespace, None, true)?;
+    if transfer.version != kv_transfer_version() {
+        return Err(ApiError::bad_request("不支持此 KV 导入文件版本"));
+    }
+    if transfer.entries.is_empty() || transfer.entries.len() > MAX_KV_TRANSFER_ENTRIES {
+        return Err(ApiError::bad_request("KV 导入必须包含 1 至 10,000 个键"));
+    }
+    use base64::Engine as _;
+    let now = crate::node::now_ms();
+    let mut decoded = Vec::with_capacity(transfer.entries.len());
+    let mut keys = std::collections::BTreeSet::new();
+    let mut total = 0usize;
+    let mut expired = 0usize;
+    for entry in transfer.entries {
+        validate_kv(&transfer.namespace, Some(&entry.key), true)?;
+        if !keys.insert(entry.key.clone()) {
+            return Err(ApiError::bad_request(format!(
+                "KV 导入包含重复键：{}",
+                entry.key
+            )));
+        }
+        let value = base64::engine::general_purpose::STANDARD
+            .decode(&entry.value_base64)
+            .map_err(|_| {
+                ApiError::bad_request(format!("KV 键 {} 的值不是有效 Base64", entry.key))
+            })?;
+        validate_kv_value_and_metadata(&value, entry.metadata.as_ref())?;
+        total = total.saturating_add(value.len());
+        if total > MAX_KV_TRANSFER {
+            return Err(ApiError::bad_request("KV 导入值总量最大为 64 MiB"));
+        }
+        let expires_at_ms = entry.expiration.map(|seconds| seconds.saturating_mul(1000));
+        if expires_at_ms.is_some_and(|expires| expires <= now) {
+            expired += 1;
+            continue;
+        }
+        if expires_at_ms.is_some_and(|expires| expires < now.saturating_add(60_000)) {
+            return Err(ApiError::bad_request(format!(
+                "KV 键 {} 的过期时间不足 60 秒",
+                entry.key
+            )));
+        }
+        decoded.push((entry.key, value, expires_at_ms, entry.metadata));
+    }
+    for (key, value, expires_at_ms, metadata) in &decoded {
+        state
+            .client
+            .kv_put_with_metadata(
+                &state.node,
+                &transfer.namespace,
+                key,
+                value.clone(),
+                *expires_at_ms,
+                metadata.as_ref(),
+            )
+            .await?;
+    }
+    Ok(Json(json!({
+        "ok": true,
+        "namespace": transfer.namespace,
+        "imported": decoded.len(),
+        "expired_skipped": expired,
+        "bytes": total,
+    })))
 }
 
 #[derive(Deserialize)]
@@ -8243,6 +8519,49 @@ mod tests {
     fn internal_kv_writes_are_rejected() {
         assert!(validate_kv("__rf", Some("d1/test"), true).is_err());
         assert!(validate_kv("public", Some("key"), true).is_ok());
+    }
+
+    #[test]
+    fn kv_console_preserves_binary_metadata_and_expiration_contract() {
+        use base64::Engine as _;
+        let binary = vec![0, 159, 255, 10];
+        assert_eq!(
+            decode_kv_write_value(
+                None,
+                Some(base64::engine::general_purpose::STANDARD.encode(&binary)),
+            )
+            .unwrap(),
+            binary
+        );
+        assert!(decode_kv_write_value(Some("text".into()), Some("dGV4dA==".into())).is_err());
+        assert!(validate_kv_value_and_metadata(
+            b"value",
+            Some(&json!({ "contentType": "application/octet-stream" }))
+        )
+        .is_ok());
+        assert!(
+            validate_kv_value_and_metadata(b"value", Some(&Value::String("x".repeat(1025))))
+                .is_err()
+        );
+        assert!(kv_expiration_ms(Some(59), None).is_err());
+        assert!(kv_expiration_ms(Some(60), None).unwrap().is_some());
+        assert!(kv_expiration_ms(Some(60), Some(crate::node::now_ms() / 1000 + 3600)).is_err());
+
+        let transfer = KvTransfer {
+            version: 1,
+            namespace: "assets".into(),
+            prefix: "images/".into(),
+            entries: vec![KvTransferEntry {
+                key: "images/logo".into(),
+                value_base64: base64::engine::general_purpose::STANDARD.encode(&binary),
+                expiration: Some(2_000_000_000),
+                metadata: Some(json!({ "kind": "logo" })),
+            }],
+        };
+        let encoded = serde_json::to_vec(&transfer).unwrap();
+        let decoded: KvTransfer = serde_json::from_slice(&encoded).unwrap();
+        assert_eq!(decoded.namespace, "assets");
+        assert_eq!(decoded.entries[0].metadata, Some(json!({ "kind": "logo" })));
     }
 
     #[test]

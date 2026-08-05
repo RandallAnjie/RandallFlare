@@ -2656,8 +2656,16 @@ async fn two_node_deploy_kv_and_static_stability() {
 
     // Query-string authentication, percent-encoded namespace/key,
     // list, and tombstone paths all work through the encrypted API.
+    let expires_at_ms = rf::node::now_ms() + 3_600_000;
     client
-        .kv_put(&a.api, "ns/special", "greet?one", b"encoded-key".to_vec())
+        .kv_put_with_metadata(
+            &a.api,
+            "ns/special",
+            "greet?one",
+            b"encoded-key".to_vec(),
+            Some(expires_at_ms),
+            Some(&serde_json::json!({"source": "e2e"})),
+        )
         .await
         .unwrap();
     let deadline = Instant::now() + Duration::from_secs(15);
@@ -2682,6 +2690,51 @@ async fn two_node_deploy_kv_and_static_stability() {
             .unwrap(),
         vec!["greet?one"]
     );
+    let rich = client
+        .kv_get_with_metadata(&b.api, "ns/special", "greet?one")
+        .await
+        .unwrap()
+        .unwrap();
+    use base64::Engine as _;
+    assert_eq!(
+        base64::engine::general_purpose::STANDARD
+            .decode(rich.value_base64)
+            .unwrap(),
+        b"encoded-key"
+    );
+    assert_eq!(rich.metadata, Some(serde_json::json!({"source": "e2e"})));
+    assert_eq!(rich.expires_at_ms, Some(expires_at_ms));
+
+    client
+        .kv_put(&a.api, "ns/special", "greet?two", b"page-two".to_vec())
+        .await
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        let page = client
+            .kv_list_page(&b.api, "ns/special", "greet?", None, 10)
+            .await
+            .unwrap();
+        if page.entries.len() == 2 {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "paged KV listing never converged"
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    let first = client
+        .kv_list_page(&b.api, "ns/special", "greet?", None, 1)
+        .await
+        .unwrap();
+    assert!(!first.list_complete);
+    let second = client
+        .kv_list_page(&b.api, "ns/special", "greet?", first.cursor.as_deref(), 1)
+        .await
+        .unwrap();
+    assert_eq!(second.entries[0].key, "greet?two");
+    assert!(second.list_complete);
     client
         .kv_delete(&b.api, "ns/special", "greet?one")
         .await

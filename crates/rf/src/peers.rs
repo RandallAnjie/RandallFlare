@@ -17,6 +17,28 @@ use std::time::Duration;
 
 const MAX_PEER_RESPONSE: usize = crate::binary::MAX_BINARY_BYTES + 1024 * 1024 + 16;
 
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq)]
+pub struct KvListItem {
+    pub key: String,
+    pub size: u64,
+    pub expires_at_ms: Option<u64>,
+    pub metadata: Option<serde_json::Value>,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq)]
+pub struct KvListPage {
+    pub entries: Vec<KvListItem>,
+    pub list_complete: bool,
+    pub cursor: Option<String>,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq)]
+pub struct KvValue {
+    pub value_base64: String,
+    pub expires_at_ms: Option<u64>,
+    pub metadata: Option<serde_json::Value>,
+}
+
 #[derive(Debug)]
 struct PeerHttpError {
     method: String,
@@ -437,10 +459,57 @@ impl PeerClient {
         }
     }
 
+    pub async fn kv_get_with_metadata(
+        &self,
+        base: &str,
+        ns: &str,
+        key: &str,
+    ) -> Result<Option<KvValue>> {
+        let path = format!(
+            "/v1/kv/{}/{}?with_metadata=true",
+            component(ns),
+            component(key)
+        );
+        match self.get(base, &path).await {
+            Ok(raw) => Ok(Some(serde_json::from_slice(&raw)?)),
+            Err(error) if peer_http_status(&error) == Some(404) => Ok(None),
+            Err(error) => Err(error),
+        }
+    }
+
     pub async fn kv_put(&self, base: &str, ns: &str, key: &str, value: Vec<u8>) -> Result<()> {
+        self.kv_put_with_metadata(base, ns, key, value, None, None)
+            .await
+    }
+
+    pub async fn kv_put_with_metadata(
+        &self,
+        base: &str,
+        ns: &str,
+        key: &str,
+        value: Vec<u8>,
+        expires_at_ms: Option<u64>,
+        metadata: Option<&serde_json::Value>,
+    ) -> Result<()> {
+        let mut query = Vec::new();
+        if let Some(expires_at_ms) = expires_at_ms {
+            query.push(format!("expires_at_ms={expires_at_ms}"));
+        }
+        if let Some(metadata) = metadata {
+            let encoded = serde_json::to_string(metadata)?;
+            if encoded.len() > 1024 {
+                bail!("KV metadata exceeds 1024 bytes");
+            }
+            query.push(format!("metadata={}", component(&encoded)));
+        }
+        let suffix = if query.is_empty() {
+            String::new()
+        } else {
+            format!("?{}", query.join("&"))
+        };
         self.post(
             base,
-            &format!("/v1/kv/{}/{}", component(ns), component(key)),
+            &format!("/v1/kv/{}/{}{}", component(ns), component(key), suffix),
             value,
         )
         .await?;
@@ -457,15 +526,35 @@ impl PeerClient {
     }
 
     pub async fn kv_list(&self, base: &str, ns: &str, prefix: &str) -> Result<Vec<String>> {
-        let path = format!("/v1/kv/{}?prefix={}", component(ns), component(prefix));
-        let raw = self.get(base, &path).await?;
-        let response: serde_json::Value = serde_json::from_slice(&raw)?;
-        Ok(response["keys"]
-            .as_array()
+        Ok(self
+            .kv_list_page(base, ns, prefix, None, 10_000)
+            .await?
+            .entries
             .into_iter()
-            .flatten()
-            .filter_map(|key| key.as_str().map(str::to_string))
+            .map(|entry| entry.key)
             .collect())
+    }
+
+    pub async fn kv_list_page(
+        &self,
+        base: &str,
+        ns: &str,
+        prefix: &str,
+        cursor: Option<&str>,
+        limit: usize,
+    ) -> Result<KvListPage> {
+        let mut path = format!(
+            "/v1/kv/{}?prefix={}&limit={}",
+            component(ns),
+            component(prefix),
+            limit.clamp(1, 1_000)
+        );
+        if let Some(cursor) = cursor.filter(|cursor| !cursor.is_empty()) {
+            path.push_str("&cursor=");
+            path.push_str(&component(cursor));
+        }
+        let raw = self.get(base, &path).await?;
+        Ok(serde_json::from_slice(&raw)?)
     }
 
     pub async fn r2_list(

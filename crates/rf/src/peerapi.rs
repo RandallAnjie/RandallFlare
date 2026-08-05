@@ -977,6 +977,7 @@ async fn log_get(
 struct KvPutQuery {
     expires_at_ms: Option<u64>,
     ttl_ms: Option<u64>,
+    metadata: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -984,6 +985,13 @@ struct KvListQuery {
     #[serde(default)]
     prefix: String,
     limit: Option<usize>,
+    cursor: Option<String>,
+}
+
+#[derive(Deserialize, Default)]
+struct KvGetQuery {
+    #[serde(default)]
+    with_metadata: bool,
 }
 
 async fn kv_list(
@@ -998,16 +1006,48 @@ async fn kv_list(
     if let Err(r) = check(&api, &remote, &headers, &method, &uri, b"") {
         return r.into_response();
     }
-    let keys = api
-        .node
-        .kv_list(&ns, &q.prefix, q.limit.unwrap_or(1000).clamp(1, 10_000));
-    axum::Json(serde_json::json!({ "keys": keys })).into_response()
+    let (items, list_complete, cursor) = api.node.kv_list_page_with_metadata(
+        &ns,
+        &q.prefix,
+        q.limit.unwrap_or(1000).clamp(1, 1_000),
+        q.cursor.as_deref(),
+    );
+    let entries = items
+        .into_iter()
+        .map(|(key, expires_at_ms, metadata)| {
+            let size = api
+                .node
+                .kv_get(&ns, &key)
+                .map(|value| value.len() as u64)
+                .unwrap_or(0);
+            crate::peers::KvListItem {
+                key,
+                size,
+                expires_at_ms,
+                metadata: metadata
+                    .as_deref()
+                    .and_then(|raw| serde_json::from_slice(raw).ok()),
+            }
+        })
+        .collect::<Vec<_>>();
+    let keys = entries
+        .iter()
+        .map(|entry| entry.key.clone())
+        .collect::<Vec<_>>();
+    axum::Json(serde_json::json!({
+        "keys": keys,
+        "entries": entries,
+        "list_complete": list_complete,
+        "cursor": cursor,
+    }))
+    .into_response()
 }
 
 async fn kv_get(
     State(api): State<Api>,
     ConnectInfo(remote): ConnectInfo<SocketAddr>,
     Path((ns, key)): Path<(String, String)>,
+    Query(query): Query<KvGetQuery>,
     method: Method,
     uri: Uri,
     headers: HeaderMap,
@@ -1015,8 +1055,26 @@ async fn kv_get(
     if let Err(r) = check(&api, &remote, &headers, &method, &uri, b"") {
         return r.into_response();
     }
-    match api.node.kv_get(&ns, &key) {
-        Some(v) => v.into_response(),
+    match api.node.kv_get_with_metadata(&ns, &key) {
+        Some((value, metadata)) if query.with_metadata => {
+            use base64::Engine as _;
+            let expires_at_ms = api
+                .node
+                .kv_list_page(&ns, &key, 1, None)
+                .0
+                .into_iter()
+                .find_map(|(candidate, expiration)| (candidate == key).then_some(expiration))
+                .flatten();
+            axum::Json(serde_json::json!({
+                "value_base64": base64::engine::general_purpose::STANDARD.encode(value),
+                "expires_at_ms": expires_at_ms,
+                "metadata": metadata
+                    .as_deref()
+                    .and_then(|raw| serde_json::from_slice::<serde_json::Value>(raw).ok()),
+            }))
+            .into_response()
+        }
+        Some((value, _)) => value.into_response(),
         None => (StatusCode::NOT_FOUND, "no such key").into_response(),
     }
 }
@@ -1044,7 +1102,30 @@ async fn kv_put(
         return r.into_response();
     }
     let expires = q.expires_at_ms.or_else(|| q.ttl_ms.map(|t| now_ms() + t));
-    match api.node.kv_put(&ns, &key, Some(body.to_vec()), expires) {
+    if q.ttl_ms.is_some_and(|ttl| ttl < 60_000)
+        || q.expires_at_ms
+            .is_some_and(|expires| expires < now_ms().saturating_add(60_000))
+    {
+        return (
+            StatusCode::BAD_REQUEST,
+            "kv expiration must be at least 60 seconds",
+        )
+            .into_response();
+    }
+    let metadata = match q.metadata {
+        Some(raw) if raw.len() > 1024 => {
+            return (StatusCode::BAD_REQUEST, "kv metadata exceeds 1024 bytes").into_response()
+        }
+        Some(raw) => match serde_json::from_str::<serde_json::Value>(&raw) {
+            Ok(value) => Some(serde_json::to_vec(&value).expect("JSON re-encodes")),
+            Err(_) => return (StatusCode::BAD_REQUEST, "kv metadata is not JSON").into_response(),
+        },
+        None => None,
+    };
+    match api
+        .node
+        .kv_put_with_metadata(&ns, &key, Some(body.to_vec()), expires, metadata)
+    {
         // Encrypted transport needs to carry an AEAD tag in the body;
         // HTTP forbids bodies on 204 responses.
         Ok(()) => StatusCode::OK.into_response(),

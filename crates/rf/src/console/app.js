@@ -14,6 +14,10 @@ const state = {
   view: "overview",
   busy: 0,
   kvSelected: null,
+  kvCursor: null,
+  kvCursorStack: [],
+  kvNextCursor: null,
+  kvEntries: new Map(),
   authChallenge: null,
   authTimer: null,
   approvalTimer: null,
@@ -454,6 +458,16 @@ function formatBytes(bytes) {
   if (value < 1024) return `${value} B`;
   if (value < 1024 * 1024) return `${(value / 1024).toFixed(1)} KiB`;
   return `${(value / (1024 * 1024)).toFixed(1)} MiB`;
+}
+
+function formatDuration(milliseconds) {
+  const seconds = Math.max(0, Math.floor(Number(milliseconds || 0) / 1000));
+  if (seconds < 60) return `${seconds} 秒`;
+  const minutes = Math.floor(seconds / 60);
+  if (minutes < 60) return `${minutes} 分钟`;
+  const hours = Math.floor(minutes / 60);
+  if (hours < 24) return `${hours} 小时`;
+  return `${Math.floor(hours / 24)} 天`;
 }
 
 function workerUrl(hostname, tlsEnabled = location.protocol === "https:") {
@@ -4125,22 +4139,59 @@ async function pollApproval(id) {
   }
 }
 
-async function loadKeys() {
+async function loadKeys({ reset = false, cursor = undefined } = {}) {
   const namespace = $("#kv-namespace").value.trim();
   const prefix = $("#kv-prefix").value;
   if (!namespace) return;
+  if (reset) {
+    state.kvCursor = null;
+    state.kvCursorStack = [];
+  } else if (cursor !== undefined) {
+    state.kvCursor = cursor;
+  }
   try {
-    const query = new URLSearchParams({ namespace, prefix });
+    const query = new URLSearchParams({ namespace, prefix, limit: "100" });
+    if (state.kvCursor) query.set("cursor", state.kvCursor);
     const data = await api(`/api/kv?${query}`);
-    $("#kv-count").textContent = `${data.keys.length} 个键`;
+    const entries = Array.isArray(data.entries) ? data.entries : [];
+    state.kvEntries = new Map(entries.map((entry) => [entry.key, entry]));
+    state.kvNextCursor = data.cursor || null;
+    $("#kv-count").textContent = `${entries.length} 个键`;
     const list = $("#kv-keys");
-    list.classList.toggle("empty-state", data.keys.length === 0);
-    list.innerHTML = data.keys.length
-      ? data.keys.map((key) => `<button class="key-button" type="button" data-key="${escapeHtml(key)}"><span>${escapeHtml(key)}</span><span>编辑 →</span></button>`).join("")
+    list.classList.toggle("empty-state", entries.length === 0);
+    list.innerHTML = entries.length
+      ? entries.map((entry) => {
+        const expiry = entry.expires_at_ms
+          ? ` · ${entry.expires_at_ms <= Date.now() ? "已过期" : `剩余 ${formatDuration(entry.expires_at_ms - Date.now())}`}`
+          : "";
+        const metadata = entry.metadata == null ? "" : " · metadata";
+        return `<button class="key-button" type="button" data-key="${escapeHtml(entry.key)}"><span><strong>${escapeHtml(entry.key)}</strong><small>${formatBytes(entry.size || 0)}${escapeHtml(expiry)}${metadata}</small></span><span>编辑 →</span></button>`;
+      }).join("")
       : "没有符合此前缀的键。";
+    $("#kv-prev").classList.toggle("hidden", state.kvCursorStack.length === 0);
+    $("#kv-next").classList.toggle("hidden", Boolean(data.list_complete));
+    $("#kv-page-meta").textContent = `第 ${state.kvCursorStack.length + 1} 页 · ${entries.length} 个键${prefix ? ` · 前缀 ${prefix}` : ""}`;
   } catch (error) {
     toast(error.message, true);
   }
+}
+
+function nextKvPage() {
+  if (!state.kvNextCursor) return;
+  state.kvCursorStack.push(state.kvCursor);
+  loadKeys({ cursor: state.kvNextCursor });
+}
+
+function previousKvPage() {
+  if (!state.kvCursorStack.length) return;
+  loadKeys({ cursor: state.kvCursorStack.pop() || null });
+}
+
+function localDateTimeValue(epochSeconds) {
+  if (!epochSeconds) return "";
+  const date = new Date(epochSeconds * 1000);
+  const local = new Date(date.getTime() - date.getTimezoneOffset() * 60_000);
+  return local.toISOString().slice(0, 16);
 }
 
 async function openKey(key) {
@@ -4150,7 +4201,11 @@ async function openKey(key) {
     const data = await api(`/api/kv/value?${query}`);
     state.kvSelected = key;
     $("#kv-key").value = key;
-    $("#kv-value").value = data.text ?? `[二进制值；Base64 编码]\n${data.base64}`;
+    $("#kv-encoding").value = data.text == null ? "base64" : "text";
+    $("#kv-value").value = data.text ?? data.base64;
+    $("#kv-ttl").value = "";
+    $("#kv-expiration").value = localDateTimeValue(data.expiration);
+    $("#kv-metadata").value = data.metadata == null ? "" : JSON.stringify(data.metadata, null, 2);
     $("#kv-editor-title").textContent = key;
     $("#kv-delete").classList.remove("hidden");
   } catch (error) {
@@ -4162,6 +4217,10 @@ function clearKey() {
   state.kvSelected = null;
   $("#kv-key").value = "";
   $("#kv-value").value = "";
+  $("#kv-encoding").value = "text";
+  $("#kv-ttl").value = "";
+  $("#kv-expiration").value = "";
+  $("#kv-metadata").value = "";
   $("#kv-editor-title").textContent = "新建键";
   $("#kv-delete").classList.add("hidden");
   $("#kv-key").focus();
@@ -4169,17 +4228,37 @@ function clearKey() {
 
 async function saveKey(event) {
   event.preventDefault();
+  let metadata = null;
+  const metadataRaw = $("#kv-metadata").value.trim();
+  if (metadataRaw) {
+    try {
+      metadata = JSON.parse(metadataRaw);
+    } catch {
+      toast("KV metadata 必须是有效 JSON", true);
+      return;
+    }
+  }
+  const ttl = $("#kv-ttl").value.trim();
+  const expirationRaw = $("#kv-expiration").value;
+  if (ttl && expirationRaw) {
+    toast("TTL 与绝对过期时间只能填写一个", true);
+    return;
+  }
   const payload = {
     namespace: $("#kv-namespace").value.trim(),
     key: $("#kv-key").value,
-    value: $("#kv-value").value,
+    metadata,
   };
+  if ($("#kv-encoding").value === "base64") payload.value_base64 = $("#kv-value").value.trim();
+  else payload.value = $("#kv-value").value;
+  if (ttl) payload.expiration_ttl = Number(ttl);
+  if (expirationRaw) payload.expiration = Math.floor(new Date(expirationRaw).getTime() / 1000);
   try {
     await api("/api/kv/value", { method: "PUT", body: JSON.stringify(payload) });
     state.kvSelected = payload.key;
     $("#kv-delete").classList.remove("hidden");
     toast(`已保存 ${payload.namespace}/${payload.key}`);
-    await loadKeys();
+    await loadKeys({ reset: true });
   } catch (error) {
     toast(error.message, true);
   }
@@ -4194,9 +4273,59 @@ async function removeKey() {
     await api(`/api/kv/value?${query}`, { method: "DELETE" });
     toast(`已删除 ${namespace}/${key}`);
     clearKey();
-    await loadKeys();
+    await loadKeys({ reset: true });
   } catch (error) {
     toast(error.message, true);
+  }
+}
+
+async function exportKv() {
+  const namespace = $("#kv-namespace").value.trim();
+  if (!namespace) return;
+  setBusy(true);
+  try {
+    const headers = new Headers();
+    if (consoleMode === "local") headers.set("x-rf-console-token", token);
+    const query = new URLSearchParams({ namespace, prefix: $("#kv-prefix").value });
+    const response = await fetch(`/api/kv/export?${query}`, { headers });
+    if (!response.ok) {
+      const payload = await response.json().catch(() => ({}));
+      throw new Error(payload.error || `导出失败（HTTP ${response.status}）`);
+    }
+    const blob = await response.blob();
+    const link = document.createElement("a");
+    link.href = URL.createObjectURL(blob);
+    link.download = `${namespace}-kv.json`;
+    document.body.appendChild(link);
+    link.click();
+    link.remove();
+    setTimeout(() => URL.revokeObjectURL(link.href), 0);
+    toast(`已导出 KV 命名空间 ${namespace}`);
+  } catch (error) {
+    toast(error.message, true);
+  } finally {
+    setBusy(false);
+  }
+}
+
+async function importKv() {
+  const file = $("#kv-import").files?.[0];
+  if (!file) return;
+  try {
+    if (file.size > 96 * 1024 * 1024) throw new Error("KV 导入 JSON 最大为 96 MiB");
+    const transfer = JSON.parse(await file.text());
+    const count = Array.isArray(transfer.entries) ? transfer.entries.length : 0;
+    if (!window.confirm(`把 ${count} 个键导入命名空间 ${transfer.namespace || "（未知）"}？同名键会覆盖。`)) return;
+    const result = await api("/api/kv/import", { method: "POST", body: JSON.stringify(transfer) });
+    $("#kv-namespace").value = result.namespace;
+    $("#kv-prefix").value = "";
+    toast(`已导入 ${result.imported} 个键${result.expired_skipped ? `，跳过 ${result.expired_skipped} 个已过期键` : ""}`);
+    await loadOverview({ quiet: true });
+    await loadKeys({ reset: true });
+  } catch (error) {
+    toast(error.message, true);
+  } finally {
+    $("#kv-import").value = "";
   }
 }
 
@@ -4458,10 +4587,15 @@ $("#source-webhook").addEventListener("change", () => {
   $("#source-pr-previews").disabled = !$("#source-webhook").checked;
 });
 $("#source-worker").addEventListener("input", updateDefaultDomainPreview);
-$("#kv-search-form").addEventListener("submit", (event) => { event.preventDefault(); loadKeys(); });
+$("#kv-search-form").addEventListener("submit", (event) => { event.preventDefault(); loadKeys({ reset: true }); });
 $("#kv-editor-form").addEventListener("submit", saveKey);
 $("#kv-new").addEventListener("click", clearKey);
 $("#kv-delete").addEventListener("click", removeKey);
+$("#kv-prev").addEventListener("click", previousKvPage);
+$("#kv-next").addEventListener("click", nextKvPage);
+$("#kv-export").addEventListener("click", exportKv);
+$("#kv-import-picker").addEventListener("click", () => $("#kv-import").click());
+$("#kv-import").addEventListener("change", importKv);
 $("#d1-create-form").addEventListener("submit", createDatabase);
 $("#d1-exec-form").addEventListener("submit", executeSql);
 $("#r2-bucket-form").addEventListener("submit", saveR2Bucket);

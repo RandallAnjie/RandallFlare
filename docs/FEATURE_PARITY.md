@@ -67,7 +67,7 @@ surface yet.
 
 | Capability | State | Remaining acceptance work |
 | --- | --- | --- |
-| KV get/put/delete/list/TTL | done | metadata and bulk get are workerd-tested; console pagination/import/export remain |
+| KV get/put/delete/list/TTL | done | metadata and bulk get are workerd-tested; the Chinese console supports binary values, TTL/metadata editing, cursor pagination, and bounded binary-safe JSON import/export |
 | D1 replicated SQL | partial | Worker prepare/bind/all/first/run/raw/exec/batch/withSession done; schema console, import/export, atomic batch and metrics remain |
 | Durable Objects | partial | full CF API audit, alarm retry controls, websocket failover soak |
 | R2 objects | partial | native binding + get/head/put/delete/list, metadata, ranges, conditions and delimiter cursors done; streaming multi-GiB IO remains |
