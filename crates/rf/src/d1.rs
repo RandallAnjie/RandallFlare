@@ -21,9 +21,13 @@ use rf_core::identity::PublicId;
 use rf_core::quorum::{Action, Entry, Msg, Raft};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
+use tokio::io::AsyncReadExt as _;
 use tokio::sync::{mpsc, oneshot};
+
+pub const MAX_D1_EXPORT_BYTES: u64 = 10 * 1024 * 1024 * 1024;
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct DbMeta {
@@ -34,10 +38,84 @@ pub struct DbMeta {
 /// A committed command: one SQL statement with JSON params.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct Cmd {
+    #[serde(default)]
     pub sql: String,
+    #[serde(default)]
     pub params: Vec<serde_json::Value>,
+    /// Newer commands may contain an atomic ordered batch. Empty keeps the
+    /// original single-statement wire format backward-compatible with stored
+    /// Raft logs and snapshots.
+    #[serde(default)]
+    pub statements: Vec<Statement>,
     /// Random tag so the proposer can recognize its own entry.
     pub tag: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Statement {
+    pub sql: String,
+    #[serde(default)]
+    pub params: Vec<serde_json::Value>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StatementResult {
+    pub rows: Option<Vec<serde_json::Map<String, serde_json::Value>>>,
+    pub rows_affected: Option<u64>,
+}
+
+pub struct SnapshotResult {
+    pub data: Option<D1ExportFile>,
+    pub leader_hint: Option<String>,
+}
+
+pub struct D1ExportFile {
+    path: PathBuf,
+    size: u64,
+}
+
+impl D1ExportFile {
+    pub fn size(&self) -> u64 {
+        self.size
+    }
+
+    pub async fn stream(self) -> Result<crate::objectstore::ObjectByteStream> {
+        let file = tokio::fs::File::open(&self.path)
+            .await
+            .context("opening portable D1 export")?;
+        let remaining = self.size;
+        let stream = futures_util::stream::try_unfold(
+            (file, self, remaining),
+            |(mut file, guard, remaining)| async move {
+                if remaining == 0 {
+                    return Ok(None);
+                }
+                let length =
+                    remaining.min(crate::transport::STREAM_PLAINTEXT_CHUNK as u64) as usize;
+                let mut buffer = vec![0; length];
+                let read = file.read(&mut buffer).await?;
+                if read == 0 {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::UnexpectedEof,
+                        "portable D1 export was truncated while streaming",
+                    ));
+                }
+                buffer.truncate(read);
+                Ok(Some((
+                    axum::body::Bytes::from(buffer),
+                    (file, guard, remaining - read as u64),
+                )))
+            },
+        );
+        Ok(Box::pin(stream))
+    }
+}
+
+impl Drop for D1ExportFile {
+    fn drop(&mut self) {
+        remove_sqlite_files(&self.path);
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -50,6 +128,8 @@ pub struct WireMsg {
 pub struct ExecResult {
     pub rows: Option<Vec<serde_json::Map<String, serde_json::Value>>>,
     pub rows_affected: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub batch: Option<Vec<StatementResult>>,
     /// Set when this node isn't the leader: api addr to retry against.
     pub leader_hint: Option<String>,
 }
@@ -60,6 +140,13 @@ pub enum DriverCmd {
         sql: String,
         params: Vec<serde_json::Value>,
         resp: oneshot::Sender<Result<ExecResult>>,
+    },
+    Batch {
+        statements: Vec<Statement>,
+        resp: oneshot::Sender<Result<ExecResult>>,
+    },
+    Snapshot {
+        resp: oneshot::Sender<Result<SnapshotResult>>,
     },
 }
 
@@ -73,23 +160,52 @@ pub fn kv_key(name: &str) -> String {
     format!("d1/{name}")
 }
 
+pub fn database_names(node: &Node) -> Vec<String> {
+    let mut names = node
+        .kv_dump(acme_ns())
+        .into_iter()
+        .filter_map(|(key, entry)| {
+            entry
+                .visible(crate::node::now_ms())
+                .and_then(|_| key.strip_prefix("d1/").map(str::to_string))
+        })
+        .collect::<Vec<_>>();
+    names.sort();
+    names.dedup();
+    names
+}
+
 /// Create a fixed micro-quorum record if absent. The caller should do
 /// this after membership has converged; the group is immutable once
 /// published, exactly like user-created D1 databases.
 pub fn ensure_database(node: &Node, name: &str) -> Result<Vec<PublicId>> {
-    let key = kv_key(name);
-    if let Some(raw) = node.kv_get(acme_ns(), &key) {
-        let meta: DbMeta = serde_json::from_slice(&raw)?;
-        return Ok(meta.group);
-    }
     let mut universe = vec![node.id()];
     for (id_hex, _) in node.peers() {
         if let Ok(id) = id_hex.parse() {
             universe.push(id);
         }
     }
+    ensure_database_on(node, name, universe)
+}
+
+/// Create a database on an explicitly selected immutable replica universe.
+/// Durable Objects use this to keep their fenced owner inside the Worker's
+/// signed placement constraints from the first commit onward.
+pub fn ensure_database_on(
+    node: &Node,
+    name: &str,
+    mut universe: Vec<PublicId>,
+) -> Result<Vec<PublicId>> {
+    let key = kv_key(name);
+    if let Some(raw) = node.kv_get(acme_ns(), &key) {
+        let meta: DbMeta = serde_json::from_slice(&raw)?;
+        return Ok(meta.group);
+    }
     universe.sort();
     universe.dedup();
+    if universe.is_empty() {
+        anyhow::bail!("D1 replica universe cannot be empty");
+    }
     let group = rf_core::quorum::rendezvous_group(name, &universe, 3);
     let meta = DbMeta {
         group: group.clone(),
@@ -140,7 +256,11 @@ fn is_read(conn: &rusqlite::Connection, sql: &str) -> Result<bool> {
 
 /// Manager: watches the KV for databases whose group includes us and
 /// spawns a driver per db.
-pub fn spawn_manager(node: Arc<Node>, registry: Registry, leadership: Leadership) {
+pub fn spawn_manager(
+    node: Arc<Node>,
+    registry: Registry,
+    leadership: Leadership,
+) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         loop {
             for key in node.kv_list(acme_ns(), "d1/", 10_000) {
@@ -179,7 +299,7 @@ pub fn spawn_manager(node: Arc<Node>, registry: Registry, leadership: Leadership
             }
             tokio::time::sleep(Duration::from_secs(1)).await;
         }
-    });
+    })
 }
 
 struct Driver {
@@ -270,6 +390,23 @@ impl Driver {
                     Some(DriverCmd::Exec { sql, params, resp }) => {
                         self.exec(sql, params, resp).await;
                     }
+                    Some(DriverCmd::Batch { statements, resp }) => {
+                        self.batch(statements, resp).await;
+                    }
+                    Some(DriverCmd::Snapshot { resp }) => {
+                        if self.raft.is_leader() {
+                            let result = self.export_snapshot().map(|data| SnapshotResult {
+                                data: Some(data),
+                                leader_hint: None,
+                            });
+                            let _ = resp.send(result);
+                        } else {
+                            let _ = resp.send(Ok(SnapshotResult {
+                                data: None,
+                                leader_hint: self.leader_api_addr(),
+                            }));
+                        }
+                    }
                     None => return,
                 },
                 _ = heartbeat.tick() => {
@@ -298,6 +435,7 @@ impl Driver {
             let _ = resp.send(Ok(ExecResult {
                 rows: None,
                 rows_affected: None,
+                batch: None,
                 leader_hint: hint,
             }));
             return;
@@ -314,7 +452,85 @@ impl Driver {
             }
         }
         let tag: u64 = rand::random();
-        let cmd = Cmd { sql, params, tag };
+        let cmd = Cmd {
+            sql,
+            params,
+            statements: Vec::new(),
+            tag,
+        };
+        self.propose(cmd, resp).await;
+    }
+
+    async fn batch(
+        &mut self,
+        statements: Vec<Statement>,
+        resp: oneshot::Sender<Result<ExecResult>>,
+    ) {
+        if !self.raft.is_leader() {
+            let hint = self.leader_api_addr();
+            let _ = resp.send(Ok(ExecResult {
+                rows: None,
+                rows_affected: None,
+                batch: None,
+                leader_hint: hint,
+            }));
+            return;
+        }
+        if statements.is_empty() || statements.len() > 100 {
+            let _ = resp.send(Err(anyhow::anyhow!(
+                "D1 atomic batch must contain 1..100 statements"
+            )));
+            return;
+        }
+        if let Some(statement) = statements.iter().find(|statement| {
+            statement.sql.trim().is_empty()
+                || statement.sql.len() > 1024 * 1024
+                || statement.params.len() > 1000
+        }) {
+            let _ = resp.send(Err(anyhow::anyhow!(
+                "invalid D1 batch statement: {:?}",
+                statement.sql.chars().take(80).collect::<String>()
+            )));
+            return;
+        }
+        let reads_only = statements
+            .iter()
+            .map(|statement| is_read(&self.sql, &statement.sql))
+            .collect::<Result<Vec<_>>>();
+        match reads_only {
+            Ok(kinds) if kinds.iter().all(|read| *read) => {
+                let result = (|| -> Result<ExecResult> {
+                    let tx = self.sql.unchecked_transaction()?;
+                    let results = run_statements(&tx, &statements)?;
+                    tx.commit()?;
+                    Ok(ExecResult {
+                        rows: None,
+                        rows_affected: Some(0),
+                        batch: Some(results),
+                        leader_hint: None,
+                    })
+                })();
+                let _ = resp.send(result);
+                return;
+            }
+            Ok(_) => {}
+            Err(error) => {
+                let _ = resp.send(Err(error));
+                return;
+            }
+        }
+        let tag: u64 = rand::random();
+        let cmd = Cmd {
+            sql: String::new(),
+            params: Vec::new(),
+            statements,
+            tag,
+        };
+        self.propose(cmd, resp).await;
+    }
+
+    async fn propose(&mut self, cmd: Cmd, resp: oneshot::Sender<Result<ExecResult>>) {
+        let tag = cmd.tag;
         let bytes = serde_json::to_vec(&cmd).expect("cmd encode");
         match self.raft.propose(bytes) {
             Ok((seq, actions)) => {
@@ -327,6 +543,7 @@ impl Driver {
                 let _ = resp.send(Ok(ExecResult {
                     rows: None,
                     rows_affected: None,
+                    batch: None,
                     leader_hint: hint,
                 }));
             }
@@ -449,6 +666,7 @@ impl Driver {
                         let _ = resp.send(Ok(ExecResult {
                             rows: None,
                             rows_affected: None,
+                            batch: None,
                             leader_hint: None,
                         }));
                     }
@@ -472,6 +690,21 @@ impl Driver {
             .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |_| Ok(()))
             .context("wal checkpoint")?;
         std::fs::read(&self.path).context("reading sqlite file")
+    }
+
+    /// Create a portable SQLite backup for an operator download. The Raft
+    /// apply marker is stripped from the copy, never from the live database.
+    fn export_snapshot(&mut self) -> Result<D1ExportFile> {
+        let path = self
+            .path
+            .with_extension(format!("export-{}.sqlite", rand::random::<u64>()));
+        match portable_sqlite_backup_file(&self.sql, &path) {
+            Ok(size) => Ok(D1ExportFile { path, size }),
+            Err(error) => {
+                remove_sqlite_files(&path);
+                Err(error)
+            }
+        }
     }
 
     /// Replace the local database with a shipped snapshot.
@@ -546,28 +779,68 @@ impl Driver {
     }
 
     fn apply(&mut self, entry: Entry) {
-        let result = (|| -> Result<u64> {
+        let result = (|| -> Result<(bool, Vec<StatementResult>)> {
             let cmd: Cmd = serde_json::from_slice(&entry.cmd).context("cmd decode")?;
-            let tx = self.sql.unchecked_transaction()?;
-            let affected = {
-                let mut stmt = tx.prepare(&cmd.sql)?;
-                bind_params(&mut stmt, &cmd.params)?;
-                stmt.raw_execute()? as u64
+            let is_batch = !cmd.statements.is_empty();
+            let statements = if is_batch {
+                cmd.statements
+            } else {
+                vec![Statement {
+                    sql: cmd.sql,
+                    params: cmd.params,
+                }]
             };
+            let tx = self.sql.unchecked_transaction()?;
+            let results = run_statements(&tx, &statements)?;
             tx.execute(
                 "UPDATE _rf_applied SET seq = ?1 WHERE id = 0",
                 [entry.seq as i64],
             )?;
             tx.commit()?;
-            Ok(affected)
+            Ok((is_batch, results))
         })();
+        if result.is_ok() {
+            let audit = crate::data_audit::d1_mutation(
+                &self.name,
+                &entry,
+                self.node.id_hex(),
+                crate::node::now_ms(),
+            );
+            if let Err(error) = self.node.store.put_data_audit(&audit) {
+                tracing::error!(
+                    "d1 {}: persist data audit for seq {}: {error:#}",
+                    self.name,
+                    entry.seq
+                );
+            }
+        }
         // Answer the proposer if this was ours.
         if let Some(tag) = self.my_entries.remove(&entry.seq) {
             if let Some(resp) = self.pending.remove(&tag) {
-                let _ = resp.send(result.map(|rows_affected| ExecResult {
-                    rows: None,
-                    rows_affected: Some(rows_affected),
-                    leader_hint: None,
+                let _ = resp.send(result.map(|(is_batch, mut results)| {
+                    if is_batch {
+                        let rows_affected = results
+                            .iter()
+                            .filter_map(|result| result.rows_affected)
+                            .sum();
+                        ExecResult {
+                            rows: None,
+                            rows_affected: Some(rows_affected),
+                            batch: Some(results),
+                            leader_hint: None,
+                        }
+                    } else {
+                        let result = results.pop().unwrap_or(StatementResult {
+                            rows: None,
+                            rows_affected: Some(0),
+                        });
+                        ExecResult {
+                            rows: result.rows,
+                            rows_affected: result.rows_affected,
+                            batch: None,
+                            leader_hint: None,
+                        }
+                    }
                 }));
                 return;
             }
@@ -600,6 +873,63 @@ fn bind_params(stmt: &mut rusqlite::Statement<'_>, params: &[serde_json::Value])
     Ok(())
 }
 
+fn run_statements(
+    connection: &rusqlite::Connection,
+    statements: &[Statement],
+) -> Result<Vec<StatementResult>> {
+    let mut results = Vec::with_capacity(statements.len());
+    for statement in statements {
+        let mut prepared = connection.prepare(&statement.sql)?;
+        bind_params(&mut prepared, &statement.params)?;
+        // SQLite marks DML with RETURNING as mutating, but it still produces
+        // rows and therefore must be stepped with query semantics. The
+        // statement has already reached this function through the replicated
+        // write path, so reading its result does not weaken consistency.
+        if prepared.readonly() || prepared.column_count() > 0 {
+            results.push(StatementResult {
+                rows: Some(read_prepared_rows(&mut prepared)?),
+                rows_affected: None,
+            });
+        } else {
+            results.push(StatementResult {
+                rows: None,
+                rows_affected: Some(prepared.raw_execute()? as u64),
+            });
+        }
+    }
+    Ok(results)
+}
+
+fn portable_sqlite_backup_file(connection: &rusqlite::Connection, path: &Path) -> Result<u64> {
+    connection
+        .backup(rusqlite::MAIN_DB, path, None)
+        .context("creating D1 SQLite backup")?;
+    let exported = rusqlite::Connection::open(path)?;
+    exported.execute_batch(
+        "DROP TABLE IF EXISTS _rf_applied;
+         PRAGMA journal_mode = DELETE;
+         VACUUM;",
+    )?;
+    drop(exported);
+    let size = std::fs::metadata(path)?.len();
+    if size == 0 || size > MAX_D1_EXPORT_BYTES {
+        anyhow::bail!("D1 export must be between 1 byte and 10 GiB");
+    }
+    Ok(size)
+}
+
+fn remove_sqlite_files(path: &Path) {
+    let _ = std::fs::remove_file(path);
+    let _ = std::fs::remove_file(path.with_extension("sqlite-wal"));
+    let _ = std::fs::remove_file(path.with_extension("sqlite-shm"));
+}
+
+#[cfg(test)]
+fn portable_sqlite_backup(connection: &rusqlite::Connection, path: &Path) -> Result<Vec<u8>> {
+    portable_sqlite_backup_file(connection, path)?;
+    Ok(std::fs::read(path)?)
+}
+
 fn run_query(
     conn: &rusqlite::Connection,
     sql: &str,
@@ -607,10 +937,25 @@ fn run_query(
 ) -> Result<ExecResult> {
     let mut stmt = conn.prepare(sql)?;
     bind_params(&mut stmt, params)?;
+    let rows = read_prepared_rows(&mut stmt)?;
+    Ok(ExecResult {
+        rows: Some(rows),
+        rows_affected: None,
+        batch: None,
+        leader_hint: None,
+    })
+}
+
+fn read_prepared_rows(
+    stmt: &mut rusqlite::Statement<'_>,
+) -> Result<Vec<serde_json::Map<String, serde_json::Value>>> {
     let cols: Vec<String> = stmt.column_names().iter().map(|c| c.to_string()).collect();
     let mut rows_out = Vec::new();
     let mut rows = stmt.raw_query();
     while let Some(row) = rows.next()? {
+        if rows_out.len() >= 10_000 {
+            anyhow::bail!("D1 query returned more than 10,000 rows");
+        }
         let mut obj = serde_json::Map::new();
         for (i, col) in cols.iter().enumerate() {
             let v: serde_json::Value = match row.get_ref(i)? {
@@ -627,11 +972,7 @@ fn run_query(
         }
         rows_out.push(obj);
     }
-    Ok(ExecResult {
-        rows: Some(rows_out),
-        rows_affected: None,
-        leader_hint: None,
-    })
+    Ok(rows_out)
 }
 
 #[cfg(test)]
@@ -645,5 +986,141 @@ mod tests {
         assert!(is_read(&conn, "PRAGMA user_version").unwrap());
         assert!(!is_read(&conn, "PRAGMA user_version = 7").unwrap());
         assert!(!is_read(&conn, "CREATE TABLE t (id INTEGER)").unwrap());
+    }
+
+    #[test]
+    fn atomic_statement_sets_commit_together_or_roll_back_together() {
+        let connection = rusqlite::Connection::open_in_memory().unwrap();
+        connection
+            .execute_batch("CREATE TABLE items (id INTEGER PRIMARY KEY, name TEXT NOT NULL);")
+            .unwrap();
+        {
+            let transaction = connection.unchecked_transaction().unwrap();
+            let results = run_statements(
+                &transaction,
+                &[
+                    Statement {
+                        sql: "INSERT INTO items (id, name) VALUES (?1, ?2)".into(),
+                        params: vec![1.into(), "one".into()],
+                    },
+                    Statement {
+                        sql: "SELECT name FROM items WHERE id = ?1".into(),
+                        params: vec![1.into()],
+                    },
+                ],
+            )
+            .unwrap();
+            assert_eq!(results[0].rows_affected, Some(1));
+            assert_eq!(results[1].rows.as_ref().unwrap()[0]["name"], "one");
+            transaction.commit().unwrap();
+        }
+        {
+            let transaction = connection.unchecked_transaction().unwrap();
+            assert!(run_statements(
+                &transaction,
+                &[
+                    Statement {
+                        sql: "INSERT INTO items (id, name) VALUES (2, 'two')".into(),
+                        params: vec![],
+                    },
+                    Statement {
+                        sql: "INSERT INTO items (id, name) VALUES (1, 'duplicate')".into(),
+                        params: vec![],
+                    },
+                ],
+            )
+            .is_err());
+        }
+        let count: i64 = connection
+            .query_row("SELECT COUNT(*) FROM items", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(count, 1, "failed batch must roll back its earlier insert");
+    }
+
+    #[test]
+    fn mutating_returning_statements_commit_and_return_rows() {
+        let connection = rusqlite::Connection::open_in_memory().unwrap();
+        connection
+            .execute_batch("CREATE TABLE jobs (id INTEGER PRIMARY KEY, status TEXT NOT NULL);")
+            .unwrap();
+        let results = run_statements(
+            &connection,
+            &[Statement {
+                sql: "INSERT INTO jobs(status) VALUES('queued') RETURNING id,status".into(),
+                params: vec![],
+            }],
+        )
+        .unwrap();
+        assert_eq!(results[0].rows.as_ref().unwrap()[0]["status"], "queued");
+        assert_eq!(
+            connection
+                .query_row("SELECT COUNT(*) FROM jobs", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            1
+        );
+    }
+
+    #[test]
+    fn portable_export_keeps_user_data_and_strips_raft_marker() {
+        let directory = std::env::temp_dir().join(format!(
+            "rf-d1-export-{}-{}",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        std::fs::create_dir_all(&directory).unwrap();
+        let source_path = directory.join("source.sqlite");
+        let export_path = directory.join("export.sqlite");
+        let source = rusqlite::Connection::open(&source_path).unwrap();
+        source
+            .execute_batch(
+                "CREATE TABLE _rf_applied (id INTEGER PRIMARY KEY, seq INTEGER NOT NULL);
+                 INSERT INTO _rf_applied VALUES (0, 9);
+                 CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT NOT NULL);
+                 INSERT INTO users VALUES (1, '安杰');",
+            )
+            .unwrap();
+        let bytes = portable_sqlite_backup(&source, &export_path).unwrap();
+        assert!(bytes.starts_with(b"SQLite format 3\0"));
+        let exported = rusqlite::Connection::open(&export_path).unwrap();
+        let name: String = exported
+            .query_row("SELECT name FROM users WHERE id = 1", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(name, "安杰");
+        let internal: i64 = exported
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_schema WHERE name = '_rf_applied'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(internal, 0);
+        drop(exported);
+        drop(source);
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[tokio::test]
+    async fn portable_export_file_streams_and_cleans_up_after_eof() {
+        use futures_util::StreamExt as _;
+
+        let path = std::env::temp_dir().join(format!(
+            "rf-d1-stream-{}-{}.sqlite",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        let bytes = vec![0x5a; crate::transport::STREAM_PLAINTEXT_CHUNK * 2 + 17];
+        std::fs::write(&path, &bytes).unwrap();
+        let export = D1ExportFile {
+            path: path.clone(),
+            size: bytes.len() as u64,
+        };
+        let mut stream = export.stream().await.unwrap();
+        let mut received = Vec::new();
+        while let Some(chunk) = stream.next().await {
+            received.extend_from_slice(&chunk.unwrap());
+        }
+        drop(stream);
+        assert_eq!(received, bytes);
+        assert!(!path.exists());
     }
 }

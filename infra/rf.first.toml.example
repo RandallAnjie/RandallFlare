@@ -36,11 +36,26 @@ enabled = true
 git = "/usr/bin/git"
 sandbox = "/usr/bin/bwrap"
 github_token_env = "RF_GITHUB_TOKEN"
+github_app_id_env = "RF_GITHUB_APP_ID"
+github_app_private_key_env = "RF_GITHUB_APP_PRIVATE_KEY_B64"
+github_app_webhook_secret_env = "RF_GITHUB_APP_WEBHOOK_SECRET"
+# github_ssh_key = "/etc/rf-github-deploy-key"
+# github_known_hosts = "/etc/rf-github-known-hosts"
 timeout_seconds = 1200
 
 [d1]
 compact_threshold = 4096
 keep_tail = 256
+
+[email]
+# Optional role: leave disabled on ordinary compute/storage nodes. An enabled
+# node needs public TCP 25, matching MX/PTR DNS and a certificate named after
+# mx_hostname under <data_dir>/certs. See docs/EMAIL.md.
+enabled = false
+# smtp_listen = "0.0.0.0:25"
+# mx_hostname = "mx1.example.com"
+# outbound = true
+# max_sessions = 32
 
 [update]
 # The hardened service cannot replace its root-owned executable. Upgrade with

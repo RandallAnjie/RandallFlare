@@ -5,6 +5,7 @@
 use crate::blob::BlobStore;
 use crate::config::NodeConfig;
 use crate::management::Management;
+use crate::objectstore::ObjectStore;
 use crate::store::Store;
 use anyhow::Result;
 use rf_core::claim::{ClaimSet, Ingest};
@@ -14,12 +15,17 @@ use rf_core::identity::{Keypair, PublicId};
 use rf_core::kv::{KvEntry, Merge, Namespace};
 use rf_core::manifest::{ManifestIngest, ManifestSet, WorkerManifest};
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::net::SocketAddr;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use tokio::sync::broadcast;
 
 pub type KvListPage = (Vec<(String, Option<u64>)>, bool, Option<String>);
+pub type KvMetadataListPage = (
+    Vec<(String, Option<u64>, Option<Vec<u8>>)>,
+    bool,
+    Option<String>,
+);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum NodeEvent {
@@ -43,7 +49,7 @@ pub struct DeploymentStatus {
     pub updated_at_ms: u64,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RuntimeLogLine {
     pub at_ms: u64,
     pub version: u64,
@@ -55,12 +61,18 @@ pub struct RuntimeLogLine {
 #[derive(Debug, Clone, Default)]
 pub struct PeerView {
     pub api_addr: Option<SocketAddr>,
+    /// Public TLS device-egress endpoint advertised through authenticated
+    /// gossip; absent on ordinary compute/storage nodes.
+    pub exit_endpoint: Option<String>,
     pub public: bool,
     pub label: String,
     pub ipv4: Option<String>,
     pub manifest_digest: String,
     pub kv_digests: BTreeMap<String, String>,
     pub deployments: BTreeMap<String, DeploymentStatus>,
+    /// Self-declared hardware/service capabilities carried by authenticated
+    /// cluster gossip (for example `build`, `email`, and `rclone`).
+    pub capabilities: BTreeSet<String>,
     pub generation: u64,
 }
 
@@ -75,8 +87,29 @@ pub struct Inner {
     pub worker_ports: HashMap<String, u16>,
     pub runtime_status: HashMap<String, DeploymentStatus>,
     pub runtime_logs: HashMap<String, VecDeque<RuntimeLogLine>>,
+    /// Request metadata waiting for the next one-second redb batch.
+    pub pending_request_logs: VecDeque<crate::observability::RequestLogEntry>,
     /// Loopback port of the kvbind server (set at daemon start).
     pub kvbind_port: u16,
+    /// Loopback port of the native workerd R2 binding adapter.
+    pub r2bind_port: u16,
+    pub d1bind_port: u16,
+    pub qbind_port: u16,
+    pub analyticsbind_port: u16,
+    pub pbind_port: u16,
+    pub workflowbind_port: u16,
+    pub emailbind_port: u16,
+    pub servicebind_port: u16,
+    pub binarybind_port: u16,
+    /// Per-process unguessable tokens used only for rf → workerd event
+    /// delivery. They are regenerated on every Worker start and never gossip.
+    pub worker_event_tokens: HashMap<String, String>,
+    /// Current local share of the signed cluster request/minute budget:
+    /// (unix-minute, accepted requests).
+    pub quota_request_window: (u64, u64),
+    /// Incremented whenever the signed platform-resource namespace changes.
+    /// Hot ingress paths use it to cache verified custom hostnames.
+    pub platform_resource_generation: u64,
 }
 
 pub struct Node {
@@ -84,8 +117,22 @@ pub struct Node {
     pub keypair: Keypair,
     pub store: Store,
     pub blobs: BlobStore,
+    pub objects: ObjectStore,
     pub management: Management,
     pub inner: Mutex<Inner>,
+    r2_schemas: Mutex<HashSet<String>>,
+    queue_schemas: Mutex<HashSet<String>>,
+    analytics_schemas: Mutex<HashSet<String>>,
+    pipeline_schemas: Mutex<HashSet<String>>,
+    workflow_schemas: Mutex<HashSet<String>>,
+    flow_schemas: Mutex<HashSet<String>>,
+    email_schemas: Mutex<HashSet<String>>,
+    cron_schemas: Mutex<HashSet<String>>,
+    verified_hostname_cache: Mutex<(u64, Arc<BTreeSet<String>>)>,
+    /// Serializes cluster-quota preflight with the following local R2 metadata
+    /// commit. Cross-node admission remains intentionally conservative and is
+    /// backed by the per-bucket D1 quorum.
+    pub(crate) r2_quota_gate: tokio::sync::Mutex<()>,
     events: broadcast::Sender<NodeEvent>,
 }
 
@@ -94,6 +141,13 @@ pub fn now_ms() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0)
+}
+
+fn kv_metadata_namespace(namespace: &str) -> String {
+    format!(
+        "__rf_kvmeta/{}",
+        crate::blob::sha256_hex(namespace.as_bytes())
+    )
 }
 
 impl Node {
@@ -106,6 +160,7 @@ impl Node {
         }
         let store = Store::open(&cfg.data_dir.join("state.redb"))?;
         let blobs = BlobStore::open(cfg.data_dir.join("blobs"))?;
+        let objects = ObjectStore::open(&cfg.data_dir, &cfg.storage)?;
         let mut inner = Inner {
             clock: Clock::new(),
             claims: ClaimSet::new(),
@@ -115,7 +170,20 @@ impl Node {
             worker_ports: HashMap::new(),
             runtime_status: HashMap::new(),
             runtime_logs: HashMap::new(),
+            pending_request_logs: VecDeque::new(),
             kvbind_port: 0,
+            r2bind_port: 0,
+            d1bind_port: 0,
+            qbind_port: 0,
+            analyticsbind_port: 0,
+            pbind_port: 0,
+            workflowbind_port: 0,
+            emailbind_port: 0,
+            servicebind_port: 0,
+            binarybind_port: 0,
+            worker_event_tokens: HashMap::new(),
+            quota_request_window: (0, 0),
+            platform_resource_generation: 0,
         };
         // Hydrate: static stability means booting entirely from disk.
         for env in store.load_manifests()? {
@@ -132,14 +200,28 @@ impl Node {
             inner.clock.observe(entry.hlc, now_ms());
             inner.kv.entry(ns).or_default().merge(&key, entry);
         }
+        if inner.kv.contains_key(crate::resource::RESOURCE_NAMESPACE) {
+            inner.platform_resource_generation = 1;
+        }
         let (events, _) = broadcast::channel(256);
         Ok(Self {
             cfg,
             keypair,
             store,
             blobs,
+            objects,
             management: Management::default(),
             inner: Mutex::new(inner),
+            r2_schemas: Mutex::new(HashSet::new()),
+            queue_schemas: Mutex::new(HashSet::new()),
+            analytics_schemas: Mutex::new(HashSet::new()),
+            pipeline_schemas: Mutex::new(HashSet::new()),
+            workflow_schemas: Mutex::new(HashSet::new()),
+            flow_schemas: Mutex::new(HashSet::new()),
+            email_schemas: Mutex::new(HashSet::new()),
+            cron_schemas: Mutex::new(HashSet::new()),
+            verified_hostname_cache: Mutex::new((0, Arc::new(BTreeSet::new()))),
+            r2_quota_gate: tokio::sync::Mutex::new(()),
             events,
         })
     }
@@ -205,10 +287,23 @@ impl Node {
 
     /// Blob hashes referenced by live manifests but absent on disk.
     pub fn missing_blobs(&self) -> Vec<[u8; 32]> {
-        let inner = self.inner.lock().unwrap();
+        let manifests = {
+            let inner = self.inner.lock().unwrap();
+            inner
+                .manifests
+                .live()
+                .map(|record| record.manifest.clone())
+                .collect::<Vec<_>>()
+        };
+        let mut manifests = manifests;
+        manifests.extend(
+            crate::preview::active_previews(self)
+                .into_iter()
+                .map(|(_, spec)| spec.manifest),
+        );
         let mut missing = Vec::new();
-        for rec in inner.manifests.live() {
-            for sha in rec.manifest.blob_refs() {
+        for manifest in manifests {
+            for sha in manifest.blob_refs() {
                 if !self.blobs.has(&sha) && !missing.contains(&sha) {
                     missing.push(sha);
                 }
@@ -218,6 +313,10 @@ impl Node {
     }
 
     pub fn notify_blobs_changed(&self) {
+        self.emit(NodeEvent::Runtime);
+    }
+
+    pub(crate) fn notify_runtime_changed(&self) {
         self.emit(NodeEvent::Runtime);
     }
 
@@ -326,6 +425,32 @@ impl Node {
         value: Option<Vec<u8>>,
         expires_at_ms: Option<u64>,
     ) -> Result<()> {
+        self.kv_put_entry(ns, key, value, expires_at_ms)?;
+        if !ns.starts_with("__rf") {
+            self.kv_put_entry(&kv_metadata_namespace(ns), key, None, None)?;
+        }
+        Ok(())
+    }
+
+    pub fn kv_put_with_metadata(
+        &self,
+        ns: &str,
+        key: &str,
+        value: Option<Vec<u8>>,
+        expires_at_ms: Option<u64>,
+        metadata: Option<Vec<u8>>,
+    ) -> Result<()> {
+        self.kv_put_entry(ns, key, value, expires_at_ms)?;
+        self.kv_put_entry(&kv_metadata_namespace(ns), key, metadata, expires_at_ms)
+    }
+
+    fn kv_put_entry(
+        &self,
+        ns: &str,
+        key: &str,
+        value: Option<Vec<u8>>,
+        expires_at_ms: Option<u64>,
+    ) -> Result<()> {
         {
             let mut inner = self.inner.lock().unwrap();
             let hlc = inner.clock.now(now_ms());
@@ -337,7 +462,12 @@ impl Node {
                 writer,
                 expires_at_ms,
             );
-            self.store.put_kv(ns, key, &entry)?;
+            if ns == crate::resource::RESOURCE_NAMESPACE {
+                inner.platform_resource_generation =
+                    inner.platform_resource_generation.wrapping_add(1);
+            }
+            let audit = crate::data_audit::kv_mutation(ns, key, &entry);
+            self.store.put_kv_audited(ns, key, &entry, audit.as_ref())?;
         }
         self.emit(NodeEvent::Kv(ns.to_string()));
         Ok(())
@@ -346,6 +476,12 @@ impl Node {
     pub fn kv_get(&self, ns: &str, key: &str) -> Option<Vec<u8>> {
         let inner = self.inner.lock().unwrap();
         inner.kv.get(ns)?.get(key, now_ms()).map(|v| v.to_vec())
+    }
+
+    pub fn kv_get_with_metadata(&self, ns: &str, key: &str) -> Option<(Vec<u8>, Option<Vec<u8>>)> {
+        let value = self.kv_get(ns, key)?;
+        let metadata = self.kv_get(&kv_metadata_namespace(ns), key);
+        Some((value, metadata))
     }
 
     pub fn kv_list(&self, ns: &str, prefix: &str, limit: usize) -> Vec<String> {
@@ -370,32 +506,57 @@ impl Node {
         limit: usize,
         cursor: Option<&str>,
     ) -> KvListPage {
+        self.kv_list_page_plain(ns, prefix, limit, cursor)
+    }
+
+    pub fn kv_list_page_with_metadata(
+        &self,
+        ns: &str,
+        prefix: &str,
+        limit: usize,
+        cursor: Option<&str>,
+    ) -> KvMetadataListPage {
+        let (items, complete, cursor) = self.kv_list_page_plain(ns, prefix, limit, cursor);
+        let metadata_ns = kv_metadata_namespace(ns);
+        let items = items
+            .into_iter()
+            .map(|(key, expiration)| {
+                let metadata = self.kv_get(&metadata_ns, &key);
+                (key, expiration, metadata)
+            })
+            .collect();
+        (items, complete, cursor)
+    }
+
+    fn kv_list_page_plain(
+        &self,
+        ns: &str,
+        prefix: &str,
+        limit: usize,
+        cursor: Option<&str>,
+    ) -> KvListPage {
         let inner = self.inner.lock().unwrap();
-        let Some(n) = inner.kv.get(ns) else {
+        let Some(namespace) = inner.kv.get(ns) else {
             return (Vec::new(), true, None);
         };
         let now = now_ms();
-        let mut out: Vec<(String, Option<u64>)> = Vec::new();
+        let mut output = Vec::new();
         let mut more = false;
-        for key in n.list(prefix, now, usize::MAX) {
-            if let Some(c) = cursor {
-                if key <= c {
-                    continue;
-                }
+        for key in namespace.list(prefix, now, usize::MAX) {
+            if cursor.is_some_and(|cursor| key <= cursor) {
+                continue;
             }
-            if out.len() == limit {
+            if output.len() == limit {
                 more = true;
                 break;
             }
-            let exp = n.entry(key).and_then(|e| e.expires_at_ms);
-            out.push((key.to_string(), exp));
+            let expiration = namespace.entry(key).and_then(|entry| entry.expires_at_ms);
+            output.push((key.to_string(), expiration));
         }
-        let next = if more {
-            out.last().map(|(k, _)| k.clone())
-        } else {
-            None
-        };
-        (out, !more, next)
+        let cursor = more
+            .then(|| output.last().map(|(key, _)| key.clone()))
+            .flatten();
+        (output, !more, cursor)
     }
 
     pub fn kv_merge_remote(&self, ns: &str, items: Vec<(String, KvEntry)>) -> Result<usize> {
@@ -411,9 +572,15 @@ impl Node {
                     .merge(&key, entry.clone())
                     == Merge::Applied
                 {
-                    self.store.put_kv(ns, &key, &entry)?;
+                    let audit = crate::data_audit::kv_mutation(ns, &key, &entry);
+                    self.store
+                        .put_kv_audited(ns, &key, &entry, audit.as_ref())?;
                     applied += 1;
                 }
+            }
+            if applied > 0 && ns == crate::resource::RESOURCE_NAMESPACE {
+                inner.platform_resource_generation =
+                    inner.platform_resource_generation.wrapping_add(1);
             }
         }
         if applied > 0 {
@@ -449,15 +616,64 @@ impl Node {
         self.inner.lock().unwrap().peers.clone()
     }
 
+    /// Consume this node's deterministic share of the cluster request budget.
+    /// Live public node identities are sorted; any division remainder is given
+    /// to the first identities, so a converged membership view sums exactly to
+    /// the operator-signed global limit rather than multiplying it per node.
+    pub fn admit_public_request(&self) -> Result<bool> {
+        let limit = crate::quota::policy(self)?.max_requests_per_minute;
+        let minute = now_ms() / 60_000;
+        let mut inner = self.inner.lock().unwrap();
+        let mut public_nodes = inner
+            .peers
+            .iter()
+            .filter(|(_, peer)| peer.public)
+            .map(|(id, _)| id.clone())
+            .collect::<BTreeSet<_>>();
+        if self.cfg.public {
+            public_nodes.insert(self.id_hex());
+        }
+        if public_nodes.is_empty() {
+            public_nodes.insert(self.id_hex());
+        }
+        let count = public_nodes.len() as u64;
+        let base = limit / count;
+        let remainder = limit % count;
+        let rank = public_nodes
+            .iter()
+            .position(|id| id == &self.id_hex())
+            .unwrap_or(0) as u64;
+        let local_limit = base + u64::from(rank < remainder);
+        if inner.quota_request_window.0 != minute {
+            inner.quota_request_window = (minute, 0);
+        }
+        if inner.quota_request_window.1 >= local_limit {
+            return Ok(false);
+        }
+        inner.quota_request_window.1 += 1;
+        Ok(true)
+    }
+
     /// Routing table: hostname → worker.
     pub fn routes(&self) -> BTreeMap<String, String> {
-        let inner = self.inner.lock().unwrap();
-        let mut routes = inner.manifests.routes();
-        for record in inner.manifests.live() {
-            if let Some(hostname) = self.cfg.default_worker_hostname(&record.manifest.name) {
+        let (mut routes, workers) = {
+            let inner = self.inner.lock().unwrap();
+            (
+                inner.manifests.routes(),
+                inner
+                    .manifests
+                    .live()
+                    .map(|record| record.manifest.name.clone())
+                    .collect::<Vec<_>>(),
+            )
+        };
+        let verified = self.verified_custom_hostnames();
+        routes.retain(|hostname, _| verified.contains(hostname));
+        for worker in workers {
+            if let Some(hostname) = self.cfg.default_worker_hostname(&worker) {
                 // A Worker's deterministic default route is reserved for that
                 // Worker, even if another manifest lists it as a custom route.
-                routes.insert(hostname, record.manifest.name.clone());
+                routes.insert(hostname, worker);
             }
         }
         routes
@@ -467,13 +683,137 @@ impl Node {
         self.cfg.default_worker_hostname(worker)
     }
 
+    pub fn default_r2_hostname(&self, bucket: &str) -> Option<String> {
+        self.cfg
+            .default_worker_domain()
+            .map(|domain| format!("r2-{bucket}.{domain}"))
+    }
+
+    pub fn default_pipeline_hostname(&self, pipeline: &str) -> Option<String> {
+        self.cfg
+            .default_worker_domain()
+            .map(|domain| format!("pipe-{pipeline}.{domain}"))
+    }
+
+    pub fn default_flow_hostname(&self, flow: &str) -> Option<String> {
+        self.cfg
+            .default_worker_domain()
+            .map(|domain| format!("flow-{flow}.{domain}"))
+    }
+
+    pub fn default_workflow_hostname(&self, workflow: &str) -> Option<String> {
+        self.cfg
+            .default_worker_domain()
+            .map(|domain| format!("workflow-{workflow}.{domain}"))
+    }
+
+    /// Verified custom hostnames, cached by the signed-resource KV generation.
+    /// The loop prevents publishing a stale set under a newer generation if a
+    /// gossip merge races the scan.
+    pub fn verified_custom_hostnames(&self) -> Arc<BTreeSet<String>> {
+        loop {
+            let generation = self.inner.lock().unwrap().platform_resource_generation;
+            {
+                let cache = self.verified_hostname_cache.lock().unwrap();
+                if cache.0 == generation {
+                    return cache.1.clone();
+                }
+            }
+            let verified: Arc<BTreeSet<String>> = Arc::new(
+                crate::hostname::claims(self)
+                    .into_iter()
+                    .filter_map(|(_, spec)| spec.verified_at_ms.map(|_| spec.hostname))
+                    .collect(),
+            );
+            let after = self.inner.lock().unwrap().platform_resource_generation;
+            if after != generation {
+                continue;
+            }
+            *self.verified_hostname_cache.lock().unwrap() = (generation, verified.clone());
+            return verified;
+        }
+    }
+
+    pub fn effective_workflow_hostnames(
+        &self,
+        workflow: &str,
+        spec: &crate::workflow::WorkflowSpec,
+    ) -> Vec<String> {
+        let mut hostnames = Vec::with_capacity(spec.hostnames.len() + 1);
+        let verified = self.verified_custom_hostnames();
+        if let Some(default) = self.default_workflow_hostname(workflow) {
+            hostnames.push(default);
+        }
+        for hostname in &spec.hostnames {
+            if verified.contains(hostname) && !hostnames.contains(hostname) {
+                hostnames.push(hostname.clone());
+            }
+        }
+        hostnames
+    }
+
+    pub fn effective_flow_hostnames(
+        &self,
+        flow: &str,
+        spec: &crate::flow::FlowSpec,
+    ) -> Vec<String> {
+        let mut hostnames = Vec::with_capacity(spec.hostnames.len() + 1);
+        let verified = self.verified_custom_hostnames();
+        if let Some(default) = self.default_flow_hostname(flow) {
+            hostnames.push(default);
+        }
+        for hostname in &spec.hostnames {
+            if verified.contains(hostname) && !hostnames.contains(hostname) {
+                hostnames.push(hostname.clone());
+            }
+        }
+        hostnames
+    }
+
+    pub fn effective_pipeline_hostnames(
+        &self,
+        pipeline: &str,
+        spec: &crate::pipeline::PipelineSpec,
+    ) -> Vec<String> {
+        let mut hostnames = Vec::with_capacity(spec.hostnames.len() + 1);
+        let verified = self.verified_custom_hostnames();
+        if let Some(default) = self.default_pipeline_hostname(pipeline) {
+            hostnames.push(default);
+        }
+        for hostname in &spec.hostnames {
+            if verified.contains(hostname) && !hostnames.contains(hostname) {
+                hostnames.push(hostname.clone());
+            }
+        }
+        hostnames
+    }
+
+    pub fn effective_r2_hostnames(
+        &self,
+        bucket: &str,
+        spec: &crate::r2::BucketSpec,
+    ) -> Vec<String> {
+        let mut hostnames = Vec::with_capacity(spec.hostnames.len() + 1);
+        let verified = self.verified_custom_hostnames();
+        if let Some(default) = self.default_r2_hostname(bucket) {
+            hostnames.push(default);
+        }
+        for hostname in &spec.hostnames {
+            if verified.contains(hostname) && !hostnames.contains(hostname) {
+                hostnames.push(hostname.clone());
+            }
+        }
+        hostnames
+    }
+
     pub fn effective_worker_hostnames(&self, manifest: &WorkerManifest) -> Vec<String> {
         let mut hostnames = Vec::with_capacity(manifest.hostnames.len() + 1);
+        let verified = self.verified_custom_hostnames();
         if let Some(default) = self.default_worker_hostname(&manifest.name) {
             hostnames.push(default);
         }
         for hostname in &manifest.hostnames {
-            if !hostnames.contains(hostname) {
+            if verified.contains(hostname) && !hostnames.contains(hostname) {
                 hostnames.push(hostname.clone());
             }
         }
@@ -497,6 +837,22 @@ impl Node {
             .live()
             .map(|r| r.manifest.clone())
             .collect()
+    }
+
+    /// All known Worker identities, including deleted heads, for the signed
+    /// transparency/audit surface.
+    pub fn manifest_names(&self) -> Vec<String> {
+        let mut names = self
+            .inner
+            .lock()
+            .unwrap()
+            .manifests
+            .all()
+            .map(|record| record.manifest.name.clone())
+            .collect::<Vec<_>>();
+        names.sort();
+        names.dedup();
+        names
     }
 
     /// Transparency log for one worker (version-ascending envelopes).
@@ -625,6 +981,49 @@ impl Node {
             .unwrap_or_default()
     }
 
+    pub(crate) fn enqueue_request_log(&self, entry: crate::observability::RequestLogEntry) {
+        const MAX_PENDING: usize = 50_000;
+        let mut inner = self.inner.lock().unwrap();
+        inner.pending_request_logs.push_back(entry);
+        while inner.pending_request_logs.len() > MAX_PENDING {
+            inner.pending_request_logs.pop_front();
+        }
+    }
+
+    pub(crate) fn take_pending_request_logs(&self) -> Vec<crate::observability::RequestLogEntry> {
+        self.inner
+            .lock()
+            .unwrap()
+            .pending_request_logs
+            .drain(..)
+            .collect()
+    }
+
+    pub(crate) fn requeue_request_logs(&self, entries: Vec<crate::observability::RequestLogEntry>) {
+        const MAX_PENDING: usize = 50_000;
+        let mut inner = self.inner.lock().unwrap();
+        for entry in entries.into_iter().rev() {
+            inner.pending_request_logs.push_front(entry);
+        }
+        while inner.pending_request_logs.len() > MAX_PENDING {
+            inner.pending_request_logs.pop_front();
+        }
+    }
+
+    pub(crate) fn pending_request_logs(
+        &self,
+        worker: &str,
+    ) -> Vec<crate::observability::RequestLogEntry> {
+        self.inner
+            .lock()
+            .unwrap()
+            .pending_request_logs
+            .iter()
+            .filter(|entry| entry.worker == worker)
+            .cloned()
+            .collect()
+    }
+
     /// Local, per-Worker materialization state advertised through gossip.
     pub fn deployment_statuses(&self) -> BTreeMap<String, DeploymentStatus> {
         let (manifests, ports, explicit) = {
@@ -639,11 +1038,21 @@ impl Node {
                 inner.runtime_status.clone(),
             )
         };
-        manifests
+        let mut statuses = manifests
             .into_iter()
             .map(|manifest| {
                 let missing = manifest.blob_refs().any(|sha| !self.blobs.has(&sha));
-                let status = if missing {
+                let eligible = crate::placement::eligible(self, &self.id_hex(), &manifest);
+                let fenced_owner = !crate::deploy::durable_objects(&manifest).is_empty()
+                    && ports.contains_key(&manifest.name);
+                let status = if !eligible && !fenced_owner {
+                    DeploymentStatus {
+                        version: manifest.version,
+                        state: "not_placed".into(),
+                        detail: "node capability tags do not satisfy this Worker".into(),
+                        updated_at_ms: now_ms(),
+                    }
+                } else if missing {
                     DeploymentStatus {
                         version: manifest.version,
                         state: "waiting_blobs".into(),
@@ -661,7 +1070,13 @@ impl Node {
                     DeploymentStatus {
                         version: manifest.version,
                         state: "running".into(),
-                        detail: format!("workerd on 127.0.0.1:{port}"),
+                        detail: if eligible {
+                            format!("workerd on 127.0.0.1:{port}")
+                        } else {
+                            format!(
+                                "fenced Durable Object owner on 127.0.0.1:{port}; retained for state safety"
+                            )
+                        },
                         updated_at_ms: explicit
                             .get(&manifest.name)
                             .map(|status| status.updated_at_ms)
@@ -681,7 +1096,57 @@ impl Node {
                 };
                 (manifest.name, status)
             })
-            .collect()
+            .collect::<BTreeMap<_, _>>();
+        for (view, preview) in crate::preview::active_previews(self) {
+            let manifest = preview.manifest;
+            let runtime_id = view.resource.name;
+            let missing = manifest.blob_refs().any(|sha| !self.blobs.has(&sha));
+            let status = if !crate::placement::eligible(self, &self.id_hex(), &manifest) {
+                DeploymentStatus {
+                    version: view.resource.version,
+                    state: "not_placed".into(),
+                    detail: "node capability tags do not satisfy this Worker preview".into(),
+                    updated_at_ms: now_ms(),
+                }
+            } else if missing {
+                DeploymentStatus {
+                    version: view.resource.version,
+                    state: "waiting_blobs".into(),
+                    detail: "fetching immutable preview blobs from peers".into(),
+                    updated_at_ms: now_ms(),
+                }
+            } else if manifest.main.is_empty() {
+                DeploymentStatus {
+                    version: view.resource.version,
+                    state: "ready".into(),
+                    detail: "static preview assets ready".into(),
+                    updated_at_ms: now_ms(),
+                }
+            } else if let Some(port) = ports.get(&runtime_id) {
+                DeploymentStatus {
+                    version: view.resource.version,
+                    state: "running".into(),
+                    detail: format!("preview workerd on 127.0.0.1:{port}"),
+                    updated_at_ms: explicit
+                        .get(&runtime_id)
+                        .map(|status| status.updated_at_ms)
+                        .unwrap_or_else(now_ms),
+                }
+            } else {
+                explicit
+                    .get(&runtime_id)
+                    .cloned()
+                    .filter(|status| status.version == view.resource.version)
+                    .unwrap_or(DeploymentStatus {
+                        version: view.resource.version,
+                        state: "starting".into(),
+                        detail: "waiting for local preview runtime".into(),
+                        updated_at_ms: now_ms(),
+                    })
+            };
+            statuses.insert(runtime_id, status);
+        }
+        statuses
     }
 
     pub fn set_kvbind_port(&self, port: u16) {
@@ -690,6 +1155,167 @@ impl Node {
 
     pub fn kvbind_port(&self) -> u16 {
         self.inner.lock().unwrap().kvbind_port
+    }
+
+    pub fn set_r2bind_port(&self, port: u16) {
+        self.inner.lock().unwrap().r2bind_port = port;
+    }
+
+    pub fn r2bind_port(&self) -> u16 {
+        self.inner.lock().unwrap().r2bind_port
+    }
+
+    pub fn set_d1bind_port(&self, port: u16) {
+        self.inner.lock().unwrap().d1bind_port = port;
+    }
+
+    pub fn d1bind_port(&self) -> u16 {
+        self.inner.lock().unwrap().d1bind_port
+    }
+
+    pub fn set_qbind_port(&self, port: u16) {
+        self.inner.lock().unwrap().qbind_port = port;
+    }
+
+    pub fn qbind_port(&self) -> u16 {
+        self.inner.lock().unwrap().qbind_port
+    }
+
+    pub fn set_analyticsbind_port(&self, port: u16) {
+        self.inner.lock().unwrap().analyticsbind_port = port;
+    }
+
+    pub fn analyticsbind_port(&self) -> u16 {
+        self.inner.lock().unwrap().analyticsbind_port
+    }
+
+    pub fn set_pbind_port(&self, port: u16) {
+        self.inner.lock().unwrap().pbind_port = port;
+    }
+
+    pub fn pbind_port(&self) -> u16 {
+        self.inner.lock().unwrap().pbind_port
+    }
+
+    pub fn set_workflowbind_port(&self, port: u16) {
+        self.inner.lock().unwrap().workflowbind_port = port;
+    }
+
+    pub fn workflowbind_port(&self) -> u16 {
+        self.inner.lock().unwrap().workflowbind_port
+    }
+
+    pub fn set_emailbind_port(&self, port: u16) {
+        self.inner.lock().unwrap().emailbind_port = port;
+    }
+
+    pub fn emailbind_port(&self) -> u16 {
+        self.inner.lock().unwrap().emailbind_port
+    }
+
+    pub fn set_servicebind_port(&self, port: u16) {
+        self.inner.lock().unwrap().servicebind_port = port;
+    }
+
+    pub fn servicebind_port(&self) -> u16 {
+        self.inner.lock().unwrap().servicebind_port
+    }
+
+    pub fn set_binarybind_port(&self, port: u16) {
+        self.inner.lock().unwrap().binarybind_port = port;
+    }
+
+    pub fn binarybind_port(&self) -> u16 {
+        self.inner.lock().unwrap().binarybind_port
+    }
+
+    pub fn set_worker_event_token(&self, worker: &str, token: String) {
+        self.inner
+            .lock()
+            .unwrap()
+            .worker_event_tokens
+            .insert(worker.to_string(), token);
+    }
+
+    pub fn remove_worker_event_token(&self, worker: &str) {
+        self.inner
+            .lock()
+            .unwrap()
+            .worker_event_tokens
+            .remove(worker);
+    }
+
+    pub fn worker_event_token(&self, worker: &str) -> Option<String> {
+        self.inner
+            .lock()
+            .unwrap()
+            .worker_event_tokens
+            .get(worker)
+            .cloned()
+    }
+
+    pub(crate) fn r2_schema_ready(&self, database: &str) -> bool {
+        self.r2_schemas.lock().unwrap().contains(database)
+    }
+
+    pub(crate) fn mark_r2_schema_ready(&self, database: String) {
+        self.r2_schemas.lock().unwrap().insert(database);
+    }
+
+    pub(crate) fn queue_schema_ready(&self, database: &str) -> bool {
+        self.queue_schemas.lock().unwrap().contains(database)
+    }
+
+    pub(crate) fn mark_queue_schema_ready(&self, database: String) {
+        self.queue_schemas.lock().unwrap().insert(database);
+    }
+
+    pub(crate) fn analytics_schema_ready(&self, database: &str) -> bool {
+        self.analytics_schemas.lock().unwrap().contains(database)
+    }
+
+    pub(crate) fn mark_analytics_schema_ready(&self, database: String) {
+        self.analytics_schemas.lock().unwrap().insert(database);
+    }
+
+    pub(crate) fn pipeline_schema_ready(&self, database: &str) -> bool {
+        self.pipeline_schemas.lock().unwrap().contains(database)
+    }
+
+    pub(crate) fn mark_pipeline_schema_ready(&self, database: String) {
+        self.pipeline_schemas.lock().unwrap().insert(database);
+    }
+
+    pub(crate) fn workflow_schema_ready(&self, database: &str) -> bool {
+        self.workflow_schemas.lock().unwrap().contains(database)
+    }
+
+    pub(crate) fn mark_workflow_schema_ready(&self, database: String) {
+        self.workflow_schemas.lock().unwrap().insert(database);
+    }
+
+    pub(crate) fn flow_schema_ready(&self, database: &str) -> bool {
+        self.flow_schemas.lock().unwrap().contains(database)
+    }
+
+    pub(crate) fn mark_flow_schema_ready(&self, database: String) {
+        self.flow_schemas.lock().unwrap().insert(database);
+    }
+
+    pub(crate) fn email_schema_ready(&self, database: &str) -> bool {
+        self.email_schemas.lock().unwrap().contains(database)
+    }
+
+    pub(crate) fn mark_email_schema_ready(&self, database: String) {
+        self.email_schemas.lock().unwrap().insert(database);
+    }
+
+    pub(crate) fn cron_schema_ready(&self, database: &str) -> bool {
+        self.cron_schemas.lock().unwrap().contains(database)
+    }
+
+    pub(crate) fn mark_cron_schema_ready(&self, database: String) {
+        self.cron_schemas.lock().unwrap().insert(database);
     }
 
     /// Periodic GC of dead claims + KV tombstones.
@@ -768,12 +1394,26 @@ mod tests {
             .unwrap();
         node.ingest_manifest(&Envelope::seal(&beta, &operator))
             .unwrap();
+        let custom_spec = crate::hostname::HostnameClaimSpec {
+            hostname: "custom.example".into(),
+            challenge: crate::hostname::generate_challenge(),
+            created_at_ms: now_ms(),
+            verified_at_ms: None,
+        };
+        let custom_claim = crate::hostname::prepare_claim_after(
+            "custom.example",
+            Some(custom_spec.clone()),
+            Some(custom_spec.created_at_ms + 1),
+            false,
+            None,
+        )
+        .unwrap();
+        crate::resource::ingest(&node, &Envelope::seal(&custom_claim, &operator)).unwrap();
 
         assert_eq!(
             node.effective_worker_hostnames(&alpha),
             vec![
                 "alpha.workers.example".to_string(),
-                "beta.workers.example".to_string(),
                 "custom.example".to_string(),
             ]
         );
@@ -781,6 +1421,34 @@ mod tests {
         assert_eq!(routes["alpha.workers.example"], "alpha");
         assert_eq!(routes["beta.workers.example"], "beta");
         assert_eq!(routes["custom.example"], "alpha");
+        let contested = manifest("gamma", &["custom.example"]);
+        let conflict = crate::quota::validate_manifest_admission(&node, &contested)
+            .unwrap_err()
+            .to_string();
+        assert!(conflict.contains("custom.example"));
+        assert!(conflict.contains("Worker alpha"));
+
+        let claim_head = crate::resource::head(
+            &node,
+            crate::hostname::HOSTNAME_CLAIM_KIND,
+            &crate::hostname::claim_name("custom.example"),
+        )
+        .unwrap();
+        let claim_spec = crate::hostname::claim_spec(&claim_head.resource).unwrap();
+        let revoked = crate::hostname::prepare_claim_after(
+            "custom.example",
+            Some(claim_spec),
+            None,
+            true,
+            Some(&claim_head),
+        )
+        .unwrap();
+        crate::resource::ingest(&node, &Envelope::seal(&revoked, &operator)).unwrap();
+        assert!(!node.routes().contains_key("custom.example"));
+        assert_eq!(
+            node.effective_worker_hostnames(&alpha),
+            vec!["alpha.workers.example".to_string()]
+        );
 
         drop(node);
         std::fs::remove_dir_all(data_dir).unwrap();

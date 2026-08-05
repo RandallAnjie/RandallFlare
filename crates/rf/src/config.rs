@@ -51,6 +51,123 @@ pub struct NodeConfig {
     /// cluster, but credentials and build processes deliberately do not.
     #[serde(default)]
     pub build: BuildConfig,
+    /// Node-local object storage settings. Remote credentials live only in
+    /// the referenced rclone config and are never replicated.
+    #[serde(default)]
+    pub storage: StorageConfig,
+    /// Optional SMTP receive/send capability. Nodes without this section do
+    /// not open port 25 and never claim mail-delivery leases.
+    #[serde(default)]
+    pub email: EmailConfig,
+    /// Optional TLS-encrypted device egress role. Client devices authenticate
+    /// with one-way signed device tokens and never receive the cluster PSK.
+    #[serde(default)]
+    pub exit: ExitConfig,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ExitConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    /// TLS SOCKS egress listener. Required only on selected exit nodes.
+    #[serde(default)]
+    pub listen: Option<SocketAddr>,
+    /// Public `hostname:port` returned to enrolled devices. The hostname must
+    /// have a certificate in `<data_dir>/certs`.
+    #[serde(default)]
+    pub advertise: Option<String>,
+    #[serde(default = "default_exit_sessions")]
+    pub max_sessions: u32,
+    #[serde(default = "default_exit_connect_timeout_seconds")]
+    pub connect_timeout_seconds: u64,
+}
+
+impl Default for ExitConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            listen: None,
+            advertise: None,
+            max_sessions: default_exit_sessions(),
+            connect_timeout_seconds: default_exit_connect_timeout_seconds(),
+        }
+    }
+}
+
+fn default_exit_sessions() -> u32 {
+    512
+}
+
+fn default_exit_connect_timeout_seconds() -> u64 {
+    15
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EmailConfig {
+    /// Join the capability-selected SMTP pool.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Public SMTP listener. Required when enabled; normally 0.0.0.0:25.
+    #[serde(default)]
+    pub smtp_listen: Option<SocketAddr>,
+    /// EHLO name, MX verification target and STARTTLS certificate stem.
+    #[serde(default)]
+    pub mx_hostname: Option<String>,
+    /// Whether this node may claim outbound SMTP delivery leases.
+    #[serde(default = "default_true")]
+    pub outbound: bool,
+    /// Maximum simultaneous inbound SMTP sessions.
+    #[serde(default = "default_email_sessions")]
+    pub max_sessions: u32,
+}
+
+impl Default for EmailConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            smtp_listen: None,
+            mx_hostname: None,
+            outbound: true,
+            max_sessions: default_email_sessions(),
+        }
+    }
+}
+
+fn default_email_sessions() -> u32 {
+    32
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct StorageConfig {
+    /// Local content-addressed object root. Defaults to `<data_dir>/objects`.
+    #[serde(default)]
+    pub local_dir: Option<PathBuf>,
+    /// rclone executable and config. Both must be set to enable rclone-backed
+    /// R2 buckets on this node.
+    #[serde(default)]
+    pub rclone_binary: Option<PathBuf>,
+    #[serde(default)]
+    pub rclone_config: Option<PathBuf>,
+    #[serde(default = "default_rclone_timeout_seconds")]
+    pub rclone_timeout_seconds: u64,
+}
+
+impl Default for StorageConfig {
+    fn default() -> Self {
+        Self {
+            local_dir: None,
+            rclone_binary: None,
+            rclone_config: None,
+            rclone_timeout_seconds: default_rclone_timeout_seconds(),
+        }
+    }
+}
+
+fn default_rclone_timeout_seconds() -> u64 {
+    30 * 60
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -70,6 +187,24 @@ pub struct BuildConfig {
     /// GitHub token. Its value is never persisted or replicated.
     #[serde(default = "default_github_token_env")]
     pub github_token_env: String,
+    /// Node-local GitHub App ID. When the three App variables are present,
+    /// installation tokens take precedence over a long-lived PAT.
+    #[serde(default = "default_github_app_id_env")]
+    pub github_app_id_env: String,
+    /// Base64-encoded PKCS#1/PKCS#8 PEM private key. The encoded value lives
+    /// only in this node's environment and is zeroized after JWT signing.
+    #[serde(default = "default_github_app_private_key_env")]
+    pub github_app_private_key_env: String,
+    /// GitHub App webhook HMAC secret. It is accepted only by the global App
+    /// webhook endpoint and is never persisted or replicated.
+    #[serde(default = "default_github_app_webhook_secret_env")]
+    pub github_app_webhook_secret_env: String,
+    /// Optional node-local read-only SSH deploy key and pinned known_hosts.
+    /// Both paths are required together; key contents never enter resources.
+    #[serde(default)]
+    pub github_ssh_key: Option<PathBuf>,
+    #[serde(default)]
+    pub github_known_hosts: Option<PathBuf>,
     /// Hard wall-clock limit for clone + build.
     #[serde(default = "default_build_timeout")]
     pub timeout_seconds: u64,
@@ -82,6 +217,11 @@ impl Default for BuildConfig {
             git: None,
             sandbox: None,
             github_token_env: default_github_token_env(),
+            github_app_id_env: default_github_app_id_env(),
+            github_app_private_key_env: default_github_app_private_key_env(),
+            github_app_webhook_secret_env: default_github_app_webhook_secret_env(),
+            github_ssh_key: None,
+            github_known_hosts: None,
             timeout_seconds: default_build_timeout(),
         }
     }
@@ -93,6 +233,18 @@ fn default_true() -> bool {
 
 fn default_github_token_env() -> String {
     "RF_GITHUB_TOKEN".into()
+}
+
+fn default_github_app_id_env() -> String {
+    "RF_GITHUB_APP_ID".into()
+}
+
+fn default_github_app_private_key_env() -> String {
+    "RF_GITHUB_APP_PRIVATE_KEY_B64".into()
+}
+
+fn default_github_app_webhook_secret_env() -> String {
+    "RF_GITHUB_APP_WEBHOOK_SECRET".into()
 }
 
 fn default_build_timeout() -> u64 {
@@ -396,14 +548,72 @@ impl NodeConfig {
         if self.build.timeout_seconds == 0 || self.build.timeout_seconds > 6 * 60 * 60 {
             anyhow::bail!("build.timeout_seconds must be between 1 and 21600");
         }
-        if self.build.github_token_env.trim().is_empty()
-            || !self
-                .build
-                .github_token_env
-                .chars()
-                .all(|c| c.is_ascii_alphanumeric() || c == '_')
+        for (label, value) in [
+            ("build.github_token_env", &self.build.github_token_env),
+            ("build.github_app_id_env", &self.build.github_app_id_env),
+            (
+                "build.github_app_private_key_env",
+                &self.build.github_app_private_key_env,
+            ),
+            (
+                "build.github_app_webhook_secret_env",
+                &self.build.github_app_webhook_secret_env,
+            ),
+        ] {
+            if value.trim().is_empty()
+                || !value.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+            {
+                anyhow::bail!("{label} must be a valid environment variable name");
+            }
+        }
+        if self.build.github_ssh_key.is_some() != self.build.github_known_hosts.is_some() {
+            anyhow::bail!(
+                "build.github_ssh_key and build.github_known_hosts must be configured together"
+            );
+        }
+        if self.storage.rclone_binary.is_some() != self.storage.rclone_config.is_some() {
+            anyhow::bail!(
+                "storage.rclone_binary and storage.rclone_config must be configured together"
+            );
+        }
+        if self.storage.rclone_timeout_seconds == 0
+            || self.storage.rclone_timeout_seconds > 24 * 60 * 60
         {
-            anyhow::bail!("build.github_token_env must be a valid environment variable name");
+            anyhow::bail!("storage.rclone_timeout_seconds must be between 1 and 86400");
+        }
+        if self.email.max_sessions == 0 || self.email.max_sessions > 1024 {
+            anyhow::bail!("email.max_sessions must be between 1 and 1024");
+        }
+        if self.email.enabled {
+            if self.email.smtp_listen.is_none() {
+                anyhow::bail!("email.smtp_listen is required when email.enabled=true");
+            }
+            let hostname = self.email.mx_hostname.as_deref().ok_or_else(|| {
+                anyhow::anyhow!("email.mx_hostname is required when email.enabled=true")
+            })?;
+            if !valid_hostname(hostname) {
+                anyhow::bail!("email.mx_hostname must be a lowercase DNS hostname");
+            }
+        }
+        if self.exit.max_sessions == 0 || self.exit.max_sessions > 16_384 {
+            anyhow::bail!("exit.max_sessions must be between 1 and 16384");
+        }
+        if self.exit.connect_timeout_seconds == 0 || self.exit.connect_timeout_seconds > 300 {
+            anyhow::bail!("exit.connect_timeout_seconds must be between 1 and 300");
+        }
+        if self.exit.enabled {
+            self.exit
+                .listen
+                .context("exit.listen is required when exit.enabled=true")?;
+            let advertise = self
+                .exit
+                .advertise
+                .as_deref()
+                .context("exit.advertise is required when exit.enabled=true")?;
+            validate_host_port(advertise).context("exit.advertise")?;
+            if advertise.parse::<SocketAddr>().is_ok() {
+                anyhow::bail!("exit.advertise must use a DNS hostname so TLS clients can send SNI");
+            }
         }
         Ok(())
     }
@@ -430,6 +640,23 @@ impl NodeConfig {
         self.default_worker_domain()
             .map(|domain| format!("{worker}.{domain}"))
     }
+}
+
+fn validate_host_port(value: &str) -> Result<()> {
+    if value.parse::<SocketAddr>().is_ok() {
+        return Ok(());
+    }
+    let (host, port) = value
+        .rsplit_once(':')
+        .context("must be hostname:port or an IP socket address")?;
+    if !valid_hostname(host) {
+        anyhow::bail!("hostname is invalid");
+    }
+    let port: u16 = port.parse().context("port is invalid")?;
+    if port == 0 {
+        anyhow::bail!("port must be non-zero");
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -532,6 +759,61 @@ mod tests {
 
         let mut invalid = cfg.clone();
         invalid.ingress.default_domain = Some("Workers.Example.com".into());
+        assert!(invalid.validate().is_err());
+    }
+
+    #[test]
+    fn email_node_is_explicit_and_bounded() {
+        let raw = r#"
+            data_dir = "/var/lib/rf"
+            operator = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+            cluster_secret = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+            [gossip]
+            listen = "127.0.0.1:7381"
+            [peer_api]
+            listen = "127.0.0.1:7382"
+            [email]
+            enabled = true
+            smtp_listen = "0.0.0.0:25"
+            mx_hostname = "mx.example.com"
+            outbound = false
+            max_sessions = 64
+        "#;
+        let cfg: NodeConfig = toml::from_str(raw).unwrap();
+        cfg.validate().unwrap();
+        assert!(cfg.email.enabled);
+        assert!(!cfg.email.outbound);
+
+        let mut invalid = cfg.clone();
+        invalid.email.mx_hostname = Some("MX.Example.com".into());
+        assert!(invalid.validate().is_err());
+        invalid.email.mx_hostname = Some("mx.example.com".into());
+        invalid.email.max_sessions = 0;
+        assert!(invalid.validate().is_err());
+    }
+
+    #[test]
+    fn exit_node_requires_a_dialable_tls_endpoint() {
+        let raw = r#"
+            data_dir = "/var/lib/rf"
+            operator = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+            cluster_secret = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+            [gossip]
+            listen = "127.0.0.1:7381"
+            [peer_api]
+            listen = "127.0.0.1:7382"
+            [exit]
+            enabled = true
+            listen = "0.0.0.0:51821"
+            advertise = "exit.example.com:51821"
+        "#;
+        let cfg: NodeConfig = toml::from_str(raw).unwrap();
+        cfg.validate().unwrap();
+        assert!(cfg.exit.enabled);
+        let mut invalid = cfg;
+        invalid.exit.advertise = Some("https://bad.example.com".into());
+        assert!(invalid.validate().is_err());
+        invalid.exit.advertise = Some("192.0.2.1:51821".into());
         assert!(invalid.validate().is_err());
     }
 }

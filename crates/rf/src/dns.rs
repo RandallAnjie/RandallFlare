@@ -222,7 +222,7 @@ pub fn spawn(node: Arc<Node>, api: DnsApi, cfg: DnsConfig) {
 }
 
 async fn tick(node: &Arc<Node>, api: &DnsApi, cfg: &DnsConfig) -> Result<()> {
-    let my_ip = if node.cfg.public {
+    let my_ip = if node.cfg.public && crate::placement::accepts_dns(node, &node.id_hex()) {
         cfg.my_ipv4.clone()
     } else {
         None
@@ -245,8 +245,9 @@ async fn tick(node: &Arc<Node>, api: &DnsApi, cfg: &DnsConfig) -> Result<()> {
 
     let peers = node.peers();
     let live_public_ips: BTreeSet<String> = peers
-        .values()
-        .filter(|p| p.public)
+        .iter()
+        .filter(|(id, p)| p.public && crate::placement::accepts_dns(node, id))
+        .map(|(_, peer)| peer)
         .filter_map(|p| p.ipv4.clone())
         .collect();
     let i_see_peers = !live_public_ips.is_empty();

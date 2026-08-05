@@ -28,6 +28,7 @@ Open only the required ports:
 | TCP | 80, 443 | public | Worker ingress + default management UI |
 | UDP | 7381 | future node IPs | encrypted gossip |
 | TCP | 7382 | administrator and future node IPs | encrypted peer/operator API |
+| TCP | 25 | public | 仅限显式启用的可选 SMTP 邮件节点 |
 
 Do not expose 7382 to the whole internet unless necessary. `/v1/ping` is public;
 all other peer API requests require the cluster secret. The install scripts do
@@ -44,7 +45,7 @@ Use the binary produced by GitHub Actions. Verify the published checksum before
 using it to create or validate credentials:
 
 ```bash
-RF_VERSION=v0.9.0
+RF_VERSION=v0.10.0
 curl -fLO "https://github.com/RandallAnjie/RandallFlare/releases/download/$RF_VERSION/rf-linux-x86_64"
 curl -fLO "https://github.com/RandallAnjie/RandallFlare/releases/download/$RF_VERSION/rf-linux-x86_64.sha256"
 sha256sum --check --strict rf-linux-x86_64.sha256
@@ -89,9 +90,9 @@ scp first-vps/rf.toml root@203.0.113.7:/root/rf.toml
 scp first-vps/rf.env root@203.0.113.7:/root/rf.env  # only when used
 ssh root@203.0.113.7
 curl -fLo /tmp/install-randallflare-release.sh \
-  https://raw.githubusercontent.com/RandallAnjie/RandallFlare/v0.9.0/infra/install-release.sh
+  https://raw.githubusercontent.com/RandallAnjie/RandallFlare/v0.10.0/infra/install-release.sh
 bash /tmp/install-randallflare-release.sh \
-  --version v0.9.0 --config /root/rf.toml --env /root/rf.env
+  --version v0.10.0 --config /root/rf.toml --env /root/rf.env
 ```
 
 Omit both `scp` of `rf.env` and `--env` when no environment file is needed.
@@ -179,11 +180,25 @@ production use. The legacy `rf console` loopback command remains available for
 offline/emergency administration.
 
 The Workers page also provides GitHub repository connection, sandboxed builds,
-push webhooks, live build/runtime logs, cluster-wide rollout status, and signed
-rollback. For a private repository, add a read-only `RF_GITHUB_TOKEN` to
-`/etc/rf.env`; it remains local to this node and is stripped from the build
-sandbox. Repository configuration and every produced Manifest still require a
-one-time operator signature.
+push and Pull Request webhooks, signed preview environments, live
+build/runtime/request logs, cluster-wide rollout status, and signed rollback.
+私有仓库优先使用 GitHub App：在 `/etc/rf.env` 中配置
+`RF_GITHUB_APP_ID`、base64 编码 PEM 私钥的
+`RF_GITHUB_APP_PRIVATE_KEY_B64` 与 `RF_GITHUB_APP_WEBHOOK_SECRET`，并把 App
+回调指向 `https://管理域名/api/webhooks/github-app`。节点只在内存中签发短期安装
+令牌，PR Check Run 与一条固定评论会随构建更新；审批码不会发送给 GitHub。兼容模式
+仍可只设置只读 `RF_GITHUB_TOKEN`。所有凭据均留在本节点并从构建沙箱中剥离，仓库
+配置和每个产出的 Manifest 仍须经过一次管理员签名。
+
+多 VPS 集群可在“节点与调度”中为成员签名区域与能力标签，并在 Worker 设置中填写
+所需标签。排空节点会先退出轮转 DNS；如果请求仍抵达该节点，入口会通过加密 Peer
+API 转发到满足约束且运行相同签名版本的节点。维护步骤、标签语义与 Durable Object
+注意事项见 [节点调度指南](./NODES.md)。
+
+邮件节点是可选角色，首台功能测试 VPS 默认不启用，也不应开放 TCP 25。需要测试
+邮件时，先按 [邮件指南](./EMAIL.md) 准备 MX/PTR、STARTTLS 证书、R2 bucket 和
+节点本地 DKIM 私钥变量，再在 `[email]` 中显式启用。邮件私钥与 rclone 凭据一样
+只能放入 VPS 的受限环境/配置文件，不能进入 Git、签名资源或浏览器。
 
 ## 6. Upgrade
 
@@ -194,8 +209,8 @@ restarting the service:
 
 ```bash
 curl -fLo /tmp/install-randallflare-release.sh \
-  https://raw.githubusercontent.com/RandallAnjie/RandallFlare/v0.9.0/infra/install-release.sh
-sudo bash /tmp/install-randallflare-release.sh --version v0.9.0
+  https://raw.githubusercontent.com/RandallAnjie/RandallFlare/v0.10.0/infra/install-release.sh
+sudo bash /tmp/install-randallflare-release.sh --version v0.10.0
 ```
 
 The default hardened unit deliberately prevents the unprivileged daemon from

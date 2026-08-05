@@ -3,7 +3,7 @@ resolver = "2"
 members = ["crates/rf-core", "crates/rf"]
 
 [workspace.package]
-version = "0.9.0"
+version = "0.10.0"
 edition = "2021"
 license = "MIT"
 repository = "https://github.com/RandallAnjie/RandallFlare"
@@ -14,3 +14,11 @@ codegen-units = 1
 strip = true
 opt-level = "z"
 panic = "abort"
+
+[patch.crates-io]
+# mailin 0.6.5 does not advertise or parse RFC 6531 SMTPUTF8. Keep the small
+# audited parser patch in-tree until the upstream crate exposes this extension.
+mailin = { path = "vendor/mailin" }
+# The upstream embedded server snapshots STARTTLS material at process start.
+# RandallFlare needs ACME materialization and renewal without SMTP downtime.
+mailin-embedded = { path = "vendor/mailin-embedded" }

@@ -5,6 +5,7 @@
 use crate::auth;
 use crate::node::{now_ms, Node};
 use crate::peers::encode_envelopes;
+use crate::r2;
 use crate::transport;
 use anyhow::Result;
 use axum::body::{to_bytes, Body, Bytes};
@@ -12,21 +13,25 @@ use axum::extract::{ConnectInfo, DefaultBodyLimit, Path, Query, State};
 use axum::http::{HeaderMap, Method, Request, StatusCode, Uri};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, post};
+use axum::routing::{delete, get, post};
 use axum::Router;
+use futures_util::StreamExt;
 use rf_core::envelope::Envelope;
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 
-const MAX_PEER_PAYLOAD: usize = 64 * 1024 * 1024;
+const MAX_PEER_PAYLOAD: usize = crate::binary::MAX_BINARY_BYTES + 1024 * 1024;
+const MAX_PEER_STREAM_BUFFER: usize = (crate::transport::MAX_STREAM_FRAME + 4) * 8;
+const PEER_STREAM_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 
 #[derive(Clone)]
 pub struct Api {
     pub node: Arc<Node>,
     pub d1: crate::d1::Registry,
     pub durable: crate::durable::Coordinator,
+    worker_http: reqwest::Client,
     secret: [u8; 32],
     seen_nonces: Arc<Mutex<HashMap<String, u64>>>,
 }
@@ -36,18 +41,32 @@ pub async fn serve(
     d1: crate::d1::Registry,
     durable: crate::durable::Coordinator,
 ) -> Result<SocketAddr> {
+    let (address, _server) = serve_managed(node, d1, durable).await?;
+    Ok(address)
+}
+
+/// Start the peer API and retain a handle for tests or supervised embedders.
+/// Dropping the handle detaches the server, matching [`serve`].
+pub async fn serve_managed(
+    node: Arc<Node>,
+    d1: crate::d1::Registry,
+    durable: crate::durable::Coordinator,
+) -> Result<(SocketAddr, tokio::task::JoinHandle<()>)> {
     let secret = node.cfg.cluster_secret_bytes()?;
     let api = Api {
         node: node.clone(),
         d1,
         durable,
+        worker_http: reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(120))
+            .build()?,
         secret,
         seen_nonces: Arc::new(Mutex::new(HashMap::new())),
     };
     let app = router(api);
     let listener = tokio::net::TcpListener::bind(node.cfg.peer_api.listen).await?;
     let addr = listener.local_addr()?;
-    tokio::spawn(async move {
+    let server = tokio::spawn(async move {
         if let Err(e) = axum::serve(
             listener,
             app.into_make_service_with_connect_info::<SocketAddr>(),
@@ -57,13 +76,15 @@ pub async fn serve(
             tracing::error!("peer api server died: {e}");
         }
     });
-    Ok(addr)
+    Ok((addr, server))
 }
 
 pub fn router(api: Api) -> Router {
     let routes = Router::new()
         .route("/v1/ping", get(ping))
         .route("/v1/status", get(status))
+        .route("/v1/storage/status", get(storage_status))
+        .route("/v1/storage/probe", post(storage_probe))
         .route("/v1/sync/manifests", get(sync_manifests))
         .route("/v1/sync/claims", get(sync_claims))
         .route("/v1/sync/kv", get(sync_kv_digests))
@@ -71,12 +92,32 @@ pub fn router(api: Api) -> Router {
         .route("/v1/blob/{sha}", get(blob_get))
         .route("/v1/blob", post(blob_put))
         .route("/v1/manifest", post(manifest_post))
+        .route("/v1/resources", get(resource_list))
+        .route("/v1/resource", post(resource_post))
+        .route("/v1/resource/{kind}/{name}", get(resource_get))
+        .route(
+            "/v1/hostname/{hostname}/verification",
+            get(hostname_verification),
+        )
         .route(
             "/v1/authorize/{code}",
             get(authorization_get).post(authorization_post),
         )
         .route("/v1/worker/{name}", get(worker_get))
+        .route("/v1/worker-dispatch", post(worker_dispatch))
+        .route("/v1/worker-tunnel", post(worker_tunnel))
         .route("/v1/log/{name}", get(log_get))
+        .route("/v1/audit/data", get(data_audit))
+        .route("/v1/audit/data/cluster", get(data_audit_cluster))
+        .route("/v1/audit/data/archive", post(data_audit_archive))
+        .route(
+            "/v1/observability/{worker}/requests",
+            get(worker_request_logs),
+        )
+        .route(
+            "/v1/observability/{worker}/runtime",
+            get(worker_runtime_logs),
+        )
         .route("/v1/kv/{ns}", get(kv_list))
         .route(
             "/v1/kv/{ns}/{*key}",
@@ -85,7 +126,86 @@ pub fn router(api: Api) -> Router {
         .route("/v1/quorum/{db}", post(quorum_msg))
         .route("/v1/d1/create", post(d1_create))
         .route("/v1/d1/{db}/exec", post(d1_exec))
-        .route("/v1/do/{worker}/proxy", post(do_proxy));
+        .route("/v1/d1/{db}/export", get(d1_export))
+        .route("/v1/d1/{db}/backup", post(d1_backup))
+        .route("/v1/queue/{queue}/messages", post(queue_send))
+        .route("/v1/queue/{queue}/stats", get(queue_stats))
+        .route("/v1/queue/{queue}/dead", get(queue_dead_letters))
+        .route("/v1/queue/{queue}/dead/{id}/redrive", post(queue_redrive))
+        .route("/v1/cron/{worker}/runs", get(cron_runs))
+        .route("/v1/cron/{worker}/fire", post(cron_fire))
+        .route("/v1/cron/{worker}/runs/{id}", delete(cron_delete_dlq))
+        .route("/v1/cron/{worker}/runs/{id}/replay", post(cron_replay))
+        .route(
+            "/v1/analytics/{dataset}/events",
+            post(analytics_write).get(analytics_recent),
+        )
+        .route("/v1/analytics/{dataset}/stats", get(analytics_stats))
+        .route("/v1/analytics/{dataset}/group", get(analytics_group))
+        .route("/v1/analytics/{dataset}/query", post(analytics_query))
+        .route("/v1/pipeline/{pipeline}/events", post(pipeline_ingest))
+        .route("/v1/pipeline/{pipeline}/status", get(pipeline_status))
+        .route("/v1/pipeline/{pipeline}/batches", get(pipeline_batches))
+        .route("/v1/pipeline/{pipeline}/flush", post(pipeline_flush))
+        .route(
+            "/v1/workflow/{workflow}/instances",
+            post(workflow_create).get(workflow_instances),
+        )
+        .route(
+            "/v1/workflow/{workflow}/instances/{id}",
+            get(workflow_instance),
+        )
+        .route(
+            "/v1/workflow/{workflow}/instances/{id}/signal",
+            post(workflow_signal),
+        )
+        .route(
+            "/v1/workflow/{workflow}/instances/{id}/{action}",
+            post(workflow_action),
+        )
+        .route("/v1/workflow/{workflow}/stats", get(workflow_stats))
+        .route("/v1/flow/{flow}/runs", post(flow_create).get(flow_runs))
+        .route("/v1/flow/{flow}/runs/{id}", get(flow_run))
+        .route("/v1/flow/{flow}/runs/{id}/{action}", post(flow_action))
+        .route("/v1/flow/{flow}/stats", get(flow_stats))
+        .route(
+            "/v1/email/{domain}/verification",
+            get(email_verification).post(email_verify),
+        )
+        .route("/v1/email/{domain}/messages", get(email_messages))
+        .route("/v1/email/{domain}/audit", get(email_audit))
+        .route("/v1/email/{domain}/dsn", post(email_dsn))
+        .route("/v1/email/{domain}/messages/{id}", get(email_message))
+        .route(
+            "/v1/email/{domain}/messages/{id}/raw",
+            get(email_message_raw),
+        )
+        .route("/v1/email/{domain}/send", post(email_send))
+        .route("/v1/do/{worker}/proxy", post(do_proxy))
+        .route("/v1/r2/{bucket}", get(r2_list))
+        .route("/v1/r2/{bucket}/multipart", get(r2_multipart_list))
+        .route(
+            "/v1/r2/{bucket}/multipart/{upload_id}",
+            get(r2_multipart_detail).delete(r2_multipart_abort),
+        )
+        .route("/v1/r2-blob/{sha}", get(r2_blob_get))
+        .route("/v1/r2-blob", post(r2_blob_put))
+        .route("/v1/r2-blob-stream/{sha}/{size}", post(r2_blob_stream_put))
+        .route("/v1/binary-blob", post(binary_blob_put))
+        .route("/v1/r2/{bucket}/meta/{*key}", get(r2_head))
+        .route("/v1/r2/{bucket}/stream/{sha}/{*key}", get(r2_stream))
+        .route(
+            "/v1/r2/{bucket}/multipart/{upload_id}/part/{part}/{*key}",
+            post(r2_multipart_part),
+        )
+        .route(
+            "/v1/r2/{bucket}/multipart/{upload_id}/complete/{*key}",
+            post(r2_multipart_complete),
+        )
+        .route(
+            "/v1/r2/{bucket}/object/{*key}",
+            get(r2_get).post(r2_put).delete(r2_delete),
+        );
     routes
         .layer(middleware::from_fn_with_state(
             api.clone(),
@@ -109,6 +229,11 @@ async fn encrypted_transport(
         .get(transport::ENC_HEADER)
         .and_then(|v| v.to_str().ok())
         == Some(transport::VERSION);
+    let tunnel_upgrade = request
+        .headers()
+        .get(axum::http::header::UPGRADE)
+        .and_then(|value| value.to_str().ok())
+        == Some(crate::durable::TUNNEL_UPGRADE);
     let remote = request
         .extensions()
         .get::<ConnectInfo<SocketAddr>>()
@@ -154,54 +279,259 @@ async fn encrypted_transport(
     }
     let method = request.method().to_string();
     let path = request_target(request.uri()).to_string();
-    let (parts, body) = request.into_parts();
-    let ciphertext = match to_bytes(body, MAX_PEER_PAYLOAD + 16).await {
-        Ok(v) => v,
-        Err(_) => return (StatusCode::PAYLOAD_TOO_LARGE, "peer payload too large").into_response(),
-    };
-    let plaintext = match transport::open(
-        &api.secret,
-        &nonce,
-        &transport::request_aad(&ts, &method, &path, &target),
-        &ciphertext,
-    ) {
-        Ok(v) => v,
-        Err(_) => return (StatusCode::UNAUTHORIZED, "bad encrypted peer payload").into_response(),
-    };
-
-    // Reject exact ciphertext replays inside the otherwise-valid HMAC
-    // clock window. The bounded cache is process-local by design: a
-    // replay sent to another node still has to represent an operation
-    // that the cluster protocols make idempotent.
-    let now = now_ms();
-    let replayed = {
-        let mut seen = api.seen_nonces.lock().unwrap();
-        seen.retain(|_, at| now.saturating_sub(*at) <= auth::MAX_SKEW_MS);
-        if seen.contains_key(&nonce) {
-            true
+    let request_stream = request
+        .headers()
+        .get(transport::STREAM_HEADER)
+        .and_then(|value| value.to_str().ok())
+        == Some(transport::STREAM_VERSION);
+    let (mut parts, body) = request.into_parts();
+    // This marker is trusted only when inserted below. A client-supplied copy
+    // must never turn a normal request into an empty-body MAC check.
+    parts.headers.remove(transport::DECRYPTED_STREAM_HEADER);
+    let response = if request_stream {
+        let mac = parts
+            .headers
+            .get(auth::MAC_HEADER)
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or("");
+        if !transport::valid_nonce_hex(&nonce)
+            || !auth::verify(&api.secret, now_ms(), &ts, mac, &method, &path, b"")
+        {
+            return (
+                StatusCode::UNAUTHORIZED,
+                "bad encrypted peer request stream",
+            )
+                .into_response();
+        }
+        if remember_nonce(&api, &nonce) {
+            (StatusCode::CONFLICT, "replayed encrypted peer request").into_response()
         } else {
-            if seen.len() >= 8192 {
-                if let Some(oldest) = seen
-                    .iter()
-                    .min_by_key(|(_, at)| *at)
-                    .map(|(n, _)| n.clone())
-                {
-                    seen.remove(&oldest);
-                }
+            parts.headers.remove(axum::http::header::CONTENT_LENGTH);
+            parts.headers.remove(transport::STREAM_HEADER);
+            parts.headers.insert(
+                transport::DECRYPTED_STREAM_HEADER,
+                axum::http::HeaderValue::from_static(transport::STREAM_VERSION),
+            );
+            let source = Box::pin(body.into_data_stream());
+            let secret = api.secret;
+            let request_nonce = nonce.clone();
+            let request_ts = ts.clone();
+            let request_method = method.clone();
+            let request_path = path.clone();
+            let request_target = target.clone();
+            let decoded = futures_util::stream::try_unfold(
+                (source, Vec::new(), 0u64, false),
+                move |(mut source, mut buffered, sequence, finished)| {
+                    let request_nonce = request_nonce.clone();
+                    let ts = request_ts.clone();
+                    let method = request_method.clone();
+                    let path = request_path.clone();
+                    let target = request_target.clone();
+                    async move {
+                        if finished {
+                            return Ok(None);
+                        }
+                        loop {
+                            if buffered.len() >= 4 {
+                                let frame_len = u32::from_be_bytes(
+                                    buffered[..4].try_into().expect("four-byte frame prefix"),
+                                ) as usize;
+                                if !(8 + 24 + 16..=transport::MAX_STREAM_FRAME).contains(&frame_len)
+                                {
+                                    return Err(std::io::Error::new(
+                                        std::io::ErrorKind::InvalidData,
+                                        "invalid encrypted peer request stream frame length",
+                                    ));
+                                }
+                                if buffered.len() >= 4 + frame_len {
+                                    let frame = buffered[4..4 + frame_len].to_vec();
+                                    buffered.drain(..4 + frame_len);
+                                    let plaintext = transport::open_request_stream_frame(
+                                        &secret,
+                                        &request_nonce,
+                                        &ts,
+                                        &method,
+                                        &path,
+                                        &target,
+                                        sequence,
+                                        &frame,
+                                    )
+                                    .map_err(|error| {
+                                        std::io::Error::new(
+                                            std::io::ErrorKind::InvalidData,
+                                            error.to_string(),
+                                        )
+                                    })?;
+                                    let next = sequence.checked_add(1).ok_or_else(|| {
+                                        std::io::Error::other(
+                                            "encrypted peer request stream sequence exhausted",
+                                        )
+                                    })?;
+                                    if plaintext.is_empty() {
+                                        if !buffered.is_empty() {
+                                            return Err(std::io::Error::new(
+                                                std::io::ErrorKind::InvalidData,
+                                                "encrypted peer request stream contains bytes after EOF",
+                                            ));
+                                        }
+                                        let end = tokio::time::timeout(
+                                            PEER_STREAM_IDLE_TIMEOUT,
+                                            source.next(),
+                                        )
+                                        .await
+                                        .map_err(|_| {
+                                            std::io::Error::new(
+                                                std::io::ErrorKind::TimedOut,
+                                                "encrypted peer request stream did not close after EOF",
+                                            )
+                                        })?;
+                                        return match end {
+                                            None => Ok(None),
+                                            Some(Ok(_)) => Err(std::io::Error::new(
+                                                std::io::ErrorKind::InvalidData,
+                                                "encrypted peer request stream contains a frame after EOF",
+                                            )),
+                                            Some(Err(error)) => {
+                                                Err(std::io::Error::other(error.to_string()))
+                                            }
+                                        };
+                                    }
+                                    return Ok(Some((
+                                        Bytes::from(plaintext),
+                                        (source, buffered, next, false),
+                                    )));
+                                }
+                            }
+                            let next =
+                                tokio::time::timeout(PEER_STREAM_IDLE_TIMEOUT, source.next())
+                                    .await
+                                    .map_err(|_| {
+                                        std::io::Error::new(
+                                            std::io::ErrorKind::TimedOut,
+                                            "encrypted peer request stream idle timeout",
+                                        )
+                                    })?;
+                            match next {
+                                Some(Ok(chunk)) => {
+                                    if buffered.len().saturating_add(chunk.len())
+                                        > MAX_PEER_STREAM_BUFFER
+                                    {
+                                        return Err(std::io::Error::new(
+                                            std::io::ErrorKind::InvalidData,
+                                            "encrypted peer request stream buffer exceeded its bound",
+                                        ));
+                                    }
+                                    buffered.extend_from_slice(&chunk);
+                                }
+                                Some(Err(error)) => {
+                                    return Err(std::io::Error::other(error.to_string()));
+                                }
+                                None => {
+                                    return Err(std::io::Error::new(
+                                        std::io::ErrorKind::UnexpectedEof,
+                                        "encrypted peer request stream ended without authenticated EOF",
+                                    ));
+                                }
+                            }
+                        }
+                    }
+                },
+            );
+            next.run(Request::from_parts(parts, Body::from_stream(decoded)))
+                .await
+        }
+    } else {
+        let ciphertext = match to_bytes(body, MAX_PEER_PAYLOAD + 16).await {
+            Ok(value) => value,
+            Err(_) => {
+                return (StatusCode::PAYLOAD_TOO_LARGE, "peer payload too large").into_response()
             }
-            seen.insert(nonce.clone(), now);
-            false
+        };
+        let plaintext = match transport::open(
+            &api.secret,
+            &nonce,
+            &transport::request_aad(&ts, &method, &path, &target),
+            &ciphertext,
+        ) {
+            Ok(value) => value,
+            Err(_) => {
+                return (StatusCode::UNAUTHORIZED, "bad encrypted peer payload").into_response()
+            }
+        };
+        if remember_nonce(&api, &nonce) {
+            (StatusCode::CONFLICT, "replayed encrypted peer request").into_response()
+        } else {
+            next.run(Request::from_parts(parts, Body::from(plaintext)))
+                .await
         }
     };
-
-    let response = if replayed {
-        (StatusCode::CONFLICT, "replayed encrypted peer request").into_response()
-    } else {
-        next.run(Request::from_parts(parts, Body::from(plaintext)))
-            .await
-    };
+    if tunnel_upgrade && response.status() == StatusCode::SWITCHING_PROTOCOLS {
+        return response;
+    }
     let status = response.status();
     let (mut parts, body) = response.into_parts();
+    if parts
+        .headers
+        .get(transport::STREAM_HEADER)
+        .and_then(|value| value.to_str().ok())
+        == Some(transport::STREAM_VERSION)
+    {
+        parts.headers.remove(axum::http::header::CONTENT_LENGTH);
+        parts.headers.insert(
+            transport::ENC_HEADER,
+            axum::http::HeaderValue::from_static(transport::VERSION),
+        );
+        let source = Box::pin(body.into_data_stream());
+        let secret = api.secret;
+        let status = status.as_u16();
+        let encrypted = futures_util::stream::try_unfold(
+            (source, 0u64, false),
+            move |(mut source, sequence, finished)| {
+                let request_nonce = nonce.clone();
+                async move {
+                    if finished {
+                        return Ok(None);
+                    }
+                    loop {
+                        match source.next().await {
+                            Some(Ok(chunk)) if chunk.is_empty() => continue,
+                            Some(Ok(chunk)) => {
+                                let frame = transport::seal_stream_frame(
+                                    &secret,
+                                    &request_nonce,
+                                    status,
+                                    sequence,
+                                    &chunk,
+                                )
+                                .map_err(|error| std::io::Error::other(error.to_string()))?;
+                                let next = sequence.checked_add(1).ok_or_else(|| {
+                                    std::io::Error::other(
+                                        "encrypted peer stream sequence exhausted",
+                                    )
+                                })?;
+                                return Ok(Some((Bytes::from(frame), (source, next, false))));
+                            }
+                            Some(Err(error)) => {
+                                return Err(std::io::Error::other(error.to_string()));
+                            }
+                            None => {
+                                let frame = transport::seal_stream_frame(
+                                    &secret,
+                                    &request_nonce,
+                                    status,
+                                    sequence,
+                                    b"",
+                                )
+                                .map_err(|error| std::io::Error::other(error.to_string()))?;
+                                return Ok(Some((Bytes::from(frame), (source, sequence, true))));
+                            }
+                        }
+                    }
+                }
+            },
+        );
+        return Response::from_parts(parts, Body::from_stream(encrypted));
+    }
     let plaintext = match to_bytes(body, MAX_PEER_PAYLOAD).await {
         Ok(v) => v,
         Err(_) => {
@@ -238,6 +568,29 @@ async fn encrypted_transport(
     Response::from_parts(parts, Body::from(ciphertext))
 }
 
+/// Reject exact request-session replays inside the otherwise-valid HMAC clock
+/// window. The cache is intentionally process-local; cluster operations remain
+/// idempotent when a valid request is independently delivered to another node.
+fn remember_nonce(api: &Api, nonce: &str) -> bool {
+    let now = now_ms();
+    let mut seen = api.seen_nonces.lock().unwrap();
+    seen.retain(|_, at| now.saturating_sub(*at) <= auth::MAX_SKEW_MS);
+    if seen.contains_key(nonce) {
+        return true;
+    }
+    if seen.len() >= 8192 {
+        if let Some(oldest) = seen
+            .iter()
+            .min_by_key(|(_, at)| *at)
+            .map(|(nonce, _)| nonce.clone())
+        {
+            seen.remove(&oldest);
+        }
+    }
+    seen.insert(nonce.to_string(), now);
+    false
+}
+
 /// Auth gate. Loopback (workerd bindings, same-host CLI) is trusted;
 /// everything else needs the cluster MAC over (ts, method, path, body).
 fn check(
@@ -259,6 +612,15 @@ fn check(
         .get(auth::MAC_HEADER)
         .and_then(|v| v.to_str().ok())
         .unwrap_or("");
+    let authenticated_body = if headers
+        .get(transport::DECRYPTED_STREAM_HEADER)
+        .and_then(|value| value.to_str().ok())
+        == Some(transport::STREAM_VERSION)
+    {
+        b"".as_slice()
+    } else {
+        body
+    };
     if auth::verify(
         &api.secret,
         now_ms(),
@@ -266,7 +628,7 @@ fn check(
         mac,
         method.as_str(),
         request_target(uri),
-        body,
+        authenticated_body,
     ) {
         Ok(())
     } else {
@@ -306,7 +668,9 @@ async fn status(
                 "label": v.label,
                 "public": v.public,
                 "api": v.api_addr.map(|a| a.to_string()),
+                "exit_endpoint": v.exit_endpoint,
                 "ip4": v.ipv4,
+                "capabilities": v.capabilities,
                 "deployments": v.deployments,
             })
         })
@@ -319,10 +683,23 @@ async fn status(
             let effective_hostnames = node.effective_worker_hostnames(&m);
             let has_do = !crate::deploy::durable_objects(&m).is_empty();
             let do_owner = if has_do {
-                api.durable.leader(&m.name).map(|id| id.to_string())
+                api.durable
+                    .leader(&m.name)
+                    .map(|id| id.to_string())
+                    .or_else(|| {
+                        peer_views.iter().find_map(|(id, peer)| {
+                            peer.deployments
+                                .get(&m.name)
+                                .filter(|status| {
+                                    status.version == m.version && status.state == "running"
+                                })
+                                .map(|_| id.clone())
+                        })
+                    })
             } else {
                 None
             };
+            let durable_owned_here = has_do && do_owner.as_deref() == Some(&node.id_hex());
             let mut deployments = vec![serde_json::json!({
                 "node": node.id_hex(),
                 "label": node.cfg.label,
@@ -359,7 +736,7 @@ async fn status(
                 "crons": m.crons,
                 "durable_objects": has_do,
                 "durable_owner": do_owner,
-                "durable_owned_here": has_do && api.durable.is_owner(&m.name),
+                "durable_owned_here": durable_owned_here,
                 "distribution": {
                     "ready": ready_nodes,
                     "total": deployments.len(),
@@ -377,24 +754,202 @@ async fn status(
         .kv_list(crate::acme::NS, "d1/", 10_000)
         .into_iter()
         .filter_map(|key| key.strip_prefix("d1/").map(str::to_string))
+        .filter(|name| {
+            !name.starts_with("r2-")
+                && !name.starts_with("rfdo-")
+                && !name.starts_with("queue-")
+                && !name.starts_with("analytics-")
+                && !name.starts_with("pipeline-")
+                && !name.starts_with("workflow-")
+                && !name.starts_with("flow-")
+                && !name.starts_with("email-")
+        })
         .collect();
+    let buckets: Vec<serde_json::Value> = crate::r2::bucket_records(node)
+        .into_iter()
+        .map(|(view, spec)| {
+            serde_json::json!({
+                "name": view.resource.name,
+                "version": view.resource.version,
+                "digest": view.digest,
+                "spec": spec,
+            })
+        })
+        .collect();
+    let queues: Vec<serde_json::Value> = crate::queue::queue_records(node)
+        .into_iter()
+        .map(|(view, spec)| {
+            serde_json::json!({
+                "name": view.resource.name,
+                "version": view.resource.version,
+                "digest": view.digest,
+                "spec": spec,
+            })
+        })
+        .collect();
+    let analytics_datasets: Vec<serde_json::Value> = crate::analytics::dataset_records(node)
+        .into_iter()
+        .map(|(view, spec)| {
+            serde_json::json!({
+                "name": view.resource.name,
+                "version": view.resource.version,
+                "digest": view.digest,
+                "spec": spec,
+            })
+        })
+        .collect();
+    let pipelines: Vec<serde_json::Value> = crate::pipeline::pipeline_records(node)
+        .into_iter()
+        .map(|(view, spec)| {
+            serde_json::json!({
+                "name": view.resource.name,
+                "version": view.resource.version,
+                "digest": view.digest,
+                "spec": spec,
+            })
+        })
+        .collect();
+    let workflows: Vec<serde_json::Value> = crate::workflow::workflow_records(node)
+        .into_iter()
+        .map(|(view, spec)| {
+            serde_json::json!({
+                "name": view.resource.name,
+                "version": view.resource.version,
+                "digest": view.digest,
+                "spec": spec,
+            })
+        })
+        .collect();
+    let flows: Vec<serde_json::Value> = crate::flow::flow_records(node)
+        .into_iter()
+        .map(|(view, spec)| {
+            let hostnames = node.effective_flow_hostnames(&view.resource.name, &spec);
+            serde_json::json!({
+                "name": view.resource.name,
+                "version": view.resource.version,
+                "digest": view.digest,
+                "default_hostname": node.default_flow_hostname(&view.resource.name),
+                "hostnames": hostnames,
+                "spec": spec,
+            })
+        })
+        .collect();
+    let email_domains: Vec<serde_json::Value> = crate::email::email_domain_records(node)
+        .into_iter()
+        .map(|(view, spec)| {
+            serde_json::json!({
+                "name": view.resource.name,
+                "version": view.resource.version,
+                "digest": view.digest,
+                "spec": spec,
+            })
+        })
+        .collect();
+    let binaries: Vec<serde_json::Value> = crate::binary::records(node)
+        .into_iter()
+        .map(|(view, spec)| {
+            serde_json::json!({
+                "name": view.resource.name,
+                "version": view.resource.version,
+                "digest": view.digest,
+                "spec": spec,
+            })
+        })
+        .collect();
+    let storage_policy = crate::storage_policy::current(node)
+        .ok()
+        .map(|(_, policy)| policy)
+        .unwrap_or_default();
     axum::Json(serde_json::json!({
         "node": node.id_hex(),
         "label": node.cfg.label,
         "cluster_id": node.cfg.cluster_id,
         "operator": node.cfg.operator.to_string(),
         "public": node.cfg.public,
+        "capabilities": crate::placement::system_tags(node, &node.id_hex()),
+        "deployments": local_deployments,
         "default_worker_domain": node.cfg.default_worker_domain(),
         "version": env!("CARGO_PKG_VERSION"),
         "peers": peers,
         "workers": workers,
         "databases": databases,
+        "r2_buckets": buckets,
+        "queues": queues,
+        "analytics_datasets": analytics_datasets,
+        "pipelines": pipelines,
+        "workflows": workflows,
+        "flows": flows,
+        "email_domains": email_domains,
+        "binaries": binaries,
+        "email_node": {
+            "enabled": node.cfg.email.enabled,
+            "outbound": node.cfg.email.outbound,
+            "mx_hostname": node.cfg.email.mx_hostname,
+            "smtp_listen": node.cfg.email.smtp_listen.map(|address| address.to_string()),
+        },
+        "exit_node": {
+            "enabled": node.cfg.exit.enabled,
+            "endpoint": node.cfg.exit.advertise,
+            "listen": node.cfg.exit.listen.map(|address| address.to_string()),
+            "max_sessions": node.cfg.exit.max_sessions,
+        },
+        "storage": {
+            "local": true,
+            "rclone": node.cfg.storage.rclone_binary.is_some(),
+            "policy": storage_policy,
+        },
         "kv_namespaces": kv_namespaces,
         "manifest_digest": node.manifest_digest_hex(),
         "routes": node.routes(),
         "missing_blobs": node.missing_blobs().len(),
     }))
     .into_response()
+}
+
+async fn storage_status(
+    State(api): State<Api>,
+    ConnectInfo(remote): ConnectInfo<SocketAddr>,
+    method: Method,
+    uri: Uri,
+    headers: HeaderMap,
+) -> Response {
+    if let Err(response) = check(&api, &remote, &headers, &method, &uri, b"") {
+        return response.into_response();
+    }
+    let operation = async {
+        let (view, policy) = crate::storage_policy::current(&api.node)?;
+        let distribution = crate::r2::storage_distribution(&api.node).await?;
+        Result::<_>::Ok(serde_json::json!({
+            "policy": policy,
+            "version": view.as_ref().map(|view| view.resource.version),
+            "digest": view.as_ref().map(|view| view.digest.clone()),
+            "distribution": distribution,
+        }))
+    }
+    .await;
+    match operation {
+        Ok(value) => axum::Json(value).into_response(),
+        Err(error) => (StatusCode::BAD_REQUEST, format!("{error:#}")).into_response(),
+    }
+}
+
+async fn storage_probe(
+    State(api): State<Api>,
+    ConnectInfo(remote): ConnectInfo<SocketAddr>,
+    method: Method,
+    uri: Uri,
+    headers: HeaderMap,
+) -> Response {
+    if let Err(response) = check(&api, &remote, &headers, &method, &uri, b"") {
+        return response.into_response();
+    }
+    match crate::storage_policy::current(&api.node) {
+        Ok((_, policy)) => {
+            axum::Json(crate::storage_policy::probe_remotes(&api.node, &policy).await)
+                .into_response()
+        }
+        Err(error) => (StatusCode::BAD_REQUEST, format!("{error:#}")).into_response(),
+    }
 }
 
 async fn sync_manifests(
@@ -507,17 +1062,8 @@ async fn manifest_post(
     let Ok(env) = Envelope::from_bytes(&body) else {
         return (StatusCode::BAD_REQUEST, "bad envelope").into_response();
     };
-    match api.node.ingest_manifest(&env) {
-        Ok(changed) => {
-            if let Ok(manifest) = env.open::<rf_core::manifest::WorkerManifest>(None) {
-                if !crate::deploy::durable_objects(&manifest).is_empty() {
-                    if let Err(e) = api.durable.ensure_worker(&manifest.name) {
-                        return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
-                    }
-                }
-            }
-            axum::Json(serde_json::json!({ "changed": changed })).into_response()
-        }
+    match ingest_manifest_envelope(&api, &env) {
+        Ok(changed) => axum::Json(serde_json::json!({ "changed": changed })).into_response(),
         Err(e) => (StatusCode::UNPROCESSABLE_ENTITY, e.to_string()).into_response(),
     }
 }
@@ -587,10 +1133,15 @@ async fn authorization_post(
     if approved.kind != crate::management::ApprovalKind::Login {
         let result = match approved.kind {
             crate::management::ApprovalKind::Manifest => {
-                ingest_manifest_envelope(&api, &approved.envelope)
+                ingest_manifest_envelope(&api, &approved.envelope).map(|_| ())
             }
             crate::management::ApprovalKind::Source => {
                 crate::build::ingest_source(&api.node, &approved.envelope).map(|_| ())
+            }
+            crate::management::ApprovalKind::Resource => {
+                ingest_resource_envelope(&api, &approved.envelope)
+                    .await
+                    .map(|_| ())
             }
             crate::management::ApprovalKind::Login => unreachable!(),
         };
@@ -612,16 +1163,32 @@ async fn authorization_post(
     .into_response()
 }
 
-fn ingest_manifest_envelope(api: &Api, envelope: &Envelope) -> Result<()> {
-    api.node.ingest_manifest(envelope)?;
+fn ingest_manifest_envelope(api: &Api, envelope: &Envelope) -> Result<bool> {
     let manifest: rf_core::manifest::WorkerManifest =
         envelope
             .open(Some(&api.node.cfg.operator))
             .map_err(|error| anyhow::anyhow!("approved manifest could not be decoded: {error}"))?;
+    crate::quota::validate_manifest_admission(&api.node, &manifest)?;
+    let changed = api.node.ingest_manifest(envelope)?;
     if !crate::deploy::durable_objects(&manifest).is_empty() {
         api.durable.ensure_worker(&manifest.name)?;
     }
-    Ok(())
+    Ok(changed)
+}
+
+async fn ingest_resource_envelope(
+    api: &Api,
+    envelope: &Envelope,
+) -> Result<crate::resource::ResourceRecord> {
+    let record: crate::resource::ResourceRecord = envelope
+        .open(Some(&api.node.cfg.operator))
+        .map_err(|error| anyhow::anyhow!("平台资源签名无效：{error}"))?;
+    record.validate()?;
+    crate::binary::validate_admission(&api.node, &record)?;
+    crate::exit::validate_admission(&api.node, &record)?;
+    crate::storage_policy::validate_transition(&api.node, &record).await?;
+    crate::quota::validate_resource_admission(&api.node, &record)?;
+    crate::resource::ingest(&api.node, envelope)
 }
 
 async fn worker_get(
@@ -675,6 +1242,7 @@ async fn log_get(
 struct KvPutQuery {
     expires_at_ms: Option<u64>,
     ttl_ms: Option<u64>,
+    metadata: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -682,6 +1250,13 @@ struct KvListQuery {
     #[serde(default)]
     prefix: String,
     limit: Option<usize>,
+    cursor: Option<String>,
+}
+
+#[derive(Deserialize, Default)]
+struct KvGetQuery {
+    #[serde(default)]
+    with_metadata: bool,
 }
 
 async fn kv_list(
@@ -696,16 +1271,48 @@ async fn kv_list(
     if let Err(r) = check(&api, &remote, &headers, &method, &uri, b"") {
         return r.into_response();
     }
-    let keys = api
-        .node
-        .kv_list(&ns, &q.prefix, q.limit.unwrap_or(1000).clamp(1, 10_000));
-    axum::Json(serde_json::json!({ "keys": keys })).into_response()
+    let (items, list_complete, cursor) = api.node.kv_list_page_with_metadata(
+        &ns,
+        &q.prefix,
+        q.limit.unwrap_or(1000).clamp(1, 1_000),
+        q.cursor.as_deref(),
+    );
+    let entries = items
+        .into_iter()
+        .map(|(key, expires_at_ms, metadata)| {
+            let size = api
+                .node
+                .kv_get(&ns, &key)
+                .map(|value| value.len() as u64)
+                .unwrap_or(0);
+            crate::peers::KvListItem {
+                key,
+                size,
+                expires_at_ms,
+                metadata: metadata
+                    .as_deref()
+                    .and_then(|raw| serde_json::from_slice(raw).ok()),
+            }
+        })
+        .collect::<Vec<_>>();
+    let keys = entries
+        .iter()
+        .map(|entry| entry.key.clone())
+        .collect::<Vec<_>>();
+    axum::Json(serde_json::json!({
+        "keys": keys,
+        "entries": entries,
+        "list_complete": list_complete,
+        "cursor": cursor,
+    }))
+    .into_response()
 }
 
 async fn kv_get(
     State(api): State<Api>,
     ConnectInfo(remote): ConnectInfo<SocketAddr>,
     Path((ns, key)): Path<(String, String)>,
+    Query(query): Query<KvGetQuery>,
     method: Method,
     uri: Uri,
     headers: HeaderMap,
@@ -713,8 +1320,26 @@ async fn kv_get(
     if let Err(r) = check(&api, &remote, &headers, &method, &uri, b"") {
         return r.into_response();
     }
-    match api.node.kv_get(&ns, &key) {
-        Some(v) => v.into_response(),
+    match api.node.kv_get_with_metadata(&ns, &key) {
+        Some((value, metadata)) if query.with_metadata => {
+            use base64::Engine as _;
+            let expires_at_ms = api
+                .node
+                .kv_list_page(&ns, &key, 1, None)
+                .0
+                .into_iter()
+                .find_map(|(candidate, expiration)| (candidate == key).then_some(expiration))
+                .flatten();
+            axum::Json(serde_json::json!({
+                "value_base64": base64::engine::general_purpose::STANDARD.encode(value),
+                "expires_at_ms": expires_at_ms,
+                "metadata": metadata
+                    .as_deref()
+                    .and_then(|raw| serde_json::from_slice::<serde_json::Value>(raw).ok()),
+            }))
+            .into_response()
+        }
+        Some((value, _)) => value.into_response(),
         None => (StatusCode::NOT_FOUND, "no such key").into_response(),
     }
 }
@@ -742,7 +1367,30 @@ async fn kv_put(
         return r.into_response();
     }
     let expires = q.expires_at_ms.or_else(|| q.ttl_ms.map(|t| now_ms() + t));
-    match api.node.kv_put(&ns, &key, Some(body.to_vec()), expires) {
+    if q.ttl_ms.is_some_and(|ttl| ttl < 60_000)
+        || q.expires_at_ms
+            .is_some_and(|expires| expires < now_ms().saturating_add(60_000))
+    {
+        return (
+            StatusCode::BAD_REQUEST,
+            "kv expiration must be at least 60 seconds",
+        )
+            .into_response();
+    }
+    let metadata = match q.metadata {
+        Some(raw) if raw.len() > 1024 => {
+            return (StatusCode::BAD_REQUEST, "kv metadata exceeds 1024 bytes").into_response()
+        }
+        Some(raw) => match serde_json::from_str::<serde_json::Value>(&raw) {
+            Ok(value) => Some(serde_json::to_vec(&value).expect("JSON re-encodes")),
+            Err(_) => return (StatusCode::BAD_REQUEST, "kv metadata is not JSON").into_response(),
+        },
+        None => None,
+    };
+    match api
+        .node
+        .kv_put_with_metadata(&ns, &key, Some(body.to_vec()), expires, metadata)
+    {
         // Encrypted transport needs to carry an AEAD tag in the body;
         // HTTP forbids bodies on 204 responses.
         Ok(()) => StatusCode::OK.into_response(),
@@ -816,6 +1464,245 @@ async fn d1_create(
     .into_response()
 }
 
+async fn worker_dispatch(
+    State(api): State<Api>,
+    ConnectInfo(remote): ConnectInfo<SocketAddr>,
+    method: Method,
+    uri: Uri,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    if let Err(response) = check(&api, &remote, &headers, &method, &uri, &body) {
+        return response.into_response();
+    }
+    let Ok(dispatch) = postcard::from_bytes::<crate::ingress::WorkerDispatchRequest>(&body) else {
+        return (StatusCode::BAD_REQUEST, "bad Worker dispatch request").into_response();
+    };
+    let manifest = if dispatch.preview {
+        crate::preview::active_previews(&api.node)
+            .into_iter()
+            .find(|(view, spec)| {
+                view.resource.name == dispatch.runtime_id
+                    && view.resource.version == dispatch.revision
+                    && spec.worker == dispatch.worker
+                    && spec.manifest.version == dispatch.manifest_version
+            })
+            .map(|(_, spec)| spec.manifest)
+    } else {
+        api.node.manifest(&dispatch.worker).filter(|manifest| {
+            dispatch.runtime_id == dispatch.worker
+                && dispatch.revision == manifest.version
+                && dispatch.manifest_version == manifest.version
+        })
+    };
+    let Some(manifest) = manifest else {
+        return (StatusCode::CONFLICT, "Worker revision changed").into_response();
+    };
+    if !crate::placement::eligible(&api.node, &api.node.id_hex(), &manifest) {
+        return (
+            StatusCode::MISDIRECTED_REQUEST,
+            "Worker is not placed on this node",
+        )
+            .into_response();
+    }
+    if !crate::deploy::durable_objects(&manifest).is_empty() {
+        return (
+            StatusCode::MISDIRECTED_REQUEST,
+            "Durable Object Workers require their fenced owner route",
+        )
+            .into_response();
+    }
+    if manifest.blob_refs().any(|sha| !api.node.blobs.has(&sha))
+        || (!manifest.main.is_empty() && api.node.worker_port(&dispatch.runtime_id).is_none())
+    {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Worker runtime is not ready",
+        )
+            .into_response();
+    }
+    let request = match crate::ingress::wire_to_request(dispatch.request) {
+        Ok(request) => request,
+        Err(error) => return (StatusCode::BAD_REQUEST, error).into_response(),
+    };
+    let path = request.uri().path().to_string();
+    let response = crate::ingress::serve_direct_worker(
+        &api.node,
+        &api.worker_http,
+        request,
+        &manifest,
+        &path,
+        &dispatch.runtime_id,
+    )
+    .await;
+    match crate::ingress::response_to_wire(response).await {
+        Ok(response) => postcard::to_stdvec(&response)
+            .map(|raw| raw.into_response())
+            .unwrap_or_else(|error| {
+                (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()).into_response()
+            }),
+        Err(error) => (StatusCode::BAD_GATEWAY, error).into_response(),
+    }
+}
+
+async fn worker_tunnel(
+    State(api): State<Api>,
+    ConnectInfo(remote): ConnectInfo<SocketAddr>,
+    mut request: Request<Body>,
+) -> Response {
+    if request
+        .headers()
+        .get(transport::ENC_HEADER)
+        .and_then(|value| value.to_str().ok())
+        != Some(transport::VERSION)
+        || request
+            .headers()
+            .get(axum::http::header::UPGRADE)
+            .and_then(|value| value.to_str().ok())
+            != Some(crate::durable::TUNNEL_UPGRADE)
+    {
+        return (
+            StatusCode::UPGRADE_REQUIRED,
+            "encrypted Worker tunnel required",
+        )
+            .into_response();
+    }
+    let session = match request
+        .headers()
+        .get(transport::NONCE_HEADER)
+        .and_then(|value| value.to_str().ok())
+    {
+        Some(session) => session.to_string(),
+        None => return (StatusCode::BAD_REQUEST, "missing tunnel session").into_response(),
+    };
+    let method = request.method().clone();
+    let uri = request.uri().clone();
+    let headers = request.headers().clone();
+    let peer_upgrade = hyper::upgrade::on(&mut request);
+    let body = match to_bytes(request.into_body(), MAX_PEER_PAYLOAD).await {
+        Ok(body) => body,
+        Err(_) => {
+            return (StatusCode::PAYLOAD_TOO_LARGE, "tunnel metadata too large").into_response()
+        }
+    };
+    if let Err(response) = check(&api, &remote, &headers, &method, &uri, &body) {
+        return response.into_response();
+    }
+    let Ok(dispatch) = postcard::from_bytes::<crate::ingress::WorkerTunnelRequest>(&body) else {
+        return (StatusCode::BAD_REQUEST, "bad Worker tunnel request").into_response();
+    };
+    let manifest = if dispatch.preview {
+        crate::preview::active_previews(&api.node)
+            .into_iter()
+            .find(|(view, spec)| {
+                view.resource.name == dispatch.runtime_id
+                    && view.resource.version == dispatch.revision
+                    && spec.worker == dispatch.worker
+                    && spec.manifest.version == dispatch.manifest_version
+            })
+            .map(|(_, spec)| spec.manifest)
+    } else {
+        api.node.manifest(&dispatch.worker).filter(|manifest| {
+            dispatch.runtime_id == dispatch.worker
+                && dispatch.revision == manifest.version
+                && dispatch.manifest_version == manifest.version
+        })
+    };
+    let Some(manifest) = manifest else {
+        return (StatusCode::CONFLICT, "Worker revision changed").into_response();
+    };
+    let should_fence = !dispatch.preview && !crate::deploy::durable_objects(&manifest).is_empty();
+    if dispatch.fenced_durable != should_fence {
+        return (
+            StatusCode::MISDIRECTED_REQUEST,
+            "Durable Object tunnel fencing mismatch",
+        )
+            .into_response();
+    }
+    if should_fence {
+        if !api.durable.is_owner(&dispatch.worker) {
+            return (
+                StatusCode::MISDIRECTED_REQUEST,
+                "this node is not the Durable Object owner",
+            )
+                .into_response();
+        }
+    } else if !crate::placement::eligible(&api.node, &api.node.id_hex(), &manifest) {
+        return (
+            StatusCode::MISDIRECTED_REQUEST,
+            "Worker is not placed on this node",
+        )
+            .into_response();
+    }
+    if manifest.blob_refs().any(|sha| !api.node.blobs.has(&sha)) {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Worker blobs are not ready",
+        )
+            .into_response();
+    }
+    let Some(port) = api.node.worker_port(&dispatch.runtime_id) else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Worker runtime is not ready",
+        )
+            .into_response();
+    };
+    let (upstream_headers, upstream) = match crate::durable::open_worker_websocket(
+        &api.worker_http,
+        &dispatch.request,
+        port,
+    )
+    .await
+    {
+        Ok(upstream) => upstream,
+        Err(error) => return (StatusCode::BAD_GATEWAY, error.to_string()).into_response(),
+    };
+    let (proof_nonce, proof) = match transport::seal(
+        &api.secret,
+        &transport::response_aad(&session, 101),
+        crate::durable::TUNNEL_PROOF,
+    ) {
+        Ok(proof) => proof,
+        Err(error) => {
+            return (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()).into_response()
+        }
+    };
+    use base64::Engine as _;
+    let proof = base64::engine::general_purpose::STANDARD.encode(proof);
+    let mut builder = Response::builder().status(StatusCode::SWITCHING_PROTOCOLS);
+    for (name, value) in &upstream_headers {
+        if name != axum::http::header::CONTENT_LENGTH {
+            builder = builder.header(name, value);
+        }
+    }
+    builder = builder
+        .header(transport::ENC_HEADER, transport::VERSION)
+        .header(transport::NONCE_HEADER, proof_nonce)
+        .header(crate::durable::TUNNEL_PROOF_HEADER, proof);
+    let response = match builder.body(Body::empty()) {
+        Ok(response) => response,
+        Err(error) => {
+            return (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()).into_response()
+        }
+    };
+    let secret = api.secret;
+    tokio::spawn(async move {
+        match peer_upgrade.await {
+            Ok(peer) => {
+                let peer = hyper_util::rt::TokioIo::new(peer);
+                if let Err(error) =
+                    crate::durable::relay_tunnel_owner(peer, upstream, secret, session).await
+                {
+                    tracing::debug!("Worker 加密隧道已结束：{error:#}");
+                }
+            }
+            Err(error) => tracing::debug!("节点间 Worker 隧道升级失败：{error}"),
+        }
+    });
+    response
+}
+
 async fn do_proxy(
     State(api): State<Api>,
     ConnectInfo(remote): ConnectInfo<SocketAddr>,
@@ -841,9 +1728,12 @@ async fn do_proxy(
 
 #[derive(serde::Deserialize)]
 struct D1ExecReq {
+    #[serde(default)]
     sql: String,
     #[serde(default)]
     params: Vec<serde_json::Value>,
+    #[serde(default)]
+    statements: Vec<crate::d1::Statement>,
 }
 
 async fn d1_exec(
@@ -883,15 +1773,25 @@ async fn d1_exec(
         return (StatusCode::NOT_FOUND, "no such database").into_response();
     };
     let (resp_tx, resp_rx) = tokio::sync::oneshot::channel();
-    if tx
-        .send(crate::d1::DriverCmd::Exec {
+    let command = if req.statements.is_empty() {
+        crate::d1::DriverCmd::Exec {
             sql: req.sql,
             params: req.params,
             resp: resp_tx,
-        })
-        .await
-        .is_err()
-    {
+        }
+    } else if req.sql.is_empty() && req.params.is_empty() {
+        crate::d1::DriverCmd::Batch {
+            statements: req.statements,
+            resp: resp_tx,
+        }
+    } else {
+        return (
+            StatusCode::BAD_REQUEST,
+            "send either one SQL statement or an atomic batch",
+        )
+            .into_response();
+    };
+    if tx.send(command).await.is_err() {
         return (StatusCode::SERVICE_UNAVAILABLE, "driver gone").into_response();
     }
     match tokio::time::timeout(std::time::Duration::from_secs(15), resp_rx).await {
@@ -908,6 +1808,7 @@ async fn d1_exec(
                 axum::Json(serde_json::json!({
                     "rows": result.rows,
                     "rows_affected": result.rows_affected,
+                    "batch": result.batch,
                 }))
                 .into_response()
             }
@@ -915,6 +1816,1275 @@ async fn d1_exec(
         Ok(Ok(Err(e))) => (StatusCode::UNPROCESSABLE_ENTITY, e.to_string()).into_response(),
         Ok(Err(_)) => (StatusCode::SERVICE_UNAVAILABLE, "driver dropped").into_response(),
         Err(_) => (StatusCode::GATEWAY_TIMEOUT, "commit timed out").into_response(),
+    }
+}
+
+async fn d1_export(
+    State(api): State<Api>,
+    ConnectInfo(remote): ConnectInfo<SocketAddr>,
+    Path(db): Path<String>,
+    method: Method,
+    uri: Uri,
+    headers: HeaderMap,
+) -> Response {
+    if let Err(response) = check(&api, &remote, &headers, &method, &uri, b"") {
+        return response.into_response();
+    }
+    let tx = api.d1.lock().unwrap().get(&db).cloned();
+    let Some(tx) = tx else {
+        return d1_group_hint_response(&api, &db);
+    };
+    let (response_tx, response_rx) = tokio::sync::oneshot::channel();
+    if tx
+        .send(crate::d1::DriverCmd::Snapshot { resp: response_tx })
+        .await
+        .is_err()
+    {
+        return (StatusCode::SERVICE_UNAVAILABLE, "driver gone").into_response();
+    }
+    match tokio::time::timeout(std::time::Duration::from_secs(600), response_rx).await {
+        Ok(Ok(Ok(result))) => match result.data {
+            Some(export) => match export.stream().await {
+                Ok(stream) => Response::builder()
+                    .status(StatusCode::OK)
+                    .header(axum::http::header::CONTENT_TYPE, "application/vnd.sqlite3")
+                    .header(transport::STREAM_HEADER, transport::STREAM_VERSION)
+                    .body(Body::from_stream(stream))
+                    .unwrap_or_else(|error| {
+                        (
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            format!("failed to build D1 export response: {error}"),
+                        )
+                            .into_response()
+                    }),
+                Err(error) => (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("failed to stream D1 export: {error}"),
+                )
+                    .into_response(),
+            },
+            None => (
+                StatusCode::MISDIRECTED_REQUEST,
+                axum::Json(serde_json::json!({ "leader_hint": result.leader_hint })),
+            )
+                .into_response(),
+        },
+        Ok(Ok(Err(error))) => (StatusCode::UNPROCESSABLE_ENTITY, error.to_string()).into_response(),
+        Ok(Err(_)) => (StatusCode::SERVICE_UNAVAILABLE, "driver dropped").into_response(),
+        Err(_) => (StatusCode::GATEWAY_TIMEOUT, "snapshot timed out").into_response(),
+    }
+}
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct D1BackupReq {
+    bucket: String,
+    #[serde(default = "default_d1_backup_prefix")]
+    prefix: String,
+}
+
+fn default_d1_backup_prefix() -> String {
+    "d1-backups".into()
+}
+
+async fn d1_backup(
+    State(api): State<Api>,
+    ConnectInfo(remote): ConnectInfo<SocketAddr>,
+    Path(db): Path<String>,
+    method: Method,
+    uri: Uri,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    if let Err(response) = check(&api, &remote, &headers, &method, &uri, &body) {
+        return response.into_response();
+    }
+    let Ok(request) = serde_json::from_slice::<D1BackupReq>(&body) else {
+        return (StatusCode::BAD_REQUEST, "bad D1 backup request").into_response();
+    };
+    match crate::d1_backup::backup_now(&api.node, &db, &request.bucket, &request.prefix).await {
+        Ok(backup) => axum::Json(backup).into_response(),
+        Err(error) => (StatusCode::UNPROCESSABLE_ENTITY, error.to_string()).into_response(),
+    }
+}
+
+fn d1_group_hint_response(api: &Api, db: &str) -> Response {
+    if let Some(raw) = api.node.kv_get(crate::acme::NS, &crate::d1::kv_key(db)) {
+        if let Ok(meta) = serde_json::from_slice::<crate::d1::DbMeta>(&raw) {
+            let peers = api.node.peers();
+            let hint = meta.group.iter().find_map(|member| {
+                if member == &api.node.id() {
+                    Some(api.node.cfg.peer_api_advertise().to_string())
+                } else {
+                    peers
+                        .get(&member.to_string())
+                        .and_then(|peer| peer.api_addr)
+                        .map(|address| address.to_string())
+                }
+            });
+            return (
+                StatusCode::MISDIRECTED_REQUEST,
+                axum::Json(serde_json::json!({ "leader_hint": hint })),
+            )
+                .into_response();
+        }
+    }
+    (StatusCode::NOT_FOUND, "no such database").into_response()
+}
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct QueueSendReq {
+    messages: Vec<crate::queue::SendMessage>,
+}
+
+#[derive(serde::Deserialize)]
+struct QueueDeadQuery {
+    limit: Option<usize>,
+}
+
+async fn queue_send(
+    State(api): State<Api>,
+    ConnectInfo(remote): ConnectInfo<SocketAddr>,
+    Path(queue): Path<String>,
+    method: Method,
+    uri: Uri,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    if let Err(response) = check(&api, &remote, &headers, &method, &uri, &body) {
+        return response.into_response();
+    }
+    let Ok(request) = serde_json::from_slice::<QueueSendReq>(&body) else {
+        return (StatusCode::BAD_REQUEST, "bad queue send request").into_response();
+    };
+    match crate::queue::enqueue(&api.node, &queue, request.messages).await {
+        Ok(ids) => axum::Json(serde_json::json!({ "message_ids": ids })).into_response(),
+        Err(error) => (StatusCode::UNPROCESSABLE_ENTITY, error.to_string()).into_response(),
+    }
+}
+
+async fn queue_stats(
+    State(api): State<Api>,
+    ConnectInfo(remote): ConnectInfo<SocketAddr>,
+    Path(queue): Path<String>,
+    method: Method,
+    uri: Uri,
+    headers: HeaderMap,
+) -> Response {
+    if let Err(response) = check(&api, &remote, &headers, &method, &uri, b"") {
+        return response.into_response();
+    }
+    match crate::queue::stats(&api.node, &queue).await {
+        Ok(stats) => axum::Json(stats).into_response(),
+        Err(error) => (StatusCode::UNPROCESSABLE_ENTITY, error.to_string()).into_response(),
+    }
+}
+
+async fn queue_dead_letters(
+    State(api): State<Api>,
+    ConnectInfo(remote): ConnectInfo<SocketAddr>,
+    Path(queue): Path<String>,
+    Query(query): Query<QueueDeadQuery>,
+    method: Method,
+    uri: Uri,
+    headers: HeaderMap,
+) -> Response {
+    if let Err(response) = check(&api, &remote, &headers, &method, &uri, b"") {
+        return response.into_response();
+    }
+    match crate::queue::list_dead_letters(&api.node, &queue, query.limit.unwrap_or(100)).await {
+        Ok(dead_letters) => {
+            axum::Json(serde_json::json!({ "dead_letters": dead_letters })).into_response()
+        }
+        Err(error) => (StatusCode::UNPROCESSABLE_ENTITY, error.to_string()).into_response(),
+    }
+}
+
+async fn queue_redrive(
+    State(api): State<Api>,
+    ConnectInfo(remote): ConnectInfo<SocketAddr>,
+    Path((queue, id)): Path<(String, String)>,
+    method: Method,
+    uri: Uri,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    if let Err(response) = check(&api, &remote, &headers, &method, &uri, &body) {
+        return response.into_response();
+    }
+    match crate::queue::redrive_dead_letter(&api.node, &queue, &id).await {
+        Ok(true) => axum::Json(serde_json::json!({ "ok": true })).into_response(),
+        Ok(false) => (StatusCode::NOT_FOUND, "dead letter not found").into_response(),
+        Err(error) => (StatusCode::UNPROCESSABLE_ENTITY, error.to_string()).into_response(),
+    }
+}
+
+#[derive(serde::Deserialize)]
+struct WorkerRequestLogsQuery {
+    #[serde(default)]
+    hostname: Option<String>,
+    #[serde(default)]
+    status: Option<u16>,
+    limit: Option<usize>,
+}
+
+async fn worker_request_logs(
+    State(api): State<Api>,
+    ConnectInfo(remote): ConnectInfo<SocketAddr>,
+    Path(worker): Path<String>,
+    Query(query): Query<WorkerRequestLogsQuery>,
+    method: Method,
+    uri: Uri,
+    headers: HeaderMap,
+) -> Response {
+    if let Err(response) = check(&api, &remote, &headers, &method, &uri, b"") {
+        return response.into_response();
+    }
+    if !rf_core::manifest::valid_name(&worker) {
+        return (StatusCode::BAD_REQUEST, "invalid worker name").into_response();
+    }
+    if query
+        .status
+        .is_some_and(|status| !(2..=5).contains(&status))
+    {
+        return (
+            StatusCode::BAD_REQUEST,
+            "status must be a class from 2 to 5",
+        )
+            .into_response();
+    }
+    match crate::observability::snapshot(
+        &api.node,
+        &worker,
+        query.hostname.as_deref().filter(|value| !value.is_empty()),
+        query.status,
+        query.limit.unwrap_or(200),
+    ) {
+        Ok(snapshot) => axum::Json(snapshot).into_response(),
+        Err(error) => (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()).into_response(),
+    }
+}
+
+#[derive(serde::Deserialize)]
+struct WorkerRuntimeLogsQuery {
+    limit: Option<usize>,
+}
+
+#[derive(serde::Deserialize)]
+struct DataAuditQuery {
+    before_ms: Option<u64>,
+    limit: Option<usize>,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DataAuditArchiveRequest {
+    bucket: String,
+    #[serde(default = "default_data_audit_prefix")]
+    prefix: String,
+    #[serde(default)]
+    before_ms: Option<u64>,
+}
+
+fn default_data_audit_prefix() -> String {
+    "data-audit".into()
+}
+
+async fn data_audit(
+    State(api): State<Api>,
+    ConnectInfo(remote): ConnectInfo<SocketAddr>,
+    Query(query): Query<DataAuditQuery>,
+    method: Method,
+    uri: Uri,
+    headers: HeaderMap,
+) -> Response {
+    if let Err(response) = check(&api, &remote, &headers, &method, &uri, b"") {
+        return response.into_response();
+    }
+    match api
+        .node
+        .store
+        .load_data_audit(query.before_ms, query.limit.unwrap_or(500))
+    {
+        Ok(entries) => axum::Json(serde_json::json!({
+            "node": api.node.id_hex(),
+            "label": api.node.cfg.label.clone(),
+            "entries": entries,
+        }))
+        .into_response(),
+        Err(error) => (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()).into_response(),
+    }
+}
+
+async fn data_audit_cluster(
+    State(api): State<Api>,
+    ConnectInfo(remote): ConnectInfo<SocketAddr>,
+    Query(query): Query<DataAuditQuery>,
+    method: Method,
+    uri: Uri,
+    headers: HeaderMap,
+) -> Response {
+    if let Err(response) = check(&api, &remote, &headers, &method, &uri, b"") {
+        return response.into_response();
+    }
+    match crate::data_audit::cluster_entries(&api.node, query.before_ms, query.limit.unwrap_or(500))
+        .await
+    {
+        Ok(entries) => axum::Json(crate::data_audit::DataAuditSnapshot {
+            node: api.node.id_hex(),
+            label: "集群合并视图".into(),
+            entries,
+        })
+        .into_response(),
+        Err(error) => (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()).into_response(),
+    }
+}
+
+async fn data_audit_archive(
+    State(api): State<Api>,
+    ConnectInfo(remote): ConnectInfo<SocketAddr>,
+    method: Method,
+    uri: Uri,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    if let Err(response) = check(&api, &remote, &headers, &method, &uri, &body) {
+        return response.into_response();
+    }
+    let Ok(request) = serde_json::from_slice::<DataAuditArchiveRequest>(&body) else {
+        return (StatusCode::BAD_REQUEST, "bad data audit archive request").into_response();
+    };
+    match crate::data_audit::archive(
+        &api.node,
+        &request.bucket,
+        &request.prefix,
+        request.before_ms,
+    )
+    .await
+    {
+        Ok(archive) => axum::Json(archive).into_response(),
+        Err(error) => (StatusCode::UNPROCESSABLE_ENTITY, error.to_string()).into_response(),
+    }
+}
+
+async fn worker_runtime_logs(
+    State(api): State<Api>,
+    ConnectInfo(remote): ConnectInfo<SocketAddr>,
+    Path(worker): Path<String>,
+    Query(query): Query<WorkerRuntimeLogsQuery>,
+    method: Method,
+    uri: Uri,
+    headers: HeaderMap,
+) -> Response {
+    if let Err(response) = check(&api, &remote, &headers, &method, &uri, b"") {
+        return response.into_response();
+    }
+    if !rf_core::manifest::valid_name(&worker) {
+        return (StatusCode::BAD_REQUEST, "invalid worker name").into_response();
+    }
+    axum::Json(crate::observability::RuntimeLogSnapshot {
+        node: api.node.id_hex(),
+        label: api.node.cfg.label.clone(),
+        lines: api
+            .node
+            .runtime_logs(&worker, query.limit.unwrap_or(300).clamp(1, 1_000)),
+    })
+    .into_response()
+}
+
+#[derive(serde::Deserialize)]
+struct CronRunsQuery {
+    #[serde(default)]
+    dlq: bool,
+    limit: Option<usize>,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CronFireRequest {
+    #[serde(default)]
+    expression: Option<String>,
+}
+
+async fn cron_runs(
+    State(api): State<Api>,
+    ConnectInfo(remote): ConnectInfo<SocketAddr>,
+    Path(worker): Path<String>,
+    Query(query): Query<CronRunsQuery>,
+    method: Method,
+    uri: Uri,
+    headers: HeaderMap,
+) -> Response {
+    if let Err(response) = check(&api, &remote, &headers, &method, &uri, b"") {
+        return response.into_response();
+    }
+    match crate::cron_driver::list_runs(&api.node, &worker, query.dlq, query.limit.unwrap_or(100))
+        .await
+    {
+        Ok(runs) => axum::Json(serde_json::json!({ "runs": runs })).into_response(),
+        Err(error) => (StatusCode::UNPROCESSABLE_ENTITY, error.to_string()).into_response(),
+    }
+}
+
+async fn cron_fire(
+    State(api): State<Api>,
+    ConnectInfo(remote): ConnectInfo<SocketAddr>,
+    Path(worker): Path<String>,
+    method: Method,
+    uri: Uri,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    if let Err(response) = check(&api, &remote, &headers, &method, &uri, &body) {
+        return response.into_response();
+    }
+    let request = if body.is_empty() {
+        CronFireRequest { expression: None }
+    } else {
+        match serde_json::from_slice::<CronFireRequest>(&body) {
+            Ok(request) => request,
+            Err(_) => return (StatusCode::BAD_REQUEST, "bad Cron fire request").into_response(),
+        }
+    };
+    match crate::cron_driver::fire_now(&api.node, &worker, request.expression.as_deref()).await {
+        Ok(run) => axum::Json(run).into_response(),
+        Err(error) => (StatusCode::UNPROCESSABLE_ENTITY, error.to_string()).into_response(),
+    }
+}
+
+async fn cron_replay(
+    State(api): State<Api>,
+    ConnectInfo(remote): ConnectInfo<SocketAddr>,
+    Path((worker, id)): Path<(String, String)>,
+    method: Method,
+    uri: Uri,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    if let Err(response) = check(&api, &remote, &headers, &method, &uri, &body) {
+        return response.into_response();
+    }
+    match crate::cron_driver::replay_dlq(&api.node, &worker, &id).await {
+        Ok(Some(run)) => axum::Json(run).into_response(),
+        Ok(None) => (StatusCode::NOT_FOUND, "Cron DLQ run not found").into_response(),
+        Err(error) => (StatusCode::UNPROCESSABLE_ENTITY, error.to_string()).into_response(),
+    }
+}
+
+async fn cron_delete_dlq(
+    State(api): State<Api>,
+    ConnectInfo(remote): ConnectInfo<SocketAddr>,
+    Path((worker, id)): Path<(String, String)>,
+    method: Method,
+    uri: Uri,
+    headers: HeaderMap,
+) -> Response {
+    if let Err(response) = check(&api, &remote, &headers, &method, &uri, b"") {
+        return response.into_response();
+    }
+    match crate::cron_driver::delete_dlq(&api.node, &worker, &id).await {
+        Ok(true) => axum::Json(serde_json::json!({ "ok": true })).into_response(),
+        Ok(false) => (StatusCode::NOT_FOUND, "Cron DLQ run not found").into_response(),
+        Err(error) => (StatusCode::UNPROCESSABLE_ENTITY, error.to_string()).into_response(),
+    }
+}
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AnalyticsWriteReq {
+    points: Vec<crate::analytics::DataPoint>,
+}
+
+#[derive(serde::Deserialize)]
+struct AnalyticsRecentQuery {
+    before: Option<u64>,
+    limit: Option<usize>,
+}
+
+#[derive(serde::Deserialize)]
+struct AnalyticsGroupQuery {
+    #[serde(default = "default_analytics_dimension")]
+    dimension: String,
+    #[serde(default)]
+    dimension_index: usize,
+    double_index: Option<usize>,
+    #[serde(default)]
+    since: u64,
+    limit: Option<usize>,
+}
+
+fn default_analytics_dimension() -> String {
+    "blob".into()
+}
+
+async fn analytics_write(
+    State(api): State<Api>,
+    ConnectInfo(remote): ConnectInfo<SocketAddr>,
+    Path(dataset): Path<String>,
+    method: Method,
+    uri: Uri,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    if let Err(response) = check(&api, &remote, &headers, &method, &uri, &body) {
+        return response.into_response();
+    }
+    let Ok(request) = serde_json::from_slice::<AnalyticsWriteReq>(&body) else {
+        return (StatusCode::BAD_REQUEST, "bad Analytics write request").into_response();
+    };
+    match crate::analytics::write(&api.node, &dataset, request.points).await {
+        Ok(written) => axum::Json(serde_json::json!({ "written": written })).into_response(),
+        Err(error) => (StatusCode::UNPROCESSABLE_ENTITY, error.to_string()).into_response(),
+    }
+}
+
+async fn analytics_recent(
+    State(api): State<Api>,
+    ConnectInfo(remote): ConnectInfo<SocketAddr>,
+    Path(dataset): Path<String>,
+    Query(query): Query<AnalyticsRecentQuery>,
+    method: Method,
+    uri: Uri,
+    headers: HeaderMap,
+) -> Response {
+    if let Err(response) = check(&api, &remote, &headers, &method, &uri, b"") {
+        return response.into_response();
+    }
+    match crate::analytics::recent(
+        &api.node,
+        &dataset,
+        query.before,
+        query.limit.unwrap_or(100),
+    )
+    .await
+    {
+        Ok(events) => axum::Json(serde_json::json!({ "events": events })).into_response(),
+        Err(error) => (StatusCode::UNPROCESSABLE_ENTITY, error.to_string()).into_response(),
+    }
+}
+
+async fn analytics_stats(
+    State(api): State<Api>,
+    ConnectInfo(remote): ConnectInfo<SocketAddr>,
+    Path(dataset): Path<String>,
+    method: Method,
+    uri: Uri,
+    headers: HeaderMap,
+) -> Response {
+    if let Err(response) = check(&api, &remote, &headers, &method, &uri, b"") {
+        return response.into_response();
+    }
+    match crate::analytics::stats(&api.node, &dataset).await {
+        Ok(stats) => axum::Json(stats).into_response(),
+        Err(error) => (StatusCode::UNPROCESSABLE_ENTITY, error.to_string()).into_response(),
+    }
+}
+
+async fn analytics_group(
+    State(api): State<Api>,
+    ConnectInfo(remote): ConnectInfo<SocketAddr>,
+    Path(dataset): Path<String>,
+    Query(query): Query<AnalyticsGroupQuery>,
+    method: Method,
+    uri: Uri,
+    headers: HeaderMap,
+) -> Response {
+    if let Err(response) = check(&api, &remote, &headers, &method, &uri, b"") {
+        return response.into_response();
+    }
+    match crate::analytics::group_by(
+        &api.node,
+        &dataset,
+        &query.dimension,
+        query.dimension_index,
+        query.double_index,
+        query.since,
+        query.limit.unwrap_or(20),
+    )
+    .await
+    {
+        Ok(groups) => axum::Json(serde_json::json!({ "groups": groups })).into_response(),
+        Err(error) => (StatusCode::UNPROCESSABLE_ENTITY, error.to_string()).into_response(),
+    }
+}
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AnalyticsQueryReq {
+    sql: String,
+    #[serde(default)]
+    params: Vec<serde_json::Value>,
+    #[serde(default = "default_analytics_query_limit")]
+    limit: usize,
+}
+
+fn default_analytics_query_limit() -> usize {
+    1_000
+}
+
+async fn analytics_query(
+    State(api): State<Api>,
+    ConnectInfo(remote): ConnectInfo<SocketAddr>,
+    Path(dataset): Path<String>,
+    method: Method,
+    uri: Uri,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    if let Err(response) = check(&api, &remote, &headers, &method, &uri, &body) {
+        return response.into_response();
+    }
+    let Ok(request) = serde_json::from_slice::<AnalyticsQueryReq>(&body) else {
+        return (StatusCode::BAD_REQUEST, "bad Analytics query request").into_response();
+    };
+    match crate::analytics::query(
+        &api.node,
+        &dataset,
+        &request.sql,
+        request.params,
+        request.limit,
+    )
+    .await
+    {
+        Ok(result) => axum::Json(result).into_response(),
+        Err(error) => (StatusCode::UNPROCESSABLE_ENTITY, error.to_string()).into_response(),
+    }
+}
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PipelineIngestReq {
+    events: Vec<serde_json::Value>,
+}
+
+#[derive(serde::Deserialize)]
+struct PipelineBatchQuery {
+    limit: Option<usize>,
+}
+
+async fn pipeline_ingest(
+    State(api): State<Api>,
+    ConnectInfo(remote): ConnectInfo<SocketAddr>,
+    Path(pipeline): Path<String>,
+    method: Method,
+    uri: Uri,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    if let Err(response) = check(&api, &remote, &headers, &method, &uri, &body) {
+        return response.into_response();
+    }
+    let Ok(request) = serde_json::from_slice::<PipelineIngestReq>(&body) else {
+        return (StatusCode::BAD_REQUEST, "bad Pipeline ingest request").into_response();
+    };
+    match crate::pipeline::ingest(&api.node, &pipeline, request.events).await {
+        Ok(accepted) => axum::Json(serde_json::json!({ "accepted": accepted })).into_response(),
+        Err(error) => (StatusCode::UNPROCESSABLE_ENTITY, error.to_string()).into_response(),
+    }
+}
+
+async fn pipeline_status(
+    State(api): State<Api>,
+    ConnectInfo(remote): ConnectInfo<SocketAddr>,
+    Path(pipeline): Path<String>,
+    method: Method,
+    uri: Uri,
+    headers: HeaderMap,
+) -> Response {
+    if let Err(response) = check(&api, &remote, &headers, &method, &uri, b"") {
+        return response.into_response();
+    }
+    match crate::pipeline::status(&api.node, &pipeline).await {
+        Ok(status) => axum::Json(status).into_response(),
+        Err(error) => (StatusCode::UNPROCESSABLE_ENTITY, error.to_string()).into_response(),
+    }
+}
+
+async fn pipeline_batches(
+    State(api): State<Api>,
+    ConnectInfo(remote): ConnectInfo<SocketAddr>,
+    Path(pipeline): Path<String>,
+    Query(query): Query<PipelineBatchQuery>,
+    method: Method,
+    uri: Uri,
+    headers: HeaderMap,
+) -> Response {
+    if let Err(response) = check(&api, &remote, &headers, &method, &uri, b"") {
+        return response.into_response();
+    }
+    match crate::pipeline::batches(&api.node, &pipeline, query.limit.unwrap_or(100)).await {
+        Ok(batches) => axum::Json(serde_json::json!({ "batches": batches })).into_response(),
+        Err(error) => (StatusCode::UNPROCESSABLE_ENTITY, error.to_string()).into_response(),
+    }
+}
+
+async fn pipeline_flush(
+    State(api): State<Api>,
+    ConnectInfo(remote): ConnectInfo<SocketAddr>,
+    Path(pipeline): Path<String>,
+    method: Method,
+    uri: Uri,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    if let Err(response) = check(&api, &remote, &headers, &method, &uri, &body) {
+        return response.into_response();
+    }
+    match crate::pipeline::flush_once(&api.node, &pipeline, true).await {
+        Ok(batch) => axum::Json(serde_json::json!({ "batch": batch })).into_response(),
+        Err(error) => (StatusCode::UNPROCESSABLE_ENTITY, error.to_string()).into_response(),
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WorkflowCreateReq {
+    instance_key: Option<String>,
+    #[serde(default)]
+    concurrency_group: Option<String>,
+    #[serde(default)]
+    input: serde_json::Value,
+}
+
+async fn workflow_create(
+    State(api): State<Api>,
+    ConnectInfo(remote): ConnectInfo<SocketAddr>,
+    Path(workflow): Path<String>,
+    method: Method,
+    uri: Uri,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    if let Err(response) = check(&api, &remote, &headers, &method, &uri, &body) {
+        return response.into_response();
+    }
+    let Ok(request) = serde_json::from_slice::<WorkflowCreateReq>(&body) else {
+        return (StatusCode::BAD_REQUEST, "Workflow 创建请求无效").into_response();
+    };
+    match crate::workflow::create_instance_in_group(
+        &api.node,
+        &workflow,
+        request.instance_key.as_deref(),
+        request.concurrency_group.as_deref(),
+        request.input,
+    )
+    .await
+    {
+        Ok(instance) => axum::Json(instance).into_response(),
+        Err(error) => (StatusCode::UNPROCESSABLE_ENTITY, error.to_string()).into_response(),
+    }
+}
+
+#[derive(Deserialize)]
+struct WorkflowListQuery {
+    status: Option<String>,
+    limit: Option<usize>,
+}
+
+async fn workflow_instances(
+    State(api): State<Api>,
+    ConnectInfo(remote): ConnectInfo<SocketAddr>,
+    Path(workflow): Path<String>,
+    Query(query): Query<WorkflowListQuery>,
+    method: Method,
+    uri: Uri,
+    headers: HeaderMap,
+) -> Response {
+    if let Err(response) = check(&api, &remote, &headers, &method, &uri, b"") {
+        return response.into_response();
+    }
+    match crate::workflow::instances(
+        &api.node,
+        &workflow,
+        query.status.as_deref(),
+        query.limit.unwrap_or(100),
+    )
+    .await
+    {
+        Ok(instances) => axum::Json(serde_json::json!({ "instances": instances })).into_response(),
+        Err(error) => (StatusCode::UNPROCESSABLE_ENTITY, error.to_string()).into_response(),
+    }
+}
+
+async fn workflow_instance(
+    State(api): State<Api>,
+    ConnectInfo(remote): ConnectInfo<SocketAddr>,
+    Path((workflow, id)): Path<(String, String)>,
+    method: Method,
+    uri: Uri,
+    headers: HeaderMap,
+) -> Response {
+    if let Err(response) = check(&api, &remote, &headers, &method, &uri, b"") {
+        return response.into_response();
+    }
+    let instance = match crate::workflow::instance(&api.node, &workflow, &id).await {
+        Ok(Some(instance)) => instance,
+        Ok(None) => return (StatusCode::NOT_FOUND, "Workflow 实例不存在").into_response(),
+        Err(error) => return (StatusCode::UNPROCESSABLE_ENTITY, error.to_string()).into_response(),
+    };
+    let (steps, signals, events) = tokio::join!(
+        crate::workflow::steps(&api.node, &workflow, &id),
+        crate::workflow::signals(&api.node, &workflow, &id),
+        crate::workflow::events(&api.node, &workflow, &id, 500),
+    );
+    match (steps, signals, events) {
+        (Ok(steps), Ok(signals), Ok(events)) => axum::Json(serde_json::json!({
+            "instance": instance,
+            "steps": steps,
+            "signals": signals,
+            "events": events,
+        }))
+        .into_response(),
+        (steps, signals, events) => {
+            let error = steps
+                .err()
+                .or_else(|| signals.err())
+                .or_else(|| events.err())
+                .expect("one branch failed");
+            (StatusCode::UNPROCESSABLE_ENTITY, error.to_string()).into_response()
+        }
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WorkflowSignalReq {
+    name: String,
+    #[serde(default)]
+    payload: serde_json::Value,
+}
+
+async fn workflow_signal(
+    State(api): State<Api>,
+    ConnectInfo(remote): ConnectInfo<SocketAddr>,
+    Path((workflow, id)): Path<(String, String)>,
+    method: Method,
+    uri: Uri,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    if let Err(response) = check(&api, &remote, &headers, &method, &uri, &body) {
+        return response.into_response();
+    }
+    let Ok(request) = serde_json::from_slice::<WorkflowSignalReq>(&body) else {
+        return (StatusCode::BAD_REQUEST, "Workflow 信号请求无效").into_response();
+    };
+    match crate::workflow::send_signal(&api.node, &workflow, &id, &request.name, request.payload)
+        .await
+    {
+        Ok(signal_id) => axum::Json(serde_json::json!({ "signal_id": signal_id })).into_response(),
+        Err(error) => (StatusCode::UNPROCESSABLE_ENTITY, error.to_string()).into_response(),
+    }
+}
+
+async fn workflow_action(
+    State(api): State<Api>,
+    ConnectInfo(remote): ConnectInfo<SocketAddr>,
+    Path((workflow, id, action)): Path<(String, String, String)>,
+    method: Method,
+    uri: Uri,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    if let Err(response) = check(&api, &remote, &headers, &method, &uri, &body) {
+        return response.into_response();
+    }
+    let changed = match action.as_str() {
+        "pause" => crate::workflow::pause(&api.node, &workflow, &id).await,
+        "resume" => crate::workflow::resume(&api.node, &workflow, &id).await,
+        "terminate" => crate::workflow::terminate(&api.node, &workflow, &id).await,
+        "restart" => crate::workflow::restart(&api.node, &workflow, &id).await,
+        _ => return (StatusCode::NOT_FOUND, "Workflow 操作不存在").into_response(),
+    };
+    match changed {
+        Ok(true) => axum::Json(serde_json::json!({ "ok": true })).into_response(),
+        Ok(false) => (
+            StatusCode::CONFLICT,
+            "Workflow 实例不存在或当前状态不允许此操作",
+        )
+            .into_response(),
+        Err(error) => (StatusCode::UNPROCESSABLE_ENTITY, error.to_string()).into_response(),
+    }
+}
+
+async fn workflow_stats(
+    State(api): State<Api>,
+    ConnectInfo(remote): ConnectInfo<SocketAddr>,
+    Path(workflow): Path<String>,
+    method: Method,
+    uri: Uri,
+    headers: HeaderMap,
+) -> Response {
+    if let Err(response) = check(&api, &remote, &headers, &method, &uri, b"") {
+        return response.into_response();
+    }
+    match crate::workflow::stats(&api.node, &workflow).await {
+        Ok(stats) => axum::Json(stats).into_response(),
+        Err(error) => (StatusCode::UNPROCESSABLE_ENTITY, error.to_string()).into_response(),
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FlowCreateReq {
+    #[serde(default)]
+    run_key: Option<String>,
+    #[serde(default)]
+    input: serde_json::Value,
+}
+
+async fn flow_create(
+    State(api): State<Api>,
+    ConnectInfo(remote): ConnectInfo<SocketAddr>,
+    Path(flow): Path<String>,
+    method: Method,
+    uri: Uri,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    if let Err(response) = check(&api, &remote, &headers, &method, &uri, &body) {
+        return response.into_response();
+    }
+    let Ok(request) = serde_json::from_slice::<FlowCreateReq>(&body) else {
+        return (StatusCode::BAD_REQUEST, "Flow 触发请求无效").into_response();
+    };
+    match crate::flow::create_run(
+        &api.node,
+        &flow,
+        request.run_key.as_deref(),
+        "manual",
+        request.input,
+    )
+    .await
+    {
+        Ok(run) => (StatusCode::ACCEPTED, axum::Json(run)).into_response(),
+        Err(error) => (StatusCode::UNPROCESSABLE_ENTITY, error.to_string()).into_response(),
+    }
+}
+
+#[derive(Deserialize)]
+struct FlowRunsQuery {
+    status: Option<String>,
+    limit: Option<usize>,
+}
+
+async fn flow_runs(
+    State(api): State<Api>,
+    ConnectInfo(remote): ConnectInfo<SocketAddr>,
+    Path(flow): Path<String>,
+    Query(query): Query<FlowRunsQuery>,
+    method: Method,
+    uri: Uri,
+    headers: HeaderMap,
+) -> Response {
+    if let Err(response) = check(&api, &remote, &headers, &method, &uri, b"") {
+        return response.into_response();
+    }
+    match crate::flow::runs(
+        &api.node,
+        &flow,
+        query.status.as_deref(),
+        query.limit.unwrap_or(100),
+    )
+    .await
+    {
+        Ok(runs) => axum::Json(runs).into_response(),
+        Err(error) => (StatusCode::UNPROCESSABLE_ENTITY, error.to_string()).into_response(),
+    }
+}
+
+async fn flow_run(
+    State(api): State<Api>,
+    ConnectInfo(remote): ConnectInfo<SocketAddr>,
+    Path((flow, id)): Path<(String, String)>,
+    method: Method,
+    uri: Uri,
+    headers: HeaderMap,
+) -> Response {
+    if let Err(response) = check(&api, &remote, &headers, &method, &uri, b"") {
+        return response.into_response();
+    }
+    let run = match crate::flow::run(&api.node, &flow, &id).await {
+        Ok(Some(run)) => run,
+        Ok(None) => return (StatusCode::NOT_FOUND, "Flow 运行不存在").into_response(),
+        Err(error) => return (StatusCode::UNPROCESSABLE_ENTITY, error.to_string()).into_response(),
+    };
+    let (steps, events) = tokio::join!(
+        crate::flow::run_steps(&api.node, &flow, &id),
+        crate::flow::run_events(&api.node, &flow, &id, 500),
+    );
+    match (steps, events) {
+        (Ok(steps), Ok(events)) => axum::Json(serde_json::json!({
+            "run": run,
+            "steps": steps,
+            "events": events,
+        }))
+        .into_response(),
+        (steps, events) => {
+            let error = steps
+                .err()
+                .or_else(|| events.err())
+                .expect("one branch failed");
+            (StatusCode::UNPROCESSABLE_ENTITY, error.to_string()).into_response()
+        }
+    }
+}
+
+async fn flow_action(
+    State(api): State<Api>,
+    ConnectInfo(remote): ConnectInfo<SocketAddr>,
+    Path((flow, id, action)): Path<(String, String, String)>,
+    method: Method,
+    uri: Uri,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    if let Err(response) = check(&api, &remote, &headers, &method, &uri, &body) {
+        return response.into_response();
+    }
+    match action.as_str() {
+        "cancel" => match crate::flow::cancel(&api.node, &flow, &id).await {
+            Ok(true) => axum::Json(serde_json::json!({ "ok": true })).into_response(),
+            Ok(false) => (StatusCode::CONFLICT, "Flow 运行不存在或已进入终态").into_response(),
+            Err(error) => (StatusCode::UNPROCESSABLE_ENTITY, error.to_string()).into_response(),
+        },
+        "retry" => match crate::flow::retry(&api.node, &flow, &id).await {
+            Ok(run) => (StatusCode::ACCEPTED, axum::Json(run)).into_response(),
+            Err(error) => (StatusCode::UNPROCESSABLE_ENTITY, error.to_string()).into_response(),
+        },
+        _ => (StatusCode::NOT_FOUND, "Flow 操作不存在").into_response(),
+    }
+}
+
+async fn flow_stats(
+    State(api): State<Api>,
+    ConnectInfo(remote): ConnectInfo<SocketAddr>,
+    Path(flow): Path<String>,
+    method: Method,
+    uri: Uri,
+    headers: HeaderMap,
+) -> Response {
+    if let Err(response) = check(&api, &remote, &headers, &method, &uri, b"") {
+        return response.into_response();
+    }
+    match crate::flow::stats(&api.node, &flow).await {
+        Ok(stats) => axum::Json(stats).into_response(),
+        Err(error) => (StatusCode::UNPROCESSABLE_ENTITY, error.to_string()).into_response(),
+    }
+}
+
+#[derive(Deserialize)]
+struct EmailMessagesQuery {
+    limit: Option<usize>,
+}
+
+async fn email_verification(
+    State(api): State<Api>,
+    ConnectInfo(remote): ConnectInfo<SocketAddr>,
+    Path(domain): Path<String>,
+    method: Method,
+    uri: Uri,
+    headers: HeaderMap,
+) -> Response {
+    if let Err(response) = check(&api, &remote, &headers, &method, &uri, b"") {
+        return response.into_response();
+    }
+    if crate::email::email_domain_record(&api.node, &domain).is_none() {
+        return (StatusCode::NOT_FOUND, "邮件域不存在").into_response();
+    }
+    match crate::email::latest_verification(&api.node, &domain).await {
+        Ok(verification) => axum::Json(serde_json::json!({
+            "verification": verification,
+        }))
+        .into_response(),
+        Err(error) => (StatusCode::UNPROCESSABLE_ENTITY, error.to_string()).into_response(),
+    }
+}
+
+async fn hostname_verification(
+    State(api): State<Api>,
+    ConnectInfo(remote): ConnectInfo<SocketAddr>,
+    Path(hostname): Path<String>,
+    method: Method,
+    uri: Uri,
+    headers: HeaderMap,
+) -> Response {
+    if let Err(response) = check(&api, &remote, &headers, &method, &uri, b"") {
+        return response.into_response();
+    }
+    let Some((_, spec)) = crate::hostname::claim(&api.node, &hostname) else {
+        return (StatusCode::NOT_FOUND, "域名所有权声明不存在").into_response();
+    };
+    match crate::hostname::query_verification(&spec).await {
+        Ok(verification) => axum::Json(verification).into_response(),
+        Err(error) => (StatusCode::UNPROCESSABLE_ENTITY, error.to_string()).into_response(),
+    }
+}
+
+async fn email_verify(
+    State(api): State<Api>,
+    ConnectInfo(remote): ConnectInfo<SocketAddr>,
+    Path(domain): Path<String>,
+    method: Method,
+    uri: Uri,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    if let Err(response) = check(&api, &remote, &headers, &method, &uri, &body) {
+        return response.into_response();
+    }
+    match crate::email::verify_domain(&api.node, &domain).await {
+        Ok(verification) => axum::Json(verification).into_response(),
+        Err(error) => (StatusCode::UNPROCESSABLE_ENTITY, error.to_string()).into_response(),
+    }
+}
+
+async fn email_messages(
+    State(api): State<Api>,
+    ConnectInfo(remote): ConnectInfo<SocketAddr>,
+    Path(domain): Path<String>,
+    Query(query): Query<EmailMessagesQuery>,
+    method: Method,
+    uri: Uri,
+    headers: HeaderMap,
+) -> Response {
+    if let Err(response) = check(&api, &remote, &headers, &method, &uri, b"") {
+        return response.into_response();
+    }
+    if crate::email::email_domain_record(&api.node, &domain).is_none() {
+        return (StatusCode::NOT_FOUND, "邮件域不存在").into_response();
+    }
+    match crate::email::list_messages(&api.node, &domain, query.limit.unwrap_or(100)).await {
+        Ok(messages) => axum::Json(serde_json::json!({ "messages": messages })).into_response(),
+        Err(error) => (StatusCode::UNPROCESSABLE_ENTITY, error.to_string()).into_response(),
+    }
+}
+
+async fn email_audit(
+    State(api): State<Api>,
+    ConnectInfo(remote): ConnectInfo<SocketAddr>,
+    Path(domain): Path<String>,
+    Query(query): Query<EmailMessagesQuery>,
+    method: Method,
+    uri: Uri,
+    headers: HeaderMap,
+) -> Response {
+    if let Err(response) = check(&api, &remote, &headers, &method, &uri, b"") {
+        return response.into_response();
+    }
+    if crate::email::email_domain_record(&api.node, &domain).is_none() {
+        return (StatusCode::NOT_FOUND, "邮件域不存在").into_response();
+    }
+    match crate::email::list_audit(&api.node, &domain, query.limit.unwrap_or(100)).await {
+        Ok(events) => axum::Json(serde_json::json!({ "events": events })).into_response(),
+        Err(error) => (StatusCode::UNPROCESSABLE_ENTITY, error.to_string()).into_response(),
+    }
+}
+
+async fn email_dsn(
+    State(api): State<Api>,
+    ConnectInfo(remote): ConnectInfo<SocketAddr>,
+    Path(domain): Path<String>,
+    method: Method,
+    uri: Uri,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    if let Err(response) = check(&api, &remote, &headers, &method, &uri, &body) {
+        return response.into_response();
+    }
+    let Some((_, spec)) = crate::email::email_domain_record(&api.node, &domain) else {
+        return (StatusCode::NOT_FOUND, "邮件域不存在").into_response();
+    };
+    match crate::email::process_dsn_once(&api.node, &domain, &spec).await {
+        Ok(processed) => axum::Json(serde_json::json!({ "processed": processed })).into_response(),
+        Err(error) => (StatusCode::UNPROCESSABLE_ENTITY, error.to_string()).into_response(),
+    }
+}
+
+async fn email_message(
+    State(api): State<Api>,
+    ConnectInfo(remote): ConnectInfo<SocketAddr>,
+    Path((domain, id)): Path<(String, String)>,
+    method: Method,
+    uri: Uri,
+    headers: HeaderMap,
+) -> Response {
+    if let Err(response) = check(&api, &remote, &headers, &method, &uri, b"") {
+        return response.into_response();
+    }
+    match crate::email::get_message(&api.node, &domain, &id).await {
+        Ok(Some(message)) => axum::Json(message).into_response(),
+        Ok(None) => (StatusCode::NOT_FOUND, "邮件记录不存在").into_response(),
+        Err(error) => (StatusCode::UNPROCESSABLE_ENTITY, error.to_string()).into_response(),
+    }
+}
+
+async fn email_message_raw(
+    State(api): State<Api>,
+    ConnectInfo(remote): ConnectInfo<SocketAddr>,
+    Path((domain, id)): Path<(String, String)>,
+    method: Method,
+    uri: Uri,
+    headers: HeaderMap,
+) -> Response {
+    if let Err(response) = check(&api, &remote, &headers, &method, &uri, b"") {
+        return response.into_response();
+    }
+    let Some(message) = (match crate::email::get_message(&api.node, &domain, &id).await {
+        Ok(message) => message,
+        Err(error) => {
+            return (StatusCode::UNPROCESSABLE_ENTITY, error.to_string()).into_response();
+        }
+    }) else {
+        return (StatusCode::NOT_FOUND, "邮件记录不存在").into_response();
+    };
+    let Some((_, spec)) = crate::email::email_domain_record(&api.node, &domain) else {
+        return (StatusCode::NOT_FOUND, "邮件域不存在").into_response();
+    };
+    match crate::r2::get_object(&api.node, &spec.bucket, &message.object_key).await {
+        Ok(Some((_metadata, raw))) => {
+            ([(axum::http::header::CONTENT_TYPE, "message/rfc822")], raw).into_response()
+        }
+        Ok(None) => (StatusCode::NOT_FOUND, "邮件原文对象不存在").into_response(),
+        Err(error) => (StatusCode::UNPROCESSABLE_ENTITY, error.to_string()).into_response(),
+    }
+}
+
+async fn email_send(
+    State(api): State<Api>,
+    ConnectInfo(remote): ConnectInfo<SocketAddr>,
+    Path(domain): Path<String>,
+    method: Method,
+    uri: Uri,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    if let Err(response) = check(&api, &remote, &headers, &method, &uri, &body) {
+        return response.into_response();
+    }
+    let (metadata, raw) = match crate::email::decode_send_request(&body) {
+        Ok(request) => request,
+        Err(error) => return (StatusCode::BAD_REQUEST, error.to_string()).into_response(),
+    };
+    match crate::email::queue_outbound(
+        &api.node,
+        &domain,
+        &metadata.mail_from,
+        &metadata.recipients,
+        raw,
+    )
+    .await
+    {
+        Ok(queued) => (
+            StatusCode::ACCEPTED,
+            axum::Json(serde_json::json!({
+                "queued": queued,
+            })),
+        )
+            .into_response(),
+        Err(error) => (StatusCode::UNPROCESSABLE_ENTITY, error.to_string()).into_response(),
     }
 }
 
@@ -932,6 +3102,605 @@ async fn kv_delete(
     match api.node.kv_put(&ns, &key, None, None) {
         Ok(()) => StatusCode::OK.into_response(),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    }
+}
+
+#[derive(Deserialize)]
+struct R2ListQuery {
+    #[serde(default)]
+    prefix: String,
+    cursor: Option<String>,
+    limit: Option<usize>,
+}
+
+async fn r2_multipart_list(
+    State(api): State<Api>,
+    ConnectInfo(remote): ConnectInfo<SocketAddr>,
+    Path(bucket): Path<String>,
+    Query(query): Query<R2ListQuery>,
+    method: Method,
+    uri: Uri,
+    headers: HeaderMap,
+) -> Response {
+    if let Err(response) = check(&api, &remote, &headers, &method, &uri, b"") {
+        return response.into_response();
+    }
+    match r2::list_multipart_uploads(
+        &api.node,
+        &bucket,
+        &query.prefix,
+        query.cursor.as_deref(),
+        query.limit.unwrap_or(100),
+    )
+    .await
+    {
+        Ok(uploads) => axum::Json(uploads).into_response(),
+        Err(error) => r2_error(error),
+    }
+}
+
+async fn r2_multipart_detail(
+    State(api): State<Api>,
+    ConnectInfo(remote): ConnectInfo<SocketAddr>,
+    Path((bucket, upload_id)): Path<(String, String)>,
+    method: Method,
+    uri: Uri,
+    headers: HeaderMap,
+) -> Response {
+    if let Err(response) = check(&api, &remote, &headers, &method, &uri, b"") {
+        return response.into_response();
+    }
+    match r2::multipart_upload_detail(&api.node, &bucket, &upload_id).await {
+        Ok(upload) => axum::Json(upload).into_response(),
+        Err(error) => r2_error(error),
+    }
+}
+
+async fn r2_multipart_abort(
+    State(api): State<Api>,
+    ConnectInfo(remote): ConnectInfo<SocketAddr>,
+    Path((bucket, upload_id)): Path<(String, String)>,
+    method: Method,
+    uri: Uri,
+    headers: HeaderMap,
+) -> Response {
+    if let Err(response) = check(&api, &remote, &headers, &method, &uri, b"") {
+        return response.into_response();
+    }
+    match r2::abort_multipart_upload_by_id(&api.node, &bucket, &upload_id).await {
+        Ok(()) => StatusCode::OK.into_response(),
+        Err(error) => r2_error(error),
+    }
+}
+
+async fn r2_list(
+    State(api): State<Api>,
+    ConnectInfo(remote): ConnectInfo<SocketAddr>,
+    Path(bucket): Path<String>,
+    Query(query): Query<R2ListQuery>,
+    method: Method,
+    uri: Uri,
+    headers: HeaderMap,
+) -> Response {
+    if let Err(response) = check(&api, &remote, &headers, &method, &uri, b"") {
+        return response.into_response();
+    }
+    match r2::list_objects(
+        &api.node,
+        &bucket,
+        &query.prefix,
+        query.cursor.as_deref(),
+        query.limit.unwrap_or(100),
+    )
+    .await
+    {
+        Ok(objects) => axum::Json(objects).into_response(),
+        Err(error) => r2_error(error),
+    }
+}
+
+async fn r2_head(
+    State(api): State<Api>,
+    ConnectInfo(remote): ConnectInfo<SocketAddr>,
+    Path((bucket, key)): Path<(String, String)>,
+    method: Method,
+    uri: Uri,
+    headers: HeaderMap,
+) -> Response {
+    if let Err(response) = check(&api, &remote, &headers, &method, &uri, b"") {
+        return response.into_response();
+    }
+    match r2::head_object(&api.node, &bucket, &key).await {
+        Ok(Some(metadata)) => axum::Json(metadata).into_response(),
+        Ok(None) => (StatusCode::NOT_FOUND, "R2 对象不存在").into_response(),
+        Err(error) => r2_error(error),
+    }
+}
+
+/// Stream one exact object revision to another node. The outer transport
+/// converts this body into independently authenticated, sequence-bound frames;
+/// this handler never invokes peer repair, preventing borrow cycles.
+async fn r2_stream(
+    State(api): State<Api>,
+    ConnectInfo(remote): ConnectInfo<SocketAddr>,
+    Path((bucket, sha256, key)): Path<(String, String, String)>,
+    method: Method,
+    uri: Uri,
+    headers: HeaderMap,
+) -> Response {
+    if headers
+        .get(transport::ENC_HEADER)
+        .and_then(|value| value.to_str().ok())
+        != Some(transport::VERSION)
+    {
+        return (
+            StatusCode::UPGRADE_REQUIRED,
+            "encrypted R2 object stream required",
+        )
+            .into_response();
+    }
+    if let Err(response) = check(&api, &remote, &headers, &method, &uri, b"") {
+        return response.into_response();
+    }
+    let digest: [u8; 32] = match hex::decode(&sha256)
+        .ok()
+        .and_then(|bytes| bytes.try_into().ok())
+    {
+        Some(digest) => digest,
+        None => return (StatusCode::BAD_REQUEST, "R2 对象摘要无效").into_response(),
+    };
+    let metadata = match r2::head_object(&api.node, &bucket, &key).await {
+        Ok(Some(metadata)) if metadata.sha256 == sha256 => metadata,
+        Ok(Some(_)) => return (StatusCode::CONFLICT, "R2 对象版本已改变").into_response(),
+        Ok(None) => return (StatusCode::NOT_FOUND, "R2 对象不存在").into_response(),
+        Err(error) => return r2_error(error),
+    };
+    let file = match api
+        .node
+        .objects
+        .materialize_verified(&metadata.storage, &digest)
+        .await
+    {
+        Ok(file) if file.size() == metadata.size => file,
+        Ok(_) => return r2_error(anyhow::anyhow!("R2 对象大小与多数派元数据不一致")),
+        Err(error) => return r2_error(error),
+    };
+    let stream = match file.stream(0, metadata.size).await {
+        Ok(stream) => stream,
+        Err(error) => return r2_error(error),
+    };
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(transport::STREAM_HEADER, transport::STREAM_VERSION)
+        .body(Body::from_stream(stream))
+        .unwrap_or_else(|error| {
+            (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()).into_response()
+        })
+}
+
+async fn r2_get(
+    State(api): State<Api>,
+    ConnectInfo(remote): ConnectInfo<SocketAddr>,
+    Path((bucket, key)): Path<(String, String)>,
+    method: Method,
+    uri: Uri,
+    headers: HeaderMap,
+) -> Response {
+    if let Err(response) = check(&api, &remote, &headers, &method, &uri, b"") {
+        return response.into_response();
+    }
+    match r2::get_object(&api.node, &bucket, &key).await {
+        Ok(Some((metadata, bytes))) => match r2::encode_get_response(&metadata, &bytes) {
+            Ok(response) => response.into_response(),
+            Err(error) => r2_error(error),
+        },
+        Ok(None) => (StatusCode::NOT_FOUND, "R2 对象不存在").into_response(),
+        Err(error) => r2_error(error),
+    }
+}
+
+async fn r2_put(
+    State(api): State<Api>,
+    ConnectInfo(remote): ConnectInfo<SocketAddr>,
+    Path((bucket, key)): Path<(String, String)>,
+    request: Request<Body>,
+) -> Response {
+    let (parts, body) = request.into_parts();
+    let streamed = parts
+        .headers
+        .get(transport::DECRYPTED_STREAM_HEADER)
+        .and_then(|value| value.to_str().ok())
+        == Some(transport::STREAM_VERSION);
+    if streamed {
+        if let Err(response) = check(
+            &api,
+            &remote,
+            &parts.headers,
+            &parts.method,
+            &parts.uri,
+            b"",
+        ) {
+            return response.into_response();
+        }
+        let source = body.into_data_stream().map(|result| {
+            result.map_err(|error| std::io::Error::other(format!("peer 上传体读取失败：{error}")))
+        });
+        let (length, source) =
+            match crate::objectstore::split_stream_prefix(Box::pin(source), 4).await {
+                Ok(value) => value,
+                Err(error) => return (StatusCode::BAD_REQUEST, error.to_string()).into_response(),
+            };
+        let options_len = u32::from_be_bytes(length.try_into().expect("four-byte prefix")) as usize;
+        if options_len > 32 * 1024 {
+            return (StatusCode::BAD_REQUEST, "R2 上传选项长度无效").into_response();
+        }
+        let (encoded_options, source) =
+            match crate::objectstore::split_stream_prefix(source, options_len).await {
+                Ok(value) => value,
+                Err(error) => return (StatusCode::BAD_REQUEST, error.to_string()).into_response(),
+            };
+        let options: r2::PutOptions = match serde_json::from_slice(&encoded_options) {
+            Ok(options) => options,
+            Err(error) => return (StatusCode::BAD_REQUEST, error.to_string()).into_response(),
+        };
+        let staged = match api
+            .node
+            .objects
+            .spool_stream(r2::MAX_DIRECT_OBJECT_BYTES as u64, source)
+            .await
+        {
+            Ok(staged) => staged,
+            Err(error) => return r2_error(error),
+        };
+        return match r2::put_object_file(&api.node, &bucket, &key, &staged, options).await {
+            Ok(metadata) => axum::Json(metadata).into_response(),
+            Err(error) => r2_error(error),
+        };
+    }
+    let body = match to_bytes(body, MAX_PEER_PAYLOAD).await {
+        Ok(body) => body,
+        Err(_) => return (StatusCode::PAYLOAD_TOO_LARGE, "R2 对象过大").into_response(),
+    };
+    if let Err(response) = check(
+        &api,
+        &remote,
+        &parts.headers,
+        &parts.method,
+        &parts.uri,
+        &body,
+    ) {
+        return response.into_response();
+    }
+    let (options, bytes) = match r2::decode_put_request(&body) {
+        Ok(request) => request,
+        Err(error) => return (StatusCode::BAD_REQUEST, error.to_string()).into_response(),
+    };
+    match r2::put_object(&api.node, &bucket, &key, bytes, options).await {
+        Ok(metadata) => axum::Json(metadata).into_response(),
+        Err(error) => r2_error(error),
+    }
+}
+
+async fn r2_delete(
+    State(api): State<Api>,
+    ConnectInfo(remote): ConnectInfo<SocketAddr>,
+    Path((bucket, key)): Path<(String, String)>,
+    method: Method,
+    uri: Uri,
+    headers: HeaderMap,
+) -> Response {
+    if let Err(response) = check(&api, &remote, &headers, &method, &uri, b"") {
+        return response.into_response();
+    }
+    match r2::delete_object(&api.node, &bucket, &key).await {
+        Ok(true) => StatusCode::OK.into_response(),
+        Ok(false) => (StatusCode::NOT_FOUND, "R2 对象不存在").into_response(),
+        Err(error) => r2_error(error),
+    }
+}
+
+async fn r2_multipart_part(
+    State(api): State<Api>,
+    ConnectInfo(remote): ConnectInfo<SocketAddr>,
+    Path((bucket, upload_id, part, key)): Path<(String, String, u32, String)>,
+    request: Request<Body>,
+) -> Response {
+    let (parts, body) = request.into_parts();
+    let streamed = parts
+        .headers
+        .get(transport::DECRYPTED_STREAM_HEADER)
+        .and_then(|value| value.to_str().ok())
+        == Some(transport::STREAM_VERSION);
+    if streamed {
+        if let Err(response) = check(
+            &api,
+            &remote,
+            &parts.headers,
+            &parts.method,
+            &parts.uri,
+            b"",
+        ) {
+            return response.into_response();
+        }
+        let source = body.into_data_stream().map(|result| {
+            result.map_err(|error| std::io::Error::other(format!("peer 分片读取失败：{error}")))
+        });
+        let staged = match api
+            .node
+            .objects
+            .spool_stream(r2::MAX_MULTIPART_PART_BYTES as u64, Box::pin(source))
+            .await
+        {
+            Ok(staged) => staged,
+            Err(error) => return r2_error(error),
+        };
+        return match r2::upload_part_file(&api.node, &bucket, &key, &upload_id, part, &staged).await
+        {
+            Ok(uploaded) => axum::Json(uploaded).into_response(),
+            Err(error) => r2_error(error),
+        };
+    }
+    let body = match to_bytes(body, MAX_PEER_PAYLOAD).await {
+        Ok(body) => body,
+        Err(_) => return (StatusCode::PAYLOAD_TOO_LARGE, "R2 multipart 分片过大").into_response(),
+    };
+    if let Err(response) = check(
+        &api,
+        &remote,
+        &parts.headers,
+        &parts.method,
+        &parts.uri,
+        &body,
+    ) {
+        return response.into_response();
+    }
+    match r2::upload_part(&api.node, &bucket, &key, &upload_id, part, &body).await {
+        Ok(uploaded) => axum::Json(uploaded).into_response(),
+        Err(error) => r2_error(error),
+    }
+}
+
+async fn r2_multipart_complete(
+    State(api): State<Api>,
+    ConnectInfo(remote): ConnectInfo<SocketAddr>,
+    Path((bucket, upload_id, key)): Path<(String, String, String)>,
+    method: Method,
+    uri: Uri,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    if let Err(response) = check(&api, &remote, &headers, &method, &uri, &body) {
+        return response.into_response();
+    }
+    let published: Vec<r2::PublishedPart> = match serde_json::from_slice(&body) {
+        Ok(parts) => parts,
+        Err(error) => return (StatusCode::BAD_REQUEST, error.to_string()).into_response(),
+    };
+    match r2::complete_multipart_upload(&api.node, &bucket, &key, &upload_id, &published).await {
+        Ok(metadata) => axum::Json(metadata).into_response(),
+        Err(error) => r2_error(error),
+    }
+}
+
+fn r2_error(error: anyhow::Error) -> Response {
+    let message = format!("{error:#}");
+    let status = if message.contains("不存在") {
+        StatusCode::NOT_FOUND
+    } else if message.contains("配额不足") {
+        StatusCode::INSUFFICIENT_STORAGE
+    } else if message.contains("不具备") || message.contains("rclone") {
+        StatusCode::SERVICE_UNAVAILABLE
+    } else {
+        StatusCode::BAD_REQUEST
+    };
+    (status, message).into_response()
+}
+
+async fn r2_blob_get(
+    State(api): State<Api>,
+    ConnectInfo(remote): ConnectInfo<SocketAddr>,
+    Path(sha): Path<String>,
+    method: Method,
+    uri: Uri,
+    headers: HeaderMap,
+) -> Response {
+    if let Err(response) = check(&api, &remote, &headers, &method, &uri, b"") {
+        return response.into_response();
+    }
+    let digest: [u8; 32] = match hex::decode(&sha).ok().and_then(|raw| raw.try_into().ok()) {
+        Some(digest) => digest,
+        None => return (StatusCode::BAD_REQUEST, "R2 对象摘要无效").into_response(),
+    };
+    match api
+        .node
+        .objects
+        .get(&crate::objectstore::StorageLocation::Local, &digest)
+        .await
+    {
+        Ok(bytes) => bytes.into_response(),
+        Err(_) => (StatusCode::NOT_FOUND, "R2 对象副本不存在").into_response(),
+    }
+}
+
+async fn r2_blob_put(
+    State(api): State<Api>,
+    ConnectInfo(remote): ConnectInfo<SocketAddr>,
+    method: Method,
+    uri: Uri,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    if let Err(response) = check(&api, &remote, &headers, &method, &uri, &body) {
+        return response.into_response();
+    }
+    if body.len() > crate::binary::MAX_BINARY_BYTES {
+        return (StatusCode::PAYLOAD_TOO_LARGE, "内容地址对象副本过大").into_response();
+    }
+    match api
+        .node
+        .objects
+        .put(&crate::objectstore::StorageLocation::Local, &body)
+        .await
+    {
+        Ok(digest) => hex::encode(digest).into_response(),
+        Err(error) => r2_error(error),
+    }
+}
+
+async fn r2_blob_stream_put(
+    State(api): State<Api>,
+    ConnectInfo(remote): ConnectInfo<SocketAddr>,
+    Path((sha, expected_size)): Path<(String, u64)>,
+    request: Request<Body>,
+) -> Response {
+    let (parts, body) = request.into_parts();
+    if let Err(response) = check(
+        &api,
+        &remote,
+        &parts.headers,
+        &parts.method,
+        &parts.uri,
+        b"",
+    ) {
+        return response.into_response();
+    }
+    if expected_size > r2::MAX_MULTIPART_OBJECT_BYTES {
+        return (StatusCode::PAYLOAD_TOO_LARGE, "R2 对象副本超过平台上限").into_response();
+    }
+    let digest: [u8; 32] = match hex::decode(&sha).ok().and_then(|raw| raw.try_into().ok()) {
+        Some(digest) => digest,
+        None => return (StatusCode::BAD_REQUEST, "R2 对象摘要无效").into_response(),
+    };
+    let stream = body.into_data_stream().map(|result| {
+        result.map_err(|error| std::io::Error::other(format!("peer 上传体读取失败：{error}")))
+    });
+    let staged = match api
+        .node
+        .objects
+        .spool_stream(expected_size, Box::pin(stream))
+        .await
+    {
+        Ok(staged) => staged,
+        Err(error) => return r2_error(error),
+    };
+    if staged.size() != expected_size || staged.sha256() != digest {
+        return (StatusCode::BAD_REQUEST, "R2 对象副本大小或摘要不匹配").into_response();
+    }
+    match api
+        .node
+        .objects
+        .put_file_verified(
+            &crate::objectstore::StorageLocation::Local,
+            &digest,
+            staged.path(),
+        )
+        .await
+    {
+        Ok(size) if size == expected_size => sha.into_response(),
+        Ok(_) => (StatusCode::BAD_REQUEST, "R2 对象副本在提交前发生变化").into_response(),
+        Err(error) => r2_error(error),
+    }
+}
+
+#[derive(Deserialize)]
+struct BinaryBlobQuery {
+    #[serde(default)]
+    remote: Option<String>,
+    #[serde(default)]
+    prefix: String,
+}
+
+async fn binary_blob_put(
+    State(api): State<Api>,
+    ConnectInfo(remote): ConnectInfo<SocketAddr>,
+    Query(query): Query<BinaryBlobQuery>,
+    method: Method,
+    uri: Uri,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    if let Err(response) = check(&api, &remote, &headers, &method, &uri, &body) {
+        return response.into_response();
+    }
+    let storage = match query.remote {
+        Some(remote) => crate::objectstore::StorageLocation::Rclone {
+            remote,
+            prefix: query.prefix,
+        },
+        None if query.prefix.is_empty() => crate::objectstore::StorageLocation::Local,
+        None => {
+            return (
+                StatusCode::BAD_REQUEST,
+                "Binary rclone prefix 必须与 remote 一起使用",
+            )
+                .into_response();
+        }
+    };
+    match crate::binary::store_bytes(&api.node, &storage, &body).await {
+        Ok((sha256, size_bytes)) => axum::Json(serde_json::json!({
+            "sha256": sha256,
+            "size_bytes": size_bytes,
+            "storage": storage,
+        }))
+        .into_response(),
+        Err(error) => r2_error(error),
+    }
+}
+
+#[derive(Deserialize)]
+struct ResourceListQuery {
+    kind: Option<String>,
+}
+
+async fn resource_list(
+    State(api): State<Api>,
+    ConnectInfo(remote): ConnectInfo<SocketAddr>,
+    Query(query): Query<ResourceListQuery>,
+    method: Method,
+    uri: Uri,
+    headers: HeaderMap,
+) -> Response {
+    if let Err(response) = check(&api, &remote, &headers, &method, &uri, b"") {
+        return response.into_response();
+    }
+    axum::Json(crate::resource::heads(&api.node, query.kind.as_deref())).into_response()
+}
+
+async fn resource_get(
+    State(api): State<Api>,
+    ConnectInfo(remote): ConnectInfo<SocketAddr>,
+    Path((kind, name)): Path<(String, String)>,
+    method: Method,
+    uri: Uri,
+    headers: HeaderMap,
+) -> Response {
+    if let Err(response) = check(&api, &remote, &headers, &method, &uri, b"") {
+        return response.into_response();
+    }
+    match crate::resource::head(&api.node, &kind, &name) {
+        Some(resource) => axum::Json(resource).into_response(),
+        None => (StatusCode::NOT_FOUND, "平台资源不存在").into_response(),
+    }
+}
+
+async fn resource_post(
+    State(api): State<Api>,
+    ConnectInfo(remote): ConnectInfo<SocketAddr>,
+    method: Method,
+    uri: Uri,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    if let Err(response) = check(&api, &remote, &headers, &method, &uri, &body) {
+        return response.into_response();
+    }
+    let envelope = match Envelope::from_bytes(&body) {
+        Ok(envelope) => envelope,
+        Err(error) => return (StatusCode::BAD_REQUEST, error.to_string()).into_response(),
+    };
+    match ingest_resource_envelope(&api, &envelope).await {
+        Ok(resource) => axum::Json(resource).into_response(),
+        Err(error) => (StatusCode::BAD_REQUEST, error.to_string()).into_response(),
     }
 }
 

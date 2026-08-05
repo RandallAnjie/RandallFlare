@@ -20,10 +20,19 @@ use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 const MAX_PROXY_BODY: usize = 64 * 1024 * 1024;
+const MAX_WEBSOCKET_HEADERS: usize = 256;
+const MAX_WEBSOCKET_HEADER_BYTES: usize = 256 * 1024;
+const MAX_WEBSOCKET_TARGET_BYTES: usize = 16 * 1024;
+const TUNNEL_CHUNK: usize = 32 * 1024;
+const MAX_TUNNEL_FRAME: usize = TUNNEL_CHUNK + 8 + 24 + 16;
+pub const TUNNEL_UPGRADE: &str = "randallflare-worker-tunnel-v1";
+pub const TUNNEL_PROOF_HEADER: &str = "x-rf-tunnel-proof";
+pub const TUNNEL_PROOF: &[u8] = b"randallflare-worker-tunnel-accepted-v1";
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProxyRequest {
     pub method: String,
     pub path_and_query: String,
@@ -31,11 +40,257 @@ pub struct ProxyRequest {
     pub body: Vec<u8>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProxyResponse {
     pub status: u16,
     pub headers: Vec<(String, Vec<u8>)>,
     pub body: Vec<u8>,
+}
+
+/// Open a real HTTP/1.1 WebSocket upgrade against a local workerd socket.
+/// The returned stream starts immediately after the upstream 101 response;
+/// callers decide whether it is connected directly to public ingress or to
+/// the encrypted inter-node tunnel.
+pub async fn open_worker_websocket(
+    client: &reqwest::Client,
+    request: &ProxyRequest,
+    port: u16,
+) -> Result<(axum::http::HeaderMap, reqwest::Upgraded)> {
+    if request.method != "GET" || !request.body.is_empty() {
+        anyhow::bail!("WebSocket upgrade must use GET");
+    }
+    if request.path_and_query.len() > MAX_WEBSOCKET_TARGET_BYTES
+        || request.headers.len() > MAX_WEBSOCKET_HEADERS
+        || request.headers.iter().fold(0usize, |total, (name, value)| {
+            total.saturating_add(name.len()).saturating_add(value.len())
+        }) > MAX_WEBSOCKET_HEADER_BYTES
+    {
+        anyhow::bail!("WebSocket request metadata exceeds its bound");
+    }
+    let connection_upgrade = request.headers.iter().any(|(name, value)| {
+        name.eq_ignore_ascii_case("connection")
+            && std::str::from_utf8(value).ok().is_some_and(|value| {
+                value
+                    .split(',')
+                    .any(|token| token.trim().eq_ignore_ascii_case("upgrade"))
+            })
+    });
+    let websocket_upgrade = request.headers.iter().any(|(name, value)| {
+        name.eq_ignore_ascii_case("upgrade")
+            && std::str::from_utf8(value)
+                .ok()
+                .is_some_and(|value| value.eq_ignore_ascii_case("websocket"))
+    });
+    if !connection_upgrade || !websocket_upgrade {
+        anyhow::bail!("WebSocket upgrade headers are missing");
+    }
+    let uri = request
+        .path_and_query
+        .parse::<axum::http::Uri>()
+        .context("invalid WebSocket request target")?;
+    if uri.scheme().is_some() || uri.authority().is_some() || !uri.path().starts_with('/') {
+        anyhow::bail!("invalid WebSocket request target");
+    }
+    let original_host = request
+        .headers
+        .iter()
+        .find(|(name, _)| name.eq_ignore_ascii_case("host"))
+        .map(|(_, value)| value.clone());
+    let url = format!("http://127.0.0.1:{port}{}", request.path_and_query);
+    let mut builder = client.get(url).body(request.body.clone());
+    for (name, value) in &request.headers {
+        if name.eq_ignore_ascii_case("host") || name.eq_ignore_ascii_case("content-length") {
+            continue;
+        }
+        let name = reqwest::header::HeaderName::from_bytes(name.as_bytes())
+            .context("invalid WebSocket header name")?;
+        let value = reqwest::header::HeaderValue::from_bytes(value)
+            .context("invalid WebSocket header value")?;
+        builder = builder.header(name, value);
+    }
+    if let Some(host) = original_host {
+        builder = builder.header("x-forwarded-host", host);
+    }
+    let response = builder.send().await.context("opening workerd WebSocket")?;
+    if response.status() != reqwest::StatusCode::SWITCHING_PROTOCOLS {
+        let status = response.status();
+        let detail = response
+            .text()
+            .await
+            .unwrap_or_default()
+            .chars()
+            .take(512)
+            .collect::<String>();
+        anyhow::bail!("workerd rejected WebSocket upgrade with {status}: {detail}");
+    }
+    let headers = response.headers().clone();
+    let upgraded = response
+        .upgrade()
+        .await
+        .context("upgrading workerd WebSocket")?;
+    Ok((headers, upgraded))
+}
+
+fn tunnel_aad(session: &str, direction: &str, sequence: u64) -> Vec<u8> {
+    format!("rf-worker-tunnel-v1\n{session}\n{direction}\n{sequence}").into_bytes()
+}
+
+async fn copy_encrypted<R, W>(
+    mut reader: R,
+    mut writer: W,
+    secret: &[u8; 32],
+    session: &str,
+    direction: &str,
+) -> Result<()>
+where
+    R: AsyncRead + Unpin,
+    W: AsyncWrite + Unpin,
+{
+    use rand::RngCore;
+
+    let mut buffer = vec![0u8; TUNNEL_CHUNK];
+    let mut sequence = 0u64;
+    loop {
+        let read = reader.read(&mut buffer).await?;
+        if read == 0 {
+            writer.shutdown().await?;
+            return Ok(());
+        }
+        let mut nonce = [0u8; 24];
+        rand::rngs::OsRng.fill_bytes(&mut nonce);
+        let ciphertext = crate::transport::seal_raw(
+            secret,
+            &nonce,
+            &tunnel_aad(session, direction, sequence),
+            &buffer[..read],
+        )?;
+        let frame_len = 8usize
+            .saturating_add(nonce.len())
+            .saturating_add(ciphertext.len());
+        if frame_len > MAX_TUNNEL_FRAME {
+            anyhow::bail!("encrypted tunnel frame exceeded its bound");
+        }
+        writer.write_u32(frame_len as u32).await?;
+        writer.write_u64(sequence).await?;
+        writer.write_all(&nonce).await?;
+        writer.write_all(&ciphertext).await?;
+        writer.flush().await?;
+        sequence = sequence
+            .checked_add(1)
+            .context("encrypted tunnel sequence exhausted")?;
+    }
+}
+
+async fn copy_decrypted<R, W>(
+    mut reader: R,
+    mut writer: W,
+    secret: &[u8; 32],
+    session: &str,
+    direction: &str,
+) -> Result<()>
+where
+    R: AsyncRead + Unpin,
+    W: AsyncWrite + Unpin,
+{
+    let mut expected_sequence = 0u64;
+    loop {
+        let frame_len = match reader.read_u32().await {
+            Ok(frame_len) => frame_len as usize,
+            Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => {
+                writer.shutdown().await?;
+                return Ok(());
+            }
+            Err(error) => return Err(error.into()),
+        };
+        if !(8 + 24 + 16..=MAX_TUNNEL_FRAME).contains(&frame_len) {
+            anyhow::bail!("invalid encrypted tunnel frame length");
+        }
+        let sequence = reader.read_u64().await?;
+        if sequence != expected_sequence {
+            anyhow::bail!("encrypted tunnel frame sequence mismatch");
+        }
+        let mut nonce = [0u8; 24];
+        reader.read_exact(&mut nonce).await?;
+        let mut ciphertext = vec![0u8; frame_len - 8 - nonce.len()];
+        reader.read_exact(&mut ciphertext).await?;
+        let plaintext = crate::transport::open_raw(
+            secret,
+            &nonce,
+            &tunnel_aad(session, direction, sequence),
+            &ciphertext,
+        )?;
+        writer.write_all(&plaintext).await?;
+        writer.flush().await?;
+        expected_sequence = expected_sequence
+            .checked_add(1)
+            .context("encrypted tunnel sequence exhausted")?;
+    }
+}
+
+/// Public-ingress side of a peer tunnel. Browser bytes are encrypted before
+/// crossing the node network; owner bytes are authenticated and decrypted.
+pub async fn relay_tunnel_ingress<I, P>(
+    ingress: I,
+    peer: P,
+    secret: [u8; 32],
+    session: String,
+) -> Result<()>
+where
+    I: AsyncRead + AsyncWrite + Unpin,
+    P: AsyncRead + AsyncWrite + Unpin,
+{
+    let (ingress_read, ingress_write) = tokio::io::split(ingress);
+    let (peer_read, peer_write) = tokio::io::split(peer);
+    tokio::try_join!(
+        copy_encrypted(
+            ingress_read,
+            peer_write,
+            &secret,
+            &session,
+            "ingress-to-owner"
+        ),
+        copy_decrypted(
+            peer_read,
+            ingress_write,
+            &secret,
+            &session,
+            "owner-to-ingress"
+        )
+    )?;
+    Ok(())
+}
+
+/// Owner side of a peer tunnel. It reverses the two framed directions and
+/// exposes an ordinary byte stream to workerd.
+pub async fn relay_tunnel_owner<P, U>(
+    peer: P,
+    upstream: U,
+    secret: [u8; 32],
+    session: String,
+) -> Result<()>
+where
+    P: AsyncRead + AsyncWrite + Unpin,
+    U: AsyncRead + AsyncWrite + Unpin,
+{
+    let (peer_read, peer_write) = tokio::io::split(peer);
+    let (upstream_read, upstream_write) = tokio::io::split(upstream);
+    tokio::try_join!(
+        copy_decrypted(
+            peer_read,
+            upstream_write,
+            &secret,
+            &session,
+            "ingress-to-owner"
+        ),
+        copy_encrypted(
+            upstream_read,
+            peer_write,
+            &secret,
+            &session,
+            "owner-to-ingress"
+        )
+    )?;
+    Ok(())
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -83,7 +338,27 @@ impl Coordinator {
     }
 
     pub fn ensure_worker(&self, worker: &str) -> Result<Vec<PublicId>> {
-        d1::ensure_database(&self.node, &Self::db_name(worker))
+        let manifest = self
+            .node
+            .manifest(worker)
+            .with_context(|| format!("Worker {worker} manifest is not available"))?;
+        let mut universe = Vec::new();
+        if crate::placement::eligible(&self.node, &self.node.id_hex(), &manifest) {
+            universe.push(self.node.id());
+        }
+        for id in self.node.peers().keys() {
+            if crate::placement::eligible(&self.node, id, &manifest) {
+                if let Ok(id) = id.parse() {
+                    universe.push(id);
+                }
+            }
+        }
+        if universe.is_empty() {
+            anyhow::bail!(
+                "no live node satisfies Durable Object Worker {worker} placement constraints"
+            );
+        }
+        d1::ensure_database_on(&self.node, &Self::db_name(worker), universe)
     }
 
     /// Upgrade path for DO manifests deployed before quorum ownership
@@ -240,27 +515,54 @@ impl Coordinator {
 
     pub async fn dispatch(&self, worker: &str, request: ProxyRequest) -> Result<ProxyResponse> {
         for _ in 0..30 {
-            let leader = self
-                .leader(worker)
-                .context("DO owner election in progress")?;
-            if leader == self.node.id() {
-                return self.proxy_on_owner(worker, request).await;
-            }
-            let addr = self
-                .node
-                .peers()
-                .get(&leader.to_string())
-                .and_then(|p| p.api_addr)
-                .context("DO owner is not reachable")?;
             let path = format!("/v1/do/{worker}/proxy");
-            match self
-                .client
-                .post(&addr.to_string(), &path, postcard::to_stdvec(&request)?)
-                .await
-            {
-                Ok(raw) => return Ok(postcard::from_bytes(&raw)?),
-                Err(_) => tokio::time::sleep(std::time::Duration::from_millis(300)).await,
+            let mut candidates = Vec::new();
+            if let Some(leader) = self.leader(worker) {
+                candidates.push(leader);
             }
+            if let Some(raw) = self
+                .node
+                .kv_get(crate::acme::NS, &d1::kv_key(&Self::db_name(worker)))
+            {
+                if let Ok(meta) = serde_json::from_slice::<d1::DbMeta>(&raw) {
+                    candidates.extend(meta.group);
+                }
+            }
+            candidates.sort();
+            candidates.dedup();
+            // Prefer a locally observed leader, while still probing the fixed
+            // replica group when this ingress node is not itself a member.
+            if let Some(leader) = self.leader(worker) {
+                if let Some(index) = candidates.iter().position(|id| *id == leader) {
+                    candidates.swap(0, index);
+                }
+            }
+            for candidate in candidates {
+                if candidate == self.node.id() {
+                    if self.is_owner(worker) {
+                        if let Ok(response) = self.proxy_on_owner(worker, request.clone()).await {
+                            return Ok(response);
+                        }
+                    }
+                    continue;
+                }
+                let Some(addr) = self
+                    .node
+                    .peers()
+                    .get(&candidate.to_string())
+                    .and_then(|peer| peer.api_addr)
+                else {
+                    continue;
+                };
+                if let Ok(raw) = self
+                    .client
+                    .post(&addr.to_string(), &path, postcard::to_stdvec(&request)?)
+                    .await
+                {
+                    return Ok(postcard::from_bytes(&raw)?);
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
         }
         anyhow::bail!("no reachable Durable Object owner for {worker}")
     }
@@ -446,5 +748,36 @@ mod tests {
             snapshot_digest(&snapshot(1, vec![1, 2, 3])).unwrap(),
             snapshot_digest(&snapshot(1, vec![1, 2, 4])).unwrap()
         );
+    }
+
+    #[tokio::test]
+    async fn encrypted_tunnel_relays_both_directions() {
+        let secret = [42u8; 32];
+        let session = "00112233445566778899aabbccddeeff0011223344556677".to_string();
+        let (mut browser, ingress_side) = tokio::io::duplex(128 * 1024);
+        let (ingress_peer, owner_peer) = tokio::io::duplex(128 * 1024);
+        let (owner_upstream, mut workerd) = tokio::io::duplex(128 * 1024);
+        let ingress_session = session.clone();
+        let ingress = tokio::spawn(async move {
+            relay_tunnel_ingress(ingress_side, ingress_peer, secret, ingress_session).await
+        });
+        let owner = tokio::spawn(async move {
+            relay_tunnel_owner(owner_peer, owner_upstream, secret, session).await
+        });
+
+        browser.write_all(b"masked websocket frame").await.unwrap();
+        let mut received = vec![0u8; "masked websocket frame".len()];
+        workerd.read_exact(&mut received).await.unwrap();
+        assert_eq!(received, b"masked websocket frame");
+
+        workerd.write_all(b"server websocket frame").await.unwrap();
+        let mut received = vec![0u8; "server websocket frame".len()];
+        browser.read_exact(&mut received).await.unwrap();
+        assert_eq!(received, b"server websocket frame");
+
+        drop(browser);
+        drop(workerd);
+        ingress.await.unwrap().unwrap();
+        owner.await.unwrap().unwrap();
     }
 }

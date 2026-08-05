@@ -25,9 +25,12 @@ pub const CONSOLE_GRANT_VERSION: u8 = 1;
 pub const LOGIN_APPROVAL_TTL_MS: u64 = 5 * 60 * 1000;
 pub const MANIFEST_APPROVAL_TTL_MS: u64 = 10 * 60 * 1000;
 pub const SOURCE_APPROVAL_TTL_MS: u64 = 10 * 60 * 1000;
+pub const RESOURCE_APPROVAL_TTL_MS: u64 = 10 * 60 * 1000;
 pub const CONSOLE_SESSION_TTL_MS: u64 = 60 * 60 * 1000;
 pub const MAX_CONSOLE_SESSION_TTL_MS: u64 = 12 * 60 * 60 * 1000;
 const MAX_PENDING: usize = 1024;
+const MAX_APPROVAL_PAYLOAD_BYTES: usize = 16 * 1024 * 1024;
+const MAX_PENDING_PAYLOAD_BYTES: usize = 64 * 1024 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ConsoleGrant {
@@ -77,6 +80,7 @@ pub enum ApprovalKind {
     Login,
     Manifest,
     Source,
+    Resource,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -236,6 +240,31 @@ impl Management {
         )
     }
 
+    pub fn create_resource(
+        &self,
+        session_id: [u8; 32],
+        resource: &crate::resource::ResourceRecord,
+        summary: String,
+    ) -> Result<CreatedApproval> {
+        self.create_resource_scoped(Some(session_id), resource, summary)
+    }
+
+    pub fn create_resource_scoped(
+        &self,
+        session_id: Option<[u8; 32]>,
+        resource: &crate::resource::ResourceRecord,
+        summary: String,
+    ) -> Result<CreatedApproval> {
+        resource.validate()?;
+        self.create(
+            ApprovalKind::Resource,
+            summary,
+            postcard::to_stdvec(resource)?,
+            session_id,
+            RESOURCE_APPROVAL_TTL_MS,
+        )
+    }
+
     fn create(
         &self,
         kind: ApprovalKind,
@@ -249,6 +278,17 @@ impl Management {
         cleanup(&mut inner, now);
         if inner.by_id.len() >= MAX_PENDING {
             bail!("待处理的管理审批过多");
+        }
+        if payload.len() > MAX_APPROVAL_PAYLOAD_BYTES {
+            bail!("管理审批载荷不得超过 16 MiB");
+        }
+        let pending_bytes = inner
+            .by_id
+            .values()
+            .map(|approval| approval.payload.len())
+            .sum::<usize>();
+        if pending_bytes.saturating_add(payload.len()) > MAX_PENDING_PAYLOAD_BYTES {
+            bail!("待处理的管理审批载荷总量过大");
         }
         let id = unique_token(&inner.by_id);
         let code = unique_code(&inner.by_code);
@@ -352,6 +392,13 @@ impl Management {
                 source.validate()?;
                 approval.status = Status::Approved(envelope.clone());
             }
+            ApprovalKind::Resource => {
+                let resource: crate::resource::ResourceRecord = envelope
+                    .open(Some(operator))
+                    .map_err(|error| anyhow::anyhow!("平台资源审批无效：{error}"))?;
+                resource.validate()?;
+                approval.status = Status::Approved(envelope.clone());
+            }
         }
         Ok(ApprovedPayload {
             id,
@@ -385,6 +432,10 @@ impl Management {
 
     pub fn poll_source(&self, id: &str, session_id: [u8; 32]) -> Result<ApprovalPoll> {
         self.poll(id, Some(session_id), ApprovalKind::Source)
+    }
+
+    pub fn poll_resource(&self, id: &str, session_id: [u8; 32]) -> Result<ApprovalPoll> {
+        self.poll(id, Some(session_id), ApprovalKind::Resource)
     }
 
     /// Internal build-manager observation, never exposed without console auth.

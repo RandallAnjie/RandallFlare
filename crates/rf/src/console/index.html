@@ -42,21 +42,60 @@
         </div>
         <nav aria-label="控制台栏目">
           <button class="nav-item active" data-view="overview">
-            <span class="nav-glyph">⌁</span><span>概览</span>
+            <span class="nav-glyph" aria-hidden="true">⌁</span><span>概览</span>
+          </button>
+          <button class="nav-item" data-view="nodes">
+            <span class="nav-glyph" aria-hidden="true">◎</span><span>节点与调度</span><span id="node-nav-count" class="count">0</span>
+          </button>
+          <button class="nav-item" data-view="network">
+            <span class="nav-glyph" aria-hidden="true">⌾</span><span>设备与出口</span><span id="network-nav-count" class="count">0</span>
           </button>
           <button class="nav-item" data-view="workers">
-            <span class="nav-glyph">◇</span><span>Worker</span><span id="worker-nav-count" class="count">0</span>
+            <span class="nav-glyph" aria-hidden="true">◇</span><span>Worker</span><span id="worker-nav-count" class="count">0</span>
           </button>
           <button class="nav-item" data-view="kv">
-            <span class="nav-glyph">≋</span><span>KV 存储</span>
+            <span class="nav-glyph" aria-hidden="true">≋</span><span>KV 存储</span>
+          </button>
+          <button class="nav-item" data-view="r2">
+            <span class="nav-glyph" aria-hidden="true">⬡</span><span>R2 对象存储</span><span id="r2-nav-count" class="count">0</span>
+          </button>
+          <button class="nav-item" data-view="storage">
+            <span class="nav-glyph" aria-hidden="true">▦</span><span>存储策略</span><span id="storage-nav-count" class="count">0</span>
           </button>
           <button class="nav-item" data-view="d1">
-            <span class="nav-glyph">◫</span><span>D1 数据库</span>
+            <span class="nav-glyph" aria-hidden="true">◫</span><span>D1 数据库</span>
+          </button>
+          <button class="nav-item" data-view="queues">
+            <span class="nav-glyph" aria-hidden="true">⇄</span><span>队列</span><span id="queue-nav-count" class="count">0</span>
+          </button>
+          <button class="nav-item" data-view="analytics">
+            <span class="nav-glyph" aria-hidden="true">⌁</span><span>Analytics</span><span id="analytics-nav-count" class="count">0</span>
+          </button>
+          <button class="nav-item" data-view="pipelines">
+            <span class="nav-glyph" aria-hidden="true">⋙</span><span>Pipeline</span><span id="pipeline-nav-count" class="count">0</span>
+          </button>
+          <button class="nav-item" data-view="workflows">
+            <span class="nav-glyph" aria-hidden="true">↯</span><span>Workflow</span><span id="workflow-nav-count" class="count">0</span>
+          </button>
+          <button class="nav-item" data-view="flows">
+            <span class="nav-glyph" aria-hidden="true">⌘</span><span>Flow 编排</span><span id="flow-nav-count" class="count">0</span>
+          </button>
+          <button class="nav-item" data-view="email">
+            <span class="nav-glyph" aria-hidden="true">@</span><span>邮件路由</span><span id="email-nav-count" class="count">0</span>
+          </button>
+          <button class="nav-item" data-view="binaries">
+            <span class="nav-glyph" aria-hidden="true">▣</span><span>Binary Deliver</span><span id="binary-nav-count" class="count">0</span>
+          </button>
+          <button class="nav-item" data-view="hostnames">
+            <span class="nav-glyph" aria-hidden="true">◇</span><span>域名与证书</span><span id="hostname-nav-count" class="count">0</span>
+          </button>
+          <button class="nav-item" data-view="security">
+            <span class="nav-glyph" aria-hidden="true">⌾</span><span>安全与访问</span>
           </button>
         </nav>
         <div class="sidebar-foot">
           <p class="sidebar-tagline">一次构建，一次验证，处处运行。</p>
-          <div class="security-note"><span>●</span> 管理员身份已验证</div>
+          <div class="security-note"><span aria-hidden="true">●</span> 管理员身份已验证</div>
           <small id="security-copy">此节点不保存<br>任何私钥。</small>
         </div>
       </aside>
@@ -70,7 +109,7 @@
           <div class="topbar-actions">
             <div class="connection"><span id="connection-dot" class="dot pending"></span><span id="connection-text">正在连接</span></div>
             <button id="logout" class="secondary compact hidden" type="button">退出登录</button>
-            <button id="refresh" class="icon-button" type="button" aria-label="刷新数据">↻</button>
+            <button id="refresh" class="icon-button" type="button" aria-label="刷新数据"><span aria-hidden="true">↻</span></button>
           </div>
         </header>
 
@@ -85,6 +124,14 @@
             <article class="metric"><span>在线节点</span><strong id="metric-nodes">—</strong><small id="metric-public">正在等待集群数据</small></article>
             <article class="metric"><span>Worker</span><strong id="metric-workers">—</strong><small id="metric-routes">暂无路由数据</small></article>
             <article class="metric"><span>D1 数据库</span><strong id="metric-databases">—</strong><small>多数派复制保障一致性</small></article>
+            <article class="metric"><span>R2 bucket</span><strong id="metric-r2">—</strong><small id="metric-r2-backend">内容寻址对象存储</small></article>
+            <article class="metric"><span>队列</span><strong id="metric-queues">—</strong><small>多数派租约与死信</small></article>
+            <article class="metric"><span>Analytics 数据集</span><strong id="metric-analytics">—</strong><small>时序事件与维度聚合</small></article>
+            <article class="metric"><span>Pipeline</span><strong id="metric-pipelines">—</strong><small>持久批次与 R2 输出</small></article>
+            <article class="metric"><span>Workflow</span><strong id="metric-workflows">—</strong><small>可恢复步骤与外部信号</small></article>
+            <article class="metric"><span>Flow</span><strong id="metric-flows">—</strong><small>可视化 DAG 与租约接管</small></article>
+            <article class="metric"><span>邮件域</span><strong id="metric-email">—</strong><small>可选 SMTP 节点与耐久路由</small></article>
+            <article class="metric"><span>Binary</span><strong id="metric-binaries">—</strong><small>按摘要缓存的沙箱程序</small></article>
             <article class="metric"><span>内容块状态</span><strong id="metric-blobs">—</strong><small>本地缺失数</small></article>
           </div>
 
@@ -110,6 +157,31 @@
             <div class="panel-head"><div><p class="eyebrow">路由概况</p><h2>运行中的 Worker</h2></div><button class="text-button" data-go="workers">管理 Worker →</button></div>
             <div id="overview-workers" class="worker-strip empty-state">暂无运行中的 Worker。</div>
           </article>
+        </section>
+
+        <section id="view-nodes" class="view" aria-labelledby="section-title">
+          <div class="projects-header">
+            <div><p class="eyebrow">去中心化调度</p><h2>节点与部署约束</h2><p class="muted">节点策略由管理员签名并传播到整个集群。Worker 只在满足全部标签的节点运行；公网入口会通过集群加密通道转发到合格实例。</p></div>
+            <button id="nodes-refresh" class="secondary" type="button">刷新节点</button>
+          </div>
+          <div class="grid one-one">
+            <article class="panel">
+              <div class="panel-head"><div><p class="eyebrow">成员目录</p><h2>集群节点</h2></div><span id="nodes-live-count" class="badge">—</span></div>
+              <div id="cluster-node-list" class="node-list empty-state">正在读取节点策略…</div>
+            </article>
+            <article class="panel settings-panel node-policy-panel">
+              <div class="settings-copy"><p class="eyebrow">签名策略</p><h2 id="node-policy-title">选择节点</h2><p id="node-policy-summary" class="muted">选择左侧节点后，可编辑区域、能力标签与生命周期状态。</p></div>
+              <form id="node-policy-form" class="settings-form hidden">
+                <label><span>节点身份</span><input id="node-policy-id" class="code-input" readonly></label>
+                <label><span>区域</span><input id="node-policy-region" class="code-input" placeholder="eu-west"><small>会自动形成 <code>region-eu-west</code> 调度标签。</small></label>
+                <label><span>自定义能力标签 <em>每行一个</em></span><textarea id="node-policy-tags" class="code-input" rows="7" placeholder="gpu&#10;high-memory"></textarea><small>只允许小写字母、数字与连字符；系统能力会自动识别。</small></label>
+                <label class="check-label"><input id="node-policy-drain" type="checkbox"><span>排空公网流量（停止加入 DNS，新请求转发到其他节点）</span></label>
+                <label class="check-label"><input id="node-policy-suspended" type="checkbox"><span>停用调度（不再承载普通 Worker）</span></label>
+                <label><span>操作原因</span><textarea id="node-policy-reason" rows="4" maxlength="500" placeholder="例如：计划维护至 2026-08-05"></textarea></label>
+                <button class="primary" type="submit">提交签名节点策略</button>
+              </form>
+            </article>
+          </div>
         </section>
 
         <section id="view-workers" class="view" aria-labelledby="section-title">
@@ -144,29 +216,34 @@
                 <p class="muted">连接仓库后，RandallFlare 会在沙箱中构建，并将经过签名的内容全量分发到所有节点。</p>
                 <form id="source-form" class="source-form">
                   <label><span>Worker 名称</span><input id="source-worker" pattern="[a-z0-9-]{1,63}" placeholder="api" required><small id="source-default-domain" class="input-note">填写名称后即可预览默认域名</small></label>
-                  <label class="wide"><span>仓库地址</span><input id="source-repository" type="url" placeholder="https://github.com/owner/repository" required></label>
+                  <label class="wide"><span>仓库地址</span><input id="source-repository" type="text" placeholder="https://github.com/owner/repository 或 git@github.com:owner/repository.git" required></label>
                   <label><span>生产分支</span><input id="source-branch" value="main" required></label>
                   <label><span>根目录</span><input id="source-root" value="." required></label>
                   <label class="wide"><span>构建命令 <em>可选 · 在 bubblewrap 沙箱中运行</em></span><input id="source-command" class="code-input" placeholder="npm ci && npm run build"></label>
                   <label><span>产物目录</span><input id="source-output" value="." required></label>
-                  <label class="check-label"><input id="source-private" type="checkbox"><span>使用当前节点的私有仓库令牌</span></label>
+                  <label class="check-label"><input id="source-private" type="checkbox"><span>使用当前节点的私有仓库凭据（优先 GitHub App）</span></label>
                   <label class="check-label"><input id="source-webhook" type="checkbox" checked><span>GitHub 推送时自动构建</span></label>
+                  <label class="check-label"><input id="source-pr-previews" type="checkbox" checked><span>为 Pull Request 构建独立预览</span></label>
                   <button class="primary wide" type="submit">导入并连接仓库</button>
                 </form>
-                <p class="form-note">私有仓库令牌仅从当前节点的 <code>RF_GITHUB_TOKEN</code> 读取，不会写入清单，也不会在集群中复制。</p>
+                <p class="form-note">私库凭据仅从当前节点环境读取：优先使用 GitHub App 的短期安装令牌，未配置 App 时回退到 <code>RF_GITHUB_TOKEN</code>。任何凭据都不会写入清单或在集群中复制。</p>
               </article>
 
               <div id="import-divider" class="method-divider"><span>或者</span></div>
 
               <article class="panel import-panel deploy-panel">
                 <div class="panel-head"><div><p class="eyebrow">手动部署</p><h2>上传 Worker 包</h2></div><span class="badge">rf.json</span></div>
-                <p class="muted">选择包含 <code>rf.json</code> 的完整产物目录。浏览器只会上传本次部署所需的文件；发布后会按清单中的 Worker 名称自动分配默认域名。</p>
+                <p class="muted">选择包含 <code>rf.json</code> 的完整产物目录，或上传 ZIP / TAR 压缩包。浏览器只会上传本次部署所需的文件；发布后会按清单中的 Worker 名称自动分配默认域名。</p>
                 <form id="deploy-form">
-                  <div id="deploy-local-fields"><label for="deploy-path">本地 Worker 包路径</label><input id="deploy-path" name="path" type="text" placeholder="/absolute/path/to/worker" autocomplete="off"></div>
+                  <div id="deploy-local-fields"><label for="deploy-path">本地 Worker 目录或压缩包路径</label><input id="deploy-path" name="path" type="text" placeholder="/absolute/path/to/worker-or-archive" autocomplete="off"></div>
                   <div id="deploy-public-fields" class="hidden">
                     <label>Worker 包目录</label>
                     <input id="deploy-files" name="files" type="file" webkitdirectory multiple hidden>
                     <div class="file-picker"><button id="deploy-file-picker" class="secondary" type="button">选择目录</button><span id="deploy-file-status">尚未选择目录</span></div>
+                    <div class="method-divider compact"><span>或者上传可复现压缩包</span></div>
+                    <label>ZIP / TAR 包</label>
+                    <input id="deploy-archive" name="archive" type="file" accept=".zip,.tar,.tar.gz,.tgz,application/zip,application/x-tar,application/gzip" hidden>
+                    <div class="file-picker"><button id="deploy-archive-picker" class="secondary" type="button">选择压缩包</button><span id="deploy-archive-status">尚未选择压缩包</span></div>
                   </div>
                   <button class="secondary" type="submit">上传并准备部署</button>
                 </form>
@@ -190,11 +267,13 @@
           <button id="project-back" class="back-button" type="button">← 返回所有项目</button>
           <div class="project-detail-head">
             <div class="project-identity"><span class="project-avatar">W</span><div><p class="eyebrow">Worker 项目</p><h2 id="project-title">—</h2><p id="project-subtitle" class="muted">正在加载项目…</p></div></div>
-            <div class="project-actions"><a id="project-open" class="secondary-link hidden" target="_blank" rel="noreferrer">访问项目 ↗</a><button id="project-redeploy" class="primary" type="button">重新部署</button></div>
+            <div class="project-actions"><a id="project-open" class="secondary-link hidden" target="_blank" rel="noreferrer">访问项目 ↗</a><button id="project-export-zip" class="secondary" type="button">导出 ZIP</button><button id="project-export-tar" class="secondary" type="button">导出 TAR.GZ</button><button id="project-redeploy" class="primary" type="button">重新部署</button></div>
           </div>
           <nav class="project-tabs" aria-label="项目详情">
             <button class="active" data-project-tab="overview" type="button">概览</button>
+            <button data-project-tab="code" type="button">代码</button>
             <button data-project-tab="deployments" type="button">部署</button>
+            <button data-project-tab="previews" type="button">预览</button>
             <button data-project-tab="logs" type="button">日志</button>
             <button data-project-tab="domains" type="button">域名与证书</button>
             <button data-project-tab="bindings" type="button">变量与绑定</button>
@@ -214,18 +293,60 @@
             </div>
           </div>
 
+          <div id="project-tab-code" class="project-tab">
+            <div class="code-workspace">
+              <article class="panel code-sidebar">
+                <div class="panel-head"><div><p class="eyebrow">当前签名版本</p><h2>文件</h2></div><button id="project-file-new" class="secondary compact" type="button">新建</button></div>
+                <p id="project-code-source-warning" class="form-note"></p>
+                <div id="project-file-list" class="code-file-list empty-state">当前版本没有文件。</div>
+              </article>
+              <article class="panel code-editor-panel">
+                <div class="panel-head"><div><p class="eyebrow">版本化编辑器</p><h2 id="project-file-title">选择文件</h2><p id="project-file-meta" class="muted compact-copy">每次保存都会生成新的签名版本，旧版本仍可回滚。</p></div><span id="project-file-state" class="badge">只读预览</span></div>
+                <form id="project-file-form" class="settings-form hidden">
+                  <div class="form-grid"><label><span>相对路径</span><input id="project-file-path" class="code-input" required></label><label><span>文件类型</span><select id="project-file-type"><option value="module">Worker 模块</option><option value="asset">静态资源</option></select></label></div>
+                  <label class="check-label"><input id="project-file-main" type="checkbox"><span>设为 Worker 入口模块</span></label>
+                  <label><span>UTF-8 文本内容</span><textarea id="project-file-content" class="code-input code-editor" rows="24" spellcheck="false"></textarea><small id="project-file-binary-note" class="input-note"></small></label>
+                  <label><span>用本地文件替换 <em>文本或二进制，最大 25 MiB</em></span><input id="project-file-upload" type="file"></label>
+                  <div class="button-row"><button class="primary" type="submit">发布文件修改</button><button id="project-file-delete" class="danger ghost hidden" type="button">删除文件</button></div>
+                </form>
+                <div id="project-file-empty" class="empty-state">从左侧选择文件，或新建一个模块/静态资源。</div>
+              </article>
+            </div>
+          </div>
+
           <div id="project-tab-deployments" class="project-tab">
             <div class="grid one-one"><article class="panel"><div class="panel-head"><div><p class="eyebrow">流水线</p><h2>构建与部署</h2></div></div><div id="detail-builds" class="build-list"></div></article><article class="panel"><div class="panel-head"><div><p class="eyebrow">可验证记录</p><h2>版本历史</h2></div></div><div id="detail-history"></div></article></div>
           </div>
 
+          <div id="project-tab-previews" class="project-tab">
+            <div class="grid one-one">
+              <article class="panel settings-panel">
+                <div class="settings-copy"><p class="eyebrow">不可变版本</p><h2>创建预览</h2><p class="muted">为任意历史版本创建确定性域名。预览不会改动生产清单，运行时与 Durable Object 数据也和生产环境隔离。</p></div>
+                <form id="project-preview-form" class="settings-form"><label><span>历史版本</span><select id="project-preview-version" required></select></label><label><span>保留天数</span><input id="project-preview-ttl" type="number" min="1" max="90" value="30" required></label><button class="primary" type="submit">创建签名预览</button></form>
+              </article>
+              <article class="panel"><div class="panel-head"><div><p class="eyebrow">临时环境</p><h2>当前预览</h2><p class="muted compact-copy">到期后所有节点会独立停止路由；删除操作会写入签名墓碑。</p></div><button id="project-preview-refresh" class="secondary compact" type="button">刷新</button></div><div id="project-preview-list" class="build-list empty-state">正在读取预览…</div></article>
+            </div>
+          </div>
+
           <div id="project-tab-logs" class="project-tab">
-            <article class="panel"><div class="panel-head"><div><p class="eyebrow">本节点实时输出</p><h2>运行日志</h2></div><button id="detail-refresh-logs" class="secondary compact" type="button">刷新日志</button></div><div id="detail-log-meta" class="muted"></div><pre id="detail-logs" class="result log-output">正在等待日志数据…</pre></article>
+            <article class="panel request-observability">
+              <div class="panel-head"><div><p class="eyebrow">集群可观测性</p><h2>请求日志</h2><p class="muted compact-copy">从所有存活节点聚合，按节点保存 7 天。为保护访客隐私，不记录查询参数、请求头、请求体、Cookie、IP 或 User-Agent。</p></div><button id="detail-refresh-requests" class="secondary compact" type="button">刷新请求</button></div>
+              <form id="request-log-filter" class="request-log-filter">
+                <label><span>访问域名</span><select id="request-log-hostname"><option value="">全部域名</option></select></label>
+                <label><span>响应状态</span><select id="request-log-status"><option value="">全部状态</option><option value="2xx">2xx 成功</option><option value="3xx">3xx 重定向</option><option value="4xx">4xx 客户端错误</option><option value="5xx">5xx 服务端错误</option></select></label>
+                <button class="primary compact" type="submit">应用筛选</button>
+              </form>
+              <div id="request-log-meta" class="muted"></div>
+              <div id="request-log-trend" class="request-trend" role="img" tabindex="0" aria-label="最近 24 小时请求状态趋势"></div>
+              <div class="data-table-wrap request-table-wrap" role="region" tabindex="0" aria-label="请求日志表格，可横向滚动"><table class="data-table"><thead><tr><th>时间</th><th>节点</th><th>请求</th><th>域名</th><th>状态</th><th>耗时</th><th>版本</th></tr></thead><tbody id="request-log-rows"><tr><td colspan="7" class="empty-cell">正在读取请求日志…</td></tr></tbody></table></div>
+            </article>
+            <article class="panel runtime-log-panel"><div class="panel-head"><div><p class="eyebrow">集群实时输出</p><h2>运行日志</h2><p class="muted compact-copy">合并所有存活节点上的 Worker 标准输出、标准错误与运行时消息。</p></div><button id="detail-refresh-logs" class="secondary compact" type="button">刷新输出</button></div><div id="detail-log-meta" class="muted"></div><pre id="detail-logs" class="result log-output">正在等待日志数据…</pre></article>
           </div>
 
           <div id="project-tab-domains" class="project-tab">
             <div id="domain-tls-summary" class="domain-overview"></div>
             <article class="panel domain-panel">
-              <div class="panel-head"><div><p class="eyebrow">生产路由</p><h2>访问域名</h2><p class="muted compact-copy">默认域名由每个节点确定性生成；自定义域名写入签名清单。证书从集群 KV 同步到每个 HTTPS 节点。</p></div><span id="project-domain-count" class="badge">0 个域名</span></div>
+              <div class="panel-head"><div><p class="eyebrow">生产路由</p><h2>访问域名</h2><p class="muted compact-copy">默认域名由节点确定性生成；自定义域名须经 DNS TXT 所有权验证，随后才会启用路由并进入证书签发队列。</p></div><span id="project-domain-count" class="badge">0 个域名</span></div>
               <div id="project-domain-list" class="domain-list empty-state">尚未绑定域名。</div>
               <form id="project-domain-add-form" class="domain-add-form">
                 <label><span>添加域名</span><input id="project-domain-input" inputmode="url" placeholder="api.example.com" required></label>
@@ -236,19 +357,34 @@
           </div>
 
           <div id="project-tab-bindings" class="project-tab">
-            <article class="panel settings-panel"><div class="settings-copy"><p class="eyebrow">运行配置</p><h2>变量与绑定</h2><p class="muted">环境变量和 KV 命名空间会随清单复制。敏感凭据请使用节点侧密钥能力，不要写入普通变量。</p></div><form id="project-bindings-form" class="settings-form"><label><span>环境变量 <em>每行 KEY=value</em></span><textarea id="project-env" class="code-input" rows="8"></textarea></label><label><span>KV 绑定 <em>每行 BINDING=namespace</em></span><textarea id="project-kv-bindings" class="code-input" rows="6"></textarea></label><button class="primary" type="submit">保存变量与绑定</button></form></article>
+            <article class="panel settings-panel"><div class="settings-copy"><p class="eyebrow">运行配置</p><h2>变量与绑定</h2><p class="muted">环境变量与平台绑定会随签名清单复制。敏感凭据请使用下方的加密 Secret，不要写入普通变量。</p></div><form id="project-bindings-form" class="settings-form"><label><span>环境变量 <em>每行 KEY=value</em></span><textarea id="project-env" class="code-input" rows="8"></textarea></label><label><span>KV 绑定 <em>每行 BINDING=namespace</em></span><textarea id="project-kv-bindings" class="code-input" rows="6"></textarea></label><label><span>R2 绑定 <em>每行 BINDING=bucket</em></span><textarea id="project-r2-bindings" class="code-input" rows="5"></textarea></label><label><span>D1 绑定 <em>每行 BINDING=database</em></span><textarea id="project-d1-bindings" class="code-input" rows="5"></textarea></label><label><span>Queue 生产者绑定 <em>每行 BINDING=queue</em></span><textarea id="project-queue-bindings" class="code-input" rows="5"></textarea></label><label><span>Analytics Engine 绑定 <em>每行 BINDING=dataset</em></span><textarea id="project-analytics-bindings" class="code-input" rows="5"></textarea></label><label><span>Pipeline 绑定 <em>每行 BINDING=pipeline</em></span><textarea id="project-pipeline-bindings" class="code-input" rows="5"></textarea></label><label><span>Workflow 绑定 <em>每行 BINDING=workflow</em></span><textarea id="project-workflow-bindings" class="code-input" rows="5"></textarea></label><label><span>Email 发送绑定 <em>每行 BINDING=邮件域资源</em></span><textarea id="project-email-bindings" class="code-input" rows="5"></textarea></label><label><span>Worker Service 绑定 <em>每行 BINDING=目标 Worker</em></span><textarea id="project-service-bindings" class="code-input" rows="5"></textarea><small>在 Worker 中直接调用 <code>env.BINDING.fetch(request)</code>；请求不会离开当前节点。</small></label><label><span>Binary Deliver 绑定 <em>每行 BINDING=Binary 资源</em></span><textarea id="project-binary-bindings" class="code-input" rows="5"></textarea><small>调用 <code>await env.BINDING.exec({ args, stdin })</code>；每次执行使用独立沙箱。</small></label><button class="primary" type="submit">保存变量与绑定</button></form></article>
+            <article class="panel settings-panel">
+              <div class="settings-copy"><p class="eyebrow">敏感配置</p><h2>加密 Secret</h2><p class="muted">Secret 以密文写入签名清单，只在各节点启动 Worker 时解密。值写入后不可查看；同名写入即安全替换。</p><p id="project-secret-transport" class="form-note"></p></div>
+              <div class="settings-form">
+                <form id="project-secret-form" class="settings-form">
+                  <div class="form-grid"><label><span>变量名</span><input id="project-secret-name" class="code-input" pattern="[A-Za-z_$][A-Za-z0-9_$]*" placeholder="API_TOKEN" autocomplete="off" required></label><label><span>Secret 值</span><input id="project-secret-value" class="code-input" type="password" autocomplete="new-password" required></label></div>
+                  <button class="primary" type="submit">加密写入或替换</button>
+                </form>
+                <div id="project-secret-list" class="secret-list empty-state">尚未配置 Secret。</div>
+              </div>
+            </article>
           </div>
 
           <div id="project-tab-triggers" class="project-tab">
             <article class="panel settings-panel"><div class="settings-copy"><p class="eyebrow">自动运行</p><h2>定时触发器</h2><p class="muted">采用标准五段 Cron 表达式。获批后，每个节点都会收到同一份触发器配置。</p></div><form id="project-triggers-form" class="settings-form"><label><span>Cron 表达式 <em>每行一条</em></span><textarea id="project-crons" class="code-input" rows="8" placeholder="*/5 * * * *"></textarea></label><button class="primary" type="submit">保存触发器</button></form></article>
+            <article class="panel settings-panel"><div class="settings-copy"><p class="eyebrow">立即验证</p><h2>手动触发</h2><p class="muted">通过节点内部随机令牌调用当前版本的 <code>scheduled()</code>，不会开放公共触发 URL。结果写入下方的 D1 微仲裁历史。</p></div><form id="project-cron-fire-form" class="settings-form"><label><span>事件表达式</span><select id="project-cron-fire-expression"><option value="manual">manual（手动）</option></select></label><button class="primary" type="submit">立即运行一次</button></form></article>
+            <div class="grid one-one">
+              <article class="panel"><div class="panel-head"><div><p class="eyebrow">最近 7 天</p><h2>执行历史</h2></div><button id="project-cron-refresh" class="secondary compact" type="button">刷新</button></div><p class="form-note">自动任务失败后按 30 秒、60 秒退避，共尝试三次。成功与普通失败记录保留 7 天。</p><div id="project-cron-runs" class="build-list empty-state">尚无 Cron 执行记录。</div></article>
+              <article class="panel"><div class="panel-head"><div><p class="eyebrow">人工处理</p><h2>死信队列</h2></div><span id="project-cron-dlq-count" class="badge">0 条</span></div><p class="form-note">耗尽三次尝试的任务会保留在这里；重放只执行一次，并记录来源。</p><div id="project-cron-dlq" class="build-list empty-state">Cron DLQ 为空。</div></article>
+            </div>
           </div>
 
           <div id="project-tab-source" class="project-tab">
-            <article id="project-source-panel" class="panel settings-panel"><div class="settings-copy"><p class="eyebrow">Git 集成</p><h2>代码源</h2><p class="muted">编辑仓库、分支与构建命令。源码配置也由管理员签名并在集群内复制。</p><div id="project-source-status" class="source-status"></div></div><form id="project-source-form" class="settings-form"><label><span>仓库地址</span><input id="project-source-repository" type="url" required></label><div class="form-grid"><label><span>分支</span><input id="project-source-branch" required></label><label><span>项目目录</span><input id="project-source-root" required></label></div><label><span>构建命令</span><input id="project-source-command" class="code-input"></label><label><span>产物目录</span><input id="project-source-output" required></label><label class="check-label"><input id="project-source-private" type="checkbox"><span>使用私有仓库令牌</span></label><label class="check-label"><input id="project-source-webhook" type="checkbox"><span>GitHub 推送时自动构建</span></label><div class="button-row"><button class="primary" type="submit">保存 Git 配置</button><button id="project-source-disconnect" class="danger ghost hidden" type="button">断开连接</button></div></form></article>
+              <article id="project-source-panel" class="panel settings-panel"><div class="settings-copy"><p class="eyebrow">Git 集成</p><h2>代码源</h2><p class="muted">编辑仓库、分支与构建命令。源码配置也由管理员签名并在集群内复制。</p><div id="project-source-status" class="source-status"></div></div><form id="project-source-form" class="settings-form"><label><span>仓库地址</span><input id="project-source-repository" type="text" placeholder="HTTPS 或 GitHub SSH 地址" required></label><div class="form-grid"><label><span>分支</span><input id="project-source-branch" required></label><label><span>项目目录</span><input id="project-source-root" required></label></div><label><span>构建命令</span><input id="project-source-command" class="code-input"></label><label><span>产物目录</span><input id="project-source-output" required></label><label class="check-label"><input id="project-source-private" type="checkbox"><span>使用私有仓库凭据（优先 GitHub App，也支持 SSH 部署密钥）</span></label><label class="check-label"><input id="project-source-webhook" type="checkbox"><span>GitHub 推送时自动构建</span></label><label class="check-label"><input id="project-source-pr-previews" type="checkbox"><span>为 Pull Request 构建独立预览并回写检查</span></label><div class="button-row"><button class="primary" type="submit">保存 Git 配置</button><button id="project-source-disconnect" class="danger ghost hidden" type="button">断开连接</button></div></form></article>
           </div>
 
           <div id="project-tab-settings" class="project-tab">
-            <article class="panel settings-panel"><div class="settings-copy"><p class="eyebrow">运行时</p><h2>兼容性</h2><p class="muted">兼容日期决定 Worker API 的行为基线。升级前建议先在测试 Worker 上验证。</p></div><form id="project-settings-form" class="settings-form"><label><span>兼容日期</span><input id="project-compatibility-date" class="code-input" type="date" required></label><button class="primary" type="submit">保存兼容日期</button></form></article>
+            <article class="panel settings-panel"><div class="settings-copy"><p class="eyebrow">运行时与调度</p><h2>兼容性及部署约束</h2><p class="muted">兼容日期决定 Worker API 的行为基线；所需标签决定哪些节点可以承载此 Worker，入口节点会自动转发到合格实例。</p></div><form id="project-settings-form" class="settings-form"><label><span>兼容日期</span><input id="project-compatibility-date" class="code-input" type="date" required></label><label><span>兼容性标志 <em>每行一个</em></span><textarea id="project-compatibility-flags" class="code-input" rows="6" placeholder="nodejs_compat"></textarea></label><label><span>节点所需标签 <em>每行一个</em></span><textarea id="project-required-tags" class="code-input" rows="6" placeholder="region-eu-west&#10;gpu"></textarea><small>留空表示可部署到任意未停用节点。标签必须在同一个节点上全部满足。</small></label><button class="primary" type="submit">保存运行时与调度配置</button></form></article>
             <article class="panel settings-panel"><div class="settings-copy"><p class="eyebrow">项目标识</p><h2>只读信息</h2><p class="muted">这些标识用于审计、节点收敛与内容校验。</p></div><dl id="project-identifiers" class="detail-list settings-identifiers"></dl></article>
             <article class="panel danger-zone"><div><p class="eyebrow">危险操作</p><h2>删除项目</h2><p class="muted">写入可验证的墓碑版本；历史记录仍会保留。</p></div><button id="project-delete" class="danger" type="button">删除 Worker</button></article>
           </div>
@@ -264,6 +400,14 @@
                 <button class="secondary" type="submit">加载</button>
               </form>
               <div id="kv-keys" class="key-list empty-state">请选择要查看的命名空间。</div>
+              <div class="button-row">
+                <button id="kv-prev" class="secondary compact hidden" type="button">← 上一页</button>
+                <button id="kv-next" class="secondary compact hidden" type="button">下一页 →</button>
+                <button id="kv-export" class="secondary compact" type="button">导出 JSON</button>
+                <button id="kv-import-picker" class="secondary compact" type="button">导入 JSON</button>
+                <input id="kv-import" type="file" accept=".json,application/json" hidden>
+              </div>
+              <p id="kv-page-meta" class="form-note">每页最多显示 100 个键；导出保留二进制值、TTL 与 metadata。</p>
             </article>
             <article class="panel editor-panel">
               <p class="eyebrow">值编辑器</p>
@@ -271,17 +415,642 @@
               <form id="kv-editor-form">
                 <label for="kv-key">键</label>
                 <input id="kv-key" required autocomplete="off">
-                <label for="kv-value">UTF-8 值</label>
+                <label for="kv-encoding">值编码</label>
+                <select id="kv-encoding"><option value="text">UTF-8 文本</option><option value="base64">Base64（二进制）</option></select>
+                <label for="kv-value">值</label>
                 <textarea id="kv-value" rows="12" required></textarea>
+                <div class="form-grid">
+                  <label><span>TTL（秒）</span><input id="kv-ttl" type="number" min="60" placeholder="留空则不过期"></label>
+                  <label><span>绝对过期时间</span><input id="kv-expiration" type="datetime-local"><small>TTL 与绝对时间只能填写一个。</small></label>
+                </div>
+                <label><span>metadata（JSON）</span><textarea id="kv-metadata" class="code-input" rows="4" placeholder="{&quot;contentType&quot;:&quot;application/json&quot;}"></textarea><small>最多 1,024 字节；Worker 可通过 getWithMetadata() 读取。</small></label>
                 <div class="button-row">
                   <button class="primary" type="submit">保存</button>
                   <button id="kv-new" class="secondary" type="button">清空</button>
                   <button id="kv-delete" class="danger ghost hidden" type="button">删除</button>
                 </div>
               </form>
-              <p class="form-note">以 <code>__rf</code> 开头的系统命名空间受保护，不能在控制台中写入。</p>
+              <p class="form-note">单值最大 25 MiB。以 <code>__rf</code> 开头的系统命名空间受保护，不能在控制台中写入。</p>
             </article>
           </div>
+        </section>
+
+        <section id="view-r2" class="view" aria-labelledby="section-title">
+          <div class="projects-header">
+            <div><p class="eyebrow">对象存储</p><h2>R2 bucket</h2><p class="muted">对象元数据由 D1 多数派提交；内容以 SHA-256 寻址，存入本地副本组或节点本地配置的 rclone remote。</p></div>
+            <span id="r2-capability" class="badge">正在检查存储能力</span>
+          </div>
+          <div class="grid r2-grid">
+            <div class="r2-sidebar-stack">
+              <article class="panel">
+                <div class="panel-head"><div><p class="eyebrow">签名资源</p><h2>创建 bucket</h2></div><span class="badge">可验证版本</span></div>
+                <form id="r2-bucket-form" class="stack-form">
+                  <label><span>bucket 名称</span><input id="r2-bucket-name" pattern="[a-z0-9-]{1,63}" placeholder="assets" required></label>
+                  <label><span>说明</span><input id="r2-bucket-description" placeholder="生产静态资源"></label>
+                  <label><span>存储后端</span><select id="r2-storage-backend"><option value="local">集群本地副本</option><option value="policy">签名 rclone 分片策略</option><option value="rclone">固定 rclone remote</option></select></label>
+                  <div id="r2-rclone-fields" class="form-grid hidden">
+                    <label><span>remote 名称</span><input id="r2-rclone-remote" placeholder="s3-primary"></label>
+                    <label><span>对象前缀</span><input id="r2-rclone-prefix" placeholder="randallflare/assets"></label>
+                  </div>
+                  <div class="form-grid">
+                    <label><span>容量上限（字节）</span><input id="r2-max-bytes" type="number" min="1" placeholder="不限制"></label>
+                    <label><span>对象数上限</span><input id="r2-max-objects" type="number" min="1" placeholder="不限制"></label>
+                  </div>
+                  <label><span>自动过期（天）</span><input id="r2-expire-days" type="number" min="1" max="36500" placeholder="不自动过期"></label>
+                  <label><span>CORS 来源 <em>每行一个</em></span><textarea id="r2-cors-origins" rows="3" placeholder="https://example.com"></textarea></label>
+                  <label><span>自定义公开域名 <em>每行一个</em></span><textarea id="r2-hostnames" rows="2" placeholder="objects.example.com"></textarea><small id="r2-default-domain" class="input-note">默认公开域名将在保存后自动生成</small></label>
+                  <label class="check-label"><input id="r2-public-access" type="checkbox"><span>允许通过公开 R2 网关读取</span></label>
+                  <button class="primary" type="submit">创建 bucket</button>
+                </form>
+                <p class="form-note">这里只复制 remote 名称和前缀；rclone 凭据始终保留在各节点自己的配置文件中。</p>
+              </article>
+              <article class="panel">
+                <div class="panel-head"><div><p class="eyebrow">bucket 目录</p><h2>所有 bucket</h2></div><span id="r2-bucket-count" class="badge">0 个</span></div>
+                <div id="r2-bucket-list" class="database-list empty-state">暂无 R2 bucket。</div>
+              </article>
+            </div>
+            <article class="panel r2-object-panel">
+              <div class="panel-head">
+                <div><p class="eyebrow">对象浏览器</p><h2 id="r2-active-bucket">请选择 bucket</h2><p id="r2-bucket-summary" class="muted compact-copy">选择左侧 bucket 后即可管理对象。</p></div>
+                <button id="r2-delete-bucket" class="danger ghost hidden" type="button">删除 bucket</button>
+              </div>
+              <div id="r2-object-tools" class="hidden">
+                <form id="r2-object-search" class="inline-form">
+                  <label><span>键前缀</span><input id="r2-object-prefix" placeholder="images/"></label>
+                  <span></span><button class="secondary" type="submit">筛选</button>
+                </form>
+                <form id="r2-upload-form" class="r2-upload-form">
+                  <label><span>对象键</span><input id="r2-object-key" placeholder="images/logo.svg" required></label>
+                  <label><span>本地文件</span><input id="r2-object-file" type="file" required></label>
+                  <button class="primary" type="submit">上传对象</button>
+                </form>
+                <div class="table-wrap r2-object-table-wrap">
+                  <table class="project-table">
+                    <thead><tr><th>对象键</th><th>大小</th><th>类型</th><th>上传时间</th><th><span class="sr-only">操作</span></th></tr></thead>
+                    <tbody id="r2-object-table"><tr><td colspan="5" class="empty-state">bucket 中暂无对象。</td></tr></tbody>
+                  </table>
+                </div>
+                <button id="r2-load-more" class="secondary hidden" type="button">加载更多</button>
+                <div class="panel-head subsection-head">
+                  <div><p class="eyebrow">分片上传</p><h3>正在进行的上传</h3><p class="muted compact-copy">查看暂存分片、到期时间和占用空间；终止后由延迟回收器安全清理底层对象。</p></div>
+                  <button id="r2-multipart-refresh" class="secondary" type="button">刷新</button>
+                </div>
+                <div class="table-wrap">
+                  <table class="project-table">
+                    <thead><tr><th>对象键 / 上传 ID</th><th>分片</th><th>暂存大小</th><th>到期时间</th><th><span class="sr-only">操作</span></th></tr></thead>
+                    <tbody id="r2-multipart-table"><tr><td colspan="5" class="empty-state">暂无正在进行的分片上传。</td></tr></tbody>
+                  </table>
+                </div>
+                <button id="r2-multipart-load-more" class="secondary hidden" type="button">加载更多上传</button>
+              </div>
+            </article>
+          </div>
+        </section>
+
+        <section id="view-queues" class="view" aria-labelledby="section-title">
+          <div class="projects-header">
+            <div><p class="eyebrow">事件驱动</p><h2>队列</h2><p class="muted">消息、租约、重试与死信都写入每个队列独立的 D1 多数派数据库；任意节点故障后都可继续投递。</p></div>
+            <span id="queue-count" class="badge">0 个队列</span>
+          </div>
+          <div class="grid r2-grid">
+            <div class="r2-sidebar-stack">
+              <article class="panel">
+                <div class="panel-head"><div><p class="eyebrow">签名资源</p><h2>创建或编辑队列</h2></div><span class="badge">至少一次</span></div>
+                <form id="queue-form" class="stack-form">
+                  <label><span>队列名称</span><input id="queue-name" pattern="[a-z0-9-]{1,63}" placeholder="jobs" required></label>
+                  <label><span>说明</span><input id="queue-description" placeholder="后台任务"></label>
+                  <label><span>消费者 Worker <em>可选</em></span><input id="queue-consumer" pattern="[a-z0-9-]{1,63}" placeholder="job-consumer"></label>
+                  <div class="form-grid">
+                    <label><span>每批条数</span><input id="queue-batch-size" type="number" min="1" max="100" value="10" required></label>
+                    <label><span>批处理等待（毫秒）</span><input id="queue-max-wait" type="number" min="100" max="60000" value="5000" required></label>
+                    <label><span>最大重试次数</span><input id="queue-max-retries" type="number" min="0" max="100" value="3" required></label>
+                    <label><span>可见性超时（毫秒）</span><input id="queue-visibility" type="number" min="1000" max="43200000" value="120000" required></label>
+                  </div>
+                  <label><span>保留时间（秒）</span><input id="queue-retention" type="number" min="60" max="1209600" value="604800" required></label>
+                  <label><span>死信转发队列 <em>可选</em></span><input id="queue-dead-target" pattern="[a-z0-9-]{1,63}" placeholder="failed-jobs"></label>
+                  <label class="check-label"><input id="queue-suspended" type="checkbox"><span>暂停消费（仍允许生产消息）</span></label>
+                  <button class="primary" type="submit">保存队列</button>
+                </form>
+              </article>
+              <article class="panel">
+                <div class="panel-head"><div><p class="eyebrow">队列目录</p><h2>所有队列</h2></div></div>
+                <div id="queue-list" class="database-list empty-state">暂无队列。</div>
+              </article>
+            </div>
+            <div class="r2-sidebar-stack">
+              <article class="panel">
+                <div class="panel-head"><div><p class="eyebrow">调试投递</p><h2 id="queue-active-name">请选择队列</h2><p id="queue-summary" class="muted compact-copy">选择左侧队列后，可发送测试消息并检查死信。</p></div><button id="queue-delete" class="danger ghost hidden" type="button">删除队列</button></div>
+                <form id="queue-send-form" class="stack-form hidden">
+                  <label><span>消息类型</span><select id="queue-message-type"><option value="json">JSON</option><option value="v8">V8（JSON 兼容子集）</option><option value="text">文本</option><option value="bytes">二进制（Base64）</option></select></label>
+                  <label><span>消息体</span><textarea id="queue-message-body" class="code-input" rows="8">{"hello":"RandallFlare"}</textarea></label>
+                  <label><span>延迟投递（秒）</span><input id="queue-message-delay" type="number" min="0" max="43200" value="0"></label>
+                  <button class="primary" type="submit">发送消息</button>
+                </form>
+              </article>
+              <article class="panel">
+                <div class="panel-head"><div><p class="eyebrow">失败处理</p><h2>死信</h2></div><button id="queue-refresh-dead" class="secondary compact" type="button">刷新</button></div>
+                <div id="queue-dead-list" class="build-list empty-state">暂无死信。</div>
+              </article>
+            </div>
+          </div>
+        </section>
+
+        <section id="view-analytics" class="view" aria-labelledby="section-title">
+          <div class="projects-header">
+            <div><p class="eyebrow">可观测数据</p><h2>Analytics Engine</h2><p class="muted">以 Cloudflare Analytics Engine 熟悉的 blobs、doubles 与 indexes 结构写入；每个数据集由独立 D1 多数派保存，可从任意节点查询。</p></div>
+            <span id="analytics-count" class="badge">0 个数据集</span>
+          </div>
+          <div class="grid r2-grid">
+            <div class="r2-sidebar-stack">
+              <article class="panel">
+                <div class="panel-head"><div><p class="eyebrow">签名资源</p><h2>创建或编辑数据集</h2></div><span class="badge">20 维</span></div>
+                <form id="analytics-form" class="stack-form">
+                  <label><span>数据集名称</span><input id="analytics-name" pattern="[a-z0-9-]{1,63}" placeholder="web-metrics" required></label>
+                  <label><span>说明</span><input id="analytics-description" placeholder="站点性能与访问指标"></label>
+                  <label><span>自动保留天数 <em>留空则永久保留</em></span><input id="analytics-retention" type="number" min="1" max="36500" placeholder="90"></label>
+                  <button class="primary" type="submit">保存数据集</button>
+                </form>
+              </article>
+              <article class="panel">
+                <div class="panel-head"><div><p class="eyebrow">数据集目录</p><h2>所有数据集</h2></div></div>
+                <div id="analytics-list" class="database-list empty-state">暂无 Analytics 数据集。</div>
+              </article>
+            </div>
+            <div class="r2-sidebar-stack">
+              <article class="panel">
+                <div class="panel-head"><div><p class="eyebrow">数据概况</p><h2 id="analytics-active-name">请选择数据集</h2><p id="analytics-summary" class="muted compact-copy">选择左侧数据集后，可查看聚合结果与最近事件。</p></div><button id="analytics-delete" class="danger ghost hidden" type="button">删除数据集</button></div>
+                <div id="analytics-stats" class="metrics compact-metrics">
+                  <article class="metric"><span>最近 1 小时</span><strong id="analytics-hour">—</strong></article>
+                  <article class="metric"><span>最近 24 小时</span><strong id="analytics-day">—</strong></article>
+                  <article class="metric"><span>全部事件</span><strong id="analytics-total">—</strong></article>
+                </div>
+                <form id="analytics-write-form" class="stack-form hidden">
+                  <label><span>调试数据点（JSON）</span><textarea id="analytics-point" class="code-input" rows="5">{"blobs":["pageview","/"],"doubles":[42.5],"indexes":["visitor-1"]}</textarea></label>
+                  <button class="secondary" type="submit">写入测试数据点</button>
+                </form>
+              </article>
+              <article class="panel">
+                <div class="panel-head"><div><p class="eyebrow">维度分析</p><h2>分组聚合</h2></div><button id="analytics-refresh" class="secondary compact" type="button">刷新</button></div>
+                <form id="analytics-group-form" class="inline-form">
+                  <label><span>维度类型</span><select id="analytics-group-kind"><option value="blob">blob</option><option value="index">index</option></select></label>
+                  <label><span>维度编号</span><input id="analytics-group-index" type="number" min="0" max="19" value="0"></label>
+                  <label><span>数值编号 <em>可空</em></span><input id="analytics-double-index" type="number" min="0" max="19" placeholder="0"></label>
+                  <button class="secondary" type="submit">聚合</button>
+                </form>
+                <div id="analytics-groups" class="build-list empty-state">暂无聚合结果。</div>
+              </article>
+              <article class="panel">
+                <div class="panel-head"><div><p class="eyebrow">SQL 工作台</p><h2>查询 events 视图</h2><p class="muted compact-copy">可使用 blob1…blob20、double1…double20、index1…index20、timestamp 和 _sample_interval。</p></div></div>
+                <form id="analytics-query-form" class="stack-form hidden">
+                  <label><span>只读 SQL</span><textarea id="analytics-query-sql" class="code-input" rows="7">SELECT blob1, COUNT(*) AS events, SUM(double1 * _sample_interval) AS total FROM events GROUP BY blob1 ORDER BY events DESC</textarea></label>
+                  <div class="form-grid"><label><span>参数数组（JSON）</span><input id="analytics-query-params" class="code-input" value="[]"></label><label><span>最大行数</span><input id="analytics-query-limit" type="number" min="1" max="9999" value="1000"></label></div>
+                  <button class="secondary" type="submit">执行查询</button>
+                </form>
+                <pre id="analytics-query-result" class="result">选择数据集后执行查询。</pre>
+              </article>
+              <article class="panel">
+                <div class="panel-head"><div><p class="eyebrow">原始事件</p><h2>最近写入</h2></div></div>
+                <div id="analytics-events" class="build-list empty-state">暂无事件。</div>
+              </article>
+            </div>
+          </div>
+        </section>
+
+        <section id="view-pipelines" class="view" aria-labelledby="section-title">
+          <div class="projects-header">
+            <div><p class="eyebrow">数据传输</p><h2>Pipeline</h2><p class="muted">先写入 D1 多数派，再以确定性批次压缩成 gzip JSONL 输出到 R2；bucket 使用 rclone 时无需更改 Pipeline。</p></div>
+            <span id="pipeline-count" class="badge">0 条 Pipeline</span>
+          </div>
+          <div class="grid r2-grid">
+            <div class="r2-sidebar-stack">
+              <article class="panel">
+                <div class="panel-head"><div><p class="eyebrow">签名资源</p><h2>创建或编辑 Pipeline</h2></div><span class="badge">可恢复</span></div>
+                <form id="pipeline-form" class="stack-form">
+                  <label><span>名称</span><input id="pipeline-name" pattern="[a-z0-9-]{1,63}" placeholder="event-archive" required></label>
+                  <label><span>说明</span><input id="pipeline-description" placeholder="归档应用事件"></label>
+                  <label><span>输出 R2 bucket</span><input id="pipeline-bucket" pattern="[a-z0-9-]{1,63}" placeholder="data-lake" required></label>
+                  <label><span>对象键模板 <em>必须包含 {batchId}</em></span><input id="pipeline-key-template" class="code-input" value="{pipeline}/year={yyyy}/month={mm}/day={dd}/hour={hh}/{agent}-{batchId}.jsonl.gz" required></label>
+                  <div class="form-grid">
+                    <label><span>批次上限（MiB）</span><input id="pipeline-batch-mib" type="number" min="0.001" max="512" step="0.001" value="64" required></label>
+                    <label><span>最长等待（秒）</span><input id="pipeline-batch-seconds" type="number" min="1" max="3600" value="60" required></label>
+                  </div>
+                  <label><span>接收域名 <em>每行一个；默认域名自动分配</em></span><textarea id="pipeline-hostnames" class="code-input" rows="3"></textarea></label>
+                  <label><span>JSON Schema <em>留空则接受任意 JSON</em></span><textarea id="pipeline-schema" class="code-input" rows="7" placeholder='{"type":"object","required":["event"]}'></textarea></label>
+                  <label><span>SQL 转换 <em>可选；表名为 events</em></span><textarea id="pipeline-transform-sql" class="code-input" rows="8" placeholder="INSERT INTO archive SELECT event, UPPER(path) AS path FROM events WHERE status >= 400"></textarea></label>
+                  <p class="form-note">支持无状态 SQLite SELECT，或 Cloudflare 同形的 <code>INSERT INTO &lt;sink&gt; SELECT</code>。原始 JSON 可通过 <code>__rf_event</code> 读取；转换在进入耐久队列前完成。</p>
+                  <label class="check-label"><input id="pipeline-suspended" type="checkbox"><span>暂停接收与自动刷新</span></label>
+                  <label><span>暂停原因</span><input id="pipeline-suspend-reason" placeholder="维护窗口"></label>
+                  <button class="primary" type="submit">保存 Pipeline</button>
+                </form>
+              </article>
+              <article class="panel">
+                <div class="panel-head"><div><p class="eyebrow">Pipeline 目录</p><h2>全部 Pipeline</h2></div></div>
+                <div id="pipeline-list" class="database-list empty-state">暂无 Pipeline。</div>
+              </article>
+            </div>
+            <div class="r2-sidebar-stack">
+              <article class="panel">
+                <div class="panel-head"><div><p class="eyebrow">传输状态</p><h2 id="pipeline-active-name">请选择 Pipeline</h2><p id="pipeline-endpoint" class="muted compact-copy">选择后显示接收端点和运行状态。</p></div><button id="pipeline-delete" class="danger ghost hidden" type="button">删除</button></div>
+                <div class="metrics compact-metrics">
+                  <article class="metric"><span>待处理事件</span><strong id="pipeline-queued-events">—</strong></article>
+                  <article class="metric"><span>待处理字节</span><strong id="pipeline-queued-bytes">—</strong></article>
+                  <article class="metric"><span>成功批次</span><strong id="pipeline-completed">—</strong></article>
+                  <article class="metric"><span>失败批次</span><strong id="pipeline-failed">—</strong></article>
+                </div>
+                <div class="button-row"><button id="pipeline-flush" class="secondary hidden" type="button">立即刷新批次</button></div>
+              </article>
+              <article class="panel">
+                <div class="panel-head"><div><p class="eyebrow">接收凭据</p><h2>Bearer 令牌</h2><p class="muted compact-copy">明文只显示一次；平台资源仅保存 SHA-256。</p></div></div>
+                <form id="pipeline-token-form" class="inline-form hidden"><label><span>令牌标签</span><input id="pipeline-token-label" placeholder="生产采集器"></label><span></span><button class="secondary" type="submit">创建令牌</button></form>
+                <div id="pipeline-token-reveal" class="hidden"><p class="banner warning">请立即复制并安全保存，此令牌不会再次显示。</p><pre id="pipeline-new-token" class="result"></pre><button id="pipeline-copy-token" class="secondary compact" type="button">复制令牌</button></div>
+                <div id="pipeline-token-list" class="build-list empty-state">暂无接收令牌。</div>
+              </article>
+              <article class="panel">
+                <div class="panel-head"><div><p class="eyebrow">调试接收</p><h2>发送事件</h2></div></div>
+                <form id="pipeline-ingest-form" class="stack-form hidden"><label><span>事件数组（JSON）</span><textarea id="pipeline-events" class="code-input" rows="6">[{"event":"pageview","path":"/"}]</textarea></label><button class="secondary" type="submit">写入 Pipeline</button></form>
+              </article>
+              <article class="panel">
+                <div class="panel-head"><div><p class="eyebrow">输出审计</p><h2>最近批次</h2></div><button id="pipeline-refresh" class="secondary compact" type="button">刷新</button></div>
+                <div id="pipeline-batches" class="build-list empty-state">暂无输出批次。</div>
+              </article>
+            </div>
+          </div>
+        </section>
+
+        <section id="view-workflows" class="view" aria-labelledby="section-title">
+          <div class="projects-header">
+            <div><p class="eyebrow">耐久执行</p><h2>Workflow</h2><p class="muted">用户代码在 Worker 内运行；每个步骤、睡眠和信号边界写入独立 D1 法定人数账本。节点退出后，其他节点从最后一个已提交步骤继续。</p></div>
+            <span id="workflow-count" class="badge">0 个 Workflow</span>
+          </div>
+          <div class="grid r2-grid">
+            <div class="r2-sidebar-stack">
+              <article class="panel">
+                <div class="panel-head"><div><p class="eyebrow">签名定义</p><h2>创建或编辑 Workflow</h2></div><span class="badge">可重放</span></div>
+                <form id="workflow-form" class="stack-form">
+                  <label><span>名称</span><input id="workflow-name" pattern="[a-z0-9-]{1,63}" placeholder="order-lifecycle" required></label>
+                  <label><span>执行 Worker</span><select id="workflow-worker" required><option value="">请选择 Worker</option></select></label>
+                  <label><span>入口类</span><input id="workflow-entrypoint" class="code-input" value="MyWorkflow" pattern="[A-Za-z_$][A-Za-z0-9_$]{0,127}" required></label>
+                  <label><span>说明</span><textarea id="workflow-description" rows="3" placeholder="处理订单、等待付款并发送确认"></textarea></label>
+                  <div class="form-grid">
+                    <label><span>记录保留（天）</span><input id="workflow-retention" type="number" min="1" max="365" value="30" required></label>
+                    <label><span>系统重试次数</span><input id="workflow-retries" type="number" min="0" max="100" value="3" required></label>
+                  </div>
+                  <label><span>单次推进超时（秒）</span><input id="workflow-timeout" type="number" min="30" max="43200" value="1500" required></label>
+                  <label><span>最大并发实例 <em>0 表示不限</em></span><input id="workflow-concurrency" type="number" min="0" max="1000" value="32" required></label>
+                  <label><span>每个命名并发组 <em>0 表示不限</em></span><input id="workflow-group-concurrency" type="number" min="0" max="1000" value="1" required><small>触发时可指定组名；同一组最多同时运行该数量，限额会随实例冻结。</small></label>
+                  <label><span>Cron（UTC，可选）</span><input id="workflow-cron" class="code-input" placeholder="0 * * * *"></label>
+                  <label class="check-label"><input id="workflow-webhook-enabled" type="checkbox"><span>启用带令牌的 Webhook 触发</span></label>
+                  <label><span>Webhook 自定义域名 <em>每行一个；自动包含 workflow-&lt;name&gt; 默认域名</em></span><textarea id="workflow-hostnames" class="code-input" rows="3" placeholder="workflow.example.com"></textarea></label>
+                  <label class="check-label"><input id="workflow-suspended" type="checkbox"><span>暂停新实例与自动推进</span></label>
+                  <label><span>暂停原因</span><input id="workflow-suspend-reason" placeholder="维护窗口"></label>
+                  <button class="primary" type="submit">保存 Workflow</button>
+                </form>
+              </article>
+              <article class="panel">
+                <div class="panel-head"><div><p class="eyebrow">Workflow 目录</p><h2>全部 Workflow</h2></div></div>
+                <div id="workflow-list" class="database-list empty-state">暂无 Workflow。</div>
+              </article>
+            </div>
+            <div class="r2-sidebar-stack">
+              <article class="panel">
+                <div class="panel-head"><div><p class="eyebrow">执行概况</p><h2 id="workflow-active-name">请选择 Workflow</h2><p id="workflow-summary" class="muted compact-copy">选择后可触发实例并查看实时执行状态。</p></div><button id="workflow-delete" class="danger ghost hidden" type="button">删除定义</button></div>
+                <div class="metrics compact-metrics">
+                  <article class="metric"><span>排队 / 运行</span><strong id="workflow-active-count">—</strong></article>
+                  <article class="metric"><span>等待</span><strong id="workflow-waiting-count">—</strong></article>
+                  <article class="metric"><span>已完成</span><strong id="workflow-complete-count">—</strong></article>
+                  <article class="metric"><span>失败</span><strong id="workflow-failed-count">—</strong></article>
+                </div>
+              </article>
+              <article class="panel">
+                <div class="panel-head"><div><p class="eyebrow">Webhook 凭据</p><h2>接收令牌</h2><p class="muted compact-copy">签名定义只保存 SHA-256；明文仅显示一次。先签发令牌，再启用 Webhook。</p></div></div>
+                <form id="workflow-token-form" class="inline-form hidden"><label><span>标签</span><input id="workflow-token-label" placeholder="生产系统"></label><span></span><button class="secondary" type="submit">签发令牌</button></form>
+                <div id="workflow-token-reveal" class="hidden"><p class="banner warning">请立即复制并安全保存，此令牌不会再次显示。</p><pre id="workflow-new-token" class="result"></pre><button id="workflow-copy-token" class="secondary compact" type="button">复制令牌</button></div>
+                <div id="workflow-token-list" class="build-list empty-state">暂无 Webhook 令牌。</div>
+              </article>
+              <article class="panel">
+                <div class="panel-head"><div><p class="eyebrow">调试触发</p><h2>创建实例</h2><p class="muted compact-copy">幂等键可安全重试；同一 Workflow 下重复键只返回原实例。</p></div></div>
+                <form id="workflow-trigger-form" class="stack-form hidden">
+                  <label><span>幂等键 <em>可选</em></span><input id="workflow-instance-key" class="code-input" placeholder="order-20260805-001"></label>
+                  <label><span>命名并发组 <em>可选</em></span><input id="workflow-instance-group" class="code-input" maxlength="256" placeholder="customer:10001"><small>例如按客户、仓库或账户串行化任务。</small></label>
+                  <label><span>输入（JSON）</span><textarea id="workflow-input" class="code-input" rows="6">{"orderId":"demo-1"}</textarea></label>
+                  <button class="secondary" type="submit">触发实例</button>
+                </form>
+              </article>
+              <article class="panel">
+                <div class="panel-head"><div><p class="eyebrow">实例目录</p><h2>最近执行</h2></div><button id="workflow-refresh" class="secondary compact" type="button">刷新</button></div>
+                <div id="workflow-instances" class="build-list empty-state">暂无实例。</div>
+              </article>
+              <article id="workflow-instance-panel" class="panel hidden">
+                <div class="panel-head"><div><p class="eyebrow">实例详情</p><h2 id="workflow-instance-title">—</h2><p id="workflow-instance-meta" class="muted compact-copy">—</p></div><span id="workflow-instance-status" class="badge">—</span></div>
+                <div id="workflow-instance-actions" class="button-row"></div>
+                <form id="workflow-signal-form" class="inline-form hidden">
+                  <label><span>信号名称</span><input id="workflow-signal-name" placeholder="approved" required></label>
+                  <label><span>负载 JSON</span><input id="workflow-signal-payload" class="code-input" value="{}" required></label>
+                  <button class="secondary" type="submit">发送信号</button>
+                </form>
+                <div class="divider"></div>
+                <h3>步骤</h3><div id="workflow-steps" class="build-list empty-state">暂无步骤。</div>
+                <h3>审计时间线</h3><div id="workflow-events" class="build-list empty-state">暂无事件。</div>
+              </article>
+            </div>
+          </div>
+        </section>
+
+        <section id="view-flows" class="view" aria-labelledby="section-title">
+          <div class="projects-header">
+            <div><p class="eyebrow">可视化编排</p><h2>Flow</h2><p class="muted">把 Worker、HTTP、KV、D1、R2、队列、Analytics、Pipeline 与 Workflow 连接成耐久 DAG。定义和运行快照完全去中心化，每一步均可审计和接管。</p></div>
+            <span id="flow-count" class="badge">0 个 Flow</span>
+          </div>
+          <div class="flow-layout">
+            <aside class="r2-sidebar-stack">
+              <article class="panel">
+                <div class="panel-head"><div><p class="eyebrow">签名定义</p><h2>Flow 设置</h2></div><span class="badge">DAG</span></div>
+                <form id="flow-form" class="stack-form">
+                  <label><span>名称</span><input id="flow-name" pattern="[a-z0-9-]{1,63}" placeholder="order-router" required></label>
+                  <label><span>说明</span><textarea id="flow-description" rows="3" placeholder="接收订单、判断风险并写入数据系统"></textarea></label>
+                  <div class="form-grid">
+                    <label><span>触发方式</span><select id="flow-trigger"><option value="manual">手动</option><option value="webhook">Webhook</option><option value="cron">定时</option></select></label>
+                    <label><span>Cron（UTC）</span><input id="flow-cron" class="code-input" placeholder="*/5 * * * *"></label>
+                  </div>
+                  <label><span>自定义域名 <em>每行一个</em></span><textarea id="flow-hostnames" class="code-input" rows="3" placeholder="hooks.example.com"></textarea></label>
+                  <div class="form-grid">
+                    <label><span>记录保留（天）</span><input id="flow-retention" type="number" min="1" max="365" value="30" required></label>
+                    <label><span>最大并发运行</span><input id="flow-concurrency" type="number" min="0" max="1000" value="32" required></label>
+                  </div>
+                  <label><span>失败告警环境变量 <em>可选</em></span><input id="flow-alert-env" class="code-input" pattern="RF_FLOW_CREDENTIAL_[A-Z0-9_]+" placeholder="RF_FLOW_CREDENTIAL_ALERT"></label>
+                  <label class="check-label"><input id="flow-suspended" type="checkbox"><span>暂停新运行与自动推进</span></label>
+                  <label><span>暂停原因</span><input id="flow-suspend-reason" placeholder="维护窗口"></label>
+                  <label id="flow-first-token-label" class="hidden"><span>首个 Webhook 令牌标签</span><input id="flow-first-token" placeholder="生产系统"></label>
+                  <button class="primary" type="submit">保存并签名</button>
+                </form>
+              </article>
+              <article class="panel">
+                <div class="panel-head"><div><p class="eyebrow">Flow 目录</p><h2>全部 Flow</h2></div></div>
+                <div id="flow-list" class="database-list empty-state">暂无 Flow。</div>
+              </article>
+            </aside>
+
+            <div class="r2-sidebar-stack flow-workspace">
+              <article class="panel flow-canvas-panel">
+                <div class="panel-head"><div><p class="eyebrow">可视化编辑器</p><h2 id="flow-active-name">新建 Flow</h2><p id="flow-endpoint" class="muted compact-copy">在下方添加节点；拖动节点可调整布局。</p></div><div class="button-row"><button id="flow-new" class="secondary compact" type="button">新建</button><button id="flow-delete" class="danger ghost compact hidden" type="button">删除</button></div></div>
+                <div id="flow-palette" class="flow-palette" role="toolbar" aria-label="添加节点">
+                  <button type="button" data-flow-add="trigger">触发器</button><button type="button" data-flow-add="worker">Worker</button><button type="button" data-flow-add="http">HTTP</button><button type="button" data-flow-add="branch">条件</button><button type="button" data-flow-add="transform">转换</button><button type="button" data-flow-add="loop">循环</button><button type="button" data-flow-add="kv">KV</button><button type="button" data-flow-add="d1">D1</button><button type="button" data-flow-add="r2">R2</button><button type="button" data-flow-add="queue">队列</button><button type="button" data-flow-add="analytics">Analytics</button><button type="button" data-flow-add="pipeline">Pipeline</button><button type="button" data-flow-add="workflow">Workflow</button><button type="button" data-flow-add="subflow">子 Flow</button><button type="button" data-flow-add="email">邮件</button>
+                </div>
+                <div id="flow-canvas" class="flow-canvas" role="region" tabindex="0" aria-label="Flow 节点画布"><svg id="flow-edges" aria-hidden="true"></svg><div id="flow-nodes"></div><p id="flow-canvas-empty" class="empty-state">先添加一个触发器，再连接资源节点。</p></div>
+              </article>
+
+              <div class="grid one-one flow-edit-grid">
+                <article class="panel">
+                  <div class="panel-head"><div><p class="eyebrow">节点检查器</p><h2 id="flow-node-title">请选择节点</h2></div></div>
+                  <form id="flow-node-form" class="stack-form hidden">
+                    <div class="form-grid"><label><span>节点 ID</span><input id="flow-node-id" class="code-input" readonly></label><label><span>类型</span><input id="flow-node-type" readonly></label></div>
+                    <label><span>显示名称</span><input id="flow-node-label" maxlength="128"></label>
+                    <label><span>失败处理</span><select id="flow-node-error"><option value="stop">停止 Flow</option><option value="continue">记录失败并继续</option><option value="branch">走 error 分支</option></select></label>
+                    <label><span>节点配置（JSON）</span><textarea id="flow-node-config" class="code-input" rows="8">{}</textarea></label>
+                    <p class="form-note">表达式使用完整 JSONata，可引用 <code>$input</code>、<code>$trigger</code>、<code>$nodes.lookup</code>、<code>$item</code> 与 <code>$now</code>；例如 <code>{{ $input.orders[price &gt; 10].sku }}</code>。整字段表达式保留 JSON 类型，混合文本执行安全插值。凭据只能填写 <code>credentialEnv</code>，且变量名必须以 <code>RF_FLOW_CREDENTIAL_</code> 开头。</p>
+                    <div class="button-row"><button class="primary" type="submit">应用节点配置</button><button id="flow-node-remove" class="danger ghost" type="button">移除节点</button></div>
+                  </form>
+                  <p id="flow-node-empty" class="empty-state">在画布中选择一个节点进行编辑。</p>
+                </article>
+                <article class="panel">
+                  <div class="panel-head"><div><p class="eyebrow">连线</p><h2>添加依赖</h2></div></div>
+                  <form id="flow-edge-form" class="stack-form">
+                    <div class="form-grid"><label><span>来源</span><select id="flow-edge-source" required></select></label><label><span>目标</span><select id="flow-edge-target" required></select></label></div>
+                    <label><span>来源出口 <em>条件节点用 true / false / error</em></span><input id="flow-edge-handle" class="code-input" placeholder="default"></label>
+                    <button class="secondary" type="submit">添加连线</button>
+                  </form>
+                  <div id="flow-edge-list" class="build-list empty-state">暂无连线。</div>
+                </article>
+              </div>
+
+              <article class="panel">
+                <details><summary><strong>高级：完整 FlowGraph JSON</strong><span class="muted">支持导入、精确编辑与复制</span></summary><textarea id="flow-graph-json" class="code-input flow-graph-json" rows="16"></textarea><div class="button-row"><button id="flow-graph-apply" class="secondary" type="button">应用 JSON 到画布</button><button id="flow-graph-copy" class="secondary" type="button">复制 JSON</button></div></details>
+              </article>
+
+              <div class="grid one-one">
+                <article class="panel">
+                  <div class="panel-head"><div><p class="eyebrow">Webhook 凭据</p><h2>接收令牌</h2><p class="muted compact-copy">定义只保存 SHA-256，明文仅显示一次。</p></div></div>
+                  <form id="flow-token-form" class="inline-form hidden"><label><span>标签</span><input id="flow-token-label" placeholder="生产系统"></label><span></span><button class="secondary" type="submit">签发令牌</button></form>
+                  <div id="flow-token-reveal" class="hidden"><p class="banner warning">请立即复制并安全保存，此令牌不会再次显示。</p><pre id="flow-new-token" class="result"></pre><button id="flow-copy-token" class="secondary compact" type="button">复制令牌</button></div>
+                  <div id="flow-token-list" class="build-list empty-state">暂无 Webhook 令牌。</div>
+                </article>
+                <article class="panel">
+                  <div class="panel-head"><div><p class="eyebrow">调试触发</p><h2>创建运行</h2></div></div>
+                  <form id="flow-trigger-form" class="stack-form hidden"><label><span>幂等键 <em>可选</em></span><input id="flow-run-key" class="code-input" placeholder="order-20260805-001"></label><label><span>输入（JSON）</span><textarea id="flow-input" class="code-input" rows="7">{"orderId":"demo-1"}</textarea></label><button class="secondary" type="submit">开始运行</button></form>
+                </article>
+              </div>
+
+              <article class="panel">
+                <div class="panel-head"><div><p class="eyebrow">运行账本</p><h2>最近运行</h2></div><button id="flow-refresh" class="secondary compact" type="button">刷新</button></div>
+                <div class="metrics compact-metrics"><article class="metric"><span>排队 / 运行</span><strong id="flow-active-count">—</strong></article><article class="metric"><span>已完成</span><strong id="flow-complete-count">—</strong></article><article class="metric"><span>失败</span><strong id="flow-failed-count">—</strong></article><article class="metric"><span>已取消</span><strong id="flow-cancelled-count">—</strong></article></div>
+                <div id="flow-runs" class="build-list empty-state">暂无运行。</div>
+              </article>
+              <article id="flow-run-panel" class="panel hidden">
+                <div class="panel-head"><div><p class="eyebrow">运行详情</p><h2 id="flow-run-title">—</h2><p id="flow-run-meta" class="muted compact-copy">—</p></div><span id="flow-run-status" class="badge">—</span></div>
+                <div id="flow-run-actions" class="button-row"></div>
+                <h3>节点步骤</h3><div id="flow-steps" class="build-list empty-state">暂无步骤。</div>
+                <h3>审计时间线</h3><div id="flow-events" class="build-list empty-state">暂无事件。</div>
+              </article>
+            </div>
+          </div>
+        </section>
+
+        <section id="view-network" class="view" aria-labelledby="section-title">
+          <div class="projects-header">
+            <div><p class="eyebrow">去中心化终端网络</p><h2>设备与出口</h2><p class="muted">设备使用一次性令牌读取管理员签名的 Surge / Clash 分流规则；DIRECT 在设备本机建立连接，指定节点与自动最近出口通过 TLS 隧道转发。设备永远不会获得集群密钥。</p></div>
+            <button id="network-refresh" class="secondary" type="button">刷新网络状态</button>
+          </div>
+          <div class="metrics compact-metrics">
+            <article class="metric"><span>签名规则</span><strong id="network-rule-count">0</strong><small>完整快照随资源链传播</small></article>
+            <article class="metric"><span>有效设备</span><strong id="network-device-count">0</strong><small id="network-device-total">共 0 台</small></article>
+            <article class="metric"><span>在线出口</span><strong id="network-exit-count">0</strong><small>由节点自行声明</small></article>
+            <article class="metric"><span>当前节点角色</span><strong id="network-local-role">未启用</strong><small id="network-local-endpoint">仅管理签名定义</small></article>
+          </div>
+
+          <div class="grid one-one">
+            <article class="panel settings-panel">
+              <div class="panel-head"><div><p class="eyebrow">Surge / Clash</p><h2 id="network-rule-title">创建分流规则</h2><p class="muted compact-copy">规则集 URL 和 GEOIP 数据必须作为签名快照一并保存，终端不会自行下载可变远程内容。</p></div><button id="network-rule-new" class="secondary compact" type="button">新建</button></div>
+              <form id="network-rule-form" class="settings-form">
+                <div class="form-grid"><label><span>规则名称</span><input id="network-rule-name" pattern="[a-z0-9-]{1,63}" placeholder="global-route" required></label><label><span>格式</span><select id="network-rule-format"><option value="auto">自动识别</option><option value="surge">Surge</option><option value="clash">Clash</option></select></label></div>
+                <div class="form-grid"><label><span>说明</span><input id="network-rule-description" maxlength="1000" placeholder="团队设备默认路由"></label><label><span>优先级</span><input id="network-rule-priority" type="number" value="0" required></label></div>
+                <label><span>规则内容</span><textarea id="network-rule-config" class="code-input" rows="12" placeholder="DOMAIN-SUFFIX,example.com,Proxy&#10;IP-CIDR,203.0.113.0/24,REJECT&#10;FINAL,DIRECT" required></textarea></label>
+                <label><span>策略到出口的映射（JSON）</span><textarea id="network-rule-policies" class="code-input" rows="7">{
+  "Proxy": { "type": "nearest" },
+  "DIRECT": { "type": "direct" },
+  "REJECT": { "type": "reject" }
+}</textarea><small>出口类型：<code>direct</code>、<code>reject</code>、<code>nearest</code>，或 <code>{"type":"node","node_id":"…"}</code>。</small></label>
+                <details><summary><strong>签名规则集快照</strong><span class="muted">RULE-SET URL / geoip:CC → 文本内容</span></summary><div class="details-form"><textarea id="network-rule-providers" class="code-input" rows="10">{}</textarea></div></details>
+                <label class="check-label"><input id="network-rule-enabled" type="checkbox" checked><span>启用此规则</span></label>
+                <div class="button-row"><button class="primary" type="submit">保存并签名</button><button id="network-rule-delete" class="danger ghost hidden" type="button">删除规则</button></div>
+              </form>
+            </article>
+            <article class="panel">
+              <div class="panel-head"><div><p class="eyebrow">规则目录</p><h2>分流规则</h2></div><span class="badge">确定性编译</span></div>
+              <div id="network-rule-list" class="database-list empty-state">暂无出口规则。</div>
+            </article>
+          </div>
+
+          <div class="grid one-one">
+            <article class="panel settings-panel">
+              <div class="panel-head"><div><p class="eyebrow">一次性凭据</p><h2 id="network-device-title">注册设备</h2><p class="muted compact-copy">节点仅保存 SHA-256；令牌只在创建成功后显示一次，无法找回。</p></div><button id="network-device-new" class="secondary compact" type="button">新设备</button></div>
+              <div id="network-device-transport-warning" class="banner warning hidden">设备令牌只能通过 HTTPS 公共控制台或回环地址本地控制台签发。</div>
+              <form id="network-device-form" class="settings-form">
+                <div class="form-grid"><label><span>设备 ID</span><input id="network-device-name" pattern="[a-z0-9-]{1,63}" placeholder="randall-phone" required></label><label><span>显示名称</span><input id="network-device-label" maxlength="80" placeholder="Randall 的手机" required></label></div>
+                <label><span>到期时间 <em>可选，本地时间</em></span><input id="network-device-expires" type="datetime-local"></label>
+                <fieldset><legend>允许使用的签名规则</legend><div id="network-device-rules" class="grant-list empty-state">请先创建分流规则。</div><small>必须明确选择至少一条；按优先级从小到大匹配。依赖尚未同步完成时会失败关闭。</small></fieldset>
+                <label class="check-label"><input id="network-device-suspended" type="checkbox"><span>暂停此设备</span></label>
+                <div class="button-row"><button id="network-device-submit" class="primary" type="submit">创建并显示令牌</button><button id="network-device-revoke" class="danger ghost hidden" type="button">立即撤销</button><button id="network-device-delete" class="danger ghost hidden" type="button">删除设备</button></div>
+              </form>
+              <article id="network-token-reveal" class="credential-reveal hidden"><p class="eyebrow">仅显示一次</p><h3>设备接入凭据</h3><p class="banner warning">请立即复制并安全保存；离开本页后无法再次查看。</p><pre id="network-token-value" class="result"></pre><div class="command-row"><code id="network-device-command"></code><button id="network-token-copy" class="secondary compact" type="button">复制</button></div></article>
+            </article>
+            <article class="panel">
+              <div class="panel-head"><div><p class="eyebrow">设备目录</p><h2>已注册终端</h2></div><span class="badge">摘要认证</span></div>
+              <div id="network-device-list" class="database-list empty-state">暂无客户端设备。</div>
+            </article>
+          </div>
+
+          <article class="panel">
+            <div class="panel-head"><div><p class="eyebrow">实时 Gossip</p><h2>TLS 出口节点</h2><p class="muted compact-copy">指定出口会在服务端再次执行同一份签名规则，并拒绝回环、内网、链路本地、云元数据和保留地址。</p></div><span class="badge">严格 SSRF 防护</span></div>
+            <div id="network-exit-list" class="node-list empty-state">尚未发现出口节点。</div>
+          </article>
+        </section>
+
+        <section id="view-email" class="view" aria-labelledby="section-title">
+          <div class="projects-header">
+            <div><p class="eyebrow">去中心化邮件</p><h2>邮件路由</h2><p class="muted">域名与路由由管理员签名，邮件原文写入 R2（包括 rclone 后端），投递状态写入 D1。SMTP 接收节点为可选角色，任何节点都不会保存管理员私钥。</p></div>
+            <span id="email-count" class="badge">0 个邮件域</span>
+          </div>
+          <div id="email-node-warning" class="banner warning hidden" role="status">当前节点未启用 SMTP 邮件角色。你仍可管理签名定义和查看集群数据，但入站接收需要至少一个邮件节点。</div>
+          <div class="grid r2-grid">
+            <div class="r2-sidebar-stack">
+              <article class="panel">
+                <div class="panel-head"><div><p class="eyebrow">签名定义</p><h2>创建或编辑邮件域</h2></div><button id="email-new" class="secondary compact" type="button">新建</button></div>
+                <form id="email-domain-form" class="stack-form">
+                  <label><span>资源名称</span><input id="email-name" pattern="[a-z0-9-]{1,63}" placeholder="support-mail" required></label>
+                  <label><span>收发域名</span><input id="email-domain" type="text" placeholder="mail.example.com" required></label>
+                  <label><span>MX 主机名</span><input id="email-mx" type="text" placeholder="mx1.example.com" required></label>
+                  <label><span>邮件原文 R2 bucket</span><select id="email-bucket" required><option value="">请选择 bucket</option></select></label>
+                  <label><span>对象前缀</span><input id="email-prefix" value="mail" required></label>
+                  <label><span>说明</span><textarea id="email-description" rows="3" placeholder="客服邮件与自动化处理"></textarea></label>
+                  <div class="form-grid">
+                    <label><span>单封上限（MiB）</span><input id="email-max-size" type="number" min="1" max="63" value="25" required></label>
+                    <label><span>记录保留（天）</span><input id="email-retention" type="number" min="1" max="3650" value="30" required></label>
+                  </div>
+                  <div class="form-grid">
+                    <label><span>每分钟入站上限</span><input id="email-inbound-rate" type="number" min="1" value="1000" required></label>
+                    <label><span>每分钟出站上限</span><input id="email-outbound-rate" type="number" min="1" value="1000" required></label>
+                  </div>
+                  <details><summary><strong>DKIM 签名</strong><span class="muted">公钥进 DNS，私钥仅在邮件节点环境变量中</span></summary>
+                    <div class="stack-form details-form">
+                      <label><span>Selector</span><input id="email-dkim-selector" value="rf" required></label>
+                      <label><span>DKIM 公钥 TXT 值</span><textarea id="email-dkim-public" class="code-input" rows="4" placeholder="v=DKIM1; k=rsa; p=..."></textarea></label>
+                      <label><span>私钥环境变量名</span><input id="email-dkim-env" class="code-input" pattern="RF_EMAIL_DKIM_[A-Z0-9_]+" placeholder="RF_EMAIL_DKIM_SUPPORT"></label>
+                      <p class="form-note">这里只保存环境变量名。PEM 私钥必须直接配置到获准发信的节点，绝不能粘贴到控制台或清单中。</p>
+                    </div>
+                  </details>
+                  <label class="check-label"><input id="email-suspended" type="checkbox"><span>暂停接收与发送</span></label>
+                  <label><span>暂停原因</span><input id="email-suspend-reason" placeholder="维护窗口"></label>
+                  <label class="check-label"><input id="email-rotate-verification" type="checkbox"><span>保存时轮换所有权验证值</span></label>
+                  <button class="primary" type="submit">保存并签名</button>
+                </form>
+              </article>
+              <article class="panel">
+                <div class="panel-head"><div><p class="eyebrow">邮件域目录</p><h2>全部邮件域</h2></div></div>
+                <div id="email-domain-list" class="database-list empty-state">暂无邮件域。</div>
+              </article>
+            </div>
+
+            <div class="r2-sidebar-stack">
+              <article class="panel">
+                <div class="panel-head"><div><p class="eyebrow">域名状态</p><h2 id="email-active-name">请选择邮件域</h2><p id="email-summary" class="muted compact-copy">选择后可配置 DNS、编辑路由并查看收发记录。</p></div><button id="email-delete" class="danger ghost hidden" type="button">删除邮件域</button></div>
+                <div class="metrics compact-metrics">
+                  <article class="metric"><span>所有权 TXT</span><strong id="email-ownership-state">—</strong></article>
+                  <article class="metric"><span>MX</span><strong id="email-mx-state">—</strong></article>
+                  <article class="metric"><span>DKIM</span><strong id="email-dkim-state">—</strong></article>
+                  <article class="metric"><span>总体状态</span><strong id="email-verified-state">—</strong></article>
+                </div>
+                <button id="email-verify" class="secondary hidden" type="button">立即检查 DNS</button>
+              </article>
+
+              <article id="email-dns-panel" class="panel hidden">
+                <div class="panel-head"><div><p class="eyebrow">DNS 配置</p><h2>需要发布的记录</h2><p class="muted compact-copy">所有权 TXT 与 MX 必须完全匹配；SPF 和 DKIM 用于提升出站信誉。</p></div></div>
+                <dl id="email-dns-records" class="detail-list"></dl>
+                <div id="email-verification-detail" class="banner hidden"></div>
+              </article>
+
+              <article id="email-routes-panel" class="panel hidden">
+                <div class="panel-head"><div><p class="eyebrow">地址路由</p><h2>入站处理规则</h2><p class="muted compact-copy">精确地址优先于地址前缀，最后匹配兜底规则；同类规则中优先级数字较小者先执行。</p></div></div>
+                <form id="email-route-form" class="stack-form">
+                  <div class="form-grid"><label><span>路由 ID</span><input id="email-route-id" pattern="[a-z0-9-]{1,63}" placeholder="support" required></label><label><span>优先级</span><input id="email-route-priority" type="number" value="0" required></label></div>
+                  <div class="form-grid"><label><span>匹配方式</span><select id="email-route-match"><option value="exact">精确地址</option><option value="prefix">地址前缀</option><option value="catch_all">兜底</option></select></label><label id="email-route-value-label"><span>匹配值</span><input id="email-route-value" placeholder="support@example.com" required></label></div>
+                  <div class="form-grid"><label><span>处理方式</span><select id="email-route-destination"><option value="worker">交给 Worker</option><option value="forward">转发地址</option><option value="drop">直接丢弃</option></select></label><label id="email-route-target-label"><span>目标</span><select id="email-route-worker"><option value="">请选择 Worker</option></select><input id="email-route-addresses" class="hidden" placeholder="one@example.com, two@example.com"></label></div>
+                  <label class="check-label"><input id="email-route-enabled" type="checkbox" checked><span>启用此规则</span></label>
+                  <button class="secondary" type="submit">添加或替换路由</button>
+                </form>
+                <div id="email-route-list" class="build-list empty-state">暂无路由。</div>
+              </article>
+
+              <div class="grid one-one">
+                <article id="email-send-panel" class="panel hidden">
+                  <div class="panel-head"><div><p class="eyebrow">调试发送</p><h2>提交 RFC 822 邮件</h2><p class="muted compact-copy">邮件会先持久化，再由有出站能力的节点按 MX 直接投递。</p></div></div>
+                  <form id="email-send-form" class="stack-form">
+                    <label><span>信封发件人</span><input id="email-send-from" type="email" required></label>
+                    <label><span>信封收件人 <em>逗号分隔</em></span><input id="email-send-to" required></label>
+                    <label><span>邮件原文</span><textarea id="email-send-raw" class="code-input" rows="10">From: sender@example.com
+To: recipient@example.net
+Subject: RandallFlare 测试邮件
+Content-Type: text/plain; charset=utf-8
+
+这是一封由 RandallFlare 耐久邮件队列发送的测试邮件。</textarea></label>
+                    <button class="secondary" type="submit">加入发送队列</button>
+                  </form>
+                </article>
+                <article id="email-message-panel" class="panel hidden">
+                  <div class="panel-head"><div><p class="eyebrow">邮件详情</p><h2 id="email-message-title">请选择记录</h2></div><a id="email-message-download" class="secondary compact hidden" href="#">下载 .eml</a></div>
+                  <dl id="email-message-detail" class="detail-list"><div><dt>状态</dt><dd>—</dd></div></dl>
+                </article>
+              </div>
+
+              <article id="email-messages-panel" class="panel hidden">
+                <div class="panel-head"><div><p class="eyebrow">耐久账本</p><h2>最近收发记录</h2></div><button id="email-refresh" class="secondary compact" type="button">刷新</button></div>
+                <div id="email-message-list" class="build-list empty-state">暂无邮件记录。</div>
+              </article>
+              <article id="email-audit-panel" class="panel hidden">
+                <div class="panel-head"><div><p class="eyebrow">可核验时间线</p><h2>路由与投递审计</h2><p class="muted compact-copy">展示接收、Worker 路由、可靠转发、DSN、保留清理及 MTA-STS 策略事件；不展示邮件原文或私钥。</p></div><button id="email-audit-refresh" class="secondary compact" type="button">刷新审计</button></div>
+                <div id="email-audit-list" class="build-list empty-state">暂无邮件审计事件。</div>
+              </article>
+            </div>
+          </div>
+        </section>
+
+        <section id="view-storage" class="view" aria-labelledby="section-title">
+          <div class="projects-header">
+            <div><p class="eyebrow">签名全局默认值</p><h2>存储策略与 rclone 分片</h2><p class="muted">新建 bucket 可继承策略；新对象按 SHA-256 稳定选盘，实际 remote 和前缀逐对象固定，因此扩容不会移动或丢失既有数据。</p></div>
+            <button id="storage-refresh" class="secondary" type="button">刷新分布</button>
+          </div>
+          <div class="metrics compact-metrics">
+            <article class="metric"><span>策略版本</span><strong id="storage-version">内置</strong><small id="storage-digest">安全本地默认值</small></article>
+            <article class="metric"><span>分片盘</span><strong id="storage-remote-count">0</strong><small>每个 remote 独立配置凭据</small></article>
+            <article class="metric"><span>已固定对象</span><strong id="storage-object-count">0</strong><small id="storage-byte-count">0 B</small></article>
+            <article class="metric"><span>新 bucket 后端</span><strong id="storage-default-backend">本地</strong><small>只影响新创建的 bucket</small></article>
+          </div>
+          <div class="grid one-one storage-grid">
+            <article class="panel settings-panel storage-policy-panel">
+              <div class="settings-copy"><p class="eyebrow">策略定义</p><h2>默认后端与分片盘</h2><p class="muted">列表顺序参与稳定分片。添加、重排或改前缀只影响后续写入；旧对象继续按元数据中的具体位置读取。仍保存对象或 multipart 分片的 remote 会被拒绝移除。</p></div>
+              <form id="storage-form" class="settings-form">
+                <label><span>新 bucket 默认后端</span><select id="storage-default"><option value="local">集群本地多数派副本</option><option value="rclone_sharded">rclone 内容分片</option></select></label>
+                <label><span>有序 rclone remote <em>每行一个，最多 256 个</em></span><textarea id="storage-remotes" class="code-input" rows="10" placeholder="drive-00&#10;drive-01&#10;drive-02"></textarea><small>名称必须对应各节点私有 rclone.conf 中的 section；配置与凭据绝不会写入资源链。</small></label>
+                <label><span>盘内平铺前缀</span><input id="storage-prefix" placeholder="randallflare/shards"><small>实际 key 为 &lt;前缀&gt;/&lt;sha256&gt;，不创建哈希目录。</small></label>
+                <label><span>D1 自动备份策略（JSON）</span><textarea id="storage-d1-backups" class="code-input" rows="10" placeholder='[{"database":"appdb","bucket":"backups","prefix":"d1-backups","interval_hours":24,"retention_days":30,"suspended":false}]'></textarea><small>快照直接写入签名 R2 bucket；bucket 可使用本地、固定 rclone 或分片 rclone 后端。</small></label>
+                <div class="button-row"><button class="primary" type="submit">提交签名存储策略</button><button id="storage-probe" class="secondary" type="button">探测所有节点</button></div>
+              </form>
+            </article>
+            <div class="r2-sidebar-stack">
+              <article class="panel"><div class="panel-head"><div><p class="eyebrow">节点可达性</p><h2>remote 探测</h2></div><span class="badge">不读取凭据</span></div><div id="storage-probes" class="database-list empty-state">点击“探测所有节点”检查 remote。</div></article>
+              <article class="panel"><div class="panel-head"><div><p class="eyebrow">实际固定位置</p><h2>对象引用分布</h2></div><span class="badge">逐对象固定</span></div><div id="storage-distribution" class="database-list empty-state">暂无已索引对象。</div></article>
+            </div>
+          </div>
+          <article class="panel"><p class="eyebrow">扩容语义</p><h2>零迁移扩容</h2><p class="muted">每次写入先计算 SHA-256，再用摘要前 32 位对当前有序 remote 集合取模。元数据提交的是选中的具体 <code>rclone_shard</code> 位置；随后增盘不会重解释旧对象。相同摘要在同一策略时天然去重，生命周期回收也按被固定的位置执行。</p></article>
         </section>
 
         <section id="view-d1" class="view" aria-labelledby="section-title">
@@ -297,6 +1066,19 @@
               <div class="divider"></div>
               <h3>已知数据库</h3>
               <div id="database-list" class="database-list empty-state">暂无数据库。</div>
+              <div class="divider"></div>
+              <h3>迁移与快照</h3>
+              <div class="button-row">
+                <button id="d1-import-picker" class="secondary compact" type="button">导入 .sql</button>
+                <button id="d1-export" class="secondary compact" type="button">导出 .sqlite</button>
+                <button id="d1-refresh" class="secondary compact" type="button">刷新概览</button>
+                <input id="d1-import" type="file" accept=".sql,.txt,application/sql,text/plain" hidden>
+              </div>
+              <form id="d1-backup-form" class="stack-form">
+                <div class="form-grid"><label><span>备份 R2 bucket</span><input id="d1-backup-bucket" pattern="[a-z0-9-]{1,63}" placeholder="backups" required></label><label><span>对象前缀</span><input id="d1-backup-prefix" value="d1-backups"></label></div>
+                <button class="secondary compact" type="submit">立即备份到 R2</button>
+              </form>
+              <p id="d1-transfer-status" class="form-note">先从上方选择数据库。SQL 导入按每 100 条组成原子批次；SQLite 快照由当前主节点在线备份。</p>
             </article>
             <article class="panel sql-panel">
               <div class="panel-head"><div><p class="eyebrow">查询控制台</p><h2>执行 SQL</h2></div><span class="badge">自动路由至主节点</span></div>
@@ -313,6 +1095,139 @@
               <pre id="d1-result" class="result">执行一条语句后，结果会显示在这里。</pre>
             </article>
           </div>
+          <article class="panel">
+            <div class="panel-head"><div><p class="eyebrow">Schema 与数据概览</p><h2 id="d1-schema-title">请选择数据库</h2><p id="d1-summary" class="muted">表、行数、列约束、样本和文件页统计都会从当前 D1 主节点读取。</p></div><span id="d1-schema-count" class="badge">0 张表</span></div>
+            <div id="d1-schema" class="build-list empty-state">选择数据库后即可浏览 schema。</div>
+          </article>
+        </section>
+
+        <section id="view-binaries" class="view" aria-labelledby="section-title">
+          <div class="projects-header">
+            <div><p class="eyebrow">安全原生程序</p><h2>Binary Deliver</h2><p class="muted">将签名、内容寻址的 Linux 程序绑定到 Worker；运行时按需缓存，每次都在独立 bubblewrap 命名空间中执行。</p></div>
+            <button id="binary-new" class="primary" type="button">上传新程序</button>
+          </div>
+          <div class="grid one-one">
+            <article class="panel">
+              <div class="panel-head"><div><p class="eyebrow">内容目录</p><h2>已签名程序</h2></div><span id="binary-count" class="badge">0 个</span></div>
+              <div id="binary-list" class="database-list empty-state">暂无 Binary Deliver 程序。</div>
+            </article>
+            <article class="panel settings-panel binary-editor-panel">
+              <div class="settings-copy"><p class="eyebrow">不可变内容 + 签名策略</p><h2 id="binary-editor-title">上传程序</h2><p id="binary-editor-summary" class="muted">新文件会先存入内容地址存储，再等待管理员批准它的 SHA-256 和执行权限。</p></div>
+              <form id="binary-form" class="settings-form">
+                <div class="form-grid"><label><span>资源名称</span><input id="binary-name" pattern="[a-z0-9-]{1,63}" placeholder="ffmpeg" required></label><label><span>目标架构</span><select id="binary-os-arch"><option value="linux/amd64">linux/amd64</option><option value="linux/arm64">linux/arm64</option></select></label></div>
+                <label><span>用途描述</span><input id="binary-description" maxlength="2000" placeholder="音视频转码和探测"></label>
+                <label id="binary-file-label"><span>可执行文件 <em>上限 200 MiB</em></span><input id="binary-file" type="file"><small>更新策略时可留空；选择文件即会发布新的内容摘要。</small></label>
+                <div class="form-grid"><label><span>存储后端</span><select id="binary-storage-backend"><option value="local">本地多节点修复</option><option value="rclone">rclone remote</option></select></label><label id="binary-rclone-remote-label" class="hidden"><span>rclone remote</span><input id="binary-rclone-remote" placeholder="archive"></label></div>
+                <label id="binary-rclone-prefix-label" class="hidden"><span>rclone 内容前缀</span><input id="binary-rclone-prefix" placeholder="randallflare/binaries"></label>
+                <div class="form-grid"><label><span>默认超时（ms）</span><input id="binary-timeout" type="number" min="100" max="600000" value="30000" required></label><label><span>标准输入上限（字节）</span><input id="binary-stdin-limit" type="number" min="0" max="209715200" value="10485760" required></label></div>
+                <label><span>stdout / stderr 单路上限（字节）</span><input id="binary-output-limit" type="number" min="0" max="209715200" value="10485760" required></label>
+                <label><span>必需节点标签 <em>每行一个</em></span><textarea id="binary-required-tags" class="code-input" rows="4" placeholder="gpu&#10;high-memory"></textarea></label>
+                <label class="check-label"><input id="binary-network" type="checkbox"><span>允许程序访问网络（仍受集群出站策略约束）</span></label>
+                <label class="check-label"><input id="binary-r2" type="checkbox"><span>允许将沙箱输出发布到调用 Worker 已绑定的 R2 bucket</span></label>
+                <label class="check-label"><input id="binary-suspended" type="checkbox"><span>暂停所有新执行</span></label>
+                <div id="binary-upload-progress" class="hidden"><div class="result-head"><span id="binary-upload-label">正在上传…</span><span id="binary-upload-percent">0%</span></div><div class="progress-track"><div id="binary-upload-bar" class="progress-value"></div></div></div>
+                <div class="button-row"><button id="binary-submit" class="primary" type="submit">上传并提交签名</button><button id="binary-delete" class="secondary danger hidden" type="button">删除 Binary</button></div>
+              </form>
+              <article id="binary-current" class="credential-reveal hidden"><p class="eyebrow">当前不可变内容</p><dl id="binary-current-detail" class="detail-list"></dl><p class="form-note">Worker 使用 <code>"binaries": { "FFMPEG": "ffmpeg" }</code> 绑定后，调用 <code>await env.FFMPEG.exec({ args: [...] })</code>。</p></article>
+            </article>
+          </div>
+        </section>
+
+        <section id="view-hostnames" class="view" aria-labelledby="section-title">
+          <div class="projects-header">
+            <div><p class="eyebrow">全局入口身份</p><h2>域名所有权</h2><p class="muted">Workers、R2、Pipeline、Workflow 与 Flow 共用签名域名目录。只有 DNS TXT 验证通过的自定义域名才会进入路由与自动证书队列。</p></div>
+            <button id="hostname-refresh" class="secondary" type="button">刷新 DNS 状态</button>
+          </div>
+          <article class="panel domain-panel">
+            <div class="panel-head"><div><p class="eyebrow">签名声明</p><h2>已声明域名</h2><p class="muted compact-copy">验证码只用于证明 DNS 控制权，不是密钥；声明与验证结果均由管理员签名并复制到整个集群。</p></div><span id="hostname-count" class="badge">0 个域名</span></div>
+            <div id="hostname-list" class="domain-list empty-state">尚未声明自定义域名。</div>
+            <form id="hostname-form" class="domain-add-form">
+              <label><span>自定义域名</span><input id="hostname-input" inputmode="url" placeholder="api.example.com" required></label>
+              <button class="primary" type="submit">创建所有权声明</button>
+            </form>
+          </article>
+          <article class="panel dns-guide"><div><p class="eyebrow">验证顺序</p><h2>安全接入</h2></div><div class="guidance-list">
+            <div><span>1</span><p><strong>写入业务清单</strong><small>可先在 Worker、R2、Pipeline、Workflow 或 Flow 中填写域名；验证前入口保持隔离。</small></p></div>
+            <div><span>2</span><p><strong>发布所有权 TXT</strong><small>把页面生成的唯一值写入 <code>_randallflare-verify.&lt;域名&gt;</code>。</small></p></div>
+            <div><span>3</span><p><strong>检查并签署</strong><small>任一节点查询 DNS；管理员签署结果后，所有节点独立启用路由和 ACME。</small></p></div>
+          </div></article>
+        </section>
+
+        <section id="view-security" class="view" aria-labelledby="section-title">
+          <div class="projects-header">
+            <div><p class="eyebrow">签名安全策略</p><h2>安全、配额与程序化访问</h2><p class="muted">配额、令牌与 S3 凭据都是操作员签名资源，可由任意节点独立验证。API 令牌只保存摘要；S3 Secret 使用集群密钥加密，明文只显示一次。</p></div>
+            <button id="security-refresh" class="secondary" type="button">刷新安全状态</button>
+          </div>
+
+          <div class="metrics compact-metrics">
+            <article class="metric"><span>Worker</span><strong id="security-worker-usage">—</strong><small id="security-worker-limit">—</small></article>
+            <article class="metric"><span>自定义域名</span><strong id="security-hostname-usage">—</strong><small id="security-hostname-limit">—</small></article>
+            <article class="metric"><span>R2 本地字节</span><strong id="security-r2-byte-usage">—</strong><small id="security-r2-byte-limit">—</small></article>
+            <article class="metric"><span>R2 对象</span><strong id="security-r2-object-usage">—</strong><small id="security-r2-object-limit">—</small></article>
+          </div>
+
+          <div id="credential-transport-warning" class="banner warning hidden" role="status">当前连接不是 HTTPS。你仍可查看安全状态和提交配额策略，但 API 令牌与 S3 Secret 只允许通过 HTTPS 管理界面创建。</div>
+
+          <div class="grid one-one security-grid">
+            <div class="r2-sidebar-stack">
+              <article class="panel settings-panel security-policy-panel">
+              <div class="settings-copy"><p class="eyebrow">集群级准入控制</p><h2>资源与网络配额</h2><p class="muted">请求预算按在线公开节点确定性拆分；关闭公网出站后，Worker 的全局 fetch 无法访问网络，平台绑定与 Service Binding 仍可用。</p></div>
+              <form id="quota-form" class="settings-form">
+                <div class="form-grid"><label><span>Worker 上限</span><input id="quota-workers" type="number" min="1" required></label><label><span>自定义域名上限</span><input id="quota-hostnames" type="number" min="1" required></label></div>
+                <label><span>单个 Worker 内容上限（字节）</span><input id="quota-worker-bytes" type="number" min="1" required><small>模块与静态资源的签名清单大小合计。</small></label>
+                <label><span>集群每分钟请求上限</span><input id="quota-requests" type="number" min="1" required></label>
+                <div class="form-grid"><label><span>R2 本地字节上限</span><input id="quota-r2-bytes" type="number" min="1" required></label><label><span>R2 对象上限</span><input id="quota-r2-objects" type="number" min="1" required></label></div>
+                <label class="check-label"><input id="quota-outbound" type="checkbox"><span>允许 Worker 通过全局 fetch 访问公网</span></label>
+                <button class="primary" type="submit">提交签名配额策略</button>
+              </form>
+              </article>
+              <article class="panel">
+                <div class="panel-head"><div><p class="eyebrow">AWS Signature V4</p><h2>创建 R2/S3 凭据</h2><p class="muted compact-copy">路径式 Endpoint 为当前控制台域名下的 <code>/s3</code>。支持 aws-cli、boto3、rclone 与 AWS SDK。</p></div></div>
+                <form id="s3-credential-form" class="stack-form">
+                  <label><span>用途名称</span><input id="s3-credential-label" maxlength="120" placeholder="备份服务器" required></label>
+                  <label class="check-label"><input id="s3-acl-enabled" type="checkbox" checked><span>启用逐 bucket 最小权限（未授权默认拒绝）</span></label>
+                  <div id="s3-grant-list" class="grant-list empty-state">创建 R2 bucket 后可在这里分配读写权限。</div>
+                  <div class="button-row"><button id="s3-credential-submit" class="primary" type="submit">生成加密 S3 凭据</button><button id="s3-credential-cancel" class="secondary hidden" type="button">取消编辑</button></div>
+                </form>
+              </article>
+            </div>
+
+            <div class="r2-sidebar-stack">
+              <article class="panel">
+                <div class="panel-head"><div><p class="eyebrow">Bearer API</p><h2>创建作用域访问令牌</h2><p class="muted compact-copy">令牌以 <code>rfp_</code> 开头，明文不会进入资源链。</p></div></div>
+                <form id="access-token-form" class="stack-form">
+                  <label><span>用途名称</span><input id="access-token-label" maxlength="120" placeholder="GitHub Actions 生产部署" required></label>
+                  <label><span>有效期（天）<em>留空表示长期有效</em></span><input id="access-token-days" type="number" min="1" max="3650" placeholder="90"></label>
+                  <fieldset class="scope-fieldset"><legend>最小权限作用域</legend><div id="access-token-scopes" class="scope-grid"></div></fieldset>
+                  <button class="primary" type="submit">生成并等待签名</button>
+                </form>
+              </article>
+              <article class="panel">
+                <div class="panel-head"><div><p class="eyebrow">已签名凭据</p><h2>API 访问令牌</h2></div></div>
+                <div id="access-token-list" class="database-list empty-state">暂无访问令牌。</div>
+              </article>
+              <article class="panel">
+                <div class="panel-head"><div><p class="eyebrow">凭据与授权</p><h2>R2/S3 客户端</h2></div><code id="s3-endpoint">/s3</code></div>
+                <div id="s3-credential-list" class="database-list empty-state">暂无 S3 凭据。</div>
+              </article>
+            </div>
+          </div>
+
+          <article id="credential-reveal" class="panel credential-reveal hidden" role="status">
+            <div class="panel-head"><div><p class="eyebrow">只显示一次</p><h2 id="credential-reveal-title">请立即保存凭据</h2><p class="muted">关闭或刷新后无法重新读取；丢失时请撤销并创建新凭据。</p></div><button id="credential-reveal-close" class="icon-button" type="button" aria-label="关闭">×</button></div>
+            <pre id="credential-reveal-value" class="result"></pre>
+            <button id="credential-reveal-copy" class="secondary" type="button">复制全部</button>
+          </article>
+
+          <article class="panel">
+            <div class="panel-head"><div><p class="eyebrow">全资源透明日志</p><h2>签名与数据变更审计</h2><p class="muted compact-copy">签名资源保留前序摘要、版本与当前摘要；KV/D1 仅保留键/命令与内容摘要，不记录键名、值、SQL 或参数。令牌摘要和凭据密文始终隐藏。</p></div><button id="security-audit-refresh" class="secondary compact" type="button">刷新审计</button></div>
+            <form id="security-audit-archive-form" class="inline-form">
+              <label><span>归档到 R2 / rclone</span><select id="security-audit-bucket" required><option value="">请选择 bucket</option></select></label>
+              <label><span>对象前缀</span><input id="security-audit-prefix" value="data-audit" maxlength="512"></label>
+              <button class="secondary" type="submit">生成 gzip JSONL 归档</button>
+            </form>
+            <div id="security-audit-list" class="build-list empty-state">正在读取签名资源历史…</div>
+          </article>
         </section>
       </main>
     </div>
