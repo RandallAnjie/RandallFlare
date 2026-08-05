@@ -173,6 +173,7 @@ pub fn router(api: Api) -> Router {
             get(email_verification).post(email_verify),
         )
         .route("/v1/email/{domain}/messages", get(email_messages))
+        .route("/v1/email/{domain}/audit", get(email_audit))
         .route("/v1/email/{domain}/dsn", post(email_dsn))
         .route("/v1/email/{domain}/messages/{id}", get(email_message))
         .route(
@@ -2956,6 +2957,27 @@ async fn email_messages(
     }
     match crate::email::list_messages(&api.node, &domain, query.limit.unwrap_or(100)).await {
         Ok(messages) => axum::Json(serde_json::json!({ "messages": messages })).into_response(),
+        Err(error) => (StatusCode::UNPROCESSABLE_ENTITY, error.to_string()).into_response(),
+    }
+}
+
+async fn email_audit(
+    State(api): State<Api>,
+    ConnectInfo(remote): ConnectInfo<SocketAddr>,
+    Path(domain): Path<String>,
+    Query(query): Query<EmailMessagesQuery>,
+    method: Method,
+    uri: Uri,
+    headers: HeaderMap,
+) -> Response {
+    if let Err(response) = check(&api, &remote, &headers, &method, &uri, b"") {
+        return response.into_response();
+    }
+    if crate::email::email_domain_record(&api.node, &domain).is_none() {
+        return (StatusCode::NOT_FOUND, "邮件域不存在").into_response();
+    }
+    match crate::email::list_audit(&api.node, &domain, query.limit.unwrap_or(100)).await {
+        Ok(events) => axum::Json(serde_json::json!({ "events": events })).into_response(),
         Err(error) => (StatusCode::UNPROCESSABLE_ENTITY, error.to_string()).into_response(),
     }
 }

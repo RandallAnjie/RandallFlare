@@ -161,8 +161,8 @@ Working today, verified by multi-process fault-injection e2e tests:
   enforcement. Permanent failure creates a crash-safe, loop-protected DSN
   through the sender's signed local route.
   Worker `email()` handlers, `env.MAIL.send()`, Flow email nodes, CLI/API,
-  retention cleanup and a dedicated Chinese DNS/routing/delivery console are
-  included. See [the Email guide](./docs/EMAIL.md).
+  retention cleanup, encrypted audit API/CLI and a dedicated Chinese
+  DNS/routing/delivery timeline are included. See [the Email guide](./docs/EMAIL.md).
 - **Decentralized device and exit networking**: one-way device credentials
   fetch operator-signed Surge/Clash rules without exposing the cluster secret.
   A local SOCKS5/HTTP proxy performs DIRECT and REJECT decisions or opens a

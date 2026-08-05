@@ -1878,6 +1878,31 @@ impl PeerClient {
         Ok(serde_json::from_slice(&raw)?)
     }
 
+    pub async fn email_audit(
+        &self,
+        base: &str,
+        domain: &str,
+        limit: usize,
+    ) -> Result<Vec<crate::email::EmailAuditEvent>> {
+        let raw = self
+            .get(
+                base,
+                &format!(
+                    "/v1/email/{}/audit?limit={}",
+                    component(domain),
+                    limit.clamp(1, 500)
+                ),
+            )
+            .await?;
+        let response: serde_json::Value = serde_json::from_slice(&raw)?;
+        Ok(serde_json::from_value(
+            response
+                .get("events")
+                .cloned()
+                .unwrap_or_else(|| serde_json::json!([])),
+        )?)
+    }
+
     pub async fn email_message_raw(&self, base: &str, domain: &str, id: &str) -> Result<Vec<u8>> {
         self.get(
             base,

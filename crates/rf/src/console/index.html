@@ -1015,6 +1015,10 @@ Content-Type: text/plain; charset=utf-8
                 <div class="panel-head"><div><p class="eyebrow">耐久账本</p><h2>最近收发记录</h2></div><button id="email-refresh" class="secondary compact" type="button">刷新</button></div>
                 <div id="email-message-list" class="build-list empty-state">暂无邮件记录。</div>
               </article>
+              <article id="email-audit-panel" class="panel hidden">
+                <div class="panel-head"><div><p class="eyebrow">可核验时间线</p><h2>路由与投递审计</h2><p class="muted compact-copy">展示接收、Worker 路由、可靠转发、DSN、保留清理及 MTA-STS 策略事件；不展示邮件原文或私钥。</p></div><button id="email-audit-refresh" class="secondary compact" type="button">刷新审计</button></div>
+                <div id="email-audit-list" class="build-list empty-state">暂无邮件审计事件。</div>
+              </article>
             </div>
           </div>
         </section>

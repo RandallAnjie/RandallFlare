@@ -73,6 +73,7 @@ const state = {
   emailActive: null,
   emailRoutes: [],
   emailMessages: [],
+  emailAudit: [],
   emailMessageActive: null,
   emailContext: { buckets: [], workers: [], email_node: null },
   binaries: [],
@@ -3399,11 +3400,12 @@ function resetEmailDomainForm() {
   state.emailActive = null;
   state.emailRoutes = [];
   state.emailMessages = [];
+  state.emailAudit = [];
   state.emailMessageActive = null;
   $("#email-domain-form").reset();
   fillEmailDomainForm(null);
   renderEmailRoutes();
-  ["#email-dns-panel", "#email-routes-panel", "#email-send-panel", "#email-message-panel", "#email-messages-panel"].forEach((id) => $(id).classList.add("hidden"));
+  ["#email-dns-panel", "#email-routes-panel", "#email-send-panel", "#email-message-panel", "#email-messages-panel", "#email-audit-panel"].forEach((id) => $(id).classList.add("hidden"));
   $("#email-delete").classList.add("hidden");
   $("#email-verify").classList.add("hidden");
   $("#email-active-name").textContent = "请选择邮件域";
@@ -3530,12 +3532,12 @@ async function selectEmailDomain(name, { loadMessages = true } = {}) {
   renderEmailDns(domain);
   $("#email-active-name").textContent = domain.spec.domain;
   $("#email-summary").textContent = `${domain.name} · v${domain.version} · R2 ${domain.spec.bucket}/${domain.spec.object_prefix}`;
-  ["#email-dns-panel", "#email-routes-panel", "#email-send-panel", "#email-messages-panel"].forEach((id) => $(id).classList.remove("hidden"));
+  ["#email-dns-panel", "#email-routes-panel", "#email-send-panel", "#email-messages-panel", "#email-audit-panel"].forEach((id) => $(id).classList.remove("hidden"));
   $("#email-message-panel").classList.add("hidden");
   $("#email-delete").classList.remove("hidden");
   $("#email-verify").classList.remove("hidden");
   $("#email-send-from").value = `noreply@${domain.spec.domain}`;
-  if (loadMessages) await loadEmailMessages();
+  if (loadMessages) await Promise.all([loadEmailMessages(), loadEmailAudit()]);
 }
 
 async function saveEmailDomain(event) {
@@ -3592,6 +3594,38 @@ async function loadEmailMessages() {
     const data = await api(`/api/email/${encodeURIComponent(state.emailActive)}/messages?limit=200`);
     state.emailMessages = data.messages || [];
     renderEmailMessages();
+  } catch (error) { toast(error.message, true); }
+}
+
+function emailAuditLabel(kind) {
+  return ({
+    domain_verified: "域名验证完成", inbound_accepted: "入站邮件已接收",
+    inbound_delivered: "Worker 已处理", inbound_forwarded: "转发已排队",
+    inbound_rejected: "Worker 已拒收", inbound_failed: "入站处理失败",
+    inbound_retry_scheduled: "入站处理等待重试", outbound_queued: "出站邮件已排队",
+    outbound_delivered: "远端 MX 已接收", outbound_failed: "出站投递失败",
+    outbound_retry_scheduled: "出站投递等待重试", dsn_generated: "退信通知已生成",
+    dsn_retry_scheduled: "退信通知等待重试", dsn_failed: "退信通知失败",
+    retention_sweep: "保留策略已清理",
+    mta_sts_policy_cached: "MTA-STS 策略已缓存",
+    mta_sts_policy_applied: "MTA-STS 策略已应用",
+    mta_sts_testing_failure: "MTA-STS 测试模式告警",
+    mta_sts_discovery_warning: "MTA-STS 策略发现告警",
+  })[kind] || kind;
+}
+
+function renderEmailAudit() {
+  const list = $("#email-audit-list");
+  list.classList.toggle("empty-state", state.emailAudit.length === 0);
+  list.innerHTML = state.emailAudit.length ? state.emailAudit.map((event) => `<article class="build-row"><span class="pipeline-state ${event.kind.includes("failed") || event.kind.includes("warning") ? "failed" : event.kind.includes("retry") ? "active" : "complete"}"></span><div><strong>${escapeHtml(emailAuditLabel(event.kind))}</strong><small>${escapeHtml(new Date(event.created_at_ms).toLocaleString("zh-CN"))} · ${escapeHtml(event.id)}</small><code>${escapeHtml(JSON.stringify(event.detail || {}))}</code></div></article>`).join("") : "暂无邮件审计事件。";
+}
+
+async function loadEmailAudit() {
+  if (!state.emailActive) return;
+  try {
+    const data = await api(`/api/email/${encodeURIComponent(state.emailActive)}/audit?limit=200`);
+    state.emailAudit = data.events || [];
+    renderEmailAudit();
   } catch (error) { toast(error.message, true); }
 }
 
@@ -5251,7 +5285,8 @@ $("#email-route-destination").addEventListener("change", updateEmailRouteFields)
 $("#email-verify").addEventListener("click", verifyEmailDomain);
 $("#email-delete").addEventListener("click", deleteEmailDomain);
 $("#email-new").addEventListener("click", resetEmailDomainForm);
-$("#email-refresh").addEventListener("click", loadEmailMessages);
+$("#email-refresh").addEventListener("click", () => Promise.all([loadEmailMessages(), loadEmailAudit()]));
+$("#email-audit-refresh").addEventListener("click", loadEmailAudit);
 $("#email-send-form").addEventListener("submit", sendEmailMessage);
 $("#email-domain-list").addEventListener("click", (event) => { const button = event.target.closest("[data-email-domain]"); if (button) selectEmailDomain(button.dataset.emailDomain); });
 $("#email-route-list").addEventListener("click", (event) => {

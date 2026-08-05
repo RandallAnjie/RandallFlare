@@ -99,7 +99,7 @@ surface yet.
 | authentication results | done | SPF, DKIM, DMARC, ARC chain validation and full Authentication-Results are persisted/exposed to operators and Worker email events |
 | raw-message R2 archival | partial | immutable source, metadata hashes, shared-recipient reference-safe retention and local/rclone buckets done; multi-GiB streaming remains |
 | Worker email handler | partial | `email()` event, headers/raw stream, `setReject`, reliable idempotent `forward`, loop protection and `env.MAIL.send()` done; real-SMTP/workerd fault soak remains |
-| outbound SMTP | partial | per-recipient durable queue, fenced leases, bounded exponential retry, direct sorted MX, Null MX, SMTPUTF8 negotiation, node-local RSA DKIM signing, crash-safe DSN processing, and RFC 8461 MTA-STS discovery/caching/MX matching/strict STARTTLS are implemented; testing-mode failures are audited and surfaced per message; aggregate TLSRPT, reputation automation and multi-MX production soak remain |
+| outbound SMTP | partial | per-recipient durable queue, fenced leases, bounded exponential retry, direct sorted MX, Null MX, SMTPUTF8 negotiation, node-local RSA DKIM signing, crash-safe DSN processing, and RFC 8461 MTA-STS discovery/caching/MX matching/strict STARTTLS are implemented; delivery/MTA-STS events have encrypted API, CLI and Chinese audit timelines, while testing outcomes are also surfaced per message; aggregate TLSRPT, reputation automation and multi-MX production soak remain |
 
 ## Delivery order
 

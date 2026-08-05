@@ -381,6 +381,14 @@ pub struct EmailMessage {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EmailAuditEvent {
+    pub id: String,
+    pub kind: String,
+    pub detail: Value,
+    pub created_at_ms: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct InboundEnvelope {
     pub helo_domain: String,
     pub client_ip: IpAddr,
@@ -2969,6 +2977,31 @@ pub async fn list_messages(node: &Node, name: &str, limit: usize) -> Result<Vec<
     )
     .iter()
     .map(row_to_message)
+    .collect()
+}
+
+pub async fn list_audit(node: &Node, name: &str, limit: usize) -> Result<Vec<EmailAuditEvent>> {
+    ensure_schema(node, name).await?;
+    rows(
+        exec(
+            node,
+            name,
+            r#"SELECT id,kind,detail_json,created_at_ms FROM email_audit
+               ORDER BY created_at_ms DESC,id DESC LIMIT ?1"#,
+            json!([limit.clamp(1, 500)]),
+        )
+        .await?,
+    )
+    .iter()
+    .map(|row| {
+        Ok(EmailAuditEvent {
+            id: string_field(row, "id")?.into(),
+            kind: string_field(row, "kind")?.into(),
+            detail: serde_json::from_str(string_field(row, "detail_json")?)
+                .context("邮件审计详情不是有效 JSON")?,
+            created_at_ms: u64_field(row, "created_at_ms"),
+        })
+    })
     .collect()
 }
 

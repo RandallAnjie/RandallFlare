@@ -1528,6 +1528,16 @@ enum EmailCmd {
         #[arg(long, env = "RF_CLUSTER_SECRET")]
         secret: String,
     },
+    /// 查看邮件接收、路由、投递、DSN 与 MTA-STS 审计时间线。
+    Audit {
+        name: String,
+        #[arg(long, default_value_t = 100)]
+        limit: usize,
+        #[arg(long, env = "RF_NODE")]
+        node: String,
+        #[arg(long, env = "RF_CLUSTER_SECRET")]
+        secret: String,
+    },
     /// 查看一条投递的元数据。
     Message {
         name: String,
@@ -4273,6 +4283,18 @@ async fn async_main(cli: Cli) -> Result<()> {
                     .email_messages(&node, &name, limit)
                     .await?;
                 println!("{}", serde_json::to_string_pretty(&messages)?);
+                Ok(())
+            }
+            EmailCmd::Audit {
+                name,
+                limit,
+                node,
+                secret,
+            } => {
+                let events = PeerClient::new(secret_bytes(&secret)?)
+                    .email_audit(&node, &name, limit)
+                    .await?;
+                println!("{}", serde_json::to_string_pretty(&events)?);
                 Ok(())
             }
             EmailCmd::Message {

@@ -504,6 +504,7 @@ pub fn router(state: ConsoleState) -> Router {
             "/api/email/{name}/messages",
             get(email_messages).post(email_send),
         )
+        .route("/api/email/{name}/audit", get(email_audit))
         .route("/api/email/{name}/messages/{id}", get(email_message))
         .route(
             "/api/email/{name}/messages/{id}/raw",
@@ -8746,6 +8747,18 @@ async fn email_messages(
         .email_messages(&state.node, &name, query.limit.unwrap_or(100))
         .await?;
     Ok(Json(json!({ "messages": messages })))
+}
+
+async fn email_audit(
+    State(state): State<ConsoleState>,
+    Path(name): Path<String>,
+    Query(query): Query<EmailMessagesQuery>,
+) -> ApiResult<Json<Value>> {
+    let events = state
+        .client
+        .email_audit(&state.node, &name, query.limit.unwrap_or(100))
+        .await?;
+    Ok(Json(json!({ "events": events })))
 }
 
 async fn email_message(

@@ -1960,6 +1960,13 @@ export default {
     assert!(dsn_text.contains("Status: 5.1.1"));
     assert!(dsn_text.contains("Diagnostic-Code: X-RandallFlare; 550 5.1.1 用户不存在"));
     assert!(!client.email_process_dsn(&n.api, "mail-e2e").await.unwrap());
+    let email_audit = client.email_audit(&n.api, "mail-e2e", 100).await.unwrap();
+    assert!(email_audit.iter().any(|event| {
+        event.kind == "outbound_queued" && event.detail["message_id"] == outbound_id
+    }));
+    assert!(email_audit.iter().any(|event| {
+        event.kind == "dsn_generated" && event.detail["dsn_message_id"] == dsn_id
+    }));
     let analytics_response = http
         .get(format!("http://127.0.0.1:{}/analytics", n.ingress))
         .header("host", "api.test")

@@ -225,6 +225,7 @@ Flow 的 `email` 节点可以使用完整 `raw`，也可以由平台生成纯文
 ```bash
 rf email list
 rf email messages support-mail --limit 50
+rf email audit support-mail --limit 100
 rf email message support-mail <message-id>
 journalctl -u rf -n 200 --no-pager
 ```
