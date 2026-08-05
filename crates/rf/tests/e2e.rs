@@ -1118,6 +1118,10 @@ export default {
                     "sequence": {"type": "integer"}
                 }
             })),
+            transform_sql: Some(
+                "INSERT INTO archive SELECT kind, sequence * 10 AS sequence FROM events WHERE sequence >= 2"
+                    .into(),
+            ),
             suspended: false,
             suspend_reason: String::new(),
             hostnames: vec!["pipe.test".into()],
@@ -1512,9 +1516,9 @@ export default {
                 .lines()
                 .map(|line| serde_json::from_str(line).unwrap())
                 .collect();
-            assert_eq!(events.len(), 2);
+            assert_eq!(events.len(), 1);
             assert_eq!(events[0]["kind"], "worker");
-            assert_eq!(events[1]["sequence"], 2);
+            assert_eq!(events[0]["sequence"], 20);
             let status = client.pipeline_status(&n.api, "events-pipe").await.unwrap();
             assert_eq!(status.queued_events, 0);
             assert_eq!(status.completed_batches, 1);

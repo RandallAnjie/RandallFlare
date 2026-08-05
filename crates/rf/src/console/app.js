@@ -2142,6 +2142,7 @@ function fillPipelineForm(pipeline) {
   $("#pipeline-batch-seconds").value = spec.batch_max_seconds || 60;
   $("#pipeline-hostnames").value = (spec.hostnames || []).join("\n");
   $("#pipeline-schema").value = spec.schema == null ? "" : JSON.stringify(spec.schema, null, 2);
+  $("#pipeline-transform-sql").value = spec.transform_sql || "";
   $("#pipeline-suspended").checked = Boolean(spec.suspended);
   $("#pipeline-suspend-reason").value = spec.suspend_reason || "";
 }
@@ -2241,6 +2242,7 @@ async function savePipeline(event) {
     batch_max_bytes: Math.round(Number($("#pipeline-batch-mib").value) * 1024 * 1024),
     batch_max_seconds: Number($("#pipeline-batch-seconds").value),
     schema,
+    transform_sql: $("#pipeline-transform-sql").value.trim() || null,
     suspended: $("#pipeline-suspended").checked,
     suspend_reason: $("#pipeline-suspend-reason").value.trim(),
     hostnames: $("#pipeline-hostnames").value.split(/\r?\n/).map((value) => value.trim()).filter(Boolean),

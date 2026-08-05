@@ -7113,6 +7113,8 @@ struct PipelineRequest {
     #[serde(default)]
     schema: Option<Value>,
     #[serde(default)]
+    transform_sql: Option<String>,
+    #[serde(default)]
     suspended: bool,
     #[serde(default)]
     suspend_reason: String,
@@ -7158,6 +7160,7 @@ fn pipeline_spec_view(spec: &crate::pipeline::PipelineSpec) -> Value {
         "batch_max_bytes": spec.batch_max_bytes,
         "batch_max_seconds": spec.batch_max_seconds,
         "schema": spec.schema,
+        "transform_sql": spec.transform_sql,
         "suspended": spec.suspended,
         "suspend_reason": spec.suspend_reason,
         "hostnames": spec.hostnames,
@@ -7245,6 +7248,7 @@ async fn pipeline_apply(
         batch_max_bytes: request.batch_max_bytes,
         batch_max_seconds: request.batch_max_seconds,
         schema: request.schema,
+        transform_sql: request.transform_sql,
         suspended: request.suspended,
         suspend_reason: request.suspend_reason,
         hostnames,
@@ -8837,6 +8841,7 @@ mod tests {
             batch_max_bytes: crate::pipeline::DEFAULT_BATCH_BYTES,
             batch_max_seconds: crate::pipeline::DEFAULT_BATCH_SECONDS,
             schema: None,
+            transform_sql: None,
             suspended: false,
             suspend_reason: String::new(),
             hostnames: vec![],

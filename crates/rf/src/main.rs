@@ -960,6 +960,12 @@ enum PipelineCmd {
         /// Inline JSON Schema.
         #[arg(long)]
         schema: Option<String>,
+        /// Stateless SQL transform (`SELECT ... FROM events`).
+        #[arg(long, conflicts_with = "transform_sql_file")]
+        transform_sql: Option<String>,
+        /// Read the stateless SQL transform from a UTF-8 file.
+        #[arg(long, conflicts_with = "transform_sql")]
+        transform_sql_file: Option<PathBuf>,
         #[arg(long)]
         hostname: Vec<String>,
         #[arg(long)]
@@ -3005,6 +3011,8 @@ async fn async_main(cli: Cli) -> Result<()> {
                 batch_max_bytes,
                 batch_max_seconds,
                 schema,
+                transform_sql,
+                transform_sql_file,
                 hostname,
                 suspended,
                 suspend_reason,
@@ -3026,6 +3034,13 @@ async fn async_main(cli: Cli) -> Result<()> {
                 let schema = schema
                     .map(|raw| serde_json::from_str(&raw).context("--schema 必须是 JSON Schema"))
                     .transpose()?;
+                let transform_sql =
+                    match transform_sql_file {
+                        Some(path) => Some(std::fs::read_to_string(&path).with_context(|| {
+                            format!("读取 Pipeline SQL 文件 {}", path.display())
+                        })?),
+                        None => transform_sql,
+                    };
                 let spec = rf::pipeline::PipelineSpec {
                     description,
                     output_bucket: bucket,
@@ -3033,6 +3048,7 @@ async fn async_main(cli: Cli) -> Result<()> {
                     batch_max_bytes,
                     batch_max_seconds,
                     schema,
+                    transform_sql,
                     suspended,
                     suspend_reason,
                     hostnames: hostname

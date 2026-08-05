@@ -624,6 +624,8 @@
                   </div>
                   <label><span>接收域名 <em>每行一个；默认域名自动分配</em></span><textarea id="pipeline-hostnames" class="code-input" rows="3"></textarea></label>
                   <label><span>JSON Schema <em>留空则接受任意 JSON</em></span><textarea id="pipeline-schema" class="code-input" rows="7" placeholder='{"type":"object","required":["event"]}'></textarea></label>
+                  <label><span>SQL 转换 <em>可选；表名为 events</em></span><textarea id="pipeline-transform-sql" class="code-input" rows="8" placeholder="INSERT INTO archive SELECT event, UPPER(path) AS path FROM events WHERE status >= 400"></textarea></label>
+                  <p class="form-note">支持无状态 SQLite SELECT，或 Cloudflare 同形的 <code>INSERT INTO &lt;sink&gt; SELECT</code>。原始 JSON 可通过 <code>__rf_event</code> 读取；转换在进入耐久队列前完成。</p>
                   <label class="check-label"><input id="pipeline-suspended" type="checkbox"><span>暂停接收与自动刷新</span></label>
                   <label><span>暂停原因</span><input id="pipeline-suspend-reason" placeholder="维护窗口"></label>
                   <button class="primary" type="submit">保存 Pipeline</button>

@@ -25,6 +25,7 @@ pub const MAX_INGEST_BYTES: usize = 32 * 1024 * 1024;
 pub const MAX_EVENTS_PER_REQUEST: usize = 10_000;
 pub const DEFAULT_BATCH_BYTES: u64 = 64 * 1024 * 1024;
 pub const DEFAULT_BATCH_SECONDS: u64 = 60;
+pub const MAX_TRANSFORM_SQL_BYTES: usize = 64 * 1024;
 const MAX_BATCH_BYTES: u64 = 512 * 1024 * 1024;
 const LEASE_MS: u64 = 5 * 60 * 1_000;
 const MAX_BATCH_EVENTS: usize = 10_000;
@@ -67,6 +68,11 @@ pub struct PipelineSpec {
     pub batch_max_seconds: u64,
     #[serde(default)]
     pub schema: Option<Value>,
+    /// Optional stateless SQL projection/filter. The accepted shape is either
+    /// `SELECT ... FROM events` or Cloudflare's
+    /// `INSERT INTO <sink> SELECT ... FROM events` form.
+    #[serde(default)]
+    pub transform_sql: Option<String>,
     #[serde(default)]
     pub suspended: bool,
     #[serde(default)]
@@ -129,6 +135,9 @@ impl PipelineSpec {
         if let Some(schema) = &self.schema {
             jsonschema::validator_for(schema)
                 .map_err(|error| anyhow::anyhow!("Pipeline JSON Schema 无效：{error}"))?;
+        }
+        if let Some(sql) = self.transform_sql.as_deref() {
+            normalize_transform_sql(sql)?;
         }
         Ok(())
     }
@@ -319,6 +328,197 @@ fn validate_event_count(events: Vec<Value>) -> Result<Vec<Value>> {
     Ok(events)
 }
 
+fn normalize_transform_sql(sql: &str) -> Result<Option<&str>> {
+    if sql.len() > MAX_TRANSFORM_SQL_BYTES || sql.contains('\0') {
+        bail!("Pipeline 转换 SQL 不得超过 64 KiB，且不能包含 NUL");
+    }
+    let sql = sql.trim();
+    if sql.is_empty() {
+        return Ok(None);
+    }
+    let sql = sql.strip_suffix(';').unwrap_or(sql).trim_end();
+    let query = if let Some(rest) = strip_keyword(sql, "INSERT") {
+        let rest =
+            strip_keyword(rest, "INTO").context("Pipeline 转换 SQL 的 INSERT 后必须包含 INTO")?;
+        let (sink, rest) =
+            take_sql_identifier(rest).context("Pipeline 转换 SQL 缺少安全的 sink 名称")?;
+        if !sink.bytes().enumerate().all(|(index, byte)| {
+            byte == b'_' || byte.is_ascii_alphanumeric() && (index > 0 || !byte.is_ascii_digit())
+        }) {
+            bail!("Pipeline 转换 SQL 的 sink 名称无效");
+        }
+        rest.trim_start()
+    } else {
+        sql
+    };
+    if strip_keyword(query, "SELECT").is_none() && strip_keyword(query, "WITH").is_none() {
+        bail!("Pipeline 转换 SQL 必须是 SELECT，或 INSERT INTO <sink> SELECT");
+    }
+    Ok(Some(query))
+}
+
+fn strip_keyword<'a>(value: &'a str, keyword: &str) -> Option<&'a str> {
+    let value = value.trim_start();
+    let head = value.get(..keyword.len())?;
+    if !head.eq_ignore_ascii_case(keyword) {
+        return None;
+    }
+    let rest = &value[keyword.len()..];
+    if rest
+        .as_bytes()
+        .first()
+        .is_some_and(|byte| !byte.is_ascii_whitespace())
+    {
+        return None;
+    }
+    Some(rest.trim_start())
+}
+
+fn take_sql_identifier(value: &str) -> Option<(&str, &str)> {
+    let value = value.trim_start();
+    let end = value
+        .find(|character: char| character.is_ascii_whitespace())
+        .unwrap_or(value.len());
+    (end > 0).then(|| (&value[..end], &value[end..]))
+}
+
+fn transform_events(events: Vec<Value>, sql: Option<&str>) -> Result<Vec<Value>> {
+    let Some(query) = sql.map(normalize_transform_sql).transpose()?.flatten() else {
+        return Ok(events);
+    };
+    let mut columns = std::collections::BTreeSet::new();
+    for event in &events {
+        if let Value::Object(object) = event {
+            for key in object.keys() {
+                if key != "__rf_event" {
+                    if key.len() > 256 || key.contains('\0') {
+                        bail!("Pipeline 事件字段名不得超过 256 字节，且不能包含 NUL");
+                    }
+                    columns.insert(key.clone());
+                }
+            }
+        }
+    }
+    if columns.len() > 256 {
+        bail!("Pipeline SQL 转换每批最多展开 256 个字段");
+    }
+    let columns = columns.into_iter().collect::<Vec<_>>();
+    let mut connection = rusqlite::Connection::open_in_memory()?;
+    let definitions = columns
+        .iter()
+        .map(|column| quoted_identifier(column))
+        .collect::<Vec<_>>();
+    let mut create = String::from("CREATE TABLE events (__rf_event TEXT NOT NULL");
+    for definition in definitions {
+        create.push_str(", ");
+        create.push_str(&definition);
+    }
+    create.push(')');
+    connection.execute_batch(&create)?;
+    let mut insert = String::from("INSERT INTO events (__rf_event");
+    for column in &columns {
+        insert.push_str(", ");
+        insert.push_str(&quoted_identifier(column));
+    }
+    insert.push_str(") VALUES (");
+    insert.push_str(
+        &(1..=columns.len() + 1)
+            .map(|index| format!("?{index}"))
+            .collect::<Vec<_>>()
+            .join(","),
+    );
+    insert.push(')');
+    let transaction = connection.transaction()?;
+    {
+        let mut statement = transaction.prepare(&insert)?;
+        for event in &events {
+            let object = event.as_object();
+            let mut values = Vec::with_capacity(columns.len() + 1);
+            values.push(rusqlite::types::Value::Text(serde_json::to_string(event)?));
+            values.extend(columns.iter().map(|column| {
+                object
+                    .and_then(|object| object.get(column))
+                    .map(json_to_sql_value)
+                    .unwrap_or(rusqlite::types::Value::Null)
+            }));
+            statement.execute(rusqlite::params_from_iter(values.iter()))?;
+        }
+    }
+    transaction.commit()?;
+    connection.execute_batch("PRAGMA query_only = ON")?;
+    let mut statement = connection
+        .prepare(query)
+        .context("Pipeline 转换 SQL 无法编译")?;
+    if !statement.readonly() || statement.parameter_count() != 0 {
+        bail!("Pipeline 转换 SQL 必须是无参数只读查询");
+    }
+    if statement.column_count() == 0 || statement.column_count() > 256 {
+        bail!("Pipeline 转换 SQL 必须输出 1 至 256 列");
+    }
+    let names = statement
+        .column_names()
+        .iter()
+        .map(|name| name.to_string())
+        .collect::<Vec<_>>();
+    let unique = names.iter().collect::<std::collections::BTreeSet<_>>();
+    if unique.len() != names.len() || names.iter().any(|name| name.is_empty()) {
+        bail!("Pipeline 转换 SQL 的输出列必须具备唯一、非空的名称");
+    }
+    let mut output = Vec::new();
+    let mut encoded_bytes = 0usize;
+    let mut rows = statement.query([])?;
+    while let Some(row) = rows.next()? {
+        if output.len() >= MAX_EVENTS_PER_REQUEST {
+            bail!("Pipeline 转换 SQL 输出不得超过 10000 个事件");
+        }
+        let mut object = Map::new();
+        for (index, name) in names.iter().enumerate() {
+            object.insert(name.clone(), sql_to_json(row.get_ref(index)?)?);
+        }
+        let event = Value::Object(object);
+        encoded_bytes = encoded_bytes.saturating_add(serde_json::to_vec(&event)?.len() + 1);
+        if encoded_bytes > MAX_INGEST_BYTES {
+            bail!("Pipeline 转换 SQL 输出不得超过 32 MiB");
+        }
+        output.push(event);
+    }
+    Ok(output)
+}
+
+fn quoted_identifier(value: &str) -> String {
+    format!("\"{}\"", value.replace('"', "\"\""))
+}
+
+fn json_to_sql_value(value: &Value) -> rusqlite::types::Value {
+    match value {
+        Value::Null => rusqlite::types::Value::Null,
+        Value::Bool(value) => rusqlite::types::Value::Integer(i64::from(*value)),
+        Value::Number(value) => value
+            .as_i64()
+            .map(rusqlite::types::Value::Integer)
+            .or_else(|| value.as_f64().map(rusqlite::types::Value::Real))
+            .unwrap_or_else(|| rusqlite::types::Value::Text(value.to_string())),
+        Value::String(value) => rusqlite::types::Value::Text(value.clone()),
+        Value::Array(_) | Value::Object(_) => {
+            rusqlite::types::Value::Text(serde_json::to_string(value).unwrap_or_default())
+        }
+    }
+}
+
+fn sql_to_json(value: rusqlite::types::ValueRef<'_>) -> Result<Value> {
+    Ok(match value {
+        rusqlite::types::ValueRef::Null => Value::Null,
+        rusqlite::types::ValueRef::Integer(value) => json!(value),
+        rusqlite::types::ValueRef::Real(value) => json!(value),
+        rusqlite::types::ValueRef::Text(value) => {
+            Value::String(std::str::from_utf8(value)?.to_string())
+        }
+        rusqlite::types::ValueRef::Blob(value) => {
+            Value::String(base64::engine::general_purpose::STANDARD.encode(value))
+        }
+    })
+}
+
 pub async fn ingest(node: &Node, pipeline: &str, events: Vec<Value>) -> Result<usize> {
     let (_, spec) = pipeline_record(node, pipeline).context("Pipeline 不存在")?;
     if spec.suspended {
@@ -333,10 +533,6 @@ pub async fn ingest(node: &Node, pipeline: &str, events: Vec<Value>) -> Result<u
         .map(jsonschema::validator_for)
         .transpose()
         .map_err(|error| anyhow::anyhow!("Pipeline JSON Schema 无效：{error}"))?;
-    let received_at_ms = now_ms();
-    let ingest_id = new_id();
-    let mut encoded = Vec::with_capacity(events.len());
-    let mut total = 0usize;
     for (index, event) in events.iter().enumerate() {
         if let Some(validator) = &validator {
             if let Err(error) = validator.validate(event) {
@@ -346,6 +542,16 @@ pub async fn ingest(node: &Node, pipeline: &str, events: Vec<Value>) -> Result<u
                 );
             }
         }
+    }
+    let events = transform_events(events, spec.transform_sql.as_deref())?;
+    if events.is_empty() {
+        return Ok(0);
+    }
+    let received_at_ms = now_ms();
+    let ingest_id = new_id();
+    let mut encoded = Vec::with_capacity(events.len());
+    let mut total = 0usize;
+    for (index, event) in events.iter().enumerate() {
         let payload = serde_json::to_string(event)?;
         total = total.saturating_add(payload.len()).saturating_add(1);
         if total > MAX_INGEST_BYTES {
@@ -889,6 +1095,7 @@ mod tests {
             batch_max_bytes: DEFAULT_BATCH_BYTES,
             batch_max_seconds: DEFAULT_BATCH_SECONDS,
             schema: None,
+            transform_sql: None,
             suspended: false,
             suspend_reason: String::new(),
             hostnames: Vec::new(),
@@ -938,5 +1145,40 @@ mod tests {
         spec.validate().unwrap();
         spec.output_key_template = "missing-id.jsonl.gz".into();
         assert!(spec.validate().is_err());
+    }
+
+    #[test]
+    fn sql_transform_filters_projects_and_computes() {
+        let transformed = transform_events(
+            vec![
+                json!({"kind": "view", "amount": 5, "meta": {"region": "us"}}),
+                json!({"kind": "purchase", "amount": 20, "meta": {"region": "eu"}}),
+            ],
+            Some(
+                "INSERT INTO archive SELECT UPPER(kind) AS event_type, amount * 1.1 AS gross, json_extract(meta, '$.region') AS region FROM events WHERE amount >= 10",
+            ),
+        )
+        .unwrap();
+        assert_eq!(transformed.len(), 1);
+        assert_eq!(transformed[0]["event_type"], "PURCHASE");
+        assert_eq!(transformed[0]["gross"], 22.0);
+        assert_eq!(transformed[0]["region"], "eu");
+    }
+
+    #[test]
+    fn sql_transform_is_read_only_bounded_and_supports_raw_json() {
+        let raw = transform_events(
+            vec![json!({"odd\"field": 7})],
+            Some("SELECT \"odd\"\"field\" AS value FROM events"),
+        )
+        .unwrap();
+        assert_eq!(raw, [json!({"value": 7})]);
+        assert!(transform_events(vec![json!({"x": 1})], Some("DELETE FROM events")).is_err());
+        assert!(transform_events(
+            vec![json!({"x": 1})],
+            Some("SELECT x FROM events; DELETE FROM events")
+        )
+        .is_err());
+        assert!(normalize_transform_sql(&"x".repeat(MAX_TRANSFORM_SQL_BYTES + 1)).is_err());
     }
 }

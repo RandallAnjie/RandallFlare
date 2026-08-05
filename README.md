@@ -117,11 +117,14 @@ Working today, verified by multi-process fault-injection e2e tests:
   workerd.
 - **Durable Pipelines**: authenticated JSON, JSON-array, NDJSON and plain-text
   ingest is JSON-Schema validated and committed to a per-Pipeline D1 quorum
-  before delivery. Quorum leases produce deterministic, retry-safe gzip JSONL
-  batches in R2, including buckets backed by rclone. Only bearer-token hashes
-  are signed; plaintext is shown once. Public/custom ingest domains, automatic
-  TLS discovery, Worker `env.ARCHIVE.send()`, status/batch audit, CLI and the
-  Chinese console are covered by real-workerd and public-ingress tests.
+  before delivery. Optional bounded, read-only SQL filters, projects and
+  computes over the per-request `events` table using either `SELECT` or
+  `INSERT INTO <sink> SELECT` syntax. Quorum leases produce deterministic,
+  retry-safe gzip JSONL batches in R2, including buckets backed by rclone. Only
+  bearer-token hashes are signed; plaintext is shown once. Public/custom ingest
+  domains, automatic TLS discovery, Worker `env.ARCHIVE.send()`, SQL transforms,
+  status/batch audit, CLI and the Chinese console are covered by real-workerd
+  and public-ingress tests. See [the Pipeline guide](./docs/PIPELINES.md).
 - **Durable Workflows**: operator-signed definitions use an independent D1
   micro-quorum for idempotent instances, replay logs, external signals and an
   append-only audit trail. Export a `WorkflowEntrypoint` from the same Worker;
