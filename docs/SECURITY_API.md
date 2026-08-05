@@ -117,10 +117,11 @@ aws --endpoint-url "${RF_S3_ENDPOINT}" \
 ```
 
 The endpoint implements AWS Signature Version 4 header authentication,
-bucket/object listing, HEAD, conditional and ranged GET, PUT, DELETE, and
-multipart initiate/upload/list-parts/list-uploads/complete/abort. It verifies the declared payload
-SHA-256 before committing data. Presigned URLs and CopyObject are not currently
-part of the compatibility surface.
+bucket/object listing, HEAD, conditional and ranged GET, streamed PUT, DELETE,
+and multipart initiate/upload/list-parts/list-uploads/complete/abort. It verifies
+the declared payload SHA-256 before committing data and follows R2 multipart
+part-size and MD5/composite-ETag semantics. Presigned URLs and CopyObject are not
+currently part of the compatibility surface.
 
 An R2 bucket may use local content-addressed storage or a configured rclone
 remote. The S3 protocol is identical in both cases; provider credentials remain

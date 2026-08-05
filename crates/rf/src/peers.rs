@@ -365,6 +365,107 @@ impl PeerClient {
         self.decode_response("POST", path, &nonce, resp).await
     }
 
+    /// Send a large authenticated request without buffering either plaintext
+    /// or ciphertext. Each source chunk must fit one transport frame; object
+    /// store streams deliberately emit at most one MiB per chunk.
+    pub async fn post_stream(
+        &self,
+        base: &str,
+        path: &str,
+        source: crate::objectstore::ObjectByteStream,
+    ) -> Result<Vec<u8>> {
+        let target = self.target_id(base).await?;
+        let ts_ms = crate::node::now_ms();
+        let ts = ts_ms.to_string();
+        let request_nonce = transport::random_nonce_hex();
+        let mac = auth::mac_hex(&self.secret, ts_ms, "POST", path, b"");
+        let secret = self.secret;
+        let stream_nonce = request_nonce.clone();
+        let stream_ts = ts.clone();
+        let stream_path = path.to_string();
+        let stream_target = target.clone();
+        let encrypted = futures_util::stream::try_unfold(
+            (source, 0u64, false),
+            move |(mut source, sequence, finished)| {
+                let request_nonce = stream_nonce.clone();
+                let ts = stream_ts.clone();
+                let path = stream_path.clone();
+                let target = stream_target.clone();
+                async move {
+                    if finished {
+                        return Ok(None);
+                    }
+                    loop {
+                        match source.next().await {
+                            Some(Ok(chunk)) if chunk.is_empty() => continue,
+                            Some(Ok(chunk)) => {
+                                if chunk.len() > transport::STREAM_PLAINTEXT_CHUNK {
+                                    return Err(std::io::Error::new(
+                                        std::io::ErrorKind::InvalidInput,
+                                        "peer request stream source chunk exceeds 1 MiB",
+                                    ));
+                                }
+                                let frame = transport::seal_request_stream_frame(
+                                    &secret,
+                                    &request_nonce,
+                                    &ts,
+                                    "POST",
+                                    &path,
+                                    &target,
+                                    sequence,
+                                    &chunk,
+                                )
+                                .map_err(|error| std::io::Error::other(error.to_string()))?;
+                                let next = sequence.checked_add(1).ok_or_else(|| {
+                                    std::io::Error::other(
+                                        "encrypted peer request stream sequence exhausted",
+                                    )
+                                })?;
+                                return Ok(Some((
+                                    axum::body::Bytes::from(frame),
+                                    (source, next, false),
+                                )));
+                            }
+                            Some(Err(error)) => return Err(error),
+                            None => {
+                                let frame = transport::seal_request_stream_frame(
+                                    &secret,
+                                    &request_nonce,
+                                    &ts,
+                                    "POST",
+                                    &path,
+                                    &target,
+                                    sequence,
+                                    b"",
+                                )
+                                .map_err(|error| std::io::Error::other(error.to_string()))?;
+                                return Ok(Some((
+                                    axum::body::Bytes::from(frame),
+                                    (source, sequence, true),
+                                )));
+                            }
+                        }
+                    }
+                }
+            },
+        );
+        let response = self
+            .streaming_http
+            .post(format!("http://{base}{path}"))
+            .header(auth::TS_HEADER, &ts)
+            .header(auth::MAC_HEADER, mac)
+            .header(transport::ENC_HEADER, transport::VERSION)
+            .header(transport::STREAM_HEADER, transport::STREAM_VERSION)
+            .header(transport::NONCE_HEADER, &request_nonce)
+            .header(transport::TARGET_HEADER, target)
+            .body(reqwest::Body::wrap_stream(encrypted))
+            .send()
+            .await
+            .with_context(|| format!("POST stream {base}{path}"))?;
+        self.decode_response("POST", path, &request_nonce, response)
+            .await
+    }
+
     /// Establish an authenticated, encrypted-upgrade tunnel to another node.
     /// The initial metadata uses the normal peer envelope. After the 101,
     /// callers exchange independently authenticated tunnel frames.
@@ -969,6 +1070,24 @@ impl PeerClient {
         Ok(serde_json::from_slice(&raw)?)
     }
 
+    pub async fn r2_put_stream(
+        &self,
+        base: &str,
+        bucket: &str,
+        key: &str,
+        staged: &crate::objectstore::StagedObjectFile,
+        options: &crate::r2::PutOptions,
+    ) -> Result<crate::r2::ObjectMeta> {
+        let path = format!("/v1/r2/{}/object/{}", component(bucket), component(key));
+        let prefix = crate::r2::encode_put_options_prefix(options)?;
+        let leading = futures_util::stream::iter(vec![Ok::<_, std::io::Error>(
+            axum::body::Bytes::from(prefix),
+        )]);
+        let source = Box::pin(leading.chain(staged.stream().await?));
+        let raw = self.post_stream(base, &path, source).await?;
+        Ok(serde_json::from_slice(&raw)?)
+    }
+
     pub async fn r2_delete(&self, base: &str, bucket: &str, key: &str) -> Result<bool> {
         let path = format!("/v1/r2/{}/object/{}", component(bucket), component(key));
         match self.delete(base, &path).await {
@@ -998,6 +1117,28 @@ impl PeerClient {
         Ok(serde_json::from_slice(&raw)?)
     }
 
+    pub async fn r2_upload_part_stream(
+        &self,
+        base: &str,
+        bucket: &str,
+        key: &str,
+        upload_id: &str,
+        part_number: u32,
+        staged: &crate::objectstore::StagedObjectFile,
+    ) -> Result<crate::r2::UploadedPart> {
+        let path = format!(
+            "/v1/r2/{}/multipart/{}/part/{}/{}",
+            component(bucket),
+            component(upload_id),
+            part_number,
+            component(key)
+        );
+        let raw = self
+            .post_stream(base, &path, staged.stream().await?)
+            .await?;
+        Ok(serde_json::from_slice(&raw)?)
+    }
+
     pub async fn r2_complete_multipart(
         &self,
         base: &str,
@@ -1021,6 +1162,24 @@ impl PeerClient {
         hex::decode(String::from_utf8(raw)?.trim())?
             .try_into()
             .map_err(|_| anyhow::anyhow!("peer returned an invalid R2 blob digest"))
+    }
+
+    pub async fn r2_put_blob_stream(
+        &self,
+        base: &str,
+        staged: &crate::objectstore::StagedObjectFile,
+    ) -> Result<[u8; 32]> {
+        let path = format!(
+            "/v1/r2-blob-stream/{}/{}",
+            hex::encode(staged.sha256()),
+            staged.size()
+        );
+        let raw = self
+            .post_stream(base, &path, staged.stream().await?)
+            .await?;
+        hex::decode(String::from_utf8(raw)?.trim())?
+            .try_into()
+            .map_err(|_| anyhow::anyhow!("peer returned an invalid streamed R2 blob digest"))
     }
 
     pub async fn binary_put_blob(

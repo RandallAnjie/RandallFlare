@@ -23,6 +23,8 @@ use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 
 const MAX_PEER_PAYLOAD: usize = crate::binary::MAX_BINARY_BYTES + 1024 * 1024;
+const MAX_PEER_STREAM_BUFFER: usize = (crate::transport::MAX_STREAM_FRAME + 4) * 8;
+const PEER_STREAM_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 
 #[derive(Clone)]
 pub struct Api {
@@ -184,6 +186,7 @@ pub fn router(api: Api) -> Router {
         )
         .route("/v1/r2-blob/{sha}", get(r2_blob_get))
         .route("/v1/r2-blob", post(r2_blob_put))
+        .route("/v1/r2-blob-stream/{sha}/{size}", post(r2_blob_stream_put))
         .route("/v1/binary-blob", post(binary_blob_put))
         .route("/v1/r2/{bucket}/meta/{*key}", get(r2_head))
         .route("/v1/r2/{bucket}/stream/{sha}/{*key}", get(r2_stream))
@@ -272,51 +275,191 @@ async fn encrypted_transport(
     }
     let method = request.method().to_string();
     let path = request_target(request.uri()).to_string();
-    let (parts, body) = request.into_parts();
-    let ciphertext = match to_bytes(body, MAX_PEER_PAYLOAD + 16).await {
-        Ok(v) => v,
-        Err(_) => return (StatusCode::PAYLOAD_TOO_LARGE, "peer payload too large").into_response(),
-    };
-    let plaintext = match transport::open(
-        &api.secret,
-        &nonce,
-        &transport::request_aad(&ts, &method, &path, &target),
-        &ciphertext,
-    ) {
-        Ok(v) => v,
-        Err(_) => return (StatusCode::UNAUTHORIZED, "bad encrypted peer payload").into_response(),
-    };
-
-    // Reject exact ciphertext replays inside the otherwise-valid HMAC
-    // clock window. The bounded cache is process-local by design: a
-    // replay sent to another node still has to represent an operation
-    // that the cluster protocols make idempotent.
-    let now = now_ms();
-    let replayed = {
-        let mut seen = api.seen_nonces.lock().unwrap();
-        seen.retain(|_, at| now.saturating_sub(*at) <= auth::MAX_SKEW_MS);
-        if seen.contains_key(&nonce) {
-            true
-        } else {
-            if seen.len() >= 8192 {
-                if let Some(oldest) = seen
-                    .iter()
-                    .min_by_key(|(_, at)| *at)
-                    .map(|(n, _)| n.clone())
-                {
-                    seen.remove(&oldest);
-                }
-            }
-            seen.insert(nonce.clone(), now);
-            false
+    let request_stream = request
+        .headers()
+        .get(transport::STREAM_HEADER)
+        .and_then(|value| value.to_str().ok())
+        == Some(transport::STREAM_VERSION);
+    let (mut parts, body) = request.into_parts();
+    // This marker is trusted only when inserted below. A client-supplied copy
+    // must never turn a normal request into an empty-body MAC check.
+    parts.headers.remove(transport::DECRYPTED_STREAM_HEADER);
+    let response = if request_stream {
+        let mac = parts
+            .headers
+            .get(auth::MAC_HEADER)
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or("");
+        if !transport::valid_nonce_hex(&nonce)
+            || !auth::verify(&api.secret, now_ms(), &ts, mac, &method, &path, b"")
+        {
+            return (
+                StatusCode::UNAUTHORIZED,
+                "bad encrypted peer request stream",
+            )
+                .into_response();
         }
-    };
-
-    let response = if replayed {
-        (StatusCode::CONFLICT, "replayed encrypted peer request").into_response()
+        if remember_nonce(&api, &nonce) {
+            (StatusCode::CONFLICT, "replayed encrypted peer request").into_response()
+        } else {
+            parts.headers.remove(axum::http::header::CONTENT_LENGTH);
+            parts.headers.remove(transport::STREAM_HEADER);
+            parts.headers.insert(
+                transport::DECRYPTED_STREAM_HEADER,
+                axum::http::HeaderValue::from_static(transport::STREAM_VERSION),
+            );
+            let source = Box::pin(body.into_data_stream());
+            let secret = api.secret;
+            let request_nonce = nonce.clone();
+            let request_ts = ts.clone();
+            let request_method = method.clone();
+            let request_path = path.clone();
+            let request_target = target.clone();
+            let decoded = futures_util::stream::try_unfold(
+                (source, Vec::new(), 0u64, false),
+                move |(mut source, mut buffered, sequence, finished)| {
+                    let request_nonce = request_nonce.clone();
+                    let ts = request_ts.clone();
+                    let method = request_method.clone();
+                    let path = request_path.clone();
+                    let target = request_target.clone();
+                    async move {
+                        if finished {
+                            return Ok(None);
+                        }
+                        loop {
+                            if buffered.len() >= 4 {
+                                let frame_len = u32::from_be_bytes(
+                                    buffered[..4].try_into().expect("four-byte frame prefix"),
+                                ) as usize;
+                                if !(8 + 24 + 16..=transport::MAX_STREAM_FRAME).contains(&frame_len)
+                                {
+                                    return Err(std::io::Error::new(
+                                        std::io::ErrorKind::InvalidData,
+                                        "invalid encrypted peer request stream frame length",
+                                    ));
+                                }
+                                if buffered.len() >= 4 + frame_len {
+                                    let frame = buffered[4..4 + frame_len].to_vec();
+                                    buffered.drain(..4 + frame_len);
+                                    let plaintext = transport::open_request_stream_frame(
+                                        &secret,
+                                        &request_nonce,
+                                        &ts,
+                                        &method,
+                                        &path,
+                                        &target,
+                                        sequence,
+                                        &frame,
+                                    )
+                                    .map_err(|error| {
+                                        std::io::Error::new(
+                                            std::io::ErrorKind::InvalidData,
+                                            error.to_string(),
+                                        )
+                                    })?;
+                                    let next = sequence.checked_add(1).ok_or_else(|| {
+                                        std::io::Error::other(
+                                            "encrypted peer request stream sequence exhausted",
+                                        )
+                                    })?;
+                                    if plaintext.is_empty() {
+                                        if !buffered.is_empty() {
+                                            return Err(std::io::Error::new(
+                                                std::io::ErrorKind::InvalidData,
+                                                "encrypted peer request stream contains bytes after EOF",
+                                            ));
+                                        }
+                                        let end = tokio::time::timeout(
+                                            PEER_STREAM_IDLE_TIMEOUT,
+                                            source.next(),
+                                        )
+                                        .await
+                                        .map_err(|_| {
+                                            std::io::Error::new(
+                                                std::io::ErrorKind::TimedOut,
+                                                "encrypted peer request stream did not close after EOF",
+                                            )
+                                        })?;
+                                        return match end {
+                                            None => Ok(None),
+                                            Some(Ok(_)) => Err(std::io::Error::new(
+                                                std::io::ErrorKind::InvalidData,
+                                                "encrypted peer request stream contains a frame after EOF",
+                                            )),
+                                            Some(Err(error)) => {
+                                                Err(std::io::Error::other(error.to_string()))
+                                            }
+                                        };
+                                    }
+                                    return Ok(Some((
+                                        Bytes::from(plaintext),
+                                        (source, buffered, next, false),
+                                    )));
+                                }
+                            }
+                            let next =
+                                tokio::time::timeout(PEER_STREAM_IDLE_TIMEOUT, source.next())
+                                    .await
+                                    .map_err(|_| {
+                                        std::io::Error::new(
+                                            std::io::ErrorKind::TimedOut,
+                                            "encrypted peer request stream idle timeout",
+                                        )
+                                    })?;
+                            match next {
+                                Some(Ok(chunk)) => {
+                                    if buffered.len().saturating_add(chunk.len())
+                                        > MAX_PEER_STREAM_BUFFER
+                                    {
+                                        return Err(std::io::Error::new(
+                                            std::io::ErrorKind::InvalidData,
+                                            "encrypted peer request stream buffer exceeded its bound",
+                                        ));
+                                    }
+                                    buffered.extend_from_slice(&chunk);
+                                }
+                                Some(Err(error)) => {
+                                    return Err(std::io::Error::other(error.to_string()));
+                                }
+                                None => {
+                                    return Err(std::io::Error::new(
+                                        std::io::ErrorKind::UnexpectedEof,
+                                        "encrypted peer request stream ended without authenticated EOF",
+                                    ));
+                                }
+                            }
+                        }
+                    }
+                },
+            );
+            next.run(Request::from_parts(parts, Body::from_stream(decoded)))
+                .await
+        }
     } else {
-        next.run(Request::from_parts(parts, Body::from(plaintext)))
-            .await
+        let ciphertext = match to_bytes(body, MAX_PEER_PAYLOAD + 16).await {
+            Ok(value) => value,
+            Err(_) => {
+                return (StatusCode::PAYLOAD_TOO_LARGE, "peer payload too large").into_response()
+            }
+        };
+        let plaintext = match transport::open(
+            &api.secret,
+            &nonce,
+            &transport::request_aad(&ts, &method, &path, &target),
+            &ciphertext,
+        ) {
+            Ok(value) => value,
+            Err(_) => {
+                return (StatusCode::UNAUTHORIZED, "bad encrypted peer payload").into_response()
+            }
+        };
+        if remember_nonce(&api, &nonce) {
+            (StatusCode::CONFLICT, "replayed encrypted peer request").into_response()
+        } else {
+            next.run(Request::from_parts(parts, Body::from(plaintext)))
+                .await
+        }
     };
     if tunnel_upgrade && response.status() == StatusCode::SWITCHING_PROTOCOLS {
         return response;
@@ -421,6 +564,29 @@ async fn encrypted_transport(
     Response::from_parts(parts, Body::from(ciphertext))
 }
 
+/// Reject exact request-session replays inside the otherwise-valid HMAC clock
+/// window. The cache is intentionally process-local; cluster operations remain
+/// idempotent when a valid request is independently delivered to another node.
+fn remember_nonce(api: &Api, nonce: &str) -> bool {
+    let now = now_ms();
+    let mut seen = api.seen_nonces.lock().unwrap();
+    seen.retain(|_, at| now.saturating_sub(*at) <= auth::MAX_SKEW_MS);
+    if seen.contains_key(nonce) {
+        return true;
+    }
+    if seen.len() >= 8192 {
+        if let Some(oldest) = seen
+            .iter()
+            .min_by_key(|(_, at)| *at)
+            .map(|(nonce, _)| nonce.clone())
+        {
+            seen.remove(&oldest);
+        }
+    }
+    seen.insert(nonce.to_string(), now);
+    false
+}
+
 /// Auth gate. Loopback (workerd bindings, same-host CLI) is trusted;
 /// everything else needs the cluster MAC over (ts, method, path, body).
 fn check(
@@ -442,6 +608,15 @@ fn check(
         .get(auth::MAC_HEADER)
         .and_then(|v| v.to_str().ok())
         .unwrap_or("");
+    let authenticated_body = if headers
+        .get(transport::DECRYPTED_STREAM_HEADER)
+        .and_then(|value| value.to_str().ok())
+        == Some(transport::STREAM_VERSION)
+    {
+        b"".as_slice()
+    } else {
+        body
+    };
     if auth::verify(
         &api.secret,
         now_ms(),
@@ -449,7 +624,7 @@ fn check(
         mac,
         method.as_str(),
         request_target(uri),
-        body,
+        authenticated_body,
     ) {
         Ok(())
     } else {
@@ -2995,6 +3170,57 @@ async fn r2_put(
     request: Request<Body>,
 ) -> Response {
     let (parts, body) = request.into_parts();
+    let streamed = parts
+        .headers
+        .get(transport::DECRYPTED_STREAM_HEADER)
+        .and_then(|value| value.to_str().ok())
+        == Some(transport::STREAM_VERSION);
+    if streamed {
+        if let Err(response) = check(
+            &api,
+            &remote,
+            &parts.headers,
+            &parts.method,
+            &parts.uri,
+            b"",
+        ) {
+            return response.into_response();
+        }
+        let source = body.into_data_stream().map(|result| {
+            result.map_err(|error| std::io::Error::other(format!("peer 上传体读取失败：{error}")))
+        });
+        let (length, source) =
+            match crate::objectstore::split_stream_prefix(Box::pin(source), 4).await {
+                Ok(value) => value,
+                Err(error) => return (StatusCode::BAD_REQUEST, error.to_string()).into_response(),
+            };
+        let options_len = u32::from_be_bytes(length.try_into().expect("four-byte prefix")) as usize;
+        if options_len > 32 * 1024 {
+            return (StatusCode::BAD_REQUEST, "R2 上传选项长度无效").into_response();
+        }
+        let (encoded_options, source) =
+            match crate::objectstore::split_stream_prefix(source, options_len).await {
+                Ok(value) => value,
+                Err(error) => return (StatusCode::BAD_REQUEST, error.to_string()).into_response(),
+            };
+        let options: r2::PutOptions = match serde_json::from_slice(&encoded_options) {
+            Ok(options) => options,
+            Err(error) => return (StatusCode::BAD_REQUEST, error.to_string()).into_response(),
+        };
+        let staged = match api
+            .node
+            .objects
+            .spool_stream(r2::MAX_DIRECT_OBJECT_BYTES as u64, source)
+            .await
+        {
+            Ok(staged) => staged,
+            Err(error) => return r2_error(error),
+        };
+        return match r2::put_object_file(&api.node, &bucket, &key, &staged, options).await {
+            Ok(metadata) => axum::Json(metadata).into_response(),
+            Err(error) => r2_error(error),
+        };
+    }
     let body = match to_bytes(body, MAX_PEER_PAYLOAD).await {
         Ok(body) => body,
         Err(_) => return (StatusCode::PAYLOAD_TOO_LARGE, "R2 对象过大").into_response(),
@@ -3044,6 +3270,40 @@ async fn r2_multipart_part(
     request: Request<Body>,
 ) -> Response {
     let (parts, body) = request.into_parts();
+    let streamed = parts
+        .headers
+        .get(transport::DECRYPTED_STREAM_HEADER)
+        .and_then(|value| value.to_str().ok())
+        == Some(transport::STREAM_VERSION);
+    if streamed {
+        if let Err(response) = check(
+            &api,
+            &remote,
+            &parts.headers,
+            &parts.method,
+            &parts.uri,
+            b"",
+        ) {
+            return response.into_response();
+        }
+        let source = body.into_data_stream().map(|result| {
+            result.map_err(|error| std::io::Error::other(format!("peer 分片读取失败：{error}")))
+        });
+        let staged = match api
+            .node
+            .objects
+            .spool_stream(r2::MAX_MULTIPART_PART_BYTES as u64, Box::pin(source))
+            .await
+        {
+            Ok(staged) => staged,
+            Err(error) => return r2_error(error),
+        };
+        return match r2::upload_part_file(&api.node, &bucket, &key, &upload_id, part, &staged).await
+        {
+            Ok(uploaded) => axum::Json(uploaded).into_response(),
+            Err(error) => r2_error(error),
+        };
+    }
     let body = match to_bytes(body, MAX_PEER_PAYLOAD).await {
         Ok(body) => body,
         Err(_) => return (StatusCode::PAYLOAD_TOO_LARGE, "R2 multipart 分片过大").into_response(),
@@ -3147,6 +3407,61 @@ async fn r2_blob_put(
         .await
     {
         Ok(digest) => hex::encode(digest).into_response(),
+        Err(error) => r2_error(error),
+    }
+}
+
+async fn r2_blob_stream_put(
+    State(api): State<Api>,
+    ConnectInfo(remote): ConnectInfo<SocketAddr>,
+    Path((sha, expected_size)): Path<(String, u64)>,
+    request: Request<Body>,
+) -> Response {
+    let (parts, body) = request.into_parts();
+    if let Err(response) = check(
+        &api,
+        &remote,
+        &parts.headers,
+        &parts.method,
+        &parts.uri,
+        b"",
+    ) {
+        return response.into_response();
+    }
+    if expected_size > r2::MAX_MULTIPART_OBJECT_BYTES {
+        return (StatusCode::PAYLOAD_TOO_LARGE, "R2 对象副本超过平台上限").into_response();
+    }
+    let digest: [u8; 32] = match hex::decode(&sha).ok().and_then(|raw| raw.try_into().ok()) {
+        Some(digest) => digest,
+        None => return (StatusCode::BAD_REQUEST, "R2 对象摘要无效").into_response(),
+    };
+    let stream = body.into_data_stream().map(|result| {
+        result.map_err(|error| std::io::Error::other(format!("peer 上传体读取失败：{error}")))
+    });
+    let staged = match api
+        .node
+        .objects
+        .spool_stream(expected_size, Box::pin(stream))
+        .await
+    {
+        Ok(staged) => staged,
+        Err(error) => return r2_error(error),
+    };
+    if staged.size() != expected_size || staged.sha256() != digest {
+        return (StatusCode::BAD_REQUEST, "R2 对象副本大小或摘要不匹配").into_response();
+    }
+    match api
+        .node
+        .objects
+        .put_file_verified(
+            &crate::objectstore::StorageLocation::Local,
+            &digest,
+            staged.path(),
+        )
+        .await
+    {
+        Ok(size) if size == expected_size => sha.into_response(),
+        Ok(_) => (StatusCode::BAD_REQUEST, "R2 对象副本在提交前发生变化").into_response(),
         Err(error) => r2_error(error),
     }
 }

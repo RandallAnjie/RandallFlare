@@ -9,14 +9,13 @@ use crate::node::Node;
 use crate::r2::{self, ObjectMeta, PublishedPart, PutOptions};
 use anyhow::{bail, Context, Result};
 use axum::body::{Body, Bytes};
-use axum::extract::{ConnectInfo, DefaultBodyLimit, State};
-use axum::http::{HeaderMap, HeaderValue, StatusCode};
+use axum::extract::{ConnectInfo, State};
+use axum::http::{HeaderMap, HeaderValue, Request, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::Router;
 use futures_util::StreamExt;
 use serde_json::{json, Map, Value};
-use sha2::{Digest, Sha256};
 use std::net::SocketAddr;
 use std::sync::Arc;
 
@@ -46,9 +45,6 @@ pub async fn serve(node: Arc<Node>) -> Result<u16> {
 pub fn router(node: Arc<Node>) -> Router {
     Router::new()
         .route("/", get(binding_get).put(binding_put))
-        .layer(DefaultBodyLimit::max(
-            r2::MAX_DIRECT_OBJECT_BYTES + MAX_BINDING_METADATA,
-        ))
         .with_state(node)
 }
 
@@ -80,20 +76,17 @@ fn request_from_header(headers: &HeaderMap) -> Result<Value> {
     Ok(value)
 }
 
-fn request_from_body<'a>(headers: &HeaderMap, body: &'a [u8]) -> Result<(Value, &'a [u8])> {
+fn request_metadata_size(headers: &HeaderMap) -> Result<usize> {
     let size = headers
         .get(METADATA_SIZE_HEADER)
         .and_then(|value| value.to_str().ok())
         .context("R2 binding 缺少元数据长度")?
         .parse::<usize>()
         .context("R2 binding 元数据长度无效")?;
-    if size > MAX_BINDING_METADATA || body.len() < size {
+    if size > MAX_BINDING_METADATA {
         bail!("R2 binding 元数据长度越界");
     }
-    let value: Value =
-        serde_json::from_slice(&body[..size]).context("R2 binding 请求元数据不是 JSON")?;
-    validate_request(&value)?;
-    Ok((value, &body[size..]))
+    Ok(size)
 }
 
 fn validate_request(request: &Value) -> Result<()> {
@@ -224,14 +217,32 @@ async fn binding_get(
 async fn binding_put(
     State(node): State<Arc<Node>>,
     ConnectInfo(remote): ConnectInfo<SocketAddr>,
-    headers: HeaderMap,
-    body: Bytes,
+    request: Request<Body>,
 ) -> Response {
+    let (parts, body) = request.into_parts();
+    let headers = parts.headers;
     let bucket = match bucket(&headers, &remote) {
         Ok(bucket) => bucket,
         Err(error) => return r2_error(StatusCode::BAD_REQUEST, 10001, error),
     };
-    let (request, bytes) = match request_from_body(&headers, &body) {
+    let metadata_size = match request_metadata_size(&headers) {
+        Ok(size) => size,
+        Err(error) => return r2_error(StatusCode::BAD_REQUEST, 10001, error),
+    };
+    let source = body.into_data_stream().map(|result| {
+        result.map_err(|error| std::io::Error::other(format!("R2 binding 上传体读取失败：{error}")))
+    });
+    let (metadata, bytes) =
+        match crate::objectstore::split_stream_prefix(Box::pin(source), metadata_size).await {
+            Ok(value) => value,
+            Err(error) => return r2_error(StatusCode::BAD_REQUEST, 10001, error),
+        };
+    let request: Value = match serde_json::from_slice(&metadata)
+        .context("R2 binding 请求元数据不是 JSON")
+        .and_then(|value| {
+            validate_request(&value)?;
+            Ok(value)
+        }) {
         Ok(request) => request,
         Err(error) => return r2_error(StatusCode::BAD_REQUEST, 10001, error),
     };
@@ -240,15 +251,6 @@ async fn binding_put(
             let Some(key) = request.get("object").and_then(Value::as_str) else {
                 return r2_error_message(StatusCode::BAD_REQUEST, 10001, "R2 put 缺少对象键");
             };
-            if let Some(expected) = request.get("sha256").and_then(Value::as_str) {
-                if !expected.eq_ignore_ascii_case(&hex::encode(Sha256::digest(bytes))) {
-                    return r2_error_message(
-                        StatusCode::BAD_REQUEST,
-                        10037,
-                        "R2 put 的 SHA-256 校验失败",
-                    );
-                }
-            }
             match r2::head_object(&node, &bucket, key).await {
                 Ok(existing) if !condition_matches(request.get("onlyIf"), existing.as_ref()) => {
                     return r2_error_message(
@@ -260,13 +262,34 @@ async fn binding_put(
                 Ok(_) => {}
                 Err(error) => return backend_error(error),
             }
-            let options = put_options(&request);
-            match options {
-                Ok(options) => match r2::put_object(&node, &bucket, key, bytes, options).await {
-                    Ok(metadata) => JsonBody(object_json(&metadata, None)).into_response(),
-                    Err(error) => backend_error(error),
-                },
-                Err(error) => r2_error(StatusCode::BAD_REQUEST, 10001, error),
+            let options = match put_options(&request) {
+                Ok(options) => options,
+                Err(error) => return r2_error(StatusCode::BAD_REQUEST, 10001, error),
+            };
+            let staged = match node
+                .objects
+                .spool_stream(r2::MAX_DIRECT_OBJECT_BYTES as u64, bytes)
+                .await
+            {
+                Ok(staged) => staged,
+                Err(error) => return backend_error(error),
+            };
+            if request
+                .get("sha256")
+                .and_then(Value::as_str)
+                .is_some_and(|expected| {
+                    !expected.eq_ignore_ascii_case(&hex::encode(staged.sha256()))
+                })
+            {
+                return r2_error_message(
+                    StatusCode::BAD_REQUEST,
+                    10037,
+                    "R2 put 的 SHA-256 校验失败",
+                );
+            }
+            match r2::put_object_file(&node, &bucket, key, &staged, options).await {
+                Ok(metadata) => JsonBody(object_json(&metadata, None)).into_response(),
+                Err(error) => backend_error(error),
             }
         }
         "delete" => {
@@ -338,7 +361,15 @@ async fn binding_put(
                     "R2 uploadPart 分片编号无效",
                 );
             };
-            match r2::upload_part(&node, &bucket, key, upload_id, part_number, bytes).await {
+            let staged = match node
+                .objects
+                .spool_stream(r2::MAX_MULTIPART_PART_BYTES as u64, bytes)
+                .await
+            {
+                Ok(staged) => staged,
+                Err(error) => return backend_error(error),
+            };
+            match r2::upload_part_file(&node, &bucket, key, upload_id, part_number, &staged).await {
                 Ok(part) => JsonBody(json!({ "etag": part.etag })).into_response(),
                 Err(error) => backend_error(error),
             }

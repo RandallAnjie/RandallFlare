@@ -133,13 +133,16 @@ async fn upload(
     bytes: &[u8],
     options: PutOptions,
 ) -> Result<()> {
-    if bytes.len() <= r2::MAX_DIRECT_OBJECT_BYTES {
+    if bytes.len() <= r2::MAX_BUFFERED_OBJECT_BYTES {
         r2::put_object(node, bucket, key, bytes, options).await?;
         return Ok(());
     }
     let multipart = r2::create_multipart_upload(node, bucket, key, options).await?;
     let mut parts = Vec::new();
-    for (index, chunk) in bytes.chunks(r2::MAX_MULTIPART_PART_BYTES).enumerate() {
+    for (index, chunk) in bytes
+        .chunks(r2::MAX_BUFFERED_MULTIPART_PART_BYTES)
+        .enumerate()
+    {
         match r2::upload_part(
             node,
             bucket,

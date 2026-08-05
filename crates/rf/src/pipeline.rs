@@ -832,14 +832,14 @@ async fn upload_batch(
     bytes: &[u8],
     options: crate::r2::PutOptions,
 ) -> Result<()> {
-    if bytes.len() <= crate::r2::MAX_DIRECT_OBJECT_BYTES {
+    if bytes.len() <= crate::r2::MAX_BUFFERED_OBJECT_BYTES {
         crate::r2::put_object(node, bucket, key, bytes, options).await?;
         return Ok(());
     }
     let upload = crate::r2::create_multipart_upload(node, bucket, key, options).await?;
     let mut parts = Vec::new();
     for (index, chunk) in bytes
-        .chunks(crate::r2::MAX_MULTIPART_PART_BYTES)
+        .chunks(crate::r2::MAX_BUFFERED_MULTIPART_PART_BYTES)
         .enumerate()
     {
         match crate::r2::upload_part(

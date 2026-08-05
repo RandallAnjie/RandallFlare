@@ -8869,7 +8869,7 @@ async fn r2_object_put(
     body: Bytes,
 ) -> ApiResult<Json<Value>> {
     state.require_mutation()?;
-    if body.len() > crate::r2::MAX_DIRECT_OBJECT_BYTES {
+    if body.len() > crate::r2::MAX_BUFFERED_OBJECT_BYTES {
         return Err(ApiError::bad_request(
             "控制台单次上传最大为 63 MiB；更大的对象请使用分片上传",
         ));

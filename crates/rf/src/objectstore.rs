@@ -8,6 +8,7 @@
 use crate::blob::sha256_hex;
 use crate::config::StorageConfig;
 use anyhow::{bail, Context, Result};
+use md5::Md5;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
@@ -30,6 +31,83 @@ pub struct VerifiedObjectFile {
     size: u64,
 }
 
+pub struct StagedObjectFile {
+    path: PathBuf,
+    size: u64,
+    sha256: [u8; 32],
+    md5: [u8; 16],
+}
+
+impl StagedObjectFile {
+    pub(crate) fn from_verified_parts(
+        path: PathBuf,
+        size: u64,
+        sha256: [u8; 32],
+        md5: [u8; 16],
+    ) -> Self {
+        Self {
+            path,
+            size,
+            sha256,
+            md5,
+        }
+    }
+
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    pub fn size(&self) -> u64 {
+        self.size
+    }
+
+    pub fn sha256(&self) -> [u8; 32] {
+        self.sha256
+    }
+
+    pub fn md5(&self) -> [u8; 16] {
+        self.md5
+    }
+
+    pub async fn stream(&self) -> Result<ObjectByteStream> {
+        stream_file(&self.path, 0, self.size, None).await
+    }
+}
+
+/// Consume exactly `length` plaintext bytes from a stream while preserving any
+/// remainder of the final chunk. This keeps length-prefixed metadata bounded
+/// without forcing the following object body into memory.
+pub async fn split_stream_prefix(
+    mut stream: ObjectByteStream,
+    length: usize,
+) -> Result<(Vec<u8>, ObjectByteStream)> {
+    use futures_util::StreamExt as _;
+
+    let mut prefix = Vec::with_capacity(length);
+    let mut remainder = None;
+    while prefix.len() < length {
+        let chunk = stream
+            .next()
+            .await
+            .context("上传流在元数据结束前提前关闭")??;
+        let needed = length - prefix.len();
+        if chunk.len() <= needed {
+            prefix.extend_from_slice(&chunk);
+        } else {
+            prefix.extend_from_slice(&chunk[..needed]);
+            remainder = Some(chunk.slice(needed..));
+        }
+    }
+    let leading = futures_util::stream::iter(remainder.into_iter().map(Ok::<_, std::io::Error>));
+    Ok((prefix, Box::pin(leading.chain(stream))))
+}
+
+impl Drop for StagedObjectFile {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
 impl VerifiedObjectFile {
     pub fn size(&self) -> u64 {
         self.size
@@ -43,31 +121,8 @@ impl VerifiedObjectFile {
         if offset > self.size || length > self.size.saturating_sub(offset) {
             bail!("对象流范围超出文件边界");
         }
-        let mut file = tokio::fs::File::open(&self.path).await?;
-        file.seek(std::io::SeekFrom::Start(offset)).await?;
-        let stream = futures_util::stream::try_unfold(
-            (file, length, self),
-            |(mut file, remaining, guard)| async move {
-                if remaining == 0 {
-                    return Ok(None);
-                }
-                let capacity = remaining.min(1024 * 1024) as usize;
-                let mut buffer = vec![0u8; capacity];
-                let read = file.read(&mut buffer).await?;
-                if read == 0 {
-                    return Err(std::io::Error::new(
-                        std::io::ErrorKind::UnexpectedEof,
-                        "verified object file was truncated while streaming",
-                    ));
-                }
-                buffer.truncate(read);
-                Ok(Some((
-                    axum::body::Bytes::from(buffer),
-                    (file, remaining - read as u64, guard),
-                )))
-            },
-        );
-        Ok(Box::pin(stream))
+        let path = self.path.clone();
+        stream_file(&path, offset, length, Some(self)).await
     }
 }
 
@@ -464,6 +519,64 @@ impl ObjectStore {
         })
     }
 
+    /// Persist an untrusted bounded stream while calculating its digest. The
+    /// returned guard owns cleanup; callers decide whether the staged bytes
+    /// become a direct object, multipart part or peer replica.
+    pub async fn spool_stream(
+        &self,
+        max_size: u64,
+        mut stream: ObjectByteStream,
+    ) -> Result<StagedObjectFile> {
+        use futures_util::StreamExt as _;
+
+        let spool_dir = self.local_root.join(".upload-spool");
+        tokio::fs::create_dir_all(&spool_dir).await?;
+        let path = spool_dir.join(format!(
+            "{}-{}.tmp",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        let transfer = async {
+            let mut file = tokio::fs::OpenOptions::new()
+                .create_new(true)
+                .write(true)
+                .open(&path)
+                .await?;
+            let mut hasher = Sha256::new();
+            let mut md5 = Md5::new();
+            let mut size = 0u64;
+            while let Some(chunk) = stream.next().await {
+                let chunk = chunk?;
+                size = size
+                    .checked_add(chunk.len() as u64)
+                    .context("上传对象大小溢出")?;
+                if size > max_size {
+                    bail!("上传对象超过当前操作的大小上限");
+                }
+                hasher.update(&chunk);
+                md5.update(&chunk);
+                file.write_all(&chunk).await?;
+            }
+            file.flush().await?;
+            file.sync_data().await?;
+            drop(file);
+            Ok::<_, anyhow::Error>((hasher.finalize().into(), md5.finalize().into(), size))
+        };
+        let (sha256, md5, size): ([u8; 32], [u8; 16], u64) = match transfer.await {
+            Ok(result) => result,
+            Err(error) => {
+                let _ = tokio::fs::remove_file(&path).await;
+                return Err(error);
+            }
+        };
+        Ok(StagedObjectFile {
+            path,
+            size,
+            sha256,
+            md5,
+        })
+    }
+
     pub async fn exists(&self, location: &StorageLocation, sha: &[u8; 32]) -> Result<bool> {
         location.validate()?;
         match location {
@@ -730,6 +843,39 @@ async fn hash_file(path: &Path) -> Result<([u8; 32], u64)> {
     Ok((hasher.finalize().into(), size))
 }
 
+async fn stream_file(
+    path: &Path,
+    offset: u64,
+    length: u64,
+    guard: Option<VerifiedObjectFile>,
+) -> Result<ObjectByteStream> {
+    let mut file = tokio::fs::File::open(path).await?;
+    file.seek(std::io::SeekFrom::Start(offset)).await?;
+    let stream = futures_util::stream::try_unfold(
+        (file, length, guard),
+        |(mut file, remaining, guard)| async move {
+            if remaining == 0 {
+                return Ok(None);
+            }
+            let capacity = remaining.min(1024 * 1024) as usize;
+            let mut buffer = vec![0u8; capacity];
+            let read = file.read(&mut buffer).await?;
+            if read == 0 {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "verified object file was truncated while streaming",
+                ));
+            }
+            buffer.truncate(read);
+            Ok(Some((
+                axum::body::Bytes::from(buffer),
+                (file, remaining - read as u64, guard),
+            )))
+        },
+    );
+    Ok(Box::pin(stream))
+}
+
 impl RcloneRuntime {
     fn command(&self, operation: &str) -> Command {
         let mut command = Command::new(&self.binary);
@@ -972,6 +1118,58 @@ mod tests {
             .is_err());
         assert_eq!(
             std::fs::read_dir(root.join(".read-spool")).unwrap().count(),
+            0
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn upload_streams_spool_hash_bound_and_clean_temporary_files() {
+        let (store, root) = store();
+        let bytes: Vec<u8> = (0..2 * 1024 * 1024 + 73)
+            .map(|index| (index % 239) as u8)
+            .collect();
+        let chunks = bytes
+            .chunks(91_117)
+            .map(|chunk| Ok(axum::body::Bytes::copy_from_slice(chunk)))
+            .collect::<Vec<std::result::Result<_, std::io::Error>>>();
+        let staged = store
+            .spool_stream(
+                bytes.len() as u64,
+                Box::pin(futures_util::stream::iter(chunks)),
+            )
+            .await
+            .unwrap();
+        let expected_sha256: [u8; 32] = Sha256::digest(&bytes).into();
+        let expected_md5: [u8; 16] = Md5::digest(&bytes).into();
+        assert_eq!(staged.size(), bytes.len() as u64);
+        assert_eq!(staged.sha256(), expected_sha256);
+        assert_eq!(staged.md5(), expected_md5);
+        let path = staged.path().to_path_buf();
+        assert!(path.is_file());
+        let received = staged
+            .stream()
+            .await
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap()
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>();
+        assert_eq!(received, bytes);
+        drop(staged);
+        assert!(!path.exists());
+
+        let too_large = vec![Ok(axum::body::Bytes::from_static(b"too large"))];
+        assert!(store
+            .spool_stream(3, Box::pin(futures_util::stream::iter(too_large)))
+            .await
+            .is_err());
+        assert_eq!(
+            std::fs::read_dir(root.join(".upload-spool"))
+                .unwrap()
+                .count(),
             0
         );
         std::fs::remove_dir_all(root).unwrap();

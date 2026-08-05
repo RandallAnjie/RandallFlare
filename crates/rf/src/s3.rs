@@ -7,6 +7,7 @@ use axum::body::{to_bytes, Body};
 use axum::http::{header, HeaderMap, HeaderValue, Method, Request, StatusCode};
 use axum::response::{IntoResponse, Response};
 use base64::Engine as _;
+use futures_util::StreamExt;
 use hmac::{Hmac, Mac};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -19,7 +20,6 @@ use zeroize::{Zeroize, Zeroizing};
 pub const CREDENTIAL_KIND: &str = "r2_s3_credential";
 pub const CREDENTIAL_SCHEMA: u8 = 1;
 const SECRET_PURPOSE: &str = "r2-s3-signature-v4";
-const MAX_S3_BODY: usize = crate::r2::MAX_DIRECT_OBJECT_BYTES;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -921,10 +921,17 @@ async fn object_request(
                 .and_then(|value| value.parse::<u32>().ok())
                 .context("S3 partNumber 无效")?;
             let declared = declared_payload_hash(request.headers());
-            let body = to_bytes(request.into_body(), crate::r2::MAX_MULTIPART_PART_BYTES).await?;
-            verify_payload_hash(&body, declared.as_deref())?;
+            let body = request.into_body().into_data_stream().map(|result| {
+                result.map_err(|error| std::io::Error::other(format!("S3 上传体读取失败：{error}")))
+            });
+            let staged = node
+                .objects
+                .spool_stream(crate::r2::MAX_MULTIPART_PART_BYTES as u64, Box::pin(body))
+                .await?;
+            verify_staged_payload_hash(&staged, declared.as_deref())?;
             let part =
-                crate::r2::upload_part(node, bucket, key, upload_id, part_number, &body).await?;
+                crate::r2::upload_part_file(node, bucket, key, upload_id, part_number, &staged)
+                    .await?;
             let mut response = StatusCode::OK.into_response();
             response.headers_mut().insert(
                 header::ETAG,
@@ -959,9 +966,15 @@ async fn object_request(
         Method::PUT => {
             let options = put_options(request.headers());
             let declared = declared_payload_hash(request.headers());
-            let body = to_bytes(request.into_body(), MAX_S3_BODY).await?;
-            verify_payload_hash(&body, declared.as_deref())?;
-            let object = crate::r2::put_object(node, bucket, key, &body, options).await?;
+            let body = request.into_body().into_data_stream().map(|result| {
+                result.map_err(|error| std::io::Error::other(format!("S3 上传体读取失败：{error}")))
+            });
+            let staged = node
+                .objects
+                .spool_stream(crate::r2::MAX_DIRECT_OBJECT_BYTES as u64, Box::pin(body))
+                .await?;
+            verify_staged_payload_hash(&staged, declared.as_deref())?;
+            let object = crate::r2::put_object_file(node, bucket, key, &staged, options).await?;
             let mut response = StatusCode::OK.into_response();
             response.headers_mut().insert(
                 header::ETAG,
@@ -987,6 +1000,24 @@ fn declared_payload_hash(headers: &HeaderMap) -> Option<String> {
         .get("x-amz-content-sha256")
         .and_then(|value| value.to_str().ok())
         .map(str::to_string)
+}
+
+fn verify_staged_payload_hash(
+    staged: &crate::objectstore::StagedObjectFile,
+    declared: Option<&str>,
+) -> Result<()> {
+    let Some(declared) = declared else {
+        return Ok(());
+    };
+    if declared != "UNSIGNED-PAYLOAD"
+        && !constant_time_eq(
+            hex::encode(staged.sha256()).as_bytes(),
+            declared.to_ascii_lowercase().as_bytes(),
+        )
+    {
+        bail!("S3 x-amz-content-sha256 与正文不一致");
+    }
+    Ok(())
 }
 
 fn put_options(headers: &HeaderMap) -> crate::r2::PutOptions {

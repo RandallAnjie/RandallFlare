@@ -542,7 +542,7 @@ async fn upload_file(
             bail!("输出文件路径越过沙箱边界或不是普通文件");
         }
         let bytes = std::fs::read(path)?;
-        if bytes.len() > crate::r2::MAX_DIRECT_OBJECT_BYTES {
+        if bytes.len() > crate::r2::MAX_BUFFERED_OBJECT_BYTES {
             bail!("Binary R2 输出文件超过 63 MiB，请使用 stdout 分片或 Pipeline");
         }
         let metadata = crate::r2::put_object(

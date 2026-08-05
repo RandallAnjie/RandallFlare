@@ -8,10 +8,12 @@
 
 use crate::d1;
 use crate::node::{now_ms, Node};
-use crate::objectstore::StorageLocation;
+use crate::objectstore::{StagedObjectFile, StorageLocation};
 use crate::peers::PeerClient;
 use crate::resource::{self, ResourceRecord, ResourceView};
 use anyhow::{bail, Context, Result};
+use futures_util::StreamExt;
+use md5::Md5;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
@@ -22,13 +24,17 @@ use tokio::io::AsyncWriteExt;
 pub const BUCKET_KIND: &str = "r2_bucket";
 pub const MAX_OBJECT_KEY_BYTES: usize = 1024;
 pub const MAX_LIST_LIMIT: usize = 1000;
-pub const MAX_DIRECT_OBJECT_BYTES: usize = 63 * 1024 * 1024;
-pub const MAX_MULTIPART_PART_BYTES: usize = 63 * 1024 * 1024;
+/// Cloudflare-compatible external upload limits. Buffered internal producers
+/// keep their smaller bounds below; network-facing paths spool to disk.
+pub const MAX_DIRECT_OBJECT_BYTES: usize = 5 * 1024 * 1024 * 1024;
+pub const MAX_MULTIPART_PART_BYTES: usize = 5 * 1024 * 1024 * 1024;
 pub const MAX_MULTIPART_OBJECT_BYTES: u64 =
-    MAX_MULTIPART_PART_BYTES as u64 * MAX_MULTIPART_PARTS as u64;
-const MAX_LOCAL_MULTIPART_OBJECT_BYTES: u64 = 512 * 1024 * 1024;
+    5 * 1024 * 1024 * 1024 * 1024 - MAX_MULTIPART_PART_BYTES as u64;
+pub const MIN_MULTIPART_PART_BYTES: u64 = 5 * 1024 * 1024;
+pub const MAX_BUFFERED_OBJECT_BYTES: usize = 63 * 1024 * 1024;
+pub const MAX_BUFFERED_MULTIPART_PART_BYTES: usize = 63 * 1024 * 1024;
 pub const MAX_MULTIPART_PARTS: usize = 10_000;
-const MULTIPART_TTL_MS: u64 = 24 * 60 * 60 * 1000;
+const MULTIPART_TTL_MS: u64 = 7 * 24 * 60 * 60 * 1000;
 const ORPHAN_GRACE_MS: u64 = 24 * 60 * 60 * 1000;
 const MAX_PUT_OPTIONS_BYTES: usize = 32 * 1024;
 
@@ -338,10 +344,33 @@ pub async fn put_object(
 ) -> Result<ObjectMeta> {
     validate_key(key)?;
     validate_metadata(&options)?;
-    if bytes.len() > MAX_DIRECT_OBJECT_BYTES {
-        bail!("R2 单次直传对象不得超过 63 MiB；更大的对象请使用分片上传");
+    if bytes.len() > MAX_BUFFERED_OBJECT_BYTES {
+        bail!("R2 内存直传对象不得超过 63 MiB；大对象必须使用流式入口");
     }
     commit_object(node, bucket, key, bytes, options).await
+}
+
+pub async fn put_object_file(
+    node: &Node,
+    bucket: &str,
+    key: &str,
+    staged: &StagedObjectFile,
+    options: PutOptions,
+) -> Result<ObjectMeta> {
+    validate_key(key)?;
+    validate_metadata(&options)?;
+    if staged.size() > MAX_DIRECT_OBJECT_BYTES as u64 {
+        bail!("R2 单次直传对象不得超过 5 GiB；更大的对象请使用分片上传");
+    }
+    commit_object_file(
+        node,
+        bucket,
+        key,
+        staged,
+        hex::encode(staged.md5()),
+        options,
+    )
+    .await
 }
 
 async fn commit_object(
@@ -373,6 +402,7 @@ async fn commit_object(
         key,
         sha,
         bytes.len() as u64,
+        hex::encode(Md5::digest(bytes)),
         storage,
         options,
         &spec,
@@ -388,6 +418,7 @@ async fn index_committed_object(
     key: &str,
     sha: [u8; 32],
     size: u64,
+    etag: String,
     storage: StorageLocation,
     options: PutOptions,
     spec: &BucketSpec,
@@ -396,7 +427,6 @@ async fn index_committed_object(
     let max_bytes = spec.max_bytes.unwrap_or(0);
     let max_objects = spec.max_objects.unwrap_or(0);
     let sha256 = hex::encode(sha);
-    let etag = sha256.clone();
     let uploaded_at_ms = now_ms();
     let result = exec(
         node,
@@ -459,39 +489,33 @@ async fn commit_object_file(
     node: &Node,
     bucket: &str,
     key: &str,
-    source: &std::path::Path,
-    size: u64,
-    sha: [u8; 32],
+    staged: &StagedObjectFile,
+    etag: String,
     options: PutOptions,
 ) -> Result<ObjectMeta> {
+    let size = staged.size();
+    let sha = staged.sha256();
     let (_, spec) = bucket_record(node, bucket).context("R2 bucket 不存在")?;
     let storage = resolve_write_storage(node, &spec, &sha)?;
-    if storage == StorageLocation::Local {
-        if size <= MAX_DIRECT_OBJECT_BYTES as u64 {
-            let bytes = tokio::fs::read(source).await?;
-            return commit_object(node, bucket, key, &bytes, options).await;
-        }
-        let group = ensure_schema(node, bucket).await?;
-        if group.len() != 1 || group[0] != node.id() {
-            bail!("本地多数派 R2 大对象需要流式副本传输；当前请改用 rclone 存储策略");
-        }
-    }
     if !node.objects.supports(&storage) {
-        bail!("当前节点没有完成此 R2 大对象所需的 rclone 能力");
+        return forward_put_file_to_storage_peer(node, bucket, key, staged, options).await;
     }
-    ensure_schema(node, bucket).await?;
+    let group = ensure_schema(node, bucket).await?;
     let _quota_guard = node.r2_quota_gate.lock().await;
     let previous = head_object(node, bucket, key).await?;
     crate::quota::validate_r2_write(node, bucket, previous.as_ref(), size).await?;
     let stored_size = node
         .objects
-        .put_file_verified(&storage, &sha, source)
+        .put_file_verified(&storage, &sha, staged.path())
         .await?;
     if stored_size != size {
         bail!("R2 流式对象大小在发布前发生变化");
     }
+    if storage == StorageLocation::Local {
+        replicate_local_blob_file(node, &group, staged).await?;
+    }
     index_committed_object(
-        node, bucket, key, sha, size, storage, options, &spec, previous,
+        node, bucket, key, sha, size, etag, storage, options, &spec, previous,
     )
     .await
 }
@@ -546,8 +570,8 @@ pub async fn upload_part(
     if !(1..=MAX_MULTIPART_PARTS as u32).contains(&part_number) {
         bail!("R2 分片编号必须介于 1 和 10000 之间");
     }
-    if bytes.len() > MAX_MULTIPART_PART_BYTES {
-        bail!("R2 单个分片不得超过 63 MiB");
+    if bytes.len() > MAX_BUFFERED_MULTIPART_PART_BYTES {
+        bail!("R2 内存上传分片不得超过 63 MiB；大分片必须使用流式入口");
     }
     ensure_schema(node, bucket).await?;
     let upload = multipart_row(node, bucket, key, upload_id).await?;
@@ -568,7 +592,88 @@ pub async fn upload_part(
         .await;
     }
     node.objects.put_verified(&storage, &sha, bytes).await?;
-    let etag = hex::encode(sha);
+    index_uploaded_part(
+        node,
+        bucket,
+        key,
+        upload_id,
+        part_number,
+        sha,
+        hex::encode(Md5::digest(bytes)),
+        bytes.len() as u64,
+        storage,
+    )
+    .await
+}
+
+pub async fn upload_part_file(
+    node: &Node,
+    bucket: &str,
+    key: &str,
+    upload_id: &str,
+    part_number: u32,
+    staged: &StagedObjectFile,
+) -> Result<UploadedPart> {
+    validate_key(key)?;
+    validate_upload_id(upload_id)?;
+    if !(1..=MAX_MULTIPART_PARTS as u32).contains(&part_number) {
+        bail!("R2 分片编号必须介于 1 和 10000 之间");
+    }
+    if staged.size() > MAX_MULTIPART_PART_BYTES as u64 {
+        bail!("R2 单个分片不得超过 5 GiB");
+    }
+    ensure_schema(node, bucket).await?;
+    let upload = multipart_row(node, bucket, key, upload_id).await?;
+    if upload.expires_at_ms <= now_ms() {
+        bail!("R2 分片上传已过期");
+    }
+    let sha = staged.sha256();
+    let storage = resolve_multipart_storage(node, &upload, &sha)?;
+    if !node.objects.supports(&storage) {
+        return forward_upload_part_file_to_storage_peer(
+            node,
+            bucket,
+            key,
+            upload_id,
+            part_number,
+            staged,
+        )
+        .await;
+    }
+    let stored_size = node
+        .objects
+        .put_file_verified(&storage, &sha, staged.path())
+        .await?;
+    if stored_size != staged.size() {
+        bail!("R2 流式分片大小在发布前发生变化");
+    }
+    index_uploaded_part(
+        node,
+        bucket,
+        key,
+        upload_id,
+        part_number,
+        sha,
+        hex::encode(staged.md5()),
+        staged.size(),
+        storage,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn index_uploaded_part(
+    node: &Node,
+    bucket: &str,
+    key: &str,
+    upload_id: &str,
+    part_number: u32,
+    sha: [u8; 32],
+    etag: String,
+    size: u64,
+    storage: StorageLocation,
+) -> Result<UploadedPart> {
+    let sha256 = hex::encode(sha);
     let result = exec(
         node,
         bucket,
@@ -576,8 +681,8 @@ pub async fn upload_part(
         json!([
             upload_id,
             part_number,
-            etag,
-            bytes.len(),
+            sha256,
+            size,
             etag,
             serde_json::to_string(&storage)?,
             now_ms(),
@@ -591,7 +696,7 @@ pub async fn upload_part(
     Ok(UploadedPart {
         part_number,
         etag,
-        size: bytes.len() as u64,
+        size,
     })
 }
 
@@ -620,11 +725,7 @@ pub async fn complete_multipart_upload(
         std::process::id(),
         rand::random::<u64>()
     ));
-    let max_object_bytes = if multipart_requires_rclone(&upload) {
-        MAX_MULTIPART_OBJECT_BYTES
-    } else {
-        MAX_LOCAL_MULTIPART_OBJECT_BYTES
-    };
+    let max_object_bytes = MAX_MULTIPART_OBJECT_BYTES;
     let assembled = async {
         let mut file = tokio::fs::OpenOptions::new()
             .create_new(true)
@@ -632,9 +733,12 @@ pub async fn complete_multipart_upload(
             .open(&assembly_path)
             .await?;
         let mut hasher = Sha256::new();
+        let mut object_md5 = Md5::new();
+        let mut multipart_etag = Md5::new();
         let mut assembled_size = 0u64;
         let mut consumed_parts = Vec::new();
-        for published in parts {
+        let mut regular_part_size = None;
+        for (part_index, published) in parts.iter().enumerate() {
             let result = exec(
                 node,
                 bucket,
@@ -665,6 +769,24 @@ pub async fn complete_multipart_upload(
                 .get("size")
                 .and_then(Value::as_u64)
                 .context("R2 分片缺少大小")?;
+            let is_last = part_index + 1 == parts.len();
+            if !is_last {
+                if declared_size < MIN_MULTIPART_PART_BYTES {
+                    bail!(
+                        "R2 除最后一个分片外，每个分片至少为 5 MiB（分片 {}）",
+                        published.part_number
+                    );
+                }
+                match regular_part_size {
+                    Some(expected) if expected != declared_size => {
+                        bail!("R2 除最后一个分片外，所有分片大小必须一致");
+                    }
+                    None => regular_part_size = Some(declared_size),
+                    _ => {}
+                }
+            } else if regular_part_size.is_some_and(|expected| declared_size > expected) {
+                bail!("R2 最后一个分片不得大于前面的分片");
+            }
             assembled_size = assembled_size
                 .checked_add(declared_size)
                 .context("R2 分片合并大小溢出")?;
@@ -679,25 +801,51 @@ pub async fn complete_multipart_upload(
                     .and_then(Value::as_str)
                     .context("R2 分片缺少存储位置")?,
             )?;
-            let bytes = node.objects.get(&storage, &sha).await?;
-            if bytes.len() as u64 != declared_size {
+            let verified = node.objects.materialize_verified(&storage, &sha).await?;
+            if verified.size() != declared_size {
                 bail!("R2 分片 {} 的大小校验失败", published.part_number);
             }
-            hasher.update(&bytes);
-            file.write_all(&bytes).await?;
+            let mut stream = verified.stream(0, declared_size).await?;
+            let mut streamed_size = 0u64;
+            let mut part_md5 = Md5::new();
+            while let Some(chunk) = stream.next().await {
+                let chunk = chunk?;
+                streamed_size = streamed_size
+                    .checked_add(chunk.len() as u64)
+                    .context("R2 分片流大小溢出")?;
+                hasher.update(&chunk);
+                object_md5.update(&chunk);
+                part_md5.update(&chunk);
+                file.write_all(&chunk).await?;
+            }
+            if streamed_size != declared_size {
+                bail!("R2 分片 {} 在合并期间被截断", published.part_number);
+            }
+            let part_md5: [u8; 16] = part_md5.finalize().into();
+            if etag.len() == 32 && !constant_time_string_eq(etag, &hex::encode(part_md5)) {
+                bail!("R2 分片 {} 的 MD5 ETag 校验失败", published.part_number);
+            }
+            multipart_etag.update(part_md5);
             consumed_parts.push((hex::encode(sha), declared_size, storage));
         }
         file.flush().await?;
         file.sync_data().await?;
         drop(file);
         let sha: [u8; 32] = hasher.finalize().into();
+        let md5: [u8; 16] = object_md5.finalize().into();
+        let completed_etag = format!("{}-{}", hex::encode(multipart_etag.finalize()), parts.len());
+        let staged = StagedObjectFile::from_verified_parts(
+            assembly_path.clone(),
+            assembled_size,
+            sha,
+            md5,
+        );
         let metadata = commit_object_file(
             node,
             bucket,
             key,
-            &assembly_path,
-            assembled_size,
-            sha,
+            &staged,
+            completed_etag,
             upload.options.clone(),
         )
         .await?;
@@ -1098,6 +1246,36 @@ async fn forward_put_to_storage_peer(
     )
 }
 
+async fn forward_put_file_to_storage_peer(
+    node: &Node,
+    bucket: &str,
+    key: &str,
+    staged: &StagedObjectFile,
+    options: PutOptions,
+) -> Result<ObjectMeta> {
+    let client = PeerClient::new(node.cfg.cluster_secret_bytes()?);
+    let mut errors = Vec::new();
+    for (id, peer) in node.peers() {
+        if !peer.capabilities.contains("rclone") {
+            continue;
+        }
+        let Some(address) = peer.api_addr else {
+            continue;
+        };
+        match client
+            .r2_put_stream(&address.to_string(), bucket, key, staged, &options)
+            .await
+        {
+            Ok(meta) => return Ok(meta),
+            Err(error) => errors.push(format!("{id}: {error:#}")),
+        }
+    }
+    bail!(
+        "当前节点没有所需 rclone 能力，且无法流式转交 R2 对象{}",
+        storage_peer_errors(&errors)
+    )
+}
+
 async fn forward_upload_part_to_storage_peer(
     node: &Node,
     bucket: &str,
@@ -1132,6 +1310,44 @@ async fn forward_upload_part_to_storage_peer(
     }
     bail!(
         "当前节点没有所需 rclone 能力，且无法转交 R2 multipart 分片{}",
+        storage_peer_errors(&errors)
+    )
+}
+
+async fn forward_upload_part_file_to_storage_peer(
+    node: &Node,
+    bucket: &str,
+    key: &str,
+    upload_id: &str,
+    part_number: u32,
+    staged: &StagedObjectFile,
+) -> Result<UploadedPart> {
+    let client = PeerClient::new(node.cfg.cluster_secret_bytes()?);
+    let mut errors = Vec::new();
+    for (id, peer) in node.peers() {
+        if !peer.capabilities.contains("rclone") {
+            continue;
+        }
+        let Some(address) = peer.api_addr else {
+            continue;
+        };
+        match client
+            .r2_upload_part_stream(
+                &address.to_string(),
+                bucket,
+                key,
+                upload_id,
+                part_number,
+                staged,
+            )
+            .await
+        {
+            Ok(part) => return Ok(part),
+            Err(error) => errors.push(format!("{id}: {error:#}")),
+        }
+    }
+    bail!(
+        "当前节点没有所需 rclone 能力，且无法流式转交 R2 multipart 分片{}",
         storage_peer_errors(&errors)
     )
 }
@@ -1743,18 +1959,23 @@ async fn remove_orphan_candidate(
 /// body. Keeping options in the body (rather than ordinary HTTP headers)
 /// prevents an on-path peer from changing object metadata.
 pub fn encode_put_request(options: &PutOptions, bytes: &[u8]) -> Result<Vec<u8>> {
-    validate_metadata(options)?;
-    if bytes.len() > MAX_DIRECT_OBJECT_BYTES {
-        bail!("R2 单次直传对象不得超过 63 MiB；更大的对象请使用分片上传");
+    if bytes.len() > MAX_BUFFERED_OBJECT_BYTES {
+        bail!("R2 内存直传对象不得超过 63 MiB；大对象必须使用流式入口");
     }
+    let mut payload = encode_put_options_prefix(options)?;
+    payload.extend_from_slice(bytes);
+    Ok(payload)
+}
+
+pub fn encode_put_options_prefix(options: &PutOptions) -> Result<Vec<u8>> {
+    validate_metadata(options)?;
     let encoded = serde_json::to_vec(options)?;
     if encoded.len() > MAX_PUT_OPTIONS_BYTES {
         bail!("R2 上传选项不得超过 32 KiB");
     }
-    let mut payload = Vec::with_capacity(4 + encoded.len() + bytes.len());
+    let mut payload = Vec::with_capacity(4 + encoded.len());
     payload.extend_from_slice(&(encoded.len() as u32).to_be_bytes());
     payload.extend_from_slice(&encoded);
-    payload.extend_from_slice(bytes);
     Ok(payload)
 }
 
@@ -1769,8 +1990,8 @@ pub fn decode_put_request(payload: &[u8]) -> Result<(PutOptions, &[u8])> {
     let options: PutOptions = serde_json::from_slice(&payload[4..4 + options_len])?;
     validate_metadata(&options)?;
     let bytes = &payload[4 + options_len..];
-    if bytes.len() > MAX_DIRECT_OBJECT_BYTES {
-        bail!("R2 单次直传对象不得超过 63 MiB；更大的对象请使用分片上传");
+    if bytes.len() > MAX_BUFFERED_OBJECT_BYTES {
+        bail!("R2 内存直传对象不得超过 63 MiB；大对象必须使用流式入口");
     }
     Ok((options, bytes))
 }
@@ -1977,6 +2198,50 @@ async fn replicate_local_blob(
     Ok(())
 }
 
+async fn replicate_local_blob_file(
+    node: &Node,
+    group: &[rf_core::identity::PublicId],
+    staged: &StagedObjectFile,
+) -> Result<()> {
+    let required = group.len() / 2 + 1;
+    let mut stored = HashSet::new();
+    if group.contains(&node.id()) {
+        stored.insert(node.id());
+    }
+    let peers = node.peers();
+    let client = PeerClient::new(node.cfg.cluster_secret_bytes()?);
+    for member in group {
+        if stored.len() >= required {
+            break;
+        }
+        if member == &node.id() {
+            continue;
+        }
+        let Some(api) = peers
+            .get(&member.to_string())
+            .and_then(|peer| peer.api_addr)
+            .map(|address| address.to_string())
+        else {
+            continue;
+        };
+        match client.r2_put_blob_stream(&api, staged).await {
+            Ok(remote_sha) if remote_sha == staged.sha256() => {
+                stored.insert(*member);
+            }
+            Ok(_) => tracing::warn!("R2 replica {member} returned a different digest"),
+            Err(error) => tracing::warn!("R2 streamed replica write to {member} failed: {error:#}"),
+        }
+    }
+    if stored.len() < required {
+        bail!(
+            "R2 对象只写入 {} 个副本，未达到数据组多数派 {}；未提交元数据",
+            stored.len(),
+            required
+        );
+    }
+    Ok(())
+}
+
 async fn exec(node: &Node, bucket: &str, sql: &str, params: Value) -> Result<Value> {
     exec_database(node, &metadata_database(bucket), sql, params).await
 }
@@ -2142,6 +2407,12 @@ mod tests {
 
     #[test]
     fn object_keys_and_metadata_are_bounded() {
+        assert_eq!(MAX_DIRECT_OBJECT_BYTES as u64, 5 * 1024 * 1024 * 1024);
+        assert_eq!(MAX_MULTIPART_PART_BYTES as u64, 5 * 1024 * 1024 * 1024);
+        assert_eq!(
+            MAX_MULTIPART_OBJECT_BYTES,
+            5 * 1024 * 1024 * 1024 * 1024 - 5 * 1024 * 1024 * 1024
+        );
         assert!(validate_key("").is_err());
         assert!(validate_key("hello/world.json").is_ok());
         assert!(validate_key(&"x".repeat(1025)).is_err());
@@ -2361,6 +2632,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(metadata.size, 8);
+        assert_eq!(metadata.etag, hex::encode(Md5::digest(b"hello R2")));
         let legacy_location = exec_database(
             &node,
             &database,
@@ -2434,12 +2706,24 @@ mod tests {
             .await
             .is_err());
         let large_streamed = vec![0x6du8; 2 * 1024 * 1024 + 257];
+        let upload_chunks = large_streamed
+            .chunks(137_111)
+            .map(|chunk| Ok(axum::body::Bytes::copy_from_slice(chunk)))
+            .collect::<Vec<std::result::Result<_, std::io::Error>>>();
+        let staged = node
+            .objects
+            .spool_stream(
+                large_streamed.len() as u64,
+                Box::pin(futures_util::stream::iter(upload_chunks)),
+            )
+            .await
+            .unwrap();
         let large_metadata = client
-            .r2_put(
+            .r2_put_stream(
                 &base,
                 "e2e-bucket",
                 "encrypted-stream.bin",
-                &large_streamed,
+                &staged,
                 &PutOptions::default(),
             )
             .await
@@ -2487,13 +2771,14 @@ mod tests {
             create_multipart_upload(&node, "e2e-bucket", "large/report.txt", options.clone())
                 .await
                 .unwrap();
+        let first_bytes = vec![b'h'; MIN_MULTIPART_PART_BYTES as usize];
         let first = upload_part(
             &node,
             "e2e-bucket",
             "large/report.txt",
             &upload.upload_id,
             1,
-            b"hello ",
+            &first_bytes,
         )
         .await
         .unwrap();
@@ -2507,6 +2792,12 @@ mod tests {
         )
         .await
         .unwrap();
+        assert_eq!(first.etag, hex::encode(Md5::digest(&first_bytes)));
+        assert_eq!(second.etag, hex::encode(Md5::digest(b"multipart")));
+        let mut completed_etag = Md5::new();
+        completed_etag.update(hex::decode(&first.etag).unwrap());
+        completed_etag.update(hex::decode(&second.etag).unwrap());
+        let expected_completed_etag = format!("{}-2", hex::encode(completed_etag.finalize()));
         let active = client
             .r2_multipart_list(&base, "e2e-bucket", "large/", None, 1)
             .await
@@ -2514,7 +2805,10 @@ mod tests {
         assert_eq!(active.uploads.len(), 1);
         assert_eq!(active.uploads[0].upload_id, upload.upload_id);
         assert_eq!(active.uploads[0].part_count, 2);
-        assert_eq!(active.uploads[0].uploaded_bytes, 15);
+        assert_eq!(
+            active.uploads[0].uploaded_bytes,
+            MIN_MULTIPART_PART_BYTES + 9
+        );
         let inspected = client
             .r2_multipart_detail(&base, "e2e-bucket", &upload.upload_id)
             .await
@@ -2536,31 +2830,35 @@ mod tests {
             &[
                 PublishedPart {
                     part_number: 1,
-                    etag: first.etag,
+                    etag: first.etag.clone(),
                 },
                 PublishedPart {
                     part_number: 2,
-                    etag: second.etag,
+                    etag: second.etag.clone(),
                 },
             ],
         )
         .await
         .unwrap();
-        assert_eq!(completed.size, 15);
+        assert_eq!(completed.size, MIN_MULTIPART_PART_BYTES + 9);
+        assert_eq!(completed.etag, expected_completed_etag);
         assert_eq!(
             std::fs::read_dir(node.objects.local_root().join(".multipart-assembly"))
                 .unwrap()
                 .count(),
             0
         );
+        let completed_bytes = get_object(&node, "e2e-bucket", "large/report.txt")
+            .await
+            .unwrap()
+            .unwrap()
+            .1;
+        assert_eq!(completed_bytes.len(), first_bytes.len() + 9);
         assert_eq!(
-            get_object(&node, "e2e-bucket", "large/report.txt")
-                .await
-                .unwrap()
-                .unwrap()
-                .1,
-            b"hello multipart"
+            &completed_bytes[..first_bytes.len()],
+            first_bytes.as_slice()
         );
+        assert_eq!(&completed_bytes[first_bytes.len()..], b"multipart");
         let r2bind_port = crate::r2bind::serve(node.clone()).await.unwrap();
         let binding_response = reqwest::Client::new()
             .get(format!("http://127.0.0.1:{r2bind_port}/"))
@@ -2571,7 +2869,7 @@ mod tests {
                     "version": 1,
                     "method": "get",
                     "object": "large/report.txt",
-                    "range": { "offset": "6", "length": "9" }
+                    "range": { "offset": first_bytes.len().to_string(), "length": "9" }
                 })
                 .to_string(),
             )
@@ -2590,9 +2888,47 @@ mod tests {
         let binding_body = binding_response.bytes().await.unwrap();
         let binding_metadata: Value =
             serde_json::from_slice(&binding_body[..metadata_size]).unwrap();
-        assert_eq!(binding_metadata["range"]["offset"], 6);
+        assert_eq!(
+            binding_metadata["range"]["offset"],
+            first_bytes.len() as u64
+        );
         assert_eq!(binding_metadata["range"]["length"], 9);
         assert_eq!(&binding_body[metadata_size..], b"multipart");
+        let binding_upload = vec![0x4bu8; 1024 * 1024 + 257];
+        let binding_request = serde_json::json!({
+            "version": 1,
+            "method": "put",
+            "object": "binding-stream.bin",
+            "sha256": hex::encode(Sha256::digest(&binding_upload)),
+        })
+        .to_string();
+        let mut binding_chunks = vec![Ok::<_, std::io::Error>(axum::body::Bytes::copy_from_slice(
+            binding_request.as_bytes(),
+        ))];
+        binding_chunks.extend(
+            binding_upload
+                .chunks(71_111)
+                .map(|chunk| Ok(axum::body::Bytes::copy_from_slice(chunk))),
+        );
+        let binding_put = reqwest::Client::new()
+            .put(format!("http://127.0.0.1:{r2bind_port}/"))
+            .header(crate::r2bind::BUCKET_HEADER, "e2e-bucket")
+            .header("cf-r2-metadata-size", binding_request.len())
+            .body(reqwest::Body::wrap_stream(futures_util::stream::iter(
+                binding_chunks,
+            )))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(binding_put.status(), reqwest::StatusCode::OK);
+        assert_eq!(
+            get_object(&node, "e2e-bucket", "binding-stream.bin")
+                .await
+                .unwrap()
+                .unwrap()
+                .1,
+            binding_upload
+        );
         assert!(complete_multipart_upload(
             &node,
             "e2e-bucket",
@@ -2682,7 +3018,7 @@ mod tests {
             .get(format!("http://{ingress_address}/large/report.txt"))
             .header("host", "r2-e2e-bucket.workers.test")
             .header("origin", "https://app.example")
-            .header("range", "bytes=6-")
+            .header("range", format!("bytes={}-", first_bytes.len()))
             .send()
             .await
             .unwrap();
@@ -2934,14 +3270,37 @@ mod tests {
             create_multipart_upload(&node, "sharded", "multipart.bin", PutOptions::default())
                 .await
                 .unwrap();
+        let mut first_part_bytes = vec![0u8; MIN_MULTIPART_PART_BYTES as usize];
+        let mut found_drive_a = false;
+        for marker in 0u8..=u8::MAX {
+            first_part_bytes[0] = marker;
+            let digest: [u8; 32] = Sha256::digest(&first_part_bytes).into();
+            if crate::storage_policy::shard_index(&digest, 2) == Some(0) {
+                found_drive_a = true;
+                break;
+            }
+        }
+        assert!(found_drive_a);
+        let upload_chunks = first_part_bytes
+            .chunks(211_111)
+            .map(|chunk| Ok(axum::body::Bytes::copy_from_slice(chunk)))
+            .collect::<Vec<std::result::Result<_, std::io::Error>>>();
+        let staged_part = node
+            .objects
+            .spool_stream(
+                first_part_bytes.len() as u64,
+                Box::pin(futures_util::stream::iter(upload_chunks)),
+            )
+            .await
+            .unwrap();
         let first_part = client
-            .r2_upload_part(
+            .r2_upload_part_stream(
                 &base,
                 "sharded",
                 "multipart.bin",
                 &multipart.upload_id,
                 1,
-                before.as_bytes(),
+                &staged_part,
             )
             .await
             .unwrap();
@@ -2996,15 +3355,19 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(completed.size, (before.len() + after.len()) as u64);
+        assert_eq!(
+            completed.size,
+            (first_part_bytes.len() + after.len()) as u64
+        );
         let (_, multipart_bytes) = get_object(&node, "sharded", "multipart.bin")
             .await
             .unwrap()
             .unwrap();
         assert_eq!(
-            multipart_bytes,
-            [before.as_bytes(), after.as_bytes()].concat()
+            &multipart_bytes[..first_part_bytes.len()],
+            first_part_bytes.as_slice()
         );
+        assert_eq!(&multipart_bytes[first_part_bytes.len()..], after.as_bytes());
 
         let distribution = storage_distribution(&node).await.unwrap();
         assert_eq!(distribution.iter().map(|item| item.objects).sum::<u64>(), 3);

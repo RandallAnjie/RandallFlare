@@ -18,6 +18,9 @@ pub const TARGET_HEADER: &str = "x-rf-target";
 pub const VERSION: &str = "2";
 pub const STREAM_HEADER: &str = "x-rf-encrypted-stream";
 pub const STREAM_VERSION: &str = "1";
+/// Added by the server-side transport middleware after it has authenticated
+/// and decrypted a request stream. It is always removed from wire input first.
+pub const DECRYPTED_STREAM_HEADER: &str = "x-rf-decrypted-request-stream";
 pub const STREAM_PLAINTEXT_CHUNK: usize = 1024 * 1024;
 pub const MAX_STREAM_FRAME: usize = 8 + 24 + STREAM_PLAINTEXT_CHUNK + 16;
 
@@ -39,6 +42,30 @@ pub fn response_aad(request_nonce: &str, status: u16) -> Vec<u8> {
 
 fn stream_response_aad(request_nonce: &str, status: u16, sequence: u64) -> Vec<u8> {
     format!("rf-peer-response-stream-v1\n{request_nonce}\n{status}\n{sequence}").into_bytes()
+}
+
+fn stream_request_aad(
+    request_nonce: &str,
+    ts: &str,
+    method: &str,
+    path: &str,
+    target: &str,
+    sequence: u64,
+) -> Vec<u8> {
+    format!(
+        "rf-peer-request-stream-v1\n{request_nonce}\n{ts}\n{method}\n{path}\n{target}\n{sequence}"
+    )
+    .into_bytes()
+}
+
+pub fn random_nonce_hex() -> String {
+    let mut nonce = [0u8; 24];
+    rand::rngs::OsRng.fill_bytes(&mut nonce);
+    hex::encode(nonce)
+}
+
+pub fn valid_nonce_hex(value: &str) -> bool {
+    value.len() == 48 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
 pub fn seal(secret: &[u8; 32], aad: &[u8], plaintext: &[u8]) -> Result<(String, Vec<u8>)> {
@@ -153,6 +180,80 @@ pub fn open_stream_frame(
     )
 }
 
+/// Encode one independently authenticated streaming-request frame. Request
+/// metadata and the session nonce are bound into every frame, so a proxy
+/// cannot transplant upload bytes between resources or nodes.
+#[allow(clippy::too_many_arguments)]
+pub fn seal_request_stream_frame(
+    secret: &[u8; 32],
+    request_nonce: &str,
+    ts: &str,
+    method: &str,
+    path: &str,
+    target: &str,
+    sequence: u64,
+    plaintext: &[u8],
+) -> Result<Vec<u8>> {
+    if plaintext.len() > STREAM_PLAINTEXT_CHUNK {
+        return Err(anyhow!("peer request stream plaintext frame exceeds 1 MiB"));
+    }
+    if !valid_nonce_hex(request_nonce) {
+        return Err(anyhow!("peer request stream session nonce is invalid"));
+    }
+    let mut nonce = [0u8; 24];
+    rand::rngs::OsRng.fill_bytes(&mut nonce);
+    let ciphertext = seal_raw(
+        secret,
+        &nonce,
+        &stream_request_aad(request_nonce, ts, method, path, target, sequence),
+        plaintext,
+    )?;
+    let frame_len = 8usize
+        .checked_add(nonce.len())
+        .and_then(|length| length.checked_add(ciphertext.len()))
+        .context("peer request stream frame length overflow")?;
+    if frame_len > MAX_STREAM_FRAME {
+        return Err(anyhow!("peer request stream frame exceeds its bound"));
+    }
+    let mut frame = Vec::with_capacity(4 + frame_len);
+    frame.extend_from_slice(&(frame_len as u32).to_be_bytes());
+    frame.extend_from_slice(&sequence.to_be_bytes());
+    frame.extend_from_slice(&nonce);
+    frame.extend_from_slice(&ciphertext);
+    Ok(frame)
+}
+
+/// Authenticate and decode a request frame excluding its length prefix.
+#[allow(clippy::too_many_arguments)]
+pub fn open_request_stream_frame(
+    secret: &[u8; 32],
+    request_nonce: &str,
+    ts: &str,
+    method: &str,
+    path: &str,
+    target: &str,
+    expected_sequence: u64,
+    frame: &[u8],
+) -> Result<Vec<u8>> {
+    if !valid_nonce_hex(request_nonce) {
+        return Err(anyhow!("peer request stream session nonce is invalid"));
+    }
+    if !(8 + 24 + 16..=MAX_STREAM_FRAME).contains(&frame.len()) {
+        return Err(anyhow!("invalid peer request stream frame length"));
+    }
+    let sequence = u64::from_be_bytes(frame[..8].try_into().expect("eight-byte slice"));
+    if sequence != expected_sequence {
+        return Err(anyhow!("peer request stream frame sequence mismatch"));
+    }
+    let nonce: [u8; 24] = frame[8..32].try_into().expect("24-byte slice");
+    open_raw(
+        secret,
+        &nonce,
+        &stream_request_aad(request_nonce, ts, method, path, target, sequence),
+        &frame[32..],
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -210,5 +311,69 @@ mod tests {
         assert!(open_stream_frame(&secret, "session-a", 200, 4, &eof[4..])
             .unwrap()
             .is_empty());
+    }
+
+    #[test]
+    fn request_streaming_frames_bind_route_target_and_sequence() {
+        let secret = [6u8; 32];
+        let session = random_nonce_hex();
+        let frame = seal_request_stream_frame(
+            &secret,
+            &session,
+            "123",
+            "POST",
+            "/v1/r2-blob-stream/abc/5",
+            "node-a",
+            7,
+            b"chunk",
+        )
+        .unwrap();
+        assert_eq!(
+            open_request_stream_frame(
+                &secret,
+                &session,
+                "123",
+                "POST",
+                "/v1/r2-blob-stream/abc/5",
+                "node-a",
+                7,
+                &frame[4..],
+            )
+            .unwrap(),
+            b"chunk"
+        );
+        assert!(open_request_stream_frame(
+            &secret,
+            &session,
+            "123",
+            "POST",
+            "/v1/r2-blob-stream/other/5",
+            "node-a",
+            7,
+            &frame[4..],
+        )
+        .is_err());
+        assert!(open_request_stream_frame(
+            &secret,
+            &session,
+            "123",
+            "POST",
+            "/v1/r2-blob-stream/abc/5",
+            "node-b",
+            7,
+            &frame[4..],
+        )
+        .is_err());
+        assert!(open_request_stream_frame(
+            &secret,
+            &session,
+            "123",
+            "POST",
+            "/v1/r2-blob-stream/abc/5",
+            "node-a",
+            8,
+            &frame[4..],
+        )
+        .is_err());
     }
 }
