@@ -17,6 +17,7 @@ use axum::body::Body;
 use axum::extract::{Request, State};
 use axum::http::{uri::Authority, uri::Uri, HeaderValue, Method, StatusCode};
 use axum::response::{IntoResponse, Response};
+use futures_util::StreamExt as _;
 use rf_core::manifest::WorkerManifest;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -978,12 +979,18 @@ async fn serve_pipeline_ingress(
         .and_then(|value| value.to_str().ok())
         .unwrap_or("application/octet-stream")
         .to_string();
-    let body = match axum::body::to_bytes(req.into_body(), crate::pipeline::MAX_INGEST_BYTES).await
+    let body = req.into_body().into_data_stream().map(|chunk| {
+        chunk.map_err(|error| std::io::Error::other(format!("Pipeline 请求体读取失败：{error}")))
+    });
+    let staged = match node
+        .objects
+        .spool_stream(crate::pipeline::MAX_INGEST_BYTES as u64, Box::pin(body))
+        .await
     {
-        Ok(body) => body,
+        Ok(staged) => staged,
         Err(error) => return (StatusCode::PAYLOAD_TOO_LARGE, error.to_string()).into_response(),
     };
-    let events = match crate::pipeline::parse_payload(&content_type, &body) {
+    let events = match crate::pipeline::parse_staged_payload(content_type, &staged).await {
         Ok(events) => events,
         Err(error) => return (StatusCode::BAD_REQUEST, error.to_string()).into_response(),
     };

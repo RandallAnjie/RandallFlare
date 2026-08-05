@@ -17,7 +17,7 @@ use flate2::Compression;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 use sha2::{Digest, Sha256};
-use std::io::Write as _;
+use std::io::{BufReader, Cursor, Read, Seek, SeekFrom, Write as _};
 use std::sync::Arc;
 
 pub const PIPELINE_KIND: &str = "pipeline";
@@ -268,6 +268,32 @@ pub fn parse_payload(content_type: &str, body: &[u8]) -> Result<Vec<Value>> {
     if body.is_empty() || body.len() > MAX_INGEST_BYTES {
         bail!("Pipeline 请求体必须介于 1 字节和 32 MiB 之间");
     }
+    parse_payload_reader(content_type, Cursor::new(body))
+}
+
+/// Parse a body that was already streamed into an owned spool file. Keeping
+/// network reads and JSON parsing separate prevents slow/chunked senders from
+/// retaining their complete request in the async HTTP task.
+pub async fn parse_staged_payload(
+    content_type: String,
+    staged: &crate::objectstore::StagedObjectFile,
+) -> Result<Vec<Value>> {
+    if staged.size() == 0 || staged.size() > MAX_INGEST_BYTES as u64 {
+        bail!("Pipeline 请求体必须介于 1 字节和 32 MiB 之间");
+    }
+    let path = staged.path().to_owned();
+    tokio::task::spawn_blocking(move || {
+        let file = std::fs::File::open(path).context("无法打开 Pipeline 临时请求体")?;
+        parse_payload_reader(&content_type, file)
+    })
+    .await
+    .context("Pipeline 请求体解析任务异常退出")?
+}
+
+fn parse_payload_reader<R>(content_type: &str, mut reader: R) -> Result<Vec<Value>>
+where
+    R: Read + Seek,
+{
     let content_type = content_type
         .split(';')
         .next()
@@ -275,22 +301,24 @@ pub fn parse_payload(content_type: &str, body: &[u8]) -> Result<Vec<Value>> {
         .trim()
         .to_ascii_lowercase();
     if content_type == "application/json" || content_type.ends_with("+json") {
-        return expand_json(serde_json::from_slice(body).context("Pipeline JSON 无效")?);
+        return expand_json(serde_json::from_reader(reader).context("Pipeline JSON 无效")?);
     }
-    let text = std::str::from_utf8(body).context("Pipeline 文本必须是 UTF-8")?;
     if matches!(
         content_type.as_str(),
         "application/x-ndjson" | "application/ndjson" | "application/jsonl"
     ) {
-        return parse_lines(text, false);
+        return parse_lines_reader(BufReader::new(reader), false);
     }
     if content_type == "text/plain" {
-        return parse_lines(text, true);
+        return parse_lines_reader(BufReader::new(reader), true);
     }
-    if let Ok(value) = serde_json::from_slice(body) {
+    if let Ok(value) = serde_json::from_reader(&mut reader) {
         return expand_json(value);
     }
-    parse_lines(text, false)
+    reader
+        .seek(SeekFrom::Start(0))
+        .context("无法重新读取 Pipeline 请求体")?;
+    parse_lines_reader(BufReader::new(reader), false)
 }
 
 fn expand_json(value: Value) -> Result<Vec<Value>> {
@@ -305,9 +333,22 @@ fn expand_json(value: Value) -> Result<Vec<Value>> {
     validate_event_count(events)
 }
 
-fn parse_lines(text: &str, plain_text_fallback: bool) -> Result<Vec<Value>> {
+fn parse_lines_reader<R: std::io::BufRead>(
+    mut reader: R,
+    plain_text_fallback: bool,
+) -> Result<Vec<Value>> {
     let mut events = Vec::new();
-    for (index, line) in text.lines().enumerate() {
+    let mut line = String::new();
+    let mut index = 0usize;
+    loop {
+        line.clear();
+        let bytes = reader
+            .read_line(&mut line)
+            .context("Pipeline 文本必须是 UTF-8")?;
+        if bytes == 0 {
+            break;
+        }
+        index += 1;
         let line = line.trim();
         if line.is_empty() {
             continue;
@@ -315,7 +356,10 @@ fn parse_lines(text: &str, plain_text_fallback: bool) -> Result<Vec<Value>> {
         match serde_json::from_str(line) {
             Ok(value) => events.push(value),
             Err(_) if plain_text_fallback => events.push(Value::String(line.into())),
-            Err(error) => bail!("Pipeline 第 {} 行不是有效 JSON：{error}", index + 1),
+            Err(error) => bail!("Pipeline 第 {index} 行不是有效 JSON：{error}"),
+        }
+        if events.len() > MAX_EVENTS_PER_REQUEST {
+            bail!("Pipeline 每次必须接收 1 至 10000 个事件");
         }
     }
     validate_event_count(events)

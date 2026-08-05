@@ -1721,12 +1721,19 @@ export default {
         .await
         .unwrap();
     assert_eq!(unauthorized.status(), 401);
+    let pipeline_chunks = [
+        Ok::<_, std::io::Error>("{\"kind\":\"public\","),
+        Ok("\"sequence\":3}\n{\"kind\":"),
+        Ok("\"public\",\"sequence\":4}\n"),
+    ];
     let public_ingest: serde_json::Value = http
         .post(format!("http://127.0.0.1:{}/send", n.ingress))
         .header("host", "pipe.test")
         .bearer_auth(&pipeline_plaintext)
         .header("content-type", "application/x-ndjson")
-        .body("{\"kind\":\"public\",\"sequence\":3}\n{\"kind\":\"public\",\"sequence\":4}\n")
+        .body(reqwest::Body::wrap_stream(futures_util::stream::iter(
+            pipeline_chunks,
+        )))
         .send()
         .await
         .unwrap()
