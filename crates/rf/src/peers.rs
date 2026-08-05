@@ -995,6 +995,28 @@ impl PeerClient {
         )?)
     }
 
+    pub async fn analytics_query(
+        &self,
+        base: &str,
+        dataset: &str,
+        sql: &str,
+        params: Vec<serde_json::Value>,
+        limit: usize,
+    ) -> Result<crate::analytics::AnalyticsQueryResult> {
+        let raw = self
+            .post(
+                base,
+                &format!("/v1/analytics/{}/query", component(dataset)),
+                serde_json::to_vec(&serde_json::json!({
+                    "sql": sql,
+                    "params": params,
+                    "limit": limit.clamp(1, crate::analytics::MAX_QUERY_ROWS),
+                }))?,
+            )
+            .await?;
+        Ok(serde_json::from_slice(&raw)?)
+    }
+
     pub async fn pipeline_ingest(
         &self,
         base: &str,

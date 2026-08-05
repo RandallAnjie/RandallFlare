@@ -277,6 +277,10 @@ pub fn router(state: ConsoleState) -> Router {
             "/api/v1/analytics/{dataset}/stats",
             get(public_api_analytics_stats),
         )
+        .route(
+            "/api/v1/analytics/{dataset}/query",
+            post(public_api_analytics_query),
+        )
         .route("/api/v1/pipelines", get(public_api_pipelines))
         .route(
             "/api/v1/pipelines/{pipeline}/events",
@@ -440,6 +444,7 @@ pub fn router(state: ConsoleState) -> Router {
         )
         .route("/api/analytics/{name}/stats", get(analytics_stats))
         .route("/api/analytics/{name}/group", get(analytics_group))
+        .route("/api/analytics/{name}/query", post(analytics_query))
         .route("/api/pipelines", get(pipeline_list).post(pipeline_apply))
         .route("/api/pipelines/{name}", delete(pipeline_delete))
         .route("/api/pipelines/{name}/tokens", post(pipeline_token_mint))
@@ -1826,6 +1831,27 @@ async fn public_api_analytics_stats(
     require_api_scope(&principal, "analytics:read")?;
     Ok(Json(serde_json::to_value(
         state.client.analytics_stats(&state.node, &dataset).await?,
+    )?))
+}
+
+async fn public_api_analytics_query(
+    State(state): State<ConsoleState>,
+    Extension(principal): Extension<crate::access::AccessPrincipal>,
+    Path(dataset): Path<String>,
+    Json(request): Json<AnalyticsSqlRequest>,
+) -> ApiResult<Json<Value>> {
+    require_api_scope(&principal, "analytics:read")?;
+    Ok(Json(serde_json::to_value(
+        state
+            .client
+            .analytics_query(
+                &state.node,
+                &dataset,
+                &request.sql,
+                request.params,
+                request.limit,
+            )
+            .await?,
     )?))
 }
 
@@ -6911,6 +6937,20 @@ struct AnalyticsWriteRequest {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AnalyticsSqlRequest {
+    sql: String,
+    #[serde(default)]
+    params: Vec<Value>,
+    #[serde(default = "analytics_default_query_limit")]
+    limit: usize,
+}
+
+fn analytics_default_query_limit() -> usize {
+    1_000
+}
+
+#[derive(Debug, Deserialize)]
 struct AnalyticsRecentQuery {
     before: Option<u64>,
     limit: Option<usize>,
@@ -7095,6 +7135,25 @@ async fn analytics_group(
         )
         .await?;
     Ok(Json(json!({ "groups": groups })))
+}
+
+async fn analytics_query(
+    State(state): State<ConsoleState>,
+    Path(name): Path<String>,
+    Json(request): Json<AnalyticsSqlRequest>,
+) -> ApiResult<Json<Value>> {
+    Ok(Json(serde_json::to_value(
+        state
+            .client
+            .analytics_query(
+                &state.node,
+                &name,
+                &request.sql,
+                request.params,
+                request.limit,
+            )
+            .await?,
+    )?))
 }
 
 #[derive(Debug, Deserialize)]

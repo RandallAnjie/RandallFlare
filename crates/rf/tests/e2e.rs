@@ -1671,6 +1671,43 @@ export default {
             assert_eq!(groups[0].key, "pageview");
             assert_eq!(groups[0].count, 1);
             assert_eq!(groups[0].sum, Some(42.5));
+            let query = client
+                .analytics_query(
+                    &n.api,
+                    "web-metrics",
+                    "SELECT blob1, COUNT(*) AS events, SUM(double1 * _sample_interval) AS total FROM events WHERE double1 > ?1 GROUP BY blob1",
+                    vec![serde_json::json!(40)],
+                    100,
+                )
+                .await
+                .unwrap();
+            assert_eq!(query.row_count, 1);
+            assert_eq!(query.rows[0]["blob1"], "pageview");
+            assert_eq!(query.rows[0]["events"], 1);
+            assert_eq!(query.rows[0]["total"], 42.5);
+            assert!(!query.truncated);
+            let truncated = client
+                .analytics_query(
+                    &n.api,
+                    "web-metrics",
+                    "SELECT blob1 FROM events UNION ALL SELECT blob1 FROM events",
+                    vec![],
+                    1,
+                )
+                .await
+                .unwrap();
+            assert_eq!(truncated.row_count, 1);
+            assert!(truncated.truncated);
+            assert!(client
+                .analytics_query(
+                    &n.api,
+                    "web-metrics",
+                    "DELETE FROM analytics_events",
+                    vec![],
+                    100,
+                )
+                .await
+                .is_err());
             break;
         }
         assert!(

@@ -597,6 +597,15 @@
                 <div id="analytics-groups" class="build-list empty-state">暂无聚合结果。</div>
               </article>
               <article class="panel">
+                <div class="panel-head"><div><p class="eyebrow">SQL 工作台</p><h2>查询 events 视图</h2><p class="muted compact-copy">可使用 blob1…blob20、double1…double20、index1…index20、timestamp 和 _sample_interval。</p></div></div>
+                <form id="analytics-query-form" class="stack-form hidden">
+                  <label><span>只读 SQL</span><textarea id="analytics-query-sql" class="code-input" rows="7">SELECT blob1, COUNT(*) AS events, SUM(double1 * _sample_interval) AS total FROM events GROUP BY blob1 ORDER BY events DESC</textarea></label>
+                  <div class="form-grid"><label><span>参数数组（JSON）</span><input id="analytics-query-params" class="code-input" value="[]"></label><label><span>最大行数</span><input id="analytics-query-limit" type="number" min="1" max="9999" value="1000"></label></div>
+                  <button class="secondary" type="submit">执行查询</button>
+                </form>
+                <pre id="analytics-query-result" class="result">选择数据集后执行查询。</pre>
+              </article>
+              <article class="panel">
                 <div class="panel-head"><div><p class="eyebrow">原始事件</p><h2>最近写入</h2></div></div>
                 <div id="analytics-events" class="build-list empty-state">暂无事件。</div>
               </article>

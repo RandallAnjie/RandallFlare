@@ -930,6 +930,23 @@ enum AnalyticsCmd {
         #[arg(long, env = "RF_CLUSTER_SECRET")]
         secret: String,
     },
+    /// Run a bounded read-only SQL query against the flattened `events` view.
+    Query {
+        name: String,
+        #[arg(required_unless_present = "file", conflicts_with = "file")]
+        sql: Option<String>,
+        #[arg(long)]
+        file: Option<PathBuf>,
+        /// Positional parameter encoded as JSON; repeat for multiple values.
+        #[arg(long = "param")]
+        params: Vec<String>,
+        #[arg(long, default_value_t = 1_000)]
+        limit: usize,
+        #[arg(long, env = "RF_NODE")]
+        node: String,
+        #[arg(long, env = "RF_CLUSTER_SECRET")]
+        secret: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -2976,6 +2993,33 @@ async fn async_main(cli: Cli) -> Result<()> {
                     )
                     .await?;
                 println!("{}", serde_json::to_string_pretty(&groups)?);
+                Ok(())
+            }
+            AnalyticsCmd::Query {
+                name,
+                sql,
+                file,
+                params,
+                limit,
+                node,
+                secret,
+            } => {
+                let sql = match file {
+                    Some(path) => std::fs::read_to_string(&path)
+                        .with_context(|| format!("读取 Analytics SQL 文件 {}", path.display()))?,
+                    None => sql.unwrap_or_default(),
+                };
+                let params = params
+                    .into_iter()
+                    .map(|value| {
+                        serde_json::from_str(&value)
+                            .with_context(|| format!("Analytics 参数不是有效 JSON：{value}"))
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                let result = PeerClient::new(secret_bytes(&secret)?)
+                    .analytics_query(&node, &name, &sql, params, limit)
+                    .await?;
+                println!("{}", serde_json::to_string_pretty(&result)?);
                 Ok(())
             }
         },

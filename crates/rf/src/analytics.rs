@@ -19,6 +19,8 @@ pub const MAX_BATCH: usize = 100;
 pub const MAX_DIMENSIONS: usize = 20;
 pub const MAX_STRING_BYTES: usize = 5 * 1024;
 pub const MAX_WRITE_BYTES: usize = 1024 * 1024;
+pub const MAX_QUERY_SQL_BYTES: usize = 64 * 1024;
+pub const MAX_QUERY_ROWS: usize = 9_999;
 const MAX_TIMESTAMP_MS: u64 = 4_102_444_800_000;
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -84,6 +86,15 @@ pub struct DimensionGroup {
     pub average: Option<f64>,
     pub minimum: Option<f64>,
     pub maximum: Option<f64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AnalyticsQueryResult {
+    pub columns: Vec<String>,
+    pub rows: Vec<serde_json::Map<String, Value>>,
+    pub row_count: usize,
+    pub truncated: bool,
+    pub elapsed_ms: u64,
 }
 
 pub fn dataset_record(node: &Node, name: &str) -> Option<(ResourceView, DatasetSpec)> {
@@ -322,6 +333,65 @@ pub async fn group_by(
     .collect()
 }
 
+pub async fn query(
+    node: &Node,
+    dataset: &str,
+    sql: &str,
+    params: Vec<Value>,
+    limit: usize,
+) -> Result<AnalyticsQueryResult> {
+    dataset_record(node, dataset).context("Analytics 数据集不存在")?;
+    if sql.len() > MAX_QUERY_SQL_BYTES || sql.contains('\0') {
+        bail!("Analytics SQL 不得超过 64 KiB，且不能包含 NUL");
+    }
+    if params.len() > 100 {
+        bail!("Analytics SQL 参数不得超过 100 个");
+    }
+    let sql = sql.trim();
+    if sql.is_empty() {
+        bail!("Analytics SQL 不能为空");
+    }
+    let sql = sql.strip_suffix(';').unwrap_or(sql).trim_end();
+    let first = sql
+        .split_ascii_whitespace()
+        .next()
+        .unwrap_or_default()
+        .to_ascii_uppercase();
+    if first != "SELECT" && first != "WITH" {
+        bail!("Analytics SQL 只能执行 SELECT 或 WITH 查询");
+    }
+    ensure_schema(node, dataset).await?;
+    let limit = limit.clamp(1, MAX_QUERY_ROWS);
+    let wrapped = format!(
+        "SELECT * FROM ({sql}) AS __rf_analytics_query LIMIT {}",
+        limit + 1
+    );
+    let started = std::time::Instant::now();
+    let result = exec(node, dataset, &wrapped, Value::Array(params)).await?;
+    let mut rows = rows(result);
+    let truncated = rows.len() > limit;
+    rows.truncate(limit);
+    let rows = rows
+        .into_iter()
+        .map(|row| {
+            row.as_object()
+                .cloned()
+                .context("Analytics SQL 返回了无效行")
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let columns = rows
+        .first()
+        .map(|row| row.keys().cloned().collect())
+        .unwrap_or_default();
+    Ok(AnalyticsQueryResult {
+        row_count: rows.len(),
+        rows,
+        columns,
+        truncated,
+        elapsed_ms: started.elapsed().as_millis().min(u64::MAX as u128) as u64,
+    })
+}
+
 async fn ensure_schema(node: &Node, dataset: &str) -> Result<()> {
     let database = database_name(dataset);
     d1::ensure_database(node, &database)?;
@@ -349,8 +419,25 @@ async fn ensure_schema(node: &Node, dataset: &str) -> Result<()> {
         json!([]),
     )
     .await?;
+    exec_database(node, &database, &analytics_view_sql(), json!([])).await?;
     node.mark_analytics_schema_ready(database);
     Ok(())
+}
+
+fn analytics_view_sql() -> String {
+    let mut sql = String::from(
+        "CREATE VIEW IF NOT EXISTS events AS SELECT id, ts_ms AS timestamp, ts_ms, created_at_ms, 1 AS _sample_interval",
+    );
+    for index in 0..MAX_DIMENSIONS {
+        sql.push_str(&format!(
+            ", json_extract(blobs_json, '$[{index}]') AS blob{}, json_extract(doubles_json, '$[{index}]') AS double{}, json_extract(indexes_json, '$[{index}]') AS index{}",
+            index + 1,
+            index + 1,
+            index + 1,
+        ));
+    }
+    sql.push_str(" FROM analytics_events");
+    sql
 }
 
 async fn exec(node: &Node, dataset: &str, sql: &str, params: Value) -> Result<Value> {

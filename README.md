@@ -112,9 +112,10 @@ Working today, verified by multi-process fault-injection e2e tests:
   Cloudflare-shaped `blobs` / `doubles` / `indexes` data-point model in an
   independent D1 micro-quorum. Workers call `env.METRICS.writeDataPoint()`;
   signed dataset CRUD, encrypted node APIs, recent-event browsing, hour/day
-  counters and dimension/value aggregations are available in the CLI and
-  Chinese console. The binding's `waitUntil` path is verified against real
-  workerd.
+  counters, dimension/value aggregations and a bounded read-only SQL workbench
+  over the flattened `events` view are available in the CLI, scoped API and
+  Chinese console. The binding's `waitUntil` path and SQL aggregation are
+  verified against real workerd. See [the Analytics guide](./docs/ANALYTICS.md).
 - **Durable Pipelines**: authenticated JSON, JSON-array, NDJSON and plain-text
   ingest is JSON-Schema validated and committed to a per-Pipeline D1 quorum
   before delivery. Optional bounded, read-only SQL filters, projects and

@@ -1982,6 +1982,7 @@ async function loadAnalytics({ quiet = false } = {}) {
       $("#analytics-active-name").textContent = "请选择数据集";
       $("#analytics-summary").textContent = "选择左侧数据集后，可查看聚合结果与最近事件。";
       $("#analytics-write-form").classList.add("hidden");
+      $("#analytics-query-form").classList.add("hidden");
       $("#analytics-delete").classList.add("hidden");
       $("#analytics-hour").textContent = "—";
       $("#analytics-day").textContent = "—";
@@ -2025,6 +2026,7 @@ async function selectAnalytics(name) {
   $("#analytics-active-name").textContent = name;
   $("#analytics-summary").textContent = dataset.spec?.description || analyticsStatsCopy(dataset.stats);
   $("#analytics-write-form").classList.remove("hidden");
+  $("#analytics-query-form").classList.remove("hidden");
   $("#analytics-delete").classList.remove("hidden");
   renderAnalyticsDatasets();
   try {
@@ -2088,6 +2090,36 @@ async function writeAnalyticsPoint(event) {
     await loadAnalytics({ quiet: true });
     await selectAnalytics(state.analyticsActive);
   } catch (error) {
+    toast(error.message, true);
+  }
+}
+
+async function runAnalyticsQuery(event) {
+  event.preventDefault();
+  if (!state.analyticsActive) return;
+  let params;
+  try {
+    params = JSON.parse($("#analytics-query-params").value || "[]");
+    if (!Array.isArray(params)) throw new Error("参数必须是 JSON 数组");
+  } catch (error) {
+    toast(`查询参数无效：${error.message}`, true);
+    return;
+  }
+  const result = $("#analytics-query-result");
+  result.textContent = "正在查询…";
+  try {
+    const data = await api(`/api/analytics/${encodeURIComponent(state.analyticsActive)}/query`, {
+      method: "POST",
+      body: JSON.stringify({
+        sql: $("#analytics-query-sql").value,
+        params,
+        limit: Number($("#analytics-query-limit").value || 1000),
+      }),
+    });
+    result.textContent = JSON.stringify(data, null, 2);
+    toast(`查询完成：${data.row_count || 0} 行${data.truncated ? "（已截断）" : ""}`);
+  } catch (error) {
+    result.textContent = error.message;
     toast(error.message, true);
   }
 }
@@ -4828,6 +4860,7 @@ $("#queue-delete").addEventListener("click", deleteQueue);
 $("#queue-refresh-dead").addEventListener("click", loadQueueDeadLetters);
 $("#analytics-form").addEventListener("submit", saveAnalytics);
 $("#analytics-write-form").addEventListener("submit", writeAnalyticsPoint);
+$("#analytics-query-form").addEventListener("submit", runAnalyticsQuery);
 $("#analytics-group-form").addEventListener("submit", (event) => {
   event.preventDefault();
   loadAnalyticsGroups().catch((error) => toast(error.message, true));
