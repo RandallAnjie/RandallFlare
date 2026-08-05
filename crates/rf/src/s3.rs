@@ -383,6 +383,9 @@ async fn handle_result(node: &Node, request: Request<Body>) -> Result<Response> 
 
     let response = match key {
         None if method == Method::HEAD => StatusCode::OK.into_response(),
+        None if method == Method::GET && query.contains_key("uploads") => {
+            list_multipart_uploads(node, bucket, &query).await?
+        }
         None if method == Method::GET => list_objects(node, bucket, &query).await?,
         // rclone and several SDKs issue CreateBucket before the first upload.
         // Bucket definitions remain operator-signed resources, so acknowledge
@@ -792,6 +795,53 @@ async fn list_objects(
     ))
 }
 
+async fn list_multipart_uploads(
+    node: &Node,
+    bucket: &str,
+    query: &BTreeMap<String, Vec<String>>,
+) -> Result<Response> {
+    let prefix = query_one(query, "prefix").unwrap_or_default();
+    let cursor = query_one(query, "upload-id-marker").filter(|value| !value.is_empty());
+    let limit = query_one(query, "max-uploads")
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(1000)
+        .clamp(1, 1000);
+    let list = crate::r2::list_multipart_uploads(node, bucket, prefix, cursor, limit).await?;
+    let uploads = list
+        .uploads
+        .iter()
+        .map(|upload| {
+            format!(
+                "<Upload><Key>{}</Key><UploadId>{}</UploadId><Initiator><ID>RandallFlare</ID><DisplayName>RandallFlare</DisplayName></Initiator><Owner><ID>RandallFlare</ID><DisplayName>RandallFlare</DisplayName></Owner><StorageClass>STANDARD</StorageClass><Initiated>{}</Initiated></Upload>",
+                escape_xml(&upload.key),
+                escape_xml(&upload.upload_id),
+                timestamp(upload.created_at_ms),
+            )
+        })
+        .collect::<String>();
+    let next_marker = list
+        .cursor
+        .as_deref()
+        .map(|cursor| {
+            format!(
+                "<NextUploadIdMarker>{}</NextUploadIdMarker>",
+                escape_xml(cursor)
+            )
+        })
+        .unwrap_or_default();
+    Ok(xml_response(
+        StatusCode::OK,
+        format!(
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?><ListMultipartUploadsResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"><Bucket>{}</Bucket><KeyMarker>{}</KeyMarker><UploadIdMarker>{}</UploadIdMarker>{next_marker}<Prefix>{}</Prefix><MaxUploads>{limit}</MaxUploads><IsTruncated>{}</IsTruncated>{uploads}</ListMultipartUploadsResult>",
+            escape_xml(bucket),
+            escape_xml(query_one(query, "key-marker").unwrap_or_default()),
+            escape_xml(query_one(query, "upload-id-marker").unwrap_or_default()),
+            escape_xml(prefix),
+            list.truncated,
+        ),
+    ))
+}
+
 async fn object_request(
     node: &Node,
     request: Request<Body>,
@@ -815,6 +865,53 @@ async fn object_request(
         ));
     }
     if let Some(upload_id) = query_one(query, "uploadId") {
+        if method == Method::GET {
+            let detail = crate::r2::multipart_upload_detail(node, bucket, upload_id).await?;
+            if detail.upload.key != key {
+                bail!("R2 分片上传不存在");
+            }
+            let marker = query_one(query, "part-number-marker")
+                .and_then(|value| value.parse::<u32>().ok())
+                .unwrap_or(0);
+            let limit = query_one(query, "max-parts")
+                .and_then(|value| value.parse::<usize>().ok())
+                .unwrap_or(1000)
+                .clamp(1, 1000);
+            let mut parts = detail
+                .parts
+                .into_iter()
+                .filter(|part| part.part_number > marker)
+                .take(limit + 1)
+                .collect::<Vec<_>>();
+            let truncated = parts.len() > limit;
+            parts.truncate(limit);
+            let next_marker = truncated
+                .then(|| parts.last().map(|part| part.part_number))
+                .flatten()
+                .map(|part| format!("<NextPartNumberMarker>{part}</NextPartNumberMarker>"))
+                .unwrap_or_default();
+            let entries = parts
+                .iter()
+                .map(|part| {
+                    format!(
+                        "<Part><PartNumber>{}</PartNumber><LastModified>{}</LastModified><ETag>&quot;{}&quot;</ETag><Size>{}</Size></Part>",
+                        part.part_number,
+                        timestamp(detail.upload.created_at_ms),
+                        escape_xml(&part.etag),
+                        part.size,
+                    )
+                })
+                .collect::<String>();
+            return Ok(xml_response(
+                StatusCode::OK,
+                format!(
+                    "<?xml version=\"1.0\" encoding=\"UTF-8\"?><ListPartsResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"><Bucket>{}</Bucket><Key>{}</Key><UploadId>{}</UploadId><PartNumberMarker>{marker}</PartNumberMarker>{next_marker}<MaxParts>{limit}</MaxParts><IsTruncated>{truncated}</IsTruncated>{entries}</ListPartsResult>",
+                    escape_xml(bucket),
+                    escape_xml(key),
+                    escape_xml(upload_id),
+                ),
+            ));
+        }
         if method == Method::DELETE {
             crate::r2::abort_multipart_upload(node, bucket, key, upload_id).await?;
             return Ok(StatusCode::NO_CONTENT.into_response());

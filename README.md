@@ -85,7 +85,8 @@ Working today, verified by multi-process fault-injection e2e tests:
 - **R2-compatible object storage**: operator-signed buckets, per-bucket D1
   metadata quorums, content-addressed local replicas or node-local rclone
   remotes, quotas, metadata, ranges, conditions, delimiter listing,
-  multipart upload, lifecycle expiry and delayed reference-safe collection.
+  multipart upload, paged in-flight upload/part administration, lifecycle expiry
+  and delayed reference-safe collection.
   Stock workerd receives native `R2Bucket` bindings; public buckets get
   `r2-<bucket>.<default_domain>` plus optional custom hostnames, CORS and
   ETag/Range-aware object delivery. Operator-signed, revocable S3 credentials

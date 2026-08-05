@@ -40,6 +40,8 @@ const state = {
   r2Active: null,
   r2Cursor: null,
   r2Objects: [],
+  r2Multipart: [],
+  r2MultipartCursor: null,
   storage: null,
   storageProbes: [],
   queues: [],
@@ -1410,6 +1412,8 @@ async function loadR2({ quiet = false } = {}) {
       state.r2Active = null;
       state.r2Objects = [];
       state.r2Cursor = null;
+      state.r2Multipart = [];
+      state.r2MultipartCursor = null;
       $("#r2-active-bucket").textContent = "请选择 bucket";
       $("#r2-bucket-summary").textContent = "选择左侧 bucket 后即可管理对象。";
       $("#r2-object-tools").classList.add("hidden");
@@ -1504,6 +1508,8 @@ async function selectR2Bucket(name) {
   state.r2Active = name;
   state.r2Objects = [];
   state.r2Cursor = null;
+  state.r2Multipart = [];
+  state.r2MultipartCursor = null;
   fillR2BucketForm(bucket);
   const storage = bucket.spec?.storage || { type: "local" };
   $("#r2-active-bucket").textContent = name;
@@ -1522,7 +1528,7 @@ async function selectR2Bucket(name) {
   $("#r2-object-tools").classList.remove("hidden");
   $("#r2-delete-bucket").classList.remove("hidden");
   renderR2Buckets();
-  await loadR2Objects();
+  await Promise.all([loadR2Objects(), loadR2Multipart()]);
 }
 
 function renderR2Objects() {
@@ -1545,6 +1551,50 @@ async function loadR2Objects({ append = false } = {}) {
     state.r2Objects = append ? [...state.r2Objects, ...(data.objects || [])] : (data.objects || []);
     state.r2Cursor = data.cursor || null;
     renderR2Objects();
+  } catch (error) {
+    toast(error.message, true);
+  }
+}
+
+function renderR2Multipart() {
+  const table = $("#r2-multipart-table");
+  table.innerHTML = state.r2Multipart.length
+    ? state.r2Multipart.map((upload) => `<tr><td><strong class="mono">${escapeHtml(upload.key)}</strong><small class="mono">${escapeHtml(upload.upload_id)}</small></td><td>${escapeHtml(upload.part_count)}</td><td>${escapeHtml(formatBytes(upload.uploaded_bytes))}</td><td><small>${escapeHtml(new Date(upload.expires_at_ms).toLocaleString("zh-CN"))}</small></td><td><div class="table-actions"><button class="mini-button" data-r2-multipart-action="inspect" data-upload-id="${escapeHtml(upload.upload_id)}">详情</button><button class="mini-button danger" data-r2-multipart-action="abort" data-upload-id="${escapeHtml(upload.upload_id)}" data-object-key="${escapeHtml(upload.key)}">终止</button></div></td></tr>`).join("")
+    : '<tr><td colspan="5" class="empty-state">暂无正在进行的分片上传。</td></tr>';
+  $("#r2-multipart-load-more").classList.toggle("hidden", !state.r2MultipartCursor);
+}
+
+async function loadR2Multipart({ append = false } = {}) {
+  if (!state.r2Active) return;
+  try {
+    const query = new URLSearchParams({ prefix: $("#r2-object-prefix").value, limit: "100" });
+    if (append && state.r2MultipartCursor) query.set("cursor", state.r2MultipartCursor);
+    const data = await api(`/api/r2/multipart/${encodeURIComponent(state.r2Active)}?${query}`);
+    state.r2Multipart = append ? [...state.r2Multipart, ...(data.uploads || [])] : (data.uploads || []);
+    state.r2MultipartCursor = data.cursor || null;
+    renderR2Multipart();
+  } catch (error) {
+    toast(error.message, true);
+  }
+}
+
+async function inspectR2Multipart(uploadId) {
+  if (!state.r2Active) return;
+  try {
+    const upload = await api(`/api/r2/multipart/${encodeURIComponent(state.r2Active)}/${encodeURIComponent(uploadId)}`);
+    const parts = (upload.parts || []).map((part) => `#${part.part_number}  ${formatBytes(part.size)}  ${part.etag}`).join("\n") || "尚未上传任何分片";
+    window.alert(`对象键：${upload.key}\n上传 ID：${upload.upload_id}\n创建：${new Date(upload.created_at_ms).toLocaleString("zh-CN")}\n到期：${new Date(upload.expires_at_ms).toLocaleString("zh-CN")}\n存储：${storageLocationCopy(upload.storage)}\n\n已上传分片\n${parts}`);
+  } catch (error) {
+    toast(error.message, true);
+  }
+}
+
+async function abortR2Multipart(uploadId, key) {
+  if (!state.r2Active || !window.confirm(`要终止对象“${key}”的分片上传吗？已暂存的分片将进入安全回收队列。`)) return;
+  try {
+    await api(`/api/r2/multipart/${encodeURIComponent(state.r2Active)}/${encodeURIComponent(uploadId)}`, { method: "DELETE" });
+    toast(`已终止 ${key} 的分片上传`);
+    await loadR2Multipart();
   } catch (error) {
     toast(error.message, true);
   }
@@ -4709,9 +4759,11 @@ $("#d1-refresh").addEventListener("click", loadD1Info);
 $("#r2-bucket-form").addEventListener("submit", saveR2Bucket);
 $("#r2-bucket-name").addEventListener("input", updateR2DefaultDomainPreview);
 $("#r2-storage-backend").addEventListener("change", toggleR2StorageFields);
-$("#r2-object-search").addEventListener("submit", (event) => { event.preventDefault(); loadR2Objects(); });
+$("#r2-object-search").addEventListener("submit", (event) => { event.preventDefault(); Promise.all([loadR2Objects(), loadR2Multipart()]); });
 $("#r2-upload-form").addEventListener("submit", uploadR2Object);
 $("#r2-load-more").addEventListener("click", () => loadR2Objects({ append: true }));
+$("#r2-multipart-refresh").addEventListener("click", () => loadR2Multipart());
+$("#r2-multipart-load-more").addEventListener("click", () => loadR2Multipart({ append: true }));
 $("#r2-delete-bucket").addEventListener("click", deleteR2Bucket);
 $("#storage-form").addEventListener("submit", saveStorage);
 $("#storage-probe").addEventListener("click", probeStorage);
@@ -4832,6 +4884,12 @@ $("#r2-object-table").addEventListener("click", (event) => {
   if (!button) return;
   if (button.dataset.r2Action === "download") downloadR2Object(button.dataset.r2Key);
   if (button.dataset.r2Action === "delete") deleteR2Object(button.dataset.r2Key);
+});
+$("#r2-multipart-table").addEventListener("click", (event) => {
+  const button = event.target.closest("button[data-r2-multipart-action]");
+  if (!button) return;
+  if (button.dataset.r2MultipartAction === "inspect") inspectR2Multipart(button.dataset.uploadId);
+  if (button.dataset.r2MultipartAction === "abort") abortR2Multipart(button.dataset.uploadId, button.dataset.objectKey);
 });
 $("#queue-list").addEventListener("click", (event) => {
   const button = event.target.closest("button[data-queue]");

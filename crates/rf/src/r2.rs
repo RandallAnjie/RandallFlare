@@ -163,6 +163,35 @@ pub struct MultipartUpload {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MultipartUploadSummary {
+    pub upload_id: String,
+    pub key: String,
+    pub content_type: Option<String>,
+    pub created_at_ms: u64,
+    pub expires_at_ms: u64,
+    pub part_count: u64,
+    pub uploaded_bytes: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MultipartUploadPage {
+    pub uploads: Vec<MultipartUploadSummary>,
+    pub truncated: bool,
+    pub cursor: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MultipartUploadDetail {
+    #[serde(flatten)]
+    pub upload: MultipartUploadSummary,
+    pub custom_metadata: serde_json::Map<String, Value>,
+    pub http_metadata: serde_json::Map<String, Value>,
+    pub storage: StorageLocation,
+    pub storage_policy: Option<String>,
+    pub parts: Vec<UploadedPart>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UploadedPart {
     pub part_number: u32,
     pub etag: String,
@@ -616,6 +645,168 @@ pub async fn abort_multipart_upload(
         }
     }
     Ok(())
+}
+
+/// List active multipart sessions without loading their staged object bytes.
+/// Upload IDs are random and immutable, which makes them safe continuation
+/// cursors even while other sessions are created or removed.
+pub async fn list_multipart_uploads(
+    node: &Node,
+    bucket: &str,
+    prefix: &str,
+    cursor: Option<&str>,
+    limit: usize,
+) -> Result<MultipartUploadPage> {
+    bucket_record(node, bucket).context("R2 bucket 不存在")?;
+    if prefix.len() > MAX_OBJECT_KEY_BYTES || cursor.is_some_and(|value| value.len() > 64) {
+        bail!("R2 分片上传列表参数过长");
+    }
+    if let Some(cursor) = cursor.filter(|value| !value.is_empty()) {
+        validate_upload_id(cursor)?;
+    }
+    ensure_schema(node, bucket).await?;
+    let limit = limit.clamp(1, MAX_LIST_LIMIT);
+    let result = exec(
+        node,
+        bucket,
+        r#"SELECT u.upload_id, u.key, u.content_type, u.created_at_ms, u.expires_at_ms,
+                  COUNT(p.part_number) AS part_count, COALESCE(SUM(p.size), 0) AS uploaded_bytes
+           FROM multipart_uploads u
+           LEFT JOIN multipart_parts p ON p.upload_id = u.upload_id
+           WHERE u.key LIKE (?1 || '%') ESCAPE '\' AND u.upload_id > ?2
+           GROUP BY u.upload_id, u.key, u.content_type, u.created_at_ms, u.expires_at_ms
+           ORDER BY u.upload_id LIMIT ?3"#,
+        json!([escape_like(prefix), cursor.unwrap_or(""), limit + 1]),
+    )
+    .await?;
+    let mut uploads = result["rows"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .map(row_to_multipart_summary)
+        .collect::<Result<Vec<_>>>()?;
+    let truncated = uploads.len() > limit;
+    uploads.truncate(limit);
+    let cursor = truncated
+        .then(|| uploads.last().map(|upload| upload.upload_id.clone()))
+        .flatten();
+    Ok(MultipartUploadPage {
+        uploads,
+        truncated,
+        cursor,
+    })
+}
+
+/// Inspect one multipart session, including all uploaded part numbers and
+/// checksums. The protocol caps a session at 10,000 parts, so this response is
+/// strictly bounded and suitable for operator diagnostics.
+pub async fn multipart_upload_detail(
+    node: &Node,
+    bucket: &str,
+    upload_id: &str,
+) -> Result<MultipartUploadDetail> {
+    validate_upload_id(upload_id)?;
+    bucket_record(node, bucket).context("R2 bucket 不存在")?;
+    ensure_schema(node, bucket).await?;
+    let upload_result = exec(
+        node,
+        bucket,
+        r#"SELECT u.upload_id, u.key, u.content_type, u.custom_metadata, u.http_metadata,
+                  u.storage_json, u.storage_policy, u.created_at_ms, u.expires_at_ms,
+                  COUNT(p.part_number) AS part_count, COALESCE(SUM(p.size), 0) AS uploaded_bytes
+           FROM multipart_uploads u
+           LEFT JOIN multipart_parts p ON p.upload_id = u.upload_id
+           WHERE u.upload_id = ?1
+           GROUP BY u.upload_id, u.key, u.content_type, u.custom_metadata, u.http_metadata,
+                    u.storage_json, u.storage_policy, u.created_at_ms, u.expires_at_ms"#,
+        json!([upload_id]),
+    )
+    .await?;
+    let row = upload_result["rows"]
+        .as_array()
+        .and_then(|rows| rows.first())
+        .and_then(Value::as_object)
+        .context("R2 分片上传不存在")?;
+    let upload = row_to_multipart_summary(&Value::Object(row.clone()))?;
+    let text = |name: &str| -> Result<&str> {
+        row.get(name)
+            .and_then(Value::as_str)
+            .with_context(|| format!("R2 分片上传缺少 {name}"))
+    };
+    let parts_result = exec(
+        node,
+        bucket,
+        "SELECT part_number, etag, size FROM multipart_parts WHERE upload_id = ?1 ORDER BY part_number",
+        json!([upload_id]),
+    )
+    .await?;
+    let parts = parts_result["rows"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .map(|row| {
+            Ok(UploadedPart {
+                part_number: row["part_number"]
+                    .as_u64()
+                    .context("R2 分片缺少 part_number")?
+                    .try_into()
+                    .context("R2 分片编号超出范围")?,
+                etag: row["etag"]
+                    .as_str()
+                    .context("R2 分片缺少 etag")?
+                    .to_string(),
+                size: row["size"].as_u64().context("R2 分片缺少 size")?,
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    Ok(MultipartUploadDetail {
+        upload,
+        custom_metadata: serde_json::from_str(text("custom_metadata")?)?,
+        http_metadata: serde_json::from_str(text("http_metadata")?)?,
+        storage: serde_json::from_str(text("storage_json")?)?,
+        storage_policy: row
+            .get("storage_policy")
+            .and_then(Value::as_str)
+            .map(str::to_string),
+        parts,
+    })
+}
+
+pub async fn abort_multipart_upload_by_id(
+    node: &Node,
+    bucket: &str,
+    upload_id: &str,
+) -> Result<()> {
+    let detail = multipart_upload_detail(node, bucket, upload_id).await?;
+    abort_multipart_upload(node, bucket, &detail.upload.key, upload_id).await
+}
+
+fn row_to_multipart_summary(row: &Value) -> Result<MultipartUploadSummary> {
+    let text = |name: &str| -> Result<&str> {
+        row.get(name)
+            .and_then(Value::as_str)
+            .with_context(|| format!("R2 分片上传缺少 {name}"))
+    };
+    Ok(MultipartUploadSummary {
+        upload_id: text("upload_id")?.to_string(),
+        key: text("key")?.to_string(),
+        content_type: row
+            .get("content_type")
+            .and_then(Value::as_str)
+            .map(str::to_string),
+        created_at_ms: row["created_at_ms"]
+            .as_u64()
+            .context("R2 分片上传缺少 created_at_ms")?,
+        expires_at_ms: row["expires_at_ms"]
+            .as_u64()
+            .context("R2 分片上传缺少 expires_at_ms")?,
+        part_count: row["part_count"]
+            .as_u64()
+            .context("R2 分片上传缺少 part_count")?,
+        uploaded_bytes: row["uploaded_bytes"]
+            .as_u64()
+            .context("R2 分片上传缺少 uploaded_bytes")?,
+    })
 }
 
 struct MultipartRow {
@@ -2027,6 +2218,27 @@ mod tests {
         )
         .await
         .unwrap();
+        let active = client
+            .r2_multipart_list(&base, "e2e-bucket", "large/", None, 1)
+            .await
+            .unwrap();
+        assert_eq!(active.uploads.len(), 1);
+        assert_eq!(active.uploads[0].upload_id, upload.upload_id);
+        assert_eq!(active.uploads[0].part_count, 2);
+        assert_eq!(active.uploads[0].uploaded_bytes, 15);
+        let inspected = client
+            .r2_multipart_detail(&base, "e2e-bucket", &upload.upload_id)
+            .await
+            .unwrap();
+        assert_eq!(inspected.upload.key, "large/report.txt");
+        assert_eq!(
+            inspected
+                .parts
+                .iter()
+                .map(|part| part.part_number)
+                .collect::<Vec<_>>(),
+            vec![1, 2]
+        );
         let completed = complete_multipart_upload(
             &node,
             "e2e-bucket",
@@ -2075,7 +2287,18 @@ mod tests {
         )
         .await
         .unwrap();
-        abort_multipart_upload(&node, "e2e-bucket", "large/aborted.bin", &aborted.upload_id)
+        upload_part(
+            &node,
+            "e2e-bucket",
+            "large/aborted.bin",
+            &aborted.upload_id,
+            1,
+            b"temporary",
+        )
+        .await
+        .unwrap();
+        client
+            .r2_multipart_abort(&base, "e2e-bucket", &aborted.upload_id)
             .await
             .unwrap();
         assert!(upload_part(

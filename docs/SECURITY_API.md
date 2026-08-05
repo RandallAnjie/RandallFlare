@@ -118,7 +118,7 @@ aws --endpoint-url "${RF_S3_ENDPOINT}" \
 
 The endpoint implements AWS Signature Version 4 header authentication,
 bucket/object listing, HEAD, conditional and ranged GET, PUT, DELETE, and
-multipart initiate/upload/complete/abort. It verifies the declared payload
+multipart initiate/upload/list-parts/list-uploads/complete/abort. It verifies the declared payload
 SHA-256 before committing data. Presigned URLs and CopyObject are not currently
 part of the compatibility surface.
 

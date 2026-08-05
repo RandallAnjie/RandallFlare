@@ -413,6 +413,11 @@ pub fn router(state: ConsoleState) -> Router {
         .route("/api/storage/probe", post(storage_probe))
         .route("/api/r2/buckets/{name}", delete(r2_bucket_delete))
         .route("/api/r2/objects/{bucket}", get(r2_object_list))
+        .route("/api/r2/multipart/{bucket}", get(r2_multipart_list))
+        .route(
+            "/api/r2/multipart/{bucket}/{upload_id}",
+            get(r2_multipart_detail).delete(r2_multipart_abort),
+        )
         .route(
             "/api/r2/object/{bucket}/{*key}",
             get(r2_object_get)
@@ -8322,6 +8327,53 @@ async fn r2_object_list(
         "truncated": objects.truncated,
         "cursor": objects.cursor,
     })))
+}
+
+async fn r2_multipart_list(
+    State(state): State<ConsoleState>,
+    Path(bucket): Path<String>,
+    Query(query): Query<R2ObjectListQuery>,
+) -> ApiResult<Json<Value>> {
+    let uploads = state
+        .client
+        .r2_multipart_list(
+            &state.node,
+            &bucket,
+            &query.prefix,
+            query.cursor.as_deref(),
+            query.limit.unwrap_or(100),
+        )
+        .await?;
+    Ok(Json(json!({
+        "bucket": bucket,
+        "uploads": uploads.uploads,
+        "truncated": uploads.truncated,
+        "cursor": uploads.cursor,
+    })))
+}
+
+async fn r2_multipart_detail(
+    State(state): State<ConsoleState>,
+    Path((bucket, upload_id)): Path<(String, String)>,
+) -> ApiResult<Json<Value>> {
+    Ok(Json(serde_json::to_value(
+        state
+            .client
+            .r2_multipart_detail(&state.node, &bucket, &upload_id)
+            .await?,
+    )?))
+}
+
+async fn r2_multipart_abort(
+    State(state): State<ConsoleState>,
+    Path((bucket, upload_id)): Path<(String, String)>,
+) -> ApiResult<Json<Value>> {
+    state.require_mutation()?;
+    state
+        .client
+        .r2_multipart_abort(&state.node, &bucket, &upload_id)
+        .await?;
+    Ok(Json(json!({ "ok": true })))
 }
 
 async fn r2_object_get(

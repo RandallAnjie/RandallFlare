@@ -491,6 +491,38 @@ enum R2Cmd {
         #[arg(long, env = "RF_CLUSTER_SECRET")]
         secret: String,
     },
+    /// List active multipart uploads and their staged byte totals.
+    MultipartList {
+        bucket: String,
+        #[arg(long, default_value = "")]
+        prefix: String,
+        #[arg(long)]
+        cursor: Option<String>,
+        #[arg(long, default_value_t = 100)]
+        limit: usize,
+        #[arg(long, env = "RF_NODE")]
+        node: String,
+        #[arg(long, env = "RF_CLUSTER_SECRET")]
+        secret: String,
+    },
+    /// Inspect all uploaded parts of one multipart session.
+    MultipartInspect {
+        bucket: String,
+        upload_id: String,
+        #[arg(long, env = "RF_NODE")]
+        node: String,
+        #[arg(long, env = "RF_CLUSTER_SECRET")]
+        secret: String,
+    },
+    /// Abort one multipart session and schedule its staged parts for GC.
+    MultipartAbort {
+        bucket: String,
+        upload_id: String,
+        #[arg(long, env = "RF_NODE")]
+        node: String,
+        #[arg(long, env = "RF_CLUSTER_SECRET")]
+        secret: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -2028,6 +2060,47 @@ async fn async_main(cli: Cli) -> Result<()> {
                     anyhow::bail!("R2 对象 {bucket}/{object} 不存在");
                 }
                 println!("R2 对象 {bucket}/{object} 已删除");
+                Ok(())
+            }
+            R2Cmd::MultipartList {
+                bucket,
+                prefix,
+                cursor,
+                limit,
+                node,
+                secret,
+            } => {
+                let client = PeerClient::new(secret_bytes(&secret)?);
+                let uploads = client
+                    .r2_multipart_list(&node, &bucket, &prefix, cursor.as_deref(), limit)
+                    .await?;
+                println!("{}", serde_json::to_string_pretty(&uploads)?);
+                Ok(())
+            }
+            R2Cmd::MultipartInspect {
+                bucket,
+                upload_id,
+                node,
+                secret,
+            } => {
+                let client = PeerClient::new(secret_bytes(&secret)?);
+                let upload = client
+                    .r2_multipart_detail(&node, &bucket, &upload_id)
+                    .await?;
+                println!("{}", serde_json::to_string_pretty(&upload)?);
+                Ok(())
+            }
+            R2Cmd::MultipartAbort {
+                bucket,
+                upload_id,
+                node,
+                secret,
+            } => {
+                let client = PeerClient::new(secret_bytes(&secret)?);
+                client
+                    .r2_multipart_abort(&node, &bucket, &upload_id)
+                    .await?;
+                println!("R2 分片上传 {upload_id} 已终止，暂存分片已进入安全回收队列");
                 Ok(())
             }
         },

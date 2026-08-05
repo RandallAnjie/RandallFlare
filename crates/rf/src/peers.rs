@@ -579,6 +579,58 @@ impl PeerClient {
         Ok(serde_json::from_slice(&raw)?)
     }
 
+    pub async fn r2_multipart_list(
+        &self,
+        base: &str,
+        bucket: &str,
+        prefix: &str,
+        cursor: Option<&str>,
+        limit: usize,
+    ) -> Result<crate::r2::MultipartUploadPage> {
+        let mut path = format!(
+            "/v1/r2/{}/multipart?prefix={}&limit={}",
+            component(bucket),
+            component(prefix),
+            limit.clamp(1, crate::r2::MAX_LIST_LIMIT)
+        );
+        if let Some(cursor) = cursor.filter(|value| !value.is_empty()) {
+            path.push_str("&cursor=");
+            path.push_str(&component(cursor));
+        }
+        let raw = self.get(base, &path).await?;
+        Ok(serde_json::from_slice(&raw)?)
+    }
+
+    pub async fn r2_multipart_detail(
+        &self,
+        base: &str,
+        bucket: &str,
+        upload_id: &str,
+    ) -> Result<crate::r2::MultipartUploadDetail> {
+        let path = format!(
+            "/v1/r2/{}/multipart/{}",
+            component(bucket),
+            component(upload_id)
+        );
+        let raw = self.get(base, &path).await?;
+        Ok(serde_json::from_slice(&raw)?)
+    }
+
+    pub async fn r2_multipart_abort(
+        &self,
+        base: &str,
+        bucket: &str,
+        upload_id: &str,
+    ) -> Result<()> {
+        let path = format!(
+            "/v1/r2/{}/multipart/{}",
+            component(bucket),
+            component(upload_id)
+        );
+        self.delete(base, &path).await?;
+        Ok(())
+    }
+
     pub async fn r2_head(
         &self,
         base: &str,

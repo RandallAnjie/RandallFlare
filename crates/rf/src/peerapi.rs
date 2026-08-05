@@ -168,6 +168,11 @@ pub fn router(api: Api) -> Router {
         .route("/v1/email/{domain}/send", post(email_send))
         .route("/v1/do/{worker}/proxy", post(do_proxy))
         .route("/v1/r2/{bucket}", get(r2_list))
+        .route("/v1/r2/{bucket}/multipart", get(r2_multipart_list))
+        .route(
+            "/v1/r2/{bucket}/multipart/{upload_id}",
+            get(r2_multipart_detail).delete(r2_multipart_abort),
+        )
         .route("/v1/r2-blob/{sha}", get(r2_blob_get))
         .route("/v1/r2-blob", post(r2_blob_put))
         .route("/v1/binary-blob", post(binary_blob_put))
@@ -2437,6 +2442,66 @@ struct R2ListQuery {
     prefix: String,
     cursor: Option<String>,
     limit: Option<usize>,
+}
+
+async fn r2_multipart_list(
+    State(api): State<Api>,
+    ConnectInfo(remote): ConnectInfo<SocketAddr>,
+    Path(bucket): Path<String>,
+    Query(query): Query<R2ListQuery>,
+    method: Method,
+    uri: Uri,
+    headers: HeaderMap,
+) -> Response {
+    if let Err(response) = check(&api, &remote, &headers, &method, &uri, b"") {
+        return response.into_response();
+    }
+    match r2::list_multipart_uploads(
+        &api.node,
+        &bucket,
+        &query.prefix,
+        query.cursor.as_deref(),
+        query.limit.unwrap_or(100),
+    )
+    .await
+    {
+        Ok(uploads) => axum::Json(uploads).into_response(),
+        Err(error) => r2_error(error),
+    }
+}
+
+async fn r2_multipart_detail(
+    State(api): State<Api>,
+    ConnectInfo(remote): ConnectInfo<SocketAddr>,
+    Path((bucket, upload_id)): Path<(String, String)>,
+    method: Method,
+    uri: Uri,
+    headers: HeaderMap,
+) -> Response {
+    if let Err(response) = check(&api, &remote, &headers, &method, &uri, b"") {
+        return response.into_response();
+    }
+    match r2::multipart_upload_detail(&api.node, &bucket, &upload_id).await {
+        Ok(upload) => axum::Json(upload).into_response(),
+        Err(error) => r2_error(error),
+    }
+}
+
+async fn r2_multipart_abort(
+    State(api): State<Api>,
+    ConnectInfo(remote): ConnectInfo<SocketAddr>,
+    Path((bucket, upload_id)): Path<(String, String)>,
+    method: Method,
+    uri: Uri,
+    headers: HeaderMap,
+) -> Response {
+    if let Err(response) = check(&api, &remote, &headers, &method, &uri, b"") {
+        return response.into_response();
+    }
+    match r2::abort_multipart_upload_by_id(&api.node, &bucket, &upload_id).await {
+        Ok(()) => StatusCode::OK.into_response(),
+        Err(error) => r2_error(error),
+    }
 }
 
 async fn r2_list(

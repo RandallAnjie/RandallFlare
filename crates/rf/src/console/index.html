@@ -488,6 +488,17 @@
                   </table>
                 </div>
                 <button id="r2-load-more" class="secondary hidden" type="button">加载更多</button>
+                <div class="panel-head subsection-head">
+                  <div><p class="eyebrow">分片上传</p><h3>正在进行的上传</h3><p class="muted compact-copy">查看暂存分片、到期时间和占用空间；终止后由延迟回收器安全清理底层对象。</p></div>
+                  <button id="r2-multipart-refresh" class="secondary" type="button">刷新</button>
+                </div>
+                <div class="table-wrap">
+                  <table class="project-table">
+                    <thead><tr><th>对象键 / 上传 ID</th><th>分片</th><th>暂存大小</th><th>到期时间</th><th><span class="sr-only">操作</span></th></tr></thead>
+                    <tbody id="r2-multipart-table"><tr><td colspan="5" class="empty-state">暂无正在进行的分片上传。</td></tr></tbody>
+                  </table>
+                </div>
+                <button id="r2-multipart-load-more" class="secondary hidden" type="button">加载更多上传</button>
               </div>
             </article>
           </div>
